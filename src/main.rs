@@ -154,7 +154,7 @@ fn fmt_bytes(b: u64) -> String {
 fn print_action(r: &model::ActionRecord) {
     let mark = if r.ok { "ok" } else { "FAILED" };
     println!("[{}] #{} {:?} {} ({}) — {}", mark, r.id, r.kind, r.pid, r.name, r.message);
-    if r.undoable && r.ok {
+    if r.undoable && r.ok && !r.undone && r.id != 0 {
         println!("    undo with: fat undo {}", r.id);
     }
 }

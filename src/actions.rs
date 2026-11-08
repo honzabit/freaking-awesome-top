@@ -1,21 +1,65 @@
 //! Safe, reversible actions with a persisted journal. OWNER: actions agent.
 //!
 //! Every action (including refused ones) is appended to a JSONL journal so the
-//! TUI, CLI and MCP all share one audit trail. Undo marks the original record
-//! `undone` (the journal is rewritten atomically) and appends the undo itself
-//! as a new record.
+//! TUI, CLI and MCP all share one audit trail. The journal is strictly
+//! append-only: an undo is a new record whose `resolves` names the original id,
+//! and `undone` is derived when loading. Lines this build can't parse (a torn
+//! write, a newer fat's record) are therefore never lost. Every read-allocate-
+//! append runs under an exclusive `flock` on `actions.jsonl.lock`, so concurrent
+//! fat processes never hand out the same id.
 use crate::model::{now_ms, ActionKind, ActionRecord, Snapshot};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::collections::HashSet;
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Process names we never signal, whatever the uid.
+/// Process names we never signal, whatever the uid or action.
 const PROTECTED_NAMES: &[&str] = &["kernel_task", "launchd", "WindowServer", "loginwindow"];
+/// Session and system daemons that other processes block on via IPC. Freezing or killing one
+/// can hang every app (including the agent that would issue the undo), so Pause/Term/Kill are
+/// refused for them whatever the uid. Renice and Resume stay allowed.
+const CRITICAL_NAMES: &[&str] = &[
+    "kernel_task", "launchd", "WindowServer", "loginwindow", "logd", "runningboardd", "coreaudiod",
+    "opendirectoryd", "mds", "mds_stores", "trustd", "syspolicyd", "secd", "securityd", "bluetoothd",
+    "configd", "notifyd", "distnoted", "cfprefsd", "usernoted", "UserEventAgent", "coreservicesd",
+    "lsd", "tccd", "powerd", "diskarbitrationd", "fseventsd", "mDNSResponder", "kernelmanagerd",
+    "watchdogd", "hidd", "airportd", "sshd", "launchservicesd", "nsurlsessiond", "containermanagerd",
+    "symptomsd", "thermalmonitord", "sandboxd", "authd", "keybagd", "apsd", "corebrightnessd",
+];
 /// Process names that are allowed but deserve a warning.
 const WARN_NAMES: &[&str] = &["Finder", "Dock", "SystemUIServer"];
 /// Tolerance (seconds) when comparing snapshot vs live start times.
 const START_TIME_SLACK: u64 = 2;
+
+/// True for daemons whose loss or freeze stalls the login session (shared with blame).
+pub fn is_critical_name(name: &str) -> bool {
+    CRITICAL_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// Refusal for actions that would freeze or end a critical daemon.
+pub fn critical_refusal(kind: ActionKind, name: &str) -> Option<String> {
+    let freezes_or_ends = matches!(kind, ActionKind::Pause | ActionKind::Term | ActionKind::Kill | ActionKind::KillTree);
+    (freezes_or_ends && is_critical_name(name)).then(|| {
+        format!("refusing: {name} is a system/session daemon other apps depend on; {kind:?} could hang the whole session")
+    })
+}
+
+/// The identity a user or agent saw when choosing a target. Actions refuse if the live
+/// process no longer matches it (exited, pid reused) instead of signalling a stranger.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Expect {
+    /// Epoch seconds, as in `Proc::start_time`. None/0 = don't check.
+    pub start_time: Option<u64>,
+    pub name: Option<String>,
+}
+
+impl Expect {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn of(start_time: u64, name: impl Into<String>) -> Expect {
+        Expect { start_time: (start_time != 0).then_some(start_time), name: Some(name.into()) }
+    }
+}
 
 /// One journal line: the public record plus private bookkeeping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +70,15 @@ struct Entry {
     /// make sure undo does not hit a recycled pid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     start_time: Option<u64>,
+    /// Ids this record undid or made moot (an undo, a resume, a kill of a paused process).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    resolves: Vec<u64>,
+}
+
+impl Entry {
+    fn new(rec: ActionRecord, start_time: Option<u64>) -> Entry {
+        Entry { rec, start_time, resolves: Vec::new() }
+    }
 }
 
 pub struct Actions {
@@ -56,6 +109,32 @@ pub fn journal_path() -> PathBuf {
         .join("actions.jsonl")
 }
 
+/// Exclusive advisory lock on `<journal>.lock`, released on drop (when the fd closes).
+/// If the lock file can't be created we proceed unlocked rather than refuse to act.
+struct JournalLock {
+    _file: Option<File>,
+}
+
+fn lock_journal(path: &Path) -> JournalLock {
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let lock_path = path.with_extension("jsonl.lock");
+    let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(lock_path).ok().filter(|f| {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a valid, owned fd; blocks until other fat processes release it.
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) == 0 }
+    });
+    JournalLock { _file: file }
+}
+
+fn open_for_append(path: &Path) -> std::io::Result<File> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
 impl Actions {
     /// Journal at dirs::state_dir()|data_local_dir()/fat/actions.jsonl
     pub fn open() -> Actions {
@@ -75,43 +154,80 @@ impl Actions {
 
     /// Apply an action. `nice` required for Renice. Refuses protected pids (0, 1, self, kernel_task, WindowServer, launchd, loginwindow).
     pub fn apply(&mut self, kind: ActionKind, pid: u32, nice: Option<i32>, snap: &Snapshot) -> ActionRecord {
+        self.apply_expect(kind, pid, nice, snap, None)
+    }
+
+    /// Like [`apply`](Self::apply), but also refuses unless the live process still matches the
+    /// identity the caller chose (start time, name). Use whenever time passes between choosing
+    /// a target and acting on it (a confirm dialog, an agent's earlier snapshot).
+    pub fn apply_expect(
+        &mut self,
+        kind: ActionKind,
+        pid: u32,
+        nice: Option<i32>,
+        snap: &Snapshot,
+        expect: Option<&Expect>,
+    ) -> ActionRecord {
+        let _lock = lock_journal(&self.path);
+        // Opened before acting so we know up front whether this action can be undone later.
+        let journal = open_for_append(&self.path);
+        self.entries = load(&self.path);
+
         let snap_name = snap.proc(pid).map(|p| p.name.clone());
         let live = live_proc(pid);
         let name = snap_name
             .clone()
             .or_else(|| live.as_ref().map(|l| l.name.clone()))
             .unwrap_or_else(|| "?".into());
-        let mut rec = ActionRecord {
-            id: 0,
-            ts: now_ms(),
-            kind,
-            pid,
-            name: name.clone(),
-            prev_nice: None,
-            new_nice: None,
-            pids: Vec::new(),
-            undoable: false,
-            undone: false,
-            ok: false,
-            message: String::new(),
-        };
+        let mut rec = blank(kind, pid, &name);
         let start_time = live.as_ref().map(|l| l.start_time);
+        let mut resolves = Vec::new();
 
-        match check_target(pid, live.as_ref(), snap) {
+        match check_target(kind, pid, live.as_ref(), snap, expect) {
             Err(msg) => rec.message = msg,
             Ok(warning) => {
                 execute(&mut rec, kind, pid, nice, snap);
+                if rec.ok {
+                    resolves = self.close_pauses(kind, &rec, start_time);
+                    if !resolves.is_empty() {
+                        let ids: Vec<String> = resolves.iter().map(|i| format!("#{i}")).collect();
+                        rec.message = format!("{} (closes pause {})", rec.message, ids.join(", "));
+                    }
+                }
                 if let Some(w) = warning {
                     rec.message = format!("{} (warning: {w})", rec.message);
                 }
             }
         }
-        self.append(Entry { rec, start_time })
+        let mut entry = Entry::new(rec, start_time);
+        entry.resolves = resolves;
+        self.write(entry, journal)
+    }
+
+    /// Open Pause records made moot by a successful action on the same process: a Resume
+    /// (nothing left to undo) or a Term/Kill/KillTree (undo would only deliver the TERM).
+    fn close_pauses(&self, kind: ActionKind, rec: &ActionRecord, start_time: Option<u64>) -> Vec<u64> {
+        if !matches!(kind, ActionKind::Resume | ActionKind::Term | ActionKind::Kill | ActionKind::KillTree) {
+            return Vec::new();
+        }
+        let touched: HashSet<u32> = rec.pids.iter().copied().chain(std::iter::once(rec.pid)).collect();
+        open_entries(&self.entries)
+            .filter(|e| e.rec.kind == ActionKind::Pause && touched.contains(&e.rec.pid))
+            // Only the same incarnation: an old pause of a recycled pid stays as it was.
+            .filter(|e| e.rec.pid != rec.pid || same_start(e.start_time, start_time))
+            .map(|e| e.rec.id)
+            .collect()
     }
 
     /// Undo by id (pause->resume, renice->restore). Kill is not undoable.
     pub fn undo(&mut self, id: u64) -> ActionRecord {
+        let _lock = lock_journal(&self.path);
         self.entries = load(&self.path);
+        self.undo_locked(id)
+    }
+
+    /// Undo with the journal lock held and `self.entries` fresh.
+    fn undo_locked(&mut self, id: u64) -> ActionRecord {
         let Some(idx) = self.entries.iter().position(|e| e.rec.id == id) else {
             return failed(ActionKind::Resume, 0, "?", format!("no action #{id} in journal"));
         };
@@ -130,35 +246,22 @@ impl Actions {
         if o.undone {
             return failed(undo_kind, o.pid, &o.name, format!("#{id} was already undone"));
         }
-
-        let mut rec = ActionRecord {
-            id: 0,
-            ts: now_ms(),
-            kind: undo_kind,
-            pid: o.pid,
-            name: o.name.clone(),
-            prev_nice: None,
-            new_nice: None,
-            pids: Vec::new(),
-            undoable: false,
-            undone: false,
-            ok: false,
-            message: String::new(),
-        };
+        let journal = open_for_append(&self.path);
+        let mut rec = blank(undo_kind, o.pid, &o.name);
 
         // Targets: the pids the original touched (falls back to the main pid).
         let targets: Vec<u32> = if o.pids.is_empty() { vec![o.pid] } else { o.pids.clone() };
         let main_live = live_proc(o.pid);
         let gone = match (&main_live, orig.start_time) {
             (None, _) => true,
-            (Some(l), Some(st)) => l.start_time.abs_diff(st) > START_TIME_SLACK,
-            (Some(_), None) => false,
+            (Some(l), st) => !same_start(st, Some(l.start_time)),
         };
         if gone {
             rec.message = format!("undo #{id}: process {} is gone (exited or pid reused); marking undone", o.pid);
             rec.ok = true;
-            self.mark_undone(id);
-            return self.append(Entry { rec, start_time: orig.start_time });
+            let mut e = Entry::new(rec, orig.start_time);
+            e.resolves = vec![id];
+            return self.write(e, journal);
         }
 
         match o.kind {
@@ -199,21 +302,18 @@ impl Actions {
             }
             other => rec.message = format!("{other:?} cannot be undone"),
         }
-        if rec.ok {
-            self.mark_undone(id);
+        let mut e = Entry::new(rec, orig.start_time);
+        if e.rec.ok {
+            e.resolves = vec![id];
         }
-        self.append(Entry { rec, start_time: orig.start_time })
+        self.write(e, journal)
     }
 
     pub fn undo_last(&mut self) -> Option<ActionRecord> {
+        let _lock = lock_journal(&self.path);
         self.entries = load(&self.path);
-        let id = self
-            .entries
-            .iter()
-            .rev()
-            .find(|e| e.rec.ok && e.rec.undoable && !e.rec.undone)
-            .map(|e| e.rec.id)?;
-        Some(self.undo(id))
+        let id = open_entries(&self.entries).last().map(|e| e.rec.id)?;
+        Some(self.undo_locked(id))
     }
 
     /// Most recent first.
@@ -225,56 +325,65 @@ impl Actions {
 
     // ---- journal persistence ----
 
-    fn append(&mut self, mut entry: Entry) -> ActionRecord {
-        // Re-read so concurrent fat instances (TUI + CLI) don't reuse ids.
-        self.entries = load(&self.path);
+    /// Assign the next id and append. Caller holds the journal lock and refreshed `entries`.
+    /// If the record can't be persisted it gets id 0 and loses `undoable`: an id that isn't
+    /// in the journal would only produce a failing `fat undo N` hint.
+    fn write(&mut self, mut entry: Entry, journal: std::io::Result<File>) -> ActionRecord {
         entry.rec.id = self.entries.iter().map(|e| e.rec.id).max().unwrap_or(0) + 1;
-        if let Some(dir) = self.path.parent() {
-            let _ = fs::create_dir_all(dir);
-        }
         let line = serde_json::to_string(&entry).unwrap_or_default();
-        let res = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .and_then(|mut f| writeln!(f, "{line}"));
+        let res = journal.and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()));
         if let Err(e) = res {
-            entry.rec.message = format!("{} (journal write failed: {e})", entry.rec.message);
+            entry.rec.id = 0;
+            let mut note = format!("not journaled ({e})");
+            if entry.rec.undoable {
+                entry.rec.undoable = false;
+                note.push_str(&format!("; fat can't undo it, resume manually with `fat resume {}`", entry.rec.pid));
+                if entry.rec.kind == ActionKind::Renice
+                    && let Some(p) = entry.rec.prev_nice
+                {
+                    note = format!("not journaled ({e}); restore manually with `fat renice {} {p}`", entry.rec.pid);
+                }
+            }
+            entry.rec.message = format!("{} ({note})", entry.rec.message);
+            return entry.rec;
         }
         let rec = entry.rec.clone();
         self.entries.push(entry);
         rec
     }
+}
 
-    fn mark_undone(&mut self, id: u64) {
-        self.entries = load(&self.path);
-        for e in &mut self.entries {
-            if e.rec.id == id {
-                e.rec.undone = true;
-            }
-        }
-        let body: String = self
-            .entries
-            .iter()
-            .filter_map(|e| serde_json::to_string(e).ok())
-            .map(|l| l + "\n")
-            .collect();
-        let tmp = self.path.with_extension("jsonl.tmp");
-        if fs::write(&tmp, body).is_ok() {
-            let _ = fs::rename(&tmp, &self.path);
-        }
+fn same_start(a: Option<u64>, b: Option<u64>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) if a != 0 && b != 0 => a.abs_diff(b) <= START_TIME_SLACK,
+        _ => true,
     }
 }
 
-fn load(path: &Path) -> Vec<Entry> {
-    let Ok(text) = fs::read_to_string(path) else { return Vec::new() };
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<Entry>(l).ok())
-        .collect()
+/// Successful, undoable, not-yet-undone records in journal order.
+fn open_entries(entries: &[Entry]) -> impl DoubleEndedIterator<Item = &Entry> {
+    entries.iter().filter(|e| e.rec.ok && e.rec.undoable && !e.rec.undone && e.rec.id != 0)
 }
 
-fn failed(kind: ActionKind, pid: u32, name: &str, message: String) -> ActionRecord {
+/// Parse the journal, deriving `undone` from later records' `resolves`. Unparseable lines are
+/// skipped here but stay untouched on disk, because nothing ever rewrites the file.
+fn load(path: &Path) -> Vec<Entry> {
+    let Ok(text) = fs::read_to_string(path) else { return Vec::new() };
+    let mut entries: Vec<Entry> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Entry>(l).ok())
+        .collect();
+    let resolved: HashSet<u64> = entries.iter().flat_map(|e| e.resolves.iter().copied()).collect();
+    for e in &mut entries {
+        if resolved.contains(&e.rec.id) {
+            e.rec.undone = true;
+        }
+    }
+    entries
+}
+
+fn blank(kind: ActionKind, pid: u32, name: &str) -> ActionRecord {
     ActionRecord {
         id: 0,
         ts: now_ms(),
@@ -287,8 +396,12 @@ fn failed(kind: ActionKind, pid: u32, name: &str, message: String) -> ActionReco
         undoable: false,
         undone: false,
         ok: false,
-        message,
+        message: String::new(),
     }
+}
+
+fn failed(kind: ActionKind, pid: u32, name: &str, message: String) -> ActionRecord {
+    ActionRecord { message, ..blank(kind, pid, name) }
 }
 
 // ---- safety checks ----
@@ -333,25 +446,70 @@ pub fn protection(pid: u32, name: &str, ours: &[u32]) -> Result<Option<String>, 
     Ok(None)
 }
 
+/// Process names agree, allowing for kernel truncation (16-char p_comm vs full name).
+fn names_match(a: &str, b: &str) -> bool {
+    let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+    !a.is_empty() && !b.is_empty() && (a == b || (a.len() >= 15 && b.starts_with(&a)) || (b.len() >= 15 && a.starts_with(&b)))
+}
+
+/// The live process is still the one the caller chose.
+fn check_expect(pid: u32, live: &LiveProc, snap_name: Option<&str>, e: &Expect) -> Result<(), String> {
+    if let Some(st) = e.start_time.filter(|&s| s != 0)
+        && live.start_time != 0
+        && st.abs_diff(live.start_time) > START_TIME_SLACK
+    {
+        return Err(format!(
+            "refusing: pid {pid} is no longer the process you chose (it started at {}, expected {}); it exited and the pid was reused",
+            live.start_time, st
+        ));
+    }
+    if let Some(n) = e.name.as_deref().filter(|n| !n.is_empty())
+        && !names_match(n, &live.name)
+        && !snap_name.is_some_and(|s| names_match(n, s))
+    {
+        return Err(format!("refusing: pid {pid} is now {:?}, not {n:?} (pid reused?)", live.name));
+    }
+    Ok(())
+}
+
 /// Full target validation: protection policy, liveness, pid-reuse, ownership.
-fn check_target(pid: u32, live: Option<&LiveProc>, snap: &Snapshot) -> Result<Option<String>, String> {
+fn check_target(
+    kind: ActionKind,
+    pid: u32,
+    live: Option<&LiveProc>,
+    snap: &Snapshot,
+    expect: Option<&Expect>,
+) -> Result<Option<String>, String> {
     let sp = snap.proc(pid);
     let name = sp.map(|p| p.name.as_str()).or(live.map(|l| l.name.as_str())).unwrap_or("?");
     let warning = protection(pid, name, &self_and_ancestors())?;
+    if let Some(r) = critical_refusal(kind, name) {
+        return Err(r);
+    }
     if let Some(l) = live
-        && l.name != name {
-            protection(pid, &l.name, &[])?;
+        && l.name != name
+    {
+        protection(pid, &l.name, &[])?;
+        if let Some(r) = critical_refusal(kind, &l.name) {
+            return Err(r);
         }
+    }
     let Some(live) = live else {
         return Err(format!("pid {pid} is not running"));
     };
+    if let Some(e) = expect {
+        check_expect(pid, live, sp.map(|p| p.name.as_str()), e)?;
+    }
     if let Some(sp) = sp
-        && sp.start_time != 0 && live.start_time != 0 && sp.start_time.abs_diff(live.start_time) > START_TIME_SLACK {
-            return Err(format!(
-                "refusing: pid {pid} was reused (snapshot start {} != live start {}); refresh and retry",
-                sp.start_time, live.start_time
-            ));
-        }
+        && sp.start_time != 0
+        && live.start_time != 0
+        && sp.start_time.abs_diff(live.start_time) > START_TIME_SLACK
+    {
+        return Err(format!(
+            "refusing: pid {pid} was reused (snapshot start {} != live start {}); refresh and retry",
+            sp.start_time, live.start_time
+        ));
+    }
     if !is_root() {
         // SAFETY: getuid/geteuid have no preconditions.
         let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
@@ -368,11 +526,27 @@ fn check_target(pid: u32, live: Option<&LiveProc>, snap: &Snapshot) -> Result<Op
 fn execute(rec: &mut ActionRecord, kind: ActionKind, pid: u32, nice: Option<i32>, snap: &Snapshot) {
     match kind {
         ActionKind::Pause => signal_one(rec, pid, libc::SIGSTOP, "paused (SIGSTOP)", true),
-        ActionKind::Resume => signal_one(rec, pid, libc::SIGCONT, "resumed (SIGCONT)", false),
-        ActionKind::Term => signal_one(rec, pid, libc::SIGTERM, "sent SIGTERM", false),
+        ActionKind::Resume => resume(rec, pid, snap),
+        ActionKind::Term => {
+            signal_one(rec, pid, libc::SIGTERM, "sent SIGTERM", false);
+            if rec.ok && continue_if_stopped(pid) {
+                rec.message.push_str(" and SIGCONT (it was paused, and a stopped process can't act on TERM)");
+            }
+        }
         ActionKind::Kill => signal_one(rec, pid, libc::SIGKILL, "sent SIGKILL", false),
         ActionKind::Renice => renice(rec, pid, nice),
         ActionKind::KillTree => kill_tree(rec, pid, snap),
+    }
+}
+
+/// A stopped process keeps TERM pending until continued; continue it so the signal lands.
+/// Returns true if it was stopped.
+fn continue_if_stopped(pid: u32) -> bool {
+    if live_proc(pid).is_some_and(|l| l.stopped) {
+        let _ = send_signal(pid, libc::SIGCONT);
+        true
+    } else {
+        false
     }
 }
 
@@ -385,6 +559,38 @@ fn signal_one(rec: &mut ActionRecord, pid: u32, sig: i32, ok_msg: &str, undoable
             rec.message = ok_msg.to_string();
         }
         Err(e) => rec.message = e,
+    }
+}
+
+fn pgid_of(pid: u32) -> Option<u32> {
+    // SAFETY: getpgid has no memory preconditions.
+    let g = unsafe { libc::getpgid(pid as libc::pid_t) };
+    (g > 0).then_some(g as u32)
+}
+
+/// SIGCONT the process, and when it leads a process group (a `fat run` job, a shell job),
+/// also the stopped members of that group: resuming only the leader leaves it waiting on
+/// children that are still frozen.
+fn resume(rec: &mut ActionRecord, pid: u32, snap: &Snapshot) {
+    signal_one(rec, pid, libc::SIGCONT, "resumed (SIGCONT)", false);
+    if !rec.ok || pgid_of(pid) != Some(pid) {
+        return;
+    }
+    let ours = self_and_ancestors();
+    let mut extra = Vec::new();
+    for d in snap.descendants(pid) {
+        let Some(l) = live_proc(d.pid) else { continue };
+        let same = d.start_time == 0 || l.start_time.abs_diff(d.start_time) <= START_TIME_SLACK;
+        if !same || !l.stopped || pgid_of(d.pid) != Some(pid) || protection(d.pid, &l.name, &ours).is_err() {
+            continue;
+        }
+        if send_signal(d.pid, libc::SIGCONT).is_ok() {
+            extra.push(d.pid);
+        }
+    }
+    if !extra.is_empty() {
+        rec.message = format!("resumed (SIGCONT) with {} stopped member(s) of its process group", extra.len());
+        rec.pids.extend(extra);
     }
 }
 
@@ -440,8 +646,13 @@ fn kill_tree(rec: &mut ActionRecord, pid: u32, snap: &Snapshot) {
 
     let mut sent = Vec::new();
     let mut skipped = Vec::new();
+    let mut continued = 0;
     for (_, cpid, cname, cstart) in desc {
         if let Err(why) = protection(cpid, &cname, &ours) {
+            skipped.push(format!("{cpid} ({why})"));
+            continue;
+        }
+        if let Some(why) = critical_refusal(ActionKind::KillTree, &cname) {
             skipped.push(format!("{cpid} ({why})"));
             continue;
         }
@@ -450,19 +661,26 @@ fn kill_tree(rec: &mut ActionRecord, pid: u32, snap: &Snapshot) {
             _ => continue, // already exited or pid reused
         }
         match send_signal(cpid, libc::SIGTERM) {
-            Ok(()) => sent.push(cpid),
+            Ok(()) => {
+                sent.push(cpid);
+                continued += continue_if_stopped(cpid) as usize;
+            }
             Err(e) => skipped.push(format!("{cpid} ({e})")),
         }
     }
     match send_signal(pid, libc::SIGTERM) {
-        Ok(()) => sent.push(pid),
+        Ok(()) => {
+            sent.push(pid);
+            continued += continue_if_stopped(pid) as usize;
+        }
         Err(e) => skipped.push(format!("{pid} ({e})")),
     }
     rec.ok = sent.contains(&pid);
     rec.message = format!(
-        "sent SIGTERM to {} process(es) leaves-first: {:?}{}",
+        "sent SIGTERM to {} process(es) leaves-first: {:?}{}{}",
         sent.len(),
         sent,
+        if continued > 0 { format!("; resumed {continued} paused one(s) so TERM is delivered") } else { String::new() },
         if skipped.is_empty() { String::new() } else { format!("; skipped {}", skipped.join(", ")) }
     );
     rec.pids = sent;
@@ -730,6 +948,138 @@ mod tests {
         assert!(ids.windows(2).all(|w| w[0] > w[1]), "{ids:?}");
         drop(kid);
         let _ = fs::remove_file(&path);
+    }
+
+    fn wait_exit(kid: &mut Kid, ms: u64) -> bool {
+        for _ in 0..ms / 25 {
+            if kid.0.try_wait().ok().flatten().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        false
+    }
+
+    #[test]
+    fn critical_daemons_refused_for_freeze_and_kill() {
+        for n in ["cfprefsd", "distnoted", "secd", "trustd", "usernoted", "notifyd", "WindowServer"] {
+            assert!(critical_refusal(ActionKind::Pause, n).is_some(), "{n}");
+            assert!(critical_refusal(ActionKind::Term, n).is_some(), "{n}");
+            assert!(critical_refusal(ActionKind::KillTree, n).is_some(), "{n}");
+            assert!(critical_refusal(ActionKind::Resume, n).is_none(), "{n}");
+            assert!(critical_refusal(ActionKind::Renice, n).is_none(), "{n}");
+        }
+        assert!(critical_refusal(ActionKind::Pause, "node").is_none());
+        assert!(is_critical_name("CFPREFSD"));
+    }
+
+    #[test]
+    fn concurrent_writers_get_unique_ids() {
+        let path = tmp_journal("concurrent");
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut a = Actions::open_at(&path);
+                    for _ in 0..15 {
+                        // Refused (pid 1) but journaled: exercises id allocation + append only.
+                        assert!(!a.apply(ActionKind::Kill, 1, None, &Snapshot::default()).ok);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let ids: Vec<u64> = Actions::open_at(&path).log().iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), 90);
+        let uniq: HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(uniq.len(), 90, "duplicate ids: {ids:?}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn undo_is_append_only_and_keeps_unknown_lines() {
+        let kid = spawn_sleep();
+        let pid = kid.0.id();
+        let snap = snap_with(pid);
+        let path = tmp_journal("appendonly");
+        let torn = r#"{"id":77,"ts":1,"kind":"pa"#;
+        let future = r#"{"id":78,"ts":2,"kind":"throttle","pid":5,"name":"x","prev_nice":null,"new_nice":null,"pids":[],"undoable":true,"undone":false,"ok":true,"message":""}"#;
+        fs::write(&path, format!("{future}\n{torn}\n")).unwrap();
+        let mut a = Actions::open_at(&path);
+        let r = a.apply(ActionKind::Pause, pid, None, &snap);
+        assert!(r.ok && r.undoable && r.id > 0, "{r:?}");
+        assert!(wait_stopped(pid, true));
+        let u = a.undo(r.id);
+        assert!(u.ok, "{u:?}");
+        assert!(wait_stopped(pid, false));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains(torn) && text.contains(future), "unparsed lines must survive an undo:\n{text}");
+        assert!(a.log().iter().find(|x| x.id == r.id).unwrap().undone);
+        assert!(!a.undo(r.id).ok, "double undo must fail");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn term_on_paused_process_with_handler_is_delivered() {
+        let have_perl = Command::new("perl").arg("-e1").status().map(|s| s.success()).unwrap_or(false);
+        if !have_perl {
+            return;
+        }
+        let mut kid = Kid(Command::new("perl").args(["-e", "$SIG{TERM} = sub { exit 0 }; sleep 300"]).spawn().unwrap());
+        let pid = kid.0.id();
+        std::thread::sleep(Duration::from_millis(150)); // let perl install its handler
+        let snap = snap_with(pid);
+        let path = tmp_journal("termpaused");
+        let mut a = Actions::open_at(&path);
+        let p = a.apply(ActionKind::Pause, pid, None, &snap);
+        assert!(p.ok);
+        assert!(wait_stopped(pid, true));
+        let t = a.apply(ActionKind::Term, pid, None, &snap);
+        assert!(t.ok, "{t:?}");
+        assert!(t.message.contains("SIGCONT"), "{}", t.message);
+        assert!(wait_exit(&mut kid, 3000), "TERM must reach a paused process");
+        // The pause is closed: undo must not "restore" (i.e. resurrect-then-kill) it.
+        assert!(a.log().iter().find(|x| x.id == p.id).unwrap().undone);
+        assert!(a.undo_last().is_none());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expect_refuses_a_different_incarnation() {
+        let kid = spawn_sleep();
+        let pid = kid.0.id();
+        let snap = snap_with(pid); // the *new* snapshot agrees with the live process...
+        let st = snap.procs[0].start_time;
+        let path = tmp_journal("expect");
+        let mut a = Actions::open_at(&path);
+        // ...but the user chose a process that started 1000s earlier.
+        let old = Expect::of(st - 1000, "sleep");
+        let r = a.apply_expect(ActionKind::Term, pid, None, &snap, Some(&old));
+        assert!(!r.ok && r.message.contains("no longer"), "{r:?}");
+        let other = Expect::of(st, "node");
+        let r = a.apply_expect(ActionKind::Pause, pid, None, &snap, Some(&other));
+        assert!(!r.ok && r.message.contains("not \"node\""), "{r:?}");
+        let ok = a.apply_expect(ActionKind::Pause, pid, None, &snap, Some(&Expect::of(st, "sleep")));
+        assert!(ok.ok, "{ok:?}");
+        assert!(a.undo(ok.id).ok);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unwritable_journal_means_not_undoable() {
+        let kid = spawn_sleep();
+        let pid = kid.0.id();
+        let snap = snap_with(pid);
+        let mut a = Actions::open_at("/dev/null/fat-no-such-dir/actions.jsonl");
+        let r = a.apply(ActionKind::Pause, pid, None, &snap);
+        assert!(r.ok, "{r:?}");
+        assert!(!r.undoable && r.id == 0, "{r:?}");
+        assert!(r.message.contains("fat resume"), "{}", r.message);
+        assert!(wait_stopped(pid, true));
+        assert!(a.apply(ActionKind::Resume, pid, None, &snap).ok);
+        assert!(wait_stopped(pid, false));
     }
 
     #[test]

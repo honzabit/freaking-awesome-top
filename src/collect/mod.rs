@@ -50,6 +50,23 @@ fn proc_refresh_kind() -> ProcessRefreshKind {
     if cfg!(target_os = "macos") { kind } else { kind.with_cpu().with_disk_usage() }
 }
 
+/// User name for `uid` via getpwuid_r (thread-safe).
+fn passwd_name(uid: u32) -> Option<String> {
+    let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: passwd is POD; getpwuid_r writes into `pw`/`buf` (sized as passed) and sets
+    // `out` to &pw on success. pw_name points into buf, which outlives the read below.
+    unsafe {
+        let mut pw: libc::passwd = std::mem::zeroed();
+        let mut out: *mut libc::passwd = std::ptr::null_mut();
+        let rc = libc::getpwuid_r(uid as libc::uid_t, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out);
+        if rc != 0 || out.is_null() || pw.pw_name.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr(pw.pw_name).to_string_lossy().into_owned();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
 impl Collector {
     pub fn new() -> Self {
         let sys = sysinfo::System::new_with_specifics(
@@ -87,7 +104,9 @@ impl Collector {
             self.users_loaded = Instant::now();
             name = lookup(&self.users);
         }
-        let name = name.unwrap_or_else(|| uid.to_string());
+        // sysinfo's list skips system accounts (_windowserver, _mdnsresponder...); ask the
+        // directory service directly before falling back to the numeric uid.
+        let name = name.or_else(|| passwd_name(uid)).unwrap_or_else(|| uid.to_string());
         self.user_names.insert(uid, name.clone());
         name
     }
@@ -140,7 +159,23 @@ impl Collector {
             })
             .collect();
 
-        for (mut pr, uid, sys_rd, sys_wr) in raw {
+        for (mut pr, mut uid, sys_rd, sys_wr) in raw {
+            // sysinfo reads ppid/uid/start via PROC_PIDTBSDINFO, which fails for other users'
+            // processes when unprivileged (it then reports ppid 0, no user, start 0). The short
+            // bsd info + sysctl paths work for everyone, so fill the identity from those.
+            if ((pr.ppid == 0 && pr.pid > 1) || uid.is_none() || pr.start_time == 0)
+                && let Some(id) = procs::ident(pr.pid)
+            {
+                if pr.ppid == 0 {
+                    pr.ppid = id.ppid;
+                }
+                if uid.is_none() {
+                    uid = Some(id.uid);
+                }
+                if pr.start_time == 0 {
+                    pr.start_time = id.start_time;
+                }
+            }
             pr.user = self.user_name(uid);
             if let Some(n) = procs::nice(pr.pid) {
                 pr.nice = n;
@@ -157,7 +192,10 @@ impl Collector {
                     pr.disk_read_bps = r.disk_read_bps;
                     pr.disk_write_bps = r.disk_write_bps;
                 }
-                None if dt > 0.0 && !cfg!(target_os = "macos") => {
+                // On macOS cpu/power come only from rusage; without it (EPERM: another user's
+                // process) the zeros mean "not measurable", which callers must not read as idle.
+                None if cfg!(target_os = "macos") => pr.usage_unknown = true,
+                None if dt > 0.0 => {
                     // sysinfo's disk_usage is "since last refresh".
                     pr.disk_read_bps = (sys_rd as f64 / dt) as u64;
                     pr.disk_write_bps = (sys_wr as f64 / dt) as u64;
@@ -272,6 +310,30 @@ mod tests {
         let busiest = s.procs.iter().map(|p| p.cpu).fold(0.0f32, f32::max);
         eprintln!("cli-like busiest={busiest} sys={}", s.system.cpu);
         assert!(busiest > 0.0, "per-process cpu must be live on the 2nd sample");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn other_users_processes_keep_identity() {
+        let mut c = Collector::new();
+        let s = c.sample();
+        let launchd = s.proc(1).expect("launchd present");
+        assert_eq!(launchd.user, "root");
+        assert!(launchd.start_time > 0);
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(launchd.usage_unknown, "root process usage can't be measured unprivileged");
+            // Root-owned daemons must not look orphaned (ppid 0) any more.
+            let zero_ppid = s.procs.iter().filter(|p| p.pid > 1 && p.ppid == 0).count();
+            assert!(zero_ppid <= 2, "{zero_ppid} processes with unknown parent (a racing exit may explain one or two)");
+        }
+        let me = s.proc(std::process::id()).unwrap();
+        assert!(!me.usage_unknown);
+        // System accounts resolve to names, not numeric uids.
+        assert_eq!(passwd_name(0).as_deref(), Some("root"));
+        if let Some(ws) = s.procs.iter().find(|p| p.name == "WindowServer") {
+            assert!(ws.user.parse::<u32>().is_err(), "uid not resolved: {}", ws.user);
+        }
     }
 
     #[test]

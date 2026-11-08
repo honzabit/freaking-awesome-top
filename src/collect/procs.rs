@@ -5,6 +5,7 @@
 //!   * `proc_pid_rusage(RUSAGE_INFO_V4)` -> billed energy (nJ), cpu time, disk io bytes
 //!   * `proc_pidinfo(PROC_PIDTASKINFO)` -> thread count
 //!   * `getpriority(PRIO_PROCESS)` -> nice
+//!
 //! All of them fail with EPERM for other users' processes when unprivileged; we skip silently.
 
 use std::collections::HashMap;
@@ -24,6 +25,8 @@ pub struct Counters {
     pub has_energy: bool,
     /// User + system cpu time in nanoseconds.
     pub cpu_ns: u64,
+    /// CPU time of this task's already-reaped children (`ri_child_*_time`), nanoseconds.
+    pub child_cpu_ns: u64,
     pub disk_read: u64,
     pub disk_write: u64,
 }
@@ -209,9 +212,61 @@ mod mac {
             energy_nj: energy_nj.unwrap_or(0),
             has_energy: energy_nj.is_some(),
             cpu_ns: ticks_to_ns(ri.ri_user_time.saturating_add(ri.ri_system_time)),
+            child_cpu_ns: ticks_to_ns(ri.ri_child_user_time.saturating_add(ri.ri_child_system_time)),
             disk_read: ri.ri_diskio_bytesread,
             disk_write: ri.ri_diskio_byteswritten,
         })
+    }
+
+    /// ppid/uid via PROC_PIDT_SHORTBSDINFO, which (unlike PROC_PIDTBSDINFO) works for other
+    /// users' processes without root.
+    pub fn short_bsd(pid: u32) -> Option<(u32, u32)> {
+        // SAFETY: proc_bsdshortinfo is POD; all-zero is valid.
+        let mut si: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+        // SAFETY: buffer pointer/size describe `si` exactly.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDT_SHORTBSDINFO,
+                0,
+                &mut si as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        (n == size && si.pbsi_pid == pid).then_some((si.pbsi_ppid, si.pbsi_uid))
+    }
+
+    /// Process start (epoch secs) via sysctl(KERN_PROC_PID), readable for every process.
+    ///
+    /// libc has no `kinfo_proc` for Apple, so we read the two fields we need at their fixed
+    /// offsets (verified against <sys/sysctl.h> on arm64/x86_64: sizeof = 648,
+    /// kp_proc.p_starttime at 0, kp_proc.p_pid at 40) and sanity-check the pid.
+    pub fn start_time(pid: u32) -> Option<u64> {
+        const KINFO_SIZE: usize = 648;
+        const OFF_START: usize = 0;
+        const OFF_PID: usize = 40;
+        let mut buf = [0u64; KINFO_SIZE / 8]; // u64 array for 8-byte alignment
+        let mut len: libc::size_t = KINFO_SIZE;
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as libc::c_int];
+        // SAFETY: mib has 4 valid entries; buf is KINFO_SIZE writable bytes and len says so.
+        let rc = unsafe {
+            libc::sysctl(mib.as_mut_ptr(), 4, buf.as_mut_ptr() as *mut libc::c_void, &mut len, std::ptr::null_mut(), 0)
+        };
+        if rc != 0 || len != KINFO_SIZE {
+            return None;
+        }
+        let bytes: &[u8] = {
+            // SAFETY: viewing an initialized u64 array as bytes is always valid.
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, KINFO_SIZE) }
+        };
+        let rd_i32 = |o: usize| i32::from_ne_bytes(bytes[o..o + 4].try_into().unwrap_or([0; 4]));
+        let rd_i64 = |o: usize| i64::from_ne_bytes(bytes[o..o + 8].try_into().unwrap_or([0; 8]));
+        if rd_i32(OFF_PID) != pid as i32 {
+            return None;
+        }
+        let secs = rd_i64(OFF_START);
+        (secs > 0).then_some(secs as u64)
     }
 
     pub fn threads(pid: u32) -> Option<u32> {
@@ -237,6 +292,29 @@ pub fn counters(pid: u32) -> Option<Counters> {
     #[cfg(target_os = "macos")]
     {
         mac::counters(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Identity readable without privileges even for other users' processes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ident {
+    pub ppid: u32,
+    pub uid: u32,
+    /// Epoch seconds (0 if unknown).
+    pub start_time: u64,
+}
+
+/// ppid, uid and start time for `pid` (macOS only), used when sysinfo cannot read a process.
+pub fn ident(pid: u32) -> Option<Ident> {
+    #[cfg(target_os = "macos")]
+    {
+        let (ppid, uid) = mac::short_bsd(pid)?;
+        Some(Ident { ppid, uid, start_time: mac::start_time(pid).unwrap_or(0) })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -305,6 +383,20 @@ mod tests {
         assert_eq!(status_char(ProcessStatus::Run), "R");
         assert_eq!(status_char(ProcessStatus::Stop), "T");
         assert_eq!(status_char(ProcessStatus::Zombie), "Z");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ident_of_launchd_without_root() {
+        // launchd is root-owned; sysinfo can't read it unprivileged but these calls can.
+        let id = ident(1).expect("ident for pid 1");
+        assert_eq!(id.uid, 0);
+        assert_eq!(id.ppid, 0);
+        assert!(id.start_time > 1_000_000_000, "{id:?}");
+        let me = ident(std::process::id()).expect("ident self");
+        // SAFETY: getuid has no preconditions.
+        assert_eq!(me.uid, unsafe { libc::getuid() });
+        assert!(me.start_time > 1_000_000_000);
     }
 
     #[test]

@@ -42,6 +42,10 @@ pub struct Proc {
     /// Single char status: R, S, T (stopped), Z, I, U.
     pub status: String,
     pub nice: i32,
+    /// True when cpu/mem/power/threads could not be measured (another user's process
+    /// without root). Those fields then read 0 but mean "unknown", not "idle".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usage_unknown: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

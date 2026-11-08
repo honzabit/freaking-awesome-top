@@ -398,6 +398,16 @@ pub struct History {
     last_changes: HashMap<&'static str, String>,
     /// proc_info hash -> row id for incarnations known to exist in the DB.
     known_info: HashMap<i64, i64>,
+    /// Exclusive writer lease (flock on `<db>.writer-lock`). The delta encoding only replays
+    /// correctly from one writer's stream, so only the lease holder records.
+    writer: Option<std::fs::File>,
+}
+
+/// Lock file guarding the single-writer rule for `db`.
+fn writer_lock_path(db: &Path) -> PathBuf {
+    let mut s = db.as_os_str().to_owned();
+    s.push(".writer-lock");
+    PathBuf::from(s)
 }
 
 impl History {
@@ -451,10 +461,63 @@ impl History {
             last_rows: HashMap::new(),
             last_changes: HashMap::new(),
             known_info: HashMap::new(),
+            writer: None,
         })
     }
 
+    /// True while this instance holds the writer lease.
+    pub fn is_writer(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    /// Take the writer lease if no other process (or instance) holds it. Non-blocking; the
+    /// lease is released when this History is dropped (or its process dies).
+    pub fn try_become_writer(&mut self) -> bool {
+        if self.writer.is_some() {
+            return true;
+        }
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(writer_lock_path(&self.path))
+        else {
+            return false;
+        };
+        // SAFETY: flock on a valid fd we own; LOCK_NB makes it fail instead of blocking.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return false;
+        }
+        let _ = f.set_len(0);
+        let _ = write!(f, "{}", std::process::id());
+        // Whatever another writer wrote since our last record isn't in our caches: restart
+        // our stream with a keyframe.
+        self.last_key = None;
+        self.last_rows.clear();
+        self.last_changes.clear();
+        self.known_info.clear();
+        self.writer = Some(f);
+        true
+    }
+
+    /// Pid recorded by the current lease holder, if any (for messages).
+    pub fn writer_pid(&self) -> Option<u32> {
+        std::fs::read_to_string(writer_lock_path(&self.path)).ok()?.trim().parse().ok()
+    }
+
+    /// Record a sample. A no-op (Ok) while another process holds the writer lease: two
+    /// interleaved delta streams would corrupt time-travel replay.
     pub fn record(&mut self, snap: &Snapshot) -> anyhow::Result<()> {
+        if !self.try_become_writer() {
+            return Ok(());
+        }
+        self.record_unchecked(snap)
+    }
+
+    fn record_unchecked(&mut self, snap: &Snapshot) -> anyhow::Result<()> {
         let ts = snap.ts;
         let is_key = match self.last_key {
             None => true,
@@ -873,6 +936,7 @@ impl History {
                 cwd: info.4,
                 user: info.5,
                 virt: 0,
+                usage_unknown: false,
             });
         }
         procs.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(a.pid.cmp(&b.pid)));
@@ -1116,8 +1180,26 @@ pub fn record_forever(cfg: &crate::config::Config) -> anyhow::Result<()> {
     let mut last_prune = Instant::now();
     let mut recorded: u64 = 0;
     let mut errors: u64 = 0;
+    let mut waiting = false;
     while !STOP.load(Ordering::SeqCst) {
         let started = Instant::now();
+        if !hist.try_become_writer() {
+            if !waiting {
+                waiting = true;
+                let who = hist.writer_pid().map(|p| format!(" (pid {p})")).unwrap_or_default();
+                eprintln!(
+                    "fat record: another fat{who} is already recording to {}; waiting for it to stop",
+                    hist.path().display()
+                );
+            }
+            while !STOP.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            continue;
+        }
+        if std::mem::take(&mut waiting) {
+            eprintln!("fat record: recording");
+        }
         let snap = collector.sample();
         match hist.record(&snap) {
             Ok(()) => recorded += 1,
@@ -1330,6 +1412,28 @@ mod tests {
         assert!((sp[0].top_cpu - 210.0).abs() < 0.5);
         drop(h);
         cleanup(&path);
+    }
+
+    #[test]
+    fn single_writer_lease() {
+        let path = tmp_db("lease");
+        let p = path.to_str().unwrap();
+        let mut a = History::open(Some(p)).unwrap();
+        let mut b = History::open(Some(p)).unwrap();
+        let mut snap = Snapshot { ts: 1_000_000, ..Default::default() };
+        a.record(&snap).unwrap();
+        assert!(a.is_writer());
+        snap.ts += 1000;
+        b.record(&snap).unwrap(); // skipped: a holds the lease
+        assert!(!b.is_writer());
+        assert_eq!(a.sample_count().unwrap(), 1, "a second writer must not interleave its delta stream");
+        assert_eq!(b.writer_pid(), Some(std::process::id()));
+        drop(a);
+        snap.ts += 1000;
+        b.record(&snap).unwrap();
+        assert!(b.is_writer());
+        assert_eq!(b.sample_count().unwrap(), 2);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

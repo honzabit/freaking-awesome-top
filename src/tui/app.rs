@@ -81,10 +81,13 @@ impl SortKey {
 /// Side effects the event loop must perform.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
-    Act { kind: ActionKind, pid: u32, nice: Option<i32> },
+    /// `start` is the target's start time when it was chosen (0 = unknown); the action is
+    /// refused if the pid has since been reused by another process.
+    Act { kind: ActionKind, pid: u32, nice: Option<i32>, start: u64 },
     Undo,
     Explain(u32),
-    Ask(String),
+    /// `id` ties the eventual answer to this question (a cancelled ask's late answer is dropped).
+    Ask { id: u64, question: String },
     RefreshLog,
     RefreshTimeline { from: Ts, to: Ts },
     LoadAt(Ts),
@@ -97,7 +100,7 @@ pub enum Modal {
     /// Editing `App::filter` (shown in the footer).
     Filter,
     Confirm { prompt: String, cmd: Command },
-    Renice { pid: u32, name: String, input: String },
+    Renice { pid: u32, name: String, input: String, start: u64 },
     AskInput(String),
     Help,
 }
@@ -105,7 +108,7 @@ pub enum Modal {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AskState {
     Idle,
-    Thinking { question: String, since: Ts },
+    Thinking { question: String, since: Ts, id: u64 },
     Answer { question: String, text: String, scroll: u16 },
 }
 
@@ -177,6 +180,8 @@ pub struct App {
     pub log_sel: usize,
 
     pub findings: Vec<Finding>,
+    /// Start time of each pid the findings mention, from the snapshot they were computed on.
+    pub findings_starts: HashMap<u32, u64>,
     pub findings_loaded: bool,
     pub log: Vec<ActionRecord>,
     pub containers: Vec<Container>,
@@ -186,6 +191,7 @@ pub struct App {
     pub why: Option<Explanation>,
     pub why_scroll: u16,
     pub ask: AskState,
+    ask_seq: u64,
     pub modal: Modal,
     pub status: Option<Status>,
 
@@ -237,6 +243,7 @@ impl App {
             doctor_sel: 0,
             log_sel: 0,
             findings: Vec::new(),
+            findings_starts: HashMap::new(),
             findings_loaded: false,
             log: Vec::new(),
             containers: Vec::new(),
@@ -245,6 +252,7 @@ impl App {
             why: None,
             why_scroll: 0,
             ask: AskState::Idle,
+            ask_seq: 0,
             modal: Modal::None,
             status: None,
             now: crate::model::now_ms(),
@@ -288,7 +296,13 @@ impl App {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_findings(&mut self, f: Vec<Finding>) {
+        self.set_findings_with_starts(f, HashMap::new());
+    }
+
+    pub fn set_findings_with_starts(&mut self, f: Vec<Finding>, starts: HashMap<u32, u64>) {
+        self.findings_starts = starts;
         self.findings = f;
         self.findings_loaded = true;
         self.doctor_sel = self.doctor_sel.min(self.findings.len().saturating_sub(1));
@@ -318,8 +332,11 @@ impl App {
         self.why_scroll = 0;
     }
 
-    pub fn set_answer(&mut self, text: String) {
-        if let AskState::Thinking { question, .. } = &self.ask {
+    /// Answer for ask `id`; ignored unless that exact question is still pending.
+    pub fn set_answer(&mut self, id: u64, text: String) {
+        if let AskState::Thinking { question, id: want, .. } = &self.ask
+            && *want == id
+        {
             self.ask = AskState::Answer { question: question.clone(), text, scroll: 0 };
         }
     }
@@ -616,35 +633,35 @@ impl App {
                     Vec::new()
                 }
             },
-            Modal::Renice { pid, name, mut input } => match k.code {
+            Modal::Renice { pid, name, mut input, start } => match k.code {
                 KeyCode::Esc => {
                     self.set_status("renice cancelled", false);
                     Vec::new()
                 }
                 KeyCode::Enter => match input.trim().parse::<i32>() {
                     Ok(n) if (-20..=20).contains(&n) => {
-                        vec![Command::Act { kind: ActionKind::Renice, pid, nice: Some(n) }]
+                        vec![Command::Act { kind: ActionKind::Renice, pid, nice: Some(n), start }]
                     }
                     _ => {
                         self.set_status(format!("invalid nice '{input}' (use -20..20)"), true);
-                        self.modal = Modal::Renice { pid, name, input };
+                        self.modal = Modal::Renice { pid, name, input, start };
                         Vec::new()
                     }
                 },
                 KeyCode::Backspace => {
                     input.pop();
-                    self.modal = Modal::Renice { pid, name, input };
+                    self.modal = Modal::Renice { pid, name, input, start };
                     Vec::new()
                 }
                 KeyCode::Char(c) if c.is_ascii_digit() || c == '-' || c == '+' => {
                     if input.len() < 4 {
                         input.push(c);
                     }
-                    self.modal = Modal::Renice { pid, name, input };
+                    self.modal = Modal::Renice { pid, name, input, start };
                     Vec::new()
                 }
                 _ => {
-                    self.modal = Modal::Renice { pid, name, input };
+                    self.modal = Modal::Renice { pid, name, input, start };
                     Vec::new()
                 }
             },
@@ -655,8 +672,10 @@ impl App {
                     if q.is_empty() {
                         return Vec::new();
                     }
-                    self.ask = AskState::Thinking { question: q.clone(), since: self.now };
-                    vec![Command::Ask(q)]
+                    self.ask_seq += 1;
+                    let id = self.ask_seq;
+                    self.ask = AskState::Thinking { question: q.clone(), since: self.now, id };
+                    vec![Command::Ask { id, question: q }]
                 }
                 KeyCode::Backspace => {
                     q.pop();
@@ -803,8 +822,8 @@ impl App {
             KeyCode::Char(' ') | KeyCode::Char('z') | KeyCode::Char('r') | KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.ensure_rows();
                 let Some(p) = self.selected_proc() else { return Vec::new() };
-                let (pid, name, paused) = (p.pid, p.name.clone(), p.status == "T");
-                return self.process_action(k.code, pid, name, paused, false);
+                let (pid, name, paused, start) = (p.pid, p.name.clone(), p.status == "T", p.start_time);
+                return self.process_action(k.code, pid, name, start, paused, false);
             }
             _ => {}
         }
@@ -812,7 +831,7 @@ impl App {
     }
 
     /// Shared action keys for any process-centric view.
-    fn process_action(&mut self, code: KeyCode, pid: u32, name: String, paused: bool, k_is_tree: bool) -> Vec<Command> {
+    fn process_action(&mut self, code: KeyCode, pid: u32, name: String, start: u64, paused: bool, k_is_tree: bool) -> Vec<Command> {
         if self.rewound() {
             self.set_status("⏪ viewing the past — press L to return to live before acting", true);
             return Vec::new();
@@ -820,23 +839,23 @@ impl App {
         match code {
             KeyCode::Char(' ') | KeyCode::Char('z') => {
                 let kind = if paused { ActionKind::Resume } else { ActionKind::Pause };
-                vec![Command::Act { kind, pid, nice: None }]
+                vec![Command::Act { kind, pid, nice: None, start }]
             }
             KeyCode::Char('r') => {
-                self.modal = Modal::Renice { pid, name, input: "10".into() };
+                self.modal = Modal::Renice { pid, name, input: "10".into(), start };
                 Vec::new()
             }
             KeyCode::Char('k') if !k_is_tree => {
                 self.modal = Modal::Confirm {
                     prompt: format!("Send TERM to {pid} ({name})?"),
-                    cmd: Command::Act { kind: ActionKind::Term, pid, nice: None },
+                    cmd: Command::Act { kind: ActionKind::Term, pid, nice: None, start },
                 };
                 Vec::new()
             }
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.modal = Modal::Confirm {
                     prompt: format!("Terminate {pid} ({name}) AND all its descendants?"),
-                    cmd: Command::Act { kind: ActionKind::KillTree, pid, nice: None },
+                    cmd: Command::Act { kind: ActionKind::KillTree, pid, nice: None, start },
                 };
                 Vec::new()
             }
@@ -875,8 +894,10 @@ impl App {
         match k.code {
             KeyCode::Enter | KeyCode::Char('w') => vec![Command::Explain(pid)],
             KeyCode::Char(' ') | KeyCode::Char('z') | KeyCode::Char('r') | KeyCode::Char('k') | KeyCode::Char('K') => {
-                let paused = self.view().and_then(|s| s.proc(pid)).is_some_and(|p| p.status == "T");
-                self.process_action(k.code, pid, name, paused, true)
+                let p = self.view().and_then(|s| s.proc(pid));
+                let paused = p.is_some_and(|p| p.status == "T");
+                let start = p.map(|p| p.start_time).unwrap_or(0);
+                self.process_action(k.code, pid, name, start, paused, true)
             }
             _ => Vec::new(),
         }
@@ -901,9 +922,11 @@ impl App {
                 }
                 match parse_action(&action) {
                     Some((kind, pid, nice)) => {
+                        // Identity from the snapshot the finding was computed on, not today's.
+                        let start = self.findings_starts.get(&pid).copied().unwrap_or(0);
                         self.modal = Modal::Confirm {
                             prompt: format!("Run suggested action: {action}?"),
-                            cmd: Command::Act { kind, pid, nice },
+                            cmd: Command::Act { kind, pid, nice, start },
                         };
                     }
                     None => self.set_status(format!("can't run '{action}' automatically"), true),
@@ -1169,6 +1192,7 @@ pub(crate) mod tests {
             status: "S".into(),
             threads: 4,
             power_mw: cpu * 10.0,
+            start_time: 1_700_000_000 + pid as u64,
             ..Default::default()
         }
     }
@@ -1360,7 +1384,7 @@ pub(crate) mod tests {
         assert!(a.on_key(key('x')).is_empty()); // ignored, still open
         assert!(matches!(a.modal, Modal::Confirm { .. }));
         let cmds = a.on_key(key('y'));
-        assert_eq!(cmds, vec![Command::Act { kind: ActionKind::Term, pid: 200, nice: None }]);
+        assert_eq!(cmds, vec![Command::Act { kind: ActionKind::Term, pid: 200, nice: None, start: 1700000200 }]);
         assert_eq!(a.modal, Modal::None);
         // cancel path
         a.on_key(key('K'));
@@ -1371,21 +1395,21 @@ pub(crate) mod tests {
     #[test]
     fn pause_toggle_and_renice_prompt() {
         let mut a = app();
-        assert_eq!(a.on_key(key(' ')), vec![Command::Act { kind: ActionKind::Pause, pid: 200, nice: None }]);
+        assert_eq!(a.on_key(key(' ')), vec![Command::Act { kind: ActionKind::Pause, pid: 200, nice: None, start: 1700000200 }]);
         a.on_key(key('i'));
         a.ensure_rows();
         while a.sel_pid != Some(300) {
             a.on_key(code(KeyCode::Down));
         }
-        assert_eq!(a.on_key(key('z')), vec![Command::Act { kind: ActionKind::Resume, pid: 300, nice: None }]);
+        assert_eq!(a.on_key(key('z')), vec![Command::Act { kind: ActionKind::Resume, pid: 300, nice: None, start: 1700000300 }]);
         a.on_key(key('r'));
         a.on_key(code(KeyCode::Backspace));
         a.on_key(code(KeyCode::Backspace));
         a.on_key(key('5'));
-        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Act { kind: ActionKind::Renice, pid: 300, nice: Some(5) }]);
+        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Act { kind: ActionKind::Renice, pid: 300, nice: Some(5), start: 1700000300 }]);
         // default +10
         a.on_key(key('r'));
-        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Act { kind: ActionKind::Renice, pid: 300, nice: Some(10) }]);
+        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Act { kind: ActionKind::Renice, pid: 300, nice: Some(10), start: 1700000300 }]);
         // invalid keeps prompt open
         a.on_key(key('r'));
         for c in "99".chars() {
@@ -1417,7 +1441,7 @@ pub(crate) mod tests {
         assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Explain(200)]);
         a.on_key(key('k'));
         match &a.modal {
-            Modal::Confirm { cmd, .. } => assert_eq!(*cmd, Command::Act { kind: ActionKind::KillTree, pid: 200, nice: None }),
+            Modal::Confirm { cmd, .. } => assert_eq!(*cmd, Command::Act { kind: ActionKind::KillTree, pid: 200, nice: None, start: 1700000200 }),
             m => panic!("expected confirm, got {m:?}"),
         }
     }
@@ -1429,16 +1453,35 @@ pub(crate) mod tests {
         for c in "why slow".chars() {
             a.on_key(key(c));
         }
-        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Ask("why slow".into())]);
+        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Ask { id: 1, question: "why slow".into() }]);
         assert!(matches!(a.ask, AskState::Thinking { .. }));
         // keys don't leak to the table while thinking
         assert!(a.on_key(key('k')).is_empty());
-        a.set_answer("line\n".repeat(50));
+        a.set_answer(1, "line\n".repeat(50));
         assert!(matches!(a.ask, AskState::Answer { .. }));
         a.on_key(code(KeyCode::PageDown));
         assert!(matches!(a.ask, AskState::Answer { scroll: 10, .. }));
         a.on_key(code(KeyCode::Esc));
         assert_eq!(a.ask, AskState::Idle);
+    }
+
+    #[test]
+    fn cancelled_ask_answer_is_not_shown_under_the_next_question() {
+        let mut a = app();
+        let ask = |a: &mut App, q: &str| {
+            a.on_key(key('?'));
+            for c in q.chars() {
+                a.on_key(key(c));
+            }
+            a.on_key(code(KeyCode::Enter))
+        };
+        assert_eq!(ask(&mut a, "q1"), vec![Command::Ask { id: 1, question: "q1".into() }]);
+        a.on_key(code(KeyCode::Esc)); // cancel; q1's thread keeps running
+        assert_eq!(ask(&mut a, "q2"), vec![Command::Ask { id: 2, question: "q2".into() }]);
+        a.set_answer(1, "answer to q1".into());
+        assert!(matches!(a.ask, AskState::Thinking { id: 2, .. }), "late q1 answer must be dropped");
+        a.set_answer(2, "answer to q2".into());
+        assert_eq!(a.ask, AskState::Answer { question: "q2".into(), text: "answer to q2".into(), scroll: 0 });
     }
 
     #[test]
@@ -1525,15 +1568,19 @@ pub(crate) mod tests {
     fn doctor_enter_confirms_suggested_action() {
         let mut a = app();
         a.on_key(key('5'));
-        a.set_findings(vec![
-            Finding { severity: "info".into(), title: "x".into(), detail: "".into(), pids: vec![], action: None },
-            Finding { severity: "crit".into(), title: "node hot".into(), detail: "".into(), pids: vec![200], action: Some("pause 200".into()) },
-        ]);
+        a.set_findings_with_starts(
+            vec![
+                Finding { severity: "info".into(), title: "x".into(), detail: "".into(), pids: vec![], action: None },
+                Finding { severity: "crit".into(), title: "node hot".into(), detail: "".into(), pids: vec![200], action: Some("pause 200".into()) },
+            ],
+            HashMap::from([(200, 42)]),
+        );
         assert!(a.on_key(code(KeyCode::Enter)).is_empty());
         assert_eq!(a.modal, Modal::None);
         a.on_key(code(KeyCode::Down));
         a.on_key(code(KeyCode::Enter));
-        assert_eq!(a.on_key(key('y')), vec![Command::Act { kind: ActionKind::Pause, pid: 200, nice: None }]);
+        // The identity comes from the findings' snapshot, not whatever is live now.
+        assert_eq!(a.on_key(key('y')), vec![Command::Act { kind: ActionKind::Pause, pid: 200, nice: None, start: 42 }]);
         assert_eq!(a.on_key(key('w')), vec![Command::Explain(200)]);
     }
 

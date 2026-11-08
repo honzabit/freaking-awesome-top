@@ -39,6 +39,9 @@ Use `why {pid}` for a blame chain explaining why a process exists and what it co
 recorder (timeline, spikes, or a past snapshot via at_minutes_ago; needs `fat record` running), `containers` for docker/podman, \
 and `ask {question}` for a plain-language answer. Actions are reversible where possible and journaled: prefer `pause` \
 (SIGSTOP, undo with `resume` or `undo`) or `renice` over `kill`; every action returns an id usable with `undo`. \
+Pass the `start_time` (and `name`) you saw in snapshot/process with every action, so a pid that was reused by another \
+process in the meantime is refused instead of signalled. Processes with `usage_unknown: true` belong to other users and \
+can't be measured without root: their zero cpu/mem means unknown, not idle. \
 CPU percent is per-core (100 = one full core); memory/disk/net values are bytes and bytes/sec; power is milliwatts.";
 
 /// Long-lived server state. Every field is optional so the dispatcher can run
@@ -297,6 +300,22 @@ fn pid_schema() -> Value {
     json!({ "type": "integer", "minimum": 1, "description": "Process id." })
 }
 
+/// Schema for an action target: pid plus the identity the agent saw, so a pid reused by
+/// another process between `snapshot` and the action is refused instead of signalled.
+fn target_schema(extra: Value) -> Value {
+    let mut props = json!({
+        "pid": pid_schema(),
+        "start_time": { "type": "integer", "minimum": 0, "description": "The process's start_time (epoch seconds) exactly as returned by snapshot/process. Strongly recommended: the action is refused if the pid now belongs to a different process." },
+        "name": { "type": "string", "description": "The process name as returned by snapshot/process; refused if the pid now runs something else." }
+    });
+    if let (Some(p), Some(e)) = (props.as_object_mut(), extra.as_object()) {
+        for (k, v) in e {
+            p.insert(k.clone(), v.clone());
+        }
+    }
+    props
+}
+
 fn schema(props: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": props, "required": required, "additionalProperties": false })
 }
@@ -380,15 +399,15 @@ pub fn tools() -> Vec<Value> {
         tool(
             "pause",
             "Pause process",
-            "Freeze a process with SIGSTOP. Fully reversible (resume or undo) — prefer this over kill to test whether a process is the culprit. Returns an action record with an id for `undo`.",
-            schema(json!({ "pid": pid_schema() }), &["pid"]),
+            "Freeze a process with SIGSTOP. Reversible (resume or undo) — prefer this over kill to test whether a process is the culprit. Refused for system/session daemons (cfprefsd, distnoted, WindowServer, ...) that other apps block on. Pass `start_time` from snapshot so a reused pid is never hit. Returns an action record with an id for `undo`.",
+            schema(target_schema(json!({})), &["pid"]),
             true,
         ),
         tool(
             "resume",
             "Resume process",
-            "Continue a paused (stopped) process with SIGCONT.",
-            schema(json!({ "pid": pid_schema() }), &["pid"]),
+            "Continue a paused (stopped) process with SIGCONT. For a process-group leader (e.g. a job paused by `fat run`), its stopped group members are resumed too.",
+            schema(target_schema(json!({})), &["pid"]),
             true,
         ),
         tool(
@@ -396,10 +415,9 @@ pub fn tools() -> Vec<Value> {
             "Change priority",
             "Set a process's nice value (-20 highest priority .. 20 lowest). Raising nice (deprioritizing) is allowed for your own processes; lowering usually needs root. Undoable.",
             schema(
-                json!({
-                    "pid": pid_schema(),
+                target_schema(json!({
                     "nice": { "type": "integer", "minimum": -20, "maximum": 20, "description": "New nice value." }
-                }),
+                })),
                 &["pid", "nice"],
             ),
             true,
@@ -407,13 +425,12 @@ pub fn tools() -> Vec<Value> {
         tool(
             "kill",
             "Terminate process",
-            "Terminate a process with SIGTERM (graceful). `tree: true` terminates the process and all its descendants; `force: true` sends SIGKILL instead. Not undoable — consider `pause` first. Journaled.",
+            "Terminate a process with SIGTERM (graceful; a paused process is continued so it can act on it). `tree: true` terminates the process and all its descendants; `force: true` sends SIGKILL instead. Not undoable — consider `pause` first. Pass `start_time` from snapshot so a reused pid is never hit. Journaled.",
             schema(
-                json!({
-                    "pid": pid_schema(),
+                target_schema(json!({
                     "tree": { "type": "boolean", "default": false, "description": "Also terminate all descendants." },
                     "force": { "type": "boolean", "default": false, "description": "Send SIGKILL instead of SIGTERM." }
-                }),
+                })),
                 &["pid"],
             ),
             true,
@@ -635,13 +652,21 @@ fn tool_find_port_owner(state: &mut State, args: &Value) -> Result<Value> {
     Ok(json!({ "port": port, "in_use": !owners.is_empty(), "owners": owners }))
 }
 
-fn apply(state: &mut State, kind: ActionKind, pid: u32, nice: Option<i32>) -> Result<Value> {
+/// The identity the agent saw when it chose the target (optional `start_time` / `name` args).
+fn arg_expect(args: &Value) -> Result<Option<crate::actions::Expect>> {
+    let start_time = arg_u64(args, "start_time")?.filter(|&s| s != 0);
+    let name = arg_str(args, "name")?.filter(|n| !n.is_empty()).map(str::to_string);
+    Ok((start_time.is_some() || name.is_some()).then_some(crate::actions::Expect { start_time, name }))
+}
+
+fn apply(state: &mut State, kind: ActionKind, pid: u32, nice: Option<i32>, args: &Value) -> Result<Value> {
+    let expect = arg_expect(args)?;
     state.snapshot()?;
     let snap = state.last.as_ref().expect("snapshot cached").1.clone();
     if snap.proc(pid).is_none() {
         bail!("no process with pid {pid}");
     }
-    let r = state.actions()?.apply(kind, pid, nice, &snap);
+    let r = state.actions()?.apply_expect(kind, pid, nice, &snap, expect.as_ref());
     // Force a fresh sample next call so status changes are visible.
     state.last = None;
     action_result(r)
@@ -649,12 +674,12 @@ fn apply(state: &mut State, kind: ActionKind, pid: u32, nice: Option<i32>) -> Re
 
 fn tool_pause(state: &mut State, args: &Value) -> Result<Value> {
     let pid = arg_pid(args)?;
-    apply(state, ActionKind::Pause, pid, None)
+    apply(state, ActionKind::Pause, pid, None, args)
 }
 
 fn tool_resume(state: &mut State, args: &Value) -> Result<Value> {
     let pid = arg_pid(args)?;
-    apply(state, ActionKind::Resume, pid, None)
+    apply(state, ActionKind::Resume, pid, None, args)
 }
 
 fn tool_renice(state: &mut State, args: &Value) -> Result<Value> {
@@ -663,7 +688,7 @@ fn tool_renice(state: &mut State, args: &Value) -> Result<Value> {
     if !(-20..=20).contains(&nice) {
         bail!("`nice` must be in -20..=20");
     }
-    apply(state, ActionKind::Renice, pid, Some(nice as i32))
+    apply(state, ActionKind::Renice, pid, Some(nice as i32), args)
 }
 
 fn tool_kill(state: &mut State, args: &Value) -> Result<Value> {
@@ -675,7 +700,7 @@ fn tool_kill(state: &mut State, args: &Value) -> Result<Value> {
     } else {
         ActionKind::Term
     };
-    apply(state, kind, pid, None)
+    apply(state, kind, pid, None, args)
 }
 
 fn tool_undo(state: &mut State, args: &Value) -> Result<Value> {
@@ -827,6 +852,23 @@ mod tests {
         let r = call(&mut s, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"history","arguments":{}}}"#);
         assert_eq!(r["result"]["isError"], true);
         assert!(r["result"]["structuredContent"]["error"].as_str().unwrap().contains("fat record"));
+    }
+
+    #[test]
+    fn action_tools_take_expected_identity() {
+        for t in tools() {
+            let name = t["name"].as_str().unwrap();
+            if ["pause", "resume", "renice", "kill"].contains(&name) {
+                let props = &t["inputSchema"]["properties"];
+                assert!(props["start_time"].is_object() && props["name"].is_object(), "{name}");
+            }
+        }
+        assert_eq!(arg_expect(&json!({"pid": 5})).unwrap(), None);
+        assert_eq!(
+            arg_expect(&json!({"pid": 5, "start_time": 1700000000u64, "name": "node"})).unwrap(),
+            Some(crate::actions::Expect { start_time: Some(1_700_000_000), name: Some("node".into()) })
+        );
+        assert!(arg_expect(&json!({"start_time": "soon"})).is_err());
     }
 
     #[test]

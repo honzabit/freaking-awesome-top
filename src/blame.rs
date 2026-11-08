@@ -34,14 +34,18 @@ pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation
     let streak = hot_streak(&series, HOT_CPU, now);
 
     // ---- headline ----
-    let mut headline = format!("{} (pid {}) is using {:.0}% CPU, {} RAM", p.name, p.pid, p.cpu, human_bytes(p.mem));
+    let mut headline = if p.usage_unknown {
+        format!("{} (pid {}): CPU and RAM unknown", p.name, p.pid)
+    } else {
+        format!("{} (pid {}) is using {:.0}% CPU, {} RAM", p.name, p.pid, p.cpu, human_bytes(p.mem))
+    };
     if p.power_mw > 0.0 {
         headline.push_str(&format!(", {}", human_watts(p.power_mw)));
     }
     if is_stopped(p) {
         headline.push_str(" [paused]");
     }
-    if p.mem == 0 && p.cpu == 0.0 && p.threads == 0 {
+    if p.usage_unknown || (p.mem == 0 && p.cpu == 0.0 && p.threads == 0) {
         headline.push_str(" (usage unreadable: owned by another user, needs root)");
     }
 
@@ -180,6 +184,7 @@ pub fn diagnose(snap: &Snapshot, hist: Option<&History>) -> Vec<Finding> {
     rule_disk(snap, &mut out);
     rule_net(snap, &mut out);
     rule_load(snap, &mut out);
+    rule_unattributed(snap, &mut out);
 
     out.sort_by_key(|f| std::cmp::Reverse(severity_rank(&f.severity)));
     out
@@ -355,6 +360,13 @@ fn symptom(snap: &Snapshot, p: &Proc, tree: &TreeCost) -> String {
     }
     if is_stopped(p) {
         return "process is paused (SIGSTOP) and using no CPU".into();
+    }
+    if parts.is_empty() && p.usage_unknown {
+        let owner = if p.user.is_empty() { "another user".to_string() } else { format!("user {}", p.user) };
+        return format!(
+            "usage unknown: owned by {owner}; macOS only lets root measure another user's CPU/memory (try `sudo fat why {}`)",
+            p.pid
+        );
     }
     if parts.is_empty() {
         let share = p.cpu / cores;
@@ -653,12 +665,41 @@ fn is_zombie(p: &Proc) -> bool {
 }
 
 fn is_system_critical(p: &Proc) -> bool {
-    matches!(
-        p.name.as_str(),
-        "kernel_task" | "launchd" | "WindowServer" | "logd" | "runningboardd" | "coreaudiod" | "opendirectoryd"
-            | "mds" | "mds_stores" | "trustd" | "syspolicyd" | "loginwindow" | "secd" | "bluetoothd" | "configd"
-            | "notifyd" | "distnoted" | "cfprefsd"
-    ) || p.pid <= 1
+    crate::actions::is_critical_name(&p.name) || p.pid <= 1
+}
+
+/// CPU the system reports as busy that no measurable process accounts for. Unprivileged, the
+/// kernel hides other users' (root/system daemons') usage, so name the gap instead of
+/// pretending those processes are idle.
+fn rule_unattributed(snap: &Snapshot, out: &mut Vec<Finding>) {
+    let unknown: Vec<&Proc> = snap.procs.iter().filter(|p| p.usage_unknown).collect();
+    if unknown.is_empty() {
+        return;
+    }
+    let total = snap.system.cpu * snap.system.cores.max(1) as f32;
+    let attributed: f32 = snap.procs.iter().map(|p| p.cpu).sum();
+    let gap = total - attributed;
+    if gap < 50.0 {
+        return;
+    }
+    let sev = if gap >= 200.0 { "warn" } else { "info" };
+    let mut names: Vec<&str> = unknown.iter().map(|p| p.name.as_str()).filter(|n| !n.is_empty()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let sample = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+    out.push(finding(
+        sev,
+        format!("{:.1} cores of CPU unattributed (other users' processes need root)", gap / 100.0),
+        format!(
+            "The system is {:.0}% busy but measurable processes account for only {:.1} cores. {} processes owned by other users \
+             (e.g. {sample}) can't be measured without root. Run `sudo fat` or `sudo fat doctor` to see which one it is.",
+            snap.system.cpu,
+            attributed / 100.0,
+            unknown.len()
+        ),
+        Vec::new(),
+        None,
+    ));
 }
 
 fn status_word(s: &str) -> String {
@@ -1507,6 +1548,28 @@ mod tests {
         assert_eq!(z.pids.len(), 3);
         assert!(z.detail.contains("-zsh (pid 102)"));
         assert_eq!(z.action.as_deref(), Some("kill 102"));
+    }
+
+    #[test]
+    fn diagnose_reports_unattributed_cpu() {
+        let mut s = Snapshot::default();
+        s.system.cores = 10;
+        s.system.cpu = 40.0; // 4 cores busy
+        let mut ws = pr(392, 1, "WindowServer", 0.0, 0);
+        ws.usage_unknown = true;
+        s.procs = vec![pr(100, 1, "node", 100.0, 1 << 20), ws.clone()];
+        let f = diagnose(&s, None);
+        let u = f.iter().find(|f| f.title.contains("unattributed")).expect("unattributed finding");
+        assert!(u.title.starts_with("3.0 cores"), "{}", u.title);
+        assert_eq!(u.severity, "warn");
+        assert!(u.detail.contains("WindowServer"));
+        // why on such a process must not claim it is idle
+        let e = explain(&s, 392, None);
+        assert!(e.chain.iter().chain(std::iter::once(&e.headline)).any(|l| l.contains("usage unknown")), "{e:?}");
+        assert!(!e.chain.iter().any(|l| l.contains("light load")));
+        // fully measured machine: no finding
+        s.procs = vec![pr(100, 1, "node", 400.0, 1 << 20)];
+        assert!(!diagnose(&s, None).iter().any(|f| f.title.contains("unattributed")));
     }
 
     #[test]

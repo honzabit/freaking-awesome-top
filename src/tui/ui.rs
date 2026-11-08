@@ -273,6 +273,8 @@ fn proc_cell<'a>(c: Col, p: &'a Proc, depth: u16, tree: bool) -> Cell<'a> {
     match c {
         Col::Pid => num(p.pid.to_string(), Style::default()),
         Col::User => Cell::from(Span::styled(clip(&p.user, 8), dim())),
+        // Another user's process without root: "?" rather than a misleading 0.
+        Col::Cpu | Col::Mem | Col::Power if p.usage_unknown => num("?".into(), dim()),
         Col::Cpu => num(format!("{:.1}", p.cpu), cpu_style(p.cpu)),
         Col::Mem => num(fmt_bytes(p.mem), mem_style(p.mem)),
         Col::Power => num(fmt_power(p.power_mw), power_style(p.power_mw)),
@@ -765,7 +767,7 @@ fn draw_why(f: &mut Frame, app: &App, area: Rect) {
 fn draw_ask(f: &mut Frame, app: &App, area: Rect) {
     match &app.ask {
         AskState::Idle => {}
-        AskState::Thinking { question, since } => {
+        AskState::Thinking { question, since, .. } => {
             let r = centered(60.min(area.width.saturating_sub(4)), 5, area);
             let spin = SPINNER[((app.now - since).max(0) / 100) as usize % SPINNER.len()];
             let t = Text::from(vec![
@@ -815,7 +817,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
                 r,
             );
         }
-        Modal::Renice { pid, name, input } => {
+        Modal::Renice { pid, name, input, .. } => {
             let r = centered(60.min(area.width.saturating_sub(2)), 6, area);
             let t = Text::from(vec![
                 Line::from(vec![Span::raw("New nice value for "), Span::styled(format!("{pid} ({name})"), Style::default().bold())]),
@@ -1098,7 +1100,7 @@ mod tests {
             if h >= 24 {
                 assert!(out.contains("Confirm") && out.contains("TERM"));
             }
-            a.modal = Modal::Renice { pid: 200, name: "node".into(), input: "10".into() };
+            a.modal = Modal::Renice { pid: 200, name: "node".into(), input: "10".into(), start: 0 };
             render(&mut a, w, h);
             a.modal = Modal::AskInput("why slow".into());
             let out = render(&mut a, w, h);
@@ -1110,13 +1112,13 @@ mod tests {
             let out = render(&mut a, w, h);
             assert!(out.contains("nod"));
             a.modal = Modal::None;
-            a.ask = AskState::Thinking { question: "why slow".into(), since: a.now };
+            a.ask = AskState::Thinking { question: "why slow".into(), since: a.now, id: 1 };
             let out = render(&mut a, w, h);
             if h >= 24 {
                 assert!(out.contains("thinking"));
             }
-            a.ask = AskState::Thinking { question: "q".into(), since: a.now };
-            a.set_answer("Your mac is slow because node is busy.\n".repeat(40));
+            a.ask = AskState::Thinking { question: "q".into(), since: a.now, id: 1 };
+            a.set_answer(1, "Your mac is slow because node is busy.\n".repeat(40));
             let out = render(&mut a, w, h);
             if h >= 24 {
                 assert!(out.contains("because node"));
