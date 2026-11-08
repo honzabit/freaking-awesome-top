@@ -81,7 +81,7 @@ enum Cmd {
         /// Max processes in tree.
         #[arg(long)]
         procs: Option<usize>,
-        /// pause | kill | warn
+        /// pause | kill | warn. A --time overrun always stops the job (unless warn).
         #[arg(long, default_value = "pause")]
         on_violation: String,
         #[arg(last = true, required = true)]
@@ -117,16 +117,23 @@ enum Cmd {
     Mcp,
 }
 
-fn sample() -> Snapshot {
+/// Two samples 600ms apart (rates need an interval). Containers, when wanted and enabled,
+/// are fetched concurrently because `docker stats` alone can take ~2s.
+fn sample_with(containers: bool) -> Snapshot {
+    let want = containers && config::Config::load().containers;
+    let fetch = want.then(|| std::thread::spawn(fleet::containers));
     let mut c = collect::Collector::new();
     let _ = c.sample();
     std::thread::sleep(std::time::Duration::from_millis(600));
     let mut s = c.sample();
-    let cfg = config::Config::load();
-    if cfg.containers {
-        s.containers = fleet::containers();
+    if let Some(h) = fetch {
+        s.containers = h.join().unwrap_or_default();
     }
     s
+}
+
+fn sample() -> Snapshot {
+    sample_with(false)
 }
 
 fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
@@ -157,12 +164,18 @@ fn ago_ms(s: &str) -> Result<i64> {
 }
 
 fn main() -> Result<()> {
+    // Behave like a normal Unix tool when piped into `head` etc.: die quietly on EPIPE
+    // instead of panicking in println!.
+    // SAFETY: setting a signal disposition to SIG_DFL at startup, before any threads exist.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     let cfg = config::Config::load();
     match cli.cmd {
         None => tui::run(cfg)?,
         Some(Cmd::Snapshot { json, top }) => {
-            let s = sample();
+            let s = sample_with(json);
             if json {
                 print_json(&s)?;
             } else {
@@ -182,7 +195,7 @@ fn main() -> Result<()> {
                 );
                 let mut procs = s.procs.clone();
                 procs.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
-                println!("{:>7} {:>6} {:>8} {:>7}  {}", "PID", "CPU%", "MEM", "POWER", "NAME");
+                println!("{:>7} {:>6} {:>8} {:>7}  NAME", "PID", "CPU%", "MEM", "POWER");
                 for p in procs.iter().take(top) {
                     println!("{:>7} {:>6.1} {:>8} {:>6.0}mW  {}", p.pid, p.cpu, fmt_bytes(p.mem), p.power_mw, p.name);
                 }
@@ -193,7 +206,7 @@ fn main() -> Result<()> {
             if json {
                 print_json(&s.ports)?;
             } else {
-                println!("{:<4} {:<22} {:>7}  {:<18} {}", "PROTO", "ADDR", "PID", "PROCESS", "NOTE");
+                println!("{:<4} {:<22} {:>7}  {:<18} NOTE", "PROTO", "ADDR", "PID", "PROCESS");
                 for p in &s.ports {
                     let orphan = if p.orphan { " ⚠ orphan" } else { "" };
                     println!(
@@ -209,7 +222,7 @@ fn main() -> Result<()> {
             }
         }
         Some(Cmd::Why { pid, json }) => {
-            let s = sample();
+            let s = sample_with(true);
             let h = history::History::open(cfg.history_path.as_deref()).ok();
             let e = blame::explain(&s, pid, h.as_ref());
             if json {
@@ -246,7 +259,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Ask { question }) => {
             let q = question.join(" ");
-            let s = sample();
+            let s = sample_with(true);
             let h = history::History::open(cfg.history_path.as_deref()).ok();
             let f = blame::diagnose(&s, h.as_ref());
             println!("{}", ask::ask(&q, &s, &f, &cfg.ask));
