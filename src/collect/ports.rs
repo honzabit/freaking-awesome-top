@@ -5,6 +5,13 @@
 //! with a one-letter field tag (`p` pid, `c` command, `R` ppid, `f` fd,
 //! `P` protocol, `n` name/address, `T` TCP/TPI info such as `ST=LISTEN`).
 //! Without root, lsof only reports the current user's sockets, which is fine.
+//!
+//! Linux: no subprocess. Sockets come from `/proc/net/{tcp,tcp6,udp,udp6}` (see
+//! [`linux`]); owners from `/proc/<pid>/fd/*` symlinks `socket:[inode]`. Without
+//! root only our own processes' fds are readable, so other users' listeners are
+//! still listed but with pid 0, process "?" and a note "owner hidden (needs root)".
+//! `/proc/net/*` is per network namespace: we see our own netns (the host's when
+//! running with host networking).
 use crate::model::{Port, Proc, Proto};
 use std::collections::HashMap;
 use std::io::Read;
@@ -28,6 +35,9 @@ struct RawSock {
     addr: String,
     port: u16,
     state: String,
+    /// Linux only: socket owner uid when the owning pid could not be found
+    /// (another user's process without root). None on macOS / when pid is known.
+    hidden_uid: Option<u32>,
 }
 
 static CACHE: Mutex<Option<(Instant, Vec<RawSock>)>> = Mutex::new(None);
@@ -38,7 +48,25 @@ pub fn ports(procs: &[Proc]) -> Vec<Port> {
     let by_pid: HashMap<u32, &Proc> = procs.iter().map(|p| (p.pid, p)).collect();
     let now = chrono::Utc::now().timestamp().max(0) as u64;
     let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
-    annotate(&raw, &by_pid, now, home.as_deref())
+    #[cfg(target_os = "linux")]
+    {
+        linux::annotate(&raw, &by_pid, now, home.as_deref())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        annotate(&raw, &by_pid, now, home.as_deref())
+    }
+}
+
+/// Fetch the raw socket list from the platform source (uncached).
+#[cfg(not(target_os = "linux"))]
+fn fetch_raw() -> Vec<RawSock> {
+    run_lsof().map(|out| dedup(parse_lsof(&out))).unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn fetch_raw() -> Vec<RawSock> {
+    dedup(linux::scan(std::path::Path::new("/proc")))
 }
 
 fn cached_raw() -> Vec<RawSock> {
@@ -47,7 +75,7 @@ fn cached_raw() -> Vec<RawSock> {
             && at.elapsed() < CACHE_TTL {
                 return socks.clone();
             }
-    let socks = run_lsof().map(|out| dedup(parse_lsof(&out))).unwrap_or_default();
+    let socks = fetch_raw();
     if let Ok(mut guard) = CACHE.lock() {
         *guard = Some((Instant::now(), socks.clone()));
     }
@@ -55,6 +83,7 @@ fn cached_raw() -> Vec<RawSock> {
 }
 
 /// Run lsof with a deadline. Returns None if lsof is missing, fails, or times out.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn run_lsof() -> Option<String> {
     let mut child = Command::new("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-iUDP", "-FpcRnPT"])
@@ -89,6 +118,7 @@ fn run_lsof() -> Option<String> {
 
 /// Parse lsof `-F` output into sockets. Unknown fields are ignored; sockets with
 /// no concrete local port (e.g. UDP `*:*`) and connected UDP sockets are skipped.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn parse_lsof(out: &str) -> Vec<RawSock> {
     struct FdAcc {
         proto: Option<Proto>,
@@ -115,6 +145,7 @@ fn parse_lsof(out: &str) -> Vec<RawSock> {
             addr,
             port,
             state: if proto == Proto::Tcp { f.state } else { String::new() },
+            hidden_uid: None,
         });
     }
 
@@ -204,6 +235,7 @@ fn dedup(socks: Vec<RawSock>) -> Vec<RawSock> {
     out
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn annotate(raw: &[RawSock], procs: &HashMap<u32, &Proc>, now: u64, home: Option<&str>) -> Vec<Port> {
     raw.iter()
         .map(|s| {
@@ -336,6 +368,7 @@ fn describe(name: &str, cmd: &str, cwd: &str, start: u64, now: u64, home: Option
 ///
 /// Homebrew services (postgres, redis under /opt/homebrew) are also launchd
 /// children but are not runtimes, so they are deliberately not flagged.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn is_orphan(ppid: u32, name: &str, exe: &str, cmd: &str, home: Option<&str>) -> bool {
     if ppid != 1 {
         return false;
@@ -370,6 +403,532 @@ fn is_orphan(ppid: u32, name: &str, exe: &str, cmd: &str, home: Option<&str>) ->
         }
     }
     false
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod linux {
+    //! Linux listening-socket discovery straight from procfs (no lsof, no root needed).
+    //!
+    //! `/proc/net/tcp` (and tcp6/udp/udp6) look like this (Linux 6.x, little-endian):
+    //!
+    //! ```text
+    //!   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+    //!    0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 8713261 1 0000000000000000 100 0 0 10 0
+    //!    1: 0100007F:B4B8 0100007F:46A1 01 00000000:000186A0 00:00000000 00000000     0        0 8711508 2 0000000000000000 20 8 0 10 -1
+    //! ```
+    //!
+    //! Addresses are the in-memory `__be32` words printed with `%08X` in host byte
+    //! order, so `0100007F` on little-endian is 127.0.0.1; IPv6 is four such words.
+    //! The port is plain big-endian hex. TCP state `0A` = LISTEN; bound (unconnected)
+    //! UDP sockets show state `07` with remote port 0. Column 7 is the owner uid and
+    //! column 9 the socket inode, which we match against `/proc/<pid>/fd/*` symlinks
+    //! of the form `socket:[8713261]`.
+    use super::*;
+    use std::collections::HashSet;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::path::Path;
+
+    const TCP_LISTEN: u8 = 0x0A;
+
+    /// One row of /proc/net/{tcp,udp}[6].
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct NetRow {
+        pub local: IpAddr,
+        pub port: u16,
+        pub rem_port: u16,
+        pub state: u8,
+        pub uid: u32,
+        pub inode: u64,
+    }
+
+    /// Decode a procfs hex address (8 hex chars for IPv4, 32 for IPv6).
+    pub fn decode_addr(hex: &str) -> Option<IpAddr> {
+        let word = |h: &str| u32::from_str_radix(h, 16).ok().map(u32::to_ne_bytes);
+        match hex.len() {
+            8 => Some(IpAddr::V4(Ipv4Addr::from(word(hex)?))),
+            32 => {
+                let mut b = [0u8; 16];
+                for i in 0..4 {
+                    b[i * 4..i * 4 + 4].copy_from_slice(&word(hex.get(i * 8..i * 8 + 8)?)?);
+                }
+                Some(IpAddr::V6(Ipv6Addr::from(b)))
+            }
+            _ => None,
+        }
+    }
+
+    fn split_hex_endpoint(s: &str) -> Option<(IpAddr, u16)> {
+        let (a, p) = s.split_once(':')?;
+        Some((decode_addr(a)?, u16::from_str_radix(p, 16).ok()?))
+    }
+
+    /// Parse a whole /proc/net/{tcp,udp}[6] file. Header and malformed rows are skipped.
+    pub fn parse_proc_net(text: &str) -> Vec<NetRow> {
+        text.lines()
+            .filter_map(|line| {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() < 10 || !f[0].ends_with(':') {
+                    return None;
+                }
+                let (local, port) = split_hex_endpoint(f[1])?;
+                let (_, rem_port) = split_hex_endpoint(f[2])?;
+                Some(NetRow {
+                    local,
+                    port,
+                    rem_port,
+                    state: u8::from_str_radix(f[3], 16).ok()?,
+                    uid: f[7].parse().ok()?,
+                    inode: f[9].parse().ok()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Same readable form as the lsof path: "*" for wildcard, IPv4-mapped IPv6 shown as
+    /// IPv4 (so v4/v6 dual-stack listeners dedup), other IPv6 bracketed.
+    pub fn fmt_addr(ip: IpAddr) -> String {
+        match ip {
+            IpAddr::V4(v4) if v4.is_unspecified() => "*".into(),
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) if v6.is_unspecified() => "*".into(),
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) if v4.is_unspecified() => "*".into(),
+                Some(v4) => v4.to_string(),
+                None => format!("[{v6}]"),
+            },
+        }
+    }
+
+    /// Map socket inode -> owning pid by reading `/proc/<pid>/fd/*` links. Without root
+    /// only our own processes are readable; the rest are skipped silently. Pids are
+    /// visited in ascending order so a socket shared after fork (gunicorn master +
+    /// workers) is attributed to the lowest pid, usually the parent; the scan stops
+    /// as soon as every wanted inode is found.
+    pub fn socket_owners(proc_root: &Path, wanted: &HashSet<u64>) -> HashMap<u64, u32> {
+        let mut found = HashMap::new();
+        if wanted.is_empty() {
+            return found;
+        }
+        let Ok(rd) = std::fs::read_dir(proc_root) else { return found };
+        let mut pids: Vec<u32> = rd
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        pids.sort_unstable();
+        for pid in pids {
+            let Ok(fds) = std::fs::read_dir(proc_root.join(pid.to_string()).join("fd")) else { continue };
+            for fd in fds.flatten() {
+                let Ok(target) = std::fs::read_link(fd.path()) else { continue };
+                let Some(ino) = target
+                    .to_str()
+                    .and_then(|t| t.strip_prefix("socket:["))
+                    .and_then(|t| t.strip_suffix(']'))
+                    .and_then(|t| t.parse::<u64>().ok())
+                else {
+                    continue;
+                };
+                if wanted.contains(&ino) {
+                    found.entry(ino).or_insert(pid);
+                }
+            }
+            if found.len() == wanted.len() {
+                break;
+            }
+        }
+        found
+    }
+
+    /// (comm, ppid) from /proc/<pid>/stat. comm may contain spaces and ')'.
+    pub fn read_stat(proc_root: &Path, pid: u32) -> Option<(String, u32)> {
+        let s = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+        let open = s.find('(')?;
+        let close = s.rfind(')')?;
+        let comm = s.get(open + 1..close)?.to_string();
+        let ppid = s.get(close + 1..)?.split_whitespace().nth(1)?.parse().ok()?;
+        Some((comm, ppid))
+    }
+
+    /// cgroup v2 path ("0::/user.slice/...") from /proc/<pid>/cgroup.
+    pub fn read_cgroup(proc_root: &Path, pid: u32) -> String {
+        std::fs::read_to_string(proc_root.join(pid.to_string()).join("cgroup"))
+            .ok()
+            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("0::").map(str::to_string)))
+            .unwrap_or_default()
+    }
+
+    /// Listening TCP + bound UDP sockets of our network namespace, with owners.
+    pub fn scan(proc_root: &Path) -> Vec<RawSock> {
+        let mut rows: Vec<(Proto, NetRow)> = Vec::new();
+        for (file, proto) in [("tcp", Proto::Tcp), ("tcp6", Proto::Tcp), ("udp", Proto::Udp), ("udp6", Proto::Udp)] {
+            let Ok(text) = std::fs::read_to_string(proc_root.join("net").join(file)) else { continue };
+            for r in parse_proc_net(&text) {
+                let keep = match proto {
+                    Proto::Tcp => r.state == TCP_LISTEN,
+                    // Connected UDP sockets are clients (QUIC, DNS lookups), not services.
+                    Proto::Udp => r.rem_port == 0,
+                };
+                if keep && r.port != 0 {
+                    rows.push((proto, r));
+                }
+            }
+        }
+        let wanted: HashSet<u64> = rows.iter().map(|(_, r)| r.inode).filter(|&i| i != 0).collect();
+        let owners = socket_owners(proc_root, &wanted);
+        let mut stat_cache: HashMap<u32, Option<(String, u32)>> = HashMap::new();
+        rows.into_iter()
+            .map(|(proto, r)| {
+                let pid = owners.get(&r.inode).copied().unwrap_or(0);
+                let (command, ppid) = if pid == 0 {
+                    ("?".to_string(), 0)
+                } else {
+                    stat_cache.entry(pid).or_insert_with(|| read_stat(proc_root, pid)).clone().unwrap_or_default()
+                };
+                RawSock {
+                    pid,
+                    ppid,
+                    command,
+                    proto,
+                    addr: fmt_addr(r.local),
+                    port: r.port,
+                    state: if proto == Proto::Tcp { "LISTEN".into() } else { String::new() },
+                    hidden_uid: (pid == 0).then_some(r.uid),
+                }
+            })
+            .collect()
+    }
+
+    /// uid -> login name from /etc/passwd (no NSS; good enough for a hint).
+    fn user_of(uid: u32) -> Option<String> {
+        let text = std::fs::read_to_string("/etc/passwd").ok()?;
+        text.lines().find_map(|l| {
+            let mut f = l.split(':');
+            let name = f.next()?;
+            let id: u32 = f.nth(1)?.parse().ok()?;
+            (id == uid).then(|| name.to_string())
+        })
+    }
+
+    pub fn annotate(raw: &[RawSock], procs: &HashMap<u32, &Proc>, now: u64, home: Option<&str>) -> Vec<Port> {
+        let root = Path::new("/proc");
+        let mut users: HashMap<u32, Option<String>> = HashMap::new();
+        raw.iter()
+            .map(|s| {
+                if s.pid == 0 {
+                    // Reading another uid's /proc/<pid>/fd needs ptrace-read access: root
+                    // normally has it, but not root in a default Docker container (no
+                    // CAP_SYS_PTRACE), so say which one is missing.
+                    // SAFETY: geteuid has no preconditions and cannot fail.
+                    let root_already = unsafe { libc::geteuid() } == 0;
+                    let mut note = if root_already { "owner hidden (needs CAP_SYS_PTRACE)" } else { "owner hidden (needs root)" }
+                        .to_string();
+                    if let Some(uid) = s.hidden_uid {
+                        let name = users.entry(uid).or_insert_with(|| user_of(uid));
+                        match name {
+                            Some(n) => note.push_str(&format!(" · uid {uid} ({n})")),
+                            None => note.push_str(&format!(" · uid {uid}")),
+                        }
+                    }
+                    return Port {
+                        proto: s.proto,
+                        addr: s.addr.clone(),
+                        port: s.port,
+                        pid: 0,
+                        process: "?".into(),
+                        state: s.state.clone(),
+                        orphan: false,
+                        note,
+                    };
+                }
+                let p = procs.get(&s.pid).copied();
+                let name = p.map(|p| p.name.as_str()).filter(|n| !n.is_empty()).unwrap_or(&s.command);
+                let ppid = p.map(|p| p.ppid).unwrap_or(s.ppid);
+                let link = |what: &str| {
+                    std::fs::read_link(root.join(s.pid.to_string()).join(what))
+                        .map(|l| l.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                };
+                let (cmd, exe, cwd, start) = match p {
+                    Some(p) => (p.cmd.clone(), p.exe.clone(), p.cwd.clone(), p.start_time),
+                    None => {
+                        let cmd = std::fs::read(root.join(s.pid.to_string()).join("cmdline"))
+                            .map(|b| {
+                                b.split(|c| *c == 0)
+                                    .filter(|a| !a.is_empty())
+                                    .map(|a| String::from_utf8_lossy(a).into_owned())
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            })
+                            .unwrap_or_default();
+                        (cmd, link("exe"), link("cwd"), 0)
+                    }
+                };
+                let parent_name = procs
+                    .get(&ppid)
+                    .map(|pp| pp.name.clone())
+                    .or_else(|| (ppid > 1).then(|| read_stat(root, ppid).map(|(c, _)| c)).flatten())
+                    .unwrap_or_default();
+                let cgroup = match p.map(|p| p.cgroup.as_str()).filter(|c| !c.is_empty()) {
+                    Some(c) => c.to_string(),
+                    None => read_cgroup(root, s.pid),
+                };
+                Port {
+                    proto: s.proto,
+                    addr: s.addr.clone(),
+                    port: s.port,
+                    pid: s.pid,
+                    process: name.to_string(),
+                    state: s.state.clone(),
+                    orphan: is_orphan_linux(ppid, &parent_name, name, &exe, &cmd, &cgroup, home),
+                    note: describe(name, &cmd, &cwd, start, now, home),
+                }
+            })
+            .collect()
+    }
+
+    /// True when the cgroup path places the process inside a systemd *service* unit
+    /// (system.slice/nginx.service, user@1000.service/app.slice/run-r12.service, ...),
+    /// i.e. something a unit file deliberately runs. `user@<uid>.service` itself is the
+    /// per-user manager and does not count; scopes (session-3.scope for ssh/tty logins,
+    /// vte-spawn-*.scope / app-*.scope for terminal windows, docker-*.scope) are not
+    /// services either, so processes there can still be orphans.
+    pub fn unit_managed(cgroup: &str) -> bool {
+        cgroup
+            .split('/')
+            .any(|c| c.ends_with(".service") && !c.starts_with("user@"))
+    }
+
+    /// Linux orphan heuristic. A listener is flagged when ALL of:
+    ///
+    /// 1. It was re-parented: `ppid == 1` (init / the container's pid 1), OR its parent
+    ///    is a subreaper named `systemd` that is not pid 1 (the `systemd --user` manager
+    ///    adopts orphans of the user's session). ppid 0 means the parent is outside our
+    ///    pid namespace (e.g. `docker exec`), which is alive, so it is not an orphan.
+    /// 2. It is not managed by a systemd service unit ([`unit_managed`]); those are
+    ///    supposed to be parented by systemd.
+    /// 3. It is not a system daemon (exe under /usr/sbin, /sbin, /usr/libexec,
+    ///    /usr/lib/systemd, /lib/systemd, /snap) nor an IDE remote server that
+    ///    daemonizes on purpose (~/.vscode-server, ~/.cursor-server, ~/.windsurf-server...).
+    /// 4. It looks like a dev server: same runtime / cargo-target / binary-in-$HOME
+    ///    rules as macOS (no ~/Library exclusion; ~/.cache and ~/.local/share excluded).
+    pub fn is_orphan_linux(
+        ppid: u32,
+        parent_name: &str,
+        name: &str,
+        exe: &str,
+        cmd: &str,
+        cgroup: &str,
+        home: Option<&str>,
+    ) -> bool {
+        let reparented = ppid == 1 || (ppid > 1 && parent_name == "systemd");
+        if !reparented || unit_managed(cgroup) {
+            return false;
+        }
+        let path = if exe.is_empty() { cmd.split_whitespace().next().unwrap_or("") } else { exe };
+        const SYSTEM_PREFIXES: &[&str] =
+            &["/usr/sbin/", "/sbin/", "/usr/libexec/", "/usr/lib/systemd/", "/lib/systemd/", "/snap/"];
+        const IDE_SERVERS: &[&str] =
+            &["/.vscode-server/", "/.vscode-server-insiders/", "/.cursor-server/", "/.windsurf-server/", "/.vscode-remote/"];
+        if SYSTEM_PREFIXES.iter().any(|p| path.starts_with(p)) || IDE_SERVERS.iter().any(|d| path.contains(d)) {
+            return false;
+        }
+        let base = path.rsplit('/').next().filter(|b| !b.is_empty()).unwrap_or(name).to_lowercase();
+        let lname = name.to_lowercase();
+        const RUNTIMES: &[&str] = &["node", "bun", "deno", "ruby", "java", "php", "beam.smp", "dotnet", "elixir", "erl"];
+        let is_runtime =
+            |n: &str| RUNTIMES.contains(&n) || n.starts_with("python") || n.starts_with("node") && n.len() <= 6;
+        if is_runtime(&base) || is_runtime(&lname) {
+            return true;
+        }
+        if path.contains("/target/debug/") || path.contains("/target/release/") {
+            return true;
+        }
+        if let Some(h) = home.filter(|h| !h.is_empty() && *h != "/") {
+            let in_home = path.starts_with(&format!("{h}/"));
+            let excluded = path.starts_with(&format!("{h}/.cache/")) || path.starts_with(&format!("{h}/.local/share/"));
+            if in_home && !excluded {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Real /proc/net/tcp6 from a Linux 7.2 aarch64 box: a dual-stack listener on
+        /// [::]:18081, an IPv4-mapped established pair, ::1:5432 listen, a global v6.
+        const TCP6: &str = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:46A1 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 8711507 1 0000000000000000 100 0 0 10 0
+   1: 0000000000000000FFFF00000100007F:46A1 0000000000000000FFFF00000100007F:B4B8 01 00000000:00000000 00:00000000 00000000     0        0 8711509 1 0000000000000000 20 0 0 10 -1
+   2: 00000000000000000000000001000000:1538 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 9001 1 0000000000000000 100 0 0 10 0
+   3: 0000000000000000FFFF00000100007F:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 9002 1 0000000000000000 100 0 0 10 0
+   4: B80D012000000000000000000100000000:0050 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 9003 1 0000000000000000 100 0 0 10 0
+";
+        const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:46A0 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 8713261 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 9004 1 0000000000000000 100 0 0 10 0
+   2: 0100007F:46A0 0100007F:9E64 06 00000000:00000000 03:0000170B 00000000     0        0 0 3 0000000000000000
+   3: 0100007F:B4B8 0100007F:46A1 01 00000000:000186A0 00:00000000 00000000     0        0 8711508 2 0000000000000000 20 8 0 10 -1
+";
+        const UDP: &str = "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+  123: 3500007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000   101        0 7001 2 0000000000000000 0
+  200: 0F02000A:D431 08080808:0035 01 00000000:00000000 00:00000000 00000000  1000        0 7002 2 0000000000000000 0
+  201: 00000000:0000 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 7003 2 0000000000000000 0
+";
+
+        #[test]
+        #[cfg(target_endian = "little")]
+        fn decodes_addresses() {
+            assert_eq!(fmt_addr(decode_addr("0100007F").unwrap()), "127.0.0.1");
+            assert_eq!(fmt_addr(decode_addr("00000000").unwrap()), "*");
+            assert_eq!(fmt_addr(decode_addr("0F02000A").unwrap()), "10.0.2.15");
+            assert_eq!(fmt_addr(decode_addr("00000000000000000000000000000000").unwrap()), "*");
+            assert_eq!(fmt_addr(decode_addr("00000000000000000000000001000000").unwrap()), "[::1]");
+            // IPv4-mapped IPv6 -> plain IPv4 so it dedups with the v4 socket.
+            assert_eq!(fmt_addr(decode_addr("0000000000000000FFFF00000100007F").unwrap()), "127.0.0.1");
+            assert_eq!(fmt_addr(decode_addr("0000000000000000FFFF000000000000").unwrap()), "*");
+            // 2001:db8::1 as the kernel prints it on little-endian.
+            assert_eq!(fmt_addr(decode_addr("B80D0120000000000000000001000000").unwrap()), "[2001:db8::1]");
+            assert_eq!(decode_addr("zz"), None);
+            assert_eq!(decode_addr("GGGGGGGG"), None);
+        }
+
+        #[test]
+        #[cfg(target_endian = "little")]
+        fn parses_proc_net_tcp6() {
+            let rows = parse_proc_net(TCP6);
+            // Row 4 has a 34-char address (malformed) and is dropped.
+            assert_eq!(rows.len(), 4, "{rows:?}");
+            assert_eq!((rows[0].port, rows[0].state, rows[0].inode, rows[0].uid), (18081, 0x0A, 8711507, 0));
+            assert_eq!(fmt_addr(rows[0].local), "*");
+            assert_eq!((rows[1].state, rows[1].rem_port), (0x01, 46264));
+            assert_eq!((fmt_addr(rows[2].local).as_str(), rows[2].port, rows[2].uid), ("[::1]", 5432, 1000));
+            assert_eq!((fmt_addr(rows[3].local).as_str(), rows[3].port), ("127.0.0.1", 8080));
+            assert!(parse_proc_net("").is_empty());
+            assert!(parse_proc_net("garbage\n  0: x y z\n").is_empty());
+        }
+
+        #[test]
+        #[cfg(target_endian = "little")]
+        fn parses_proc_net_udp() {
+            let rows = parse_proc_net(UDP);
+            assert_eq!(rows.len(), 3);
+            assert_eq!((fmt_addr(rows[0].local).as_str(), rows[0].port, rows[0].rem_port), ("127.0.0.53", 53, 0));
+            assert_eq!(rows[1].rem_port, 53, "connected client socket");
+        }
+
+        fn fixture() -> std::path::PathBuf {
+            let root = std::env::temp_dir().join(format!("fat-ports-{}-{:?}", std::process::id(), std::thread::current().id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("net")).unwrap();
+            std::fs::write(root.join("net/tcp"), TCP).unwrap();
+            std::fs::write(root.join("net/tcp6"), TCP6).unwrap();
+            std::fs::write(root.join("net/udp"), UDP).unwrap();
+            // udp6 missing on purpose: must be tolerated.
+            let mk = |pid: u32, stat: &str, fds: &[&str]| {
+                let d = root.join(pid.to_string());
+                std::fs::create_dir_all(d.join("fd")).unwrap();
+                std::fs::write(d.join("stat"), stat).unwrap();
+                for (i, t) in fds.iter().enumerate() {
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(t, d.join("fd").join(i.to_string())).unwrap();
+                }
+            };
+            // Python dual-stack http.server holds both the [::]:18081 listener and the v4 one.
+            mk(4242, "4242 (python3) S 1 4242 4242 0 -1", &["/dev/null", "socket:[8711507]", "socket:[8713261]", "pipe:[5]"]);
+            // A forked worker sharing the same listener: lower pid wins attribution.
+            mk(5000, "5000 (python3 worker) S 4242 4242 4242 0 -1", &["socket:[8711507]"]);
+            // Postgres on ::1:5432 with a ')' in comm.
+            mk(777, "777 (postgres: x) S 1 777 777 0 -1", &["socket:[9001]", "socket:[9002]"]);
+            mk(888, "888 (resolved) S 1 1 1 0 -1", &["socket:[7001]"]);
+            std::fs::write(root.join("self"), "not a pid dir").unwrap();
+            root
+        }
+
+        #[test]
+        #[cfg(all(unix, target_endian = "little"))]
+        fn scans_fixture_tree() {
+            let root = fixture();
+            let socks = dedup(scan(&root));
+            let _ = std::fs::remove_dir_all(&root);
+            let find = |proto, port| socks.iter().find(|s| s.proto == proto && s.port == port).unwrap();
+            let web = find(Proto::Tcp, 18081);
+            assert_eq!((web.pid, web.ppid, web.command.as_str(), web.addr.as_str()), (4242, 1, "python3", "*"));
+            assert_eq!(find(Proto::Tcp, 18080).pid, 4242);
+            let pg: Vec<_> = socks.iter().filter(|s| s.pid == 777).collect();
+            assert_eq!(pg.len(), 2, "5432 on ::1 and 8080 on mapped 127.0.0.1");
+            assert_eq!(pg[0].command, "postgres: x");
+            // 127.0.0.1:8080 owned by uid 1000 with no visible fd: hidden owner. It shares the
+            // port with pid 777's v4-mapped socket but stays separate (different pid).
+            let hidden: Vec<_> = socks.iter().filter(|s| s.pid == 0).collect();
+            assert_eq!(hidden.len(), 1, "{socks:?}");
+            assert_eq!((hidden[0].port, hidden[0].hidden_uid, hidden[0].command.as_str()), (8080, Some(1000), "?"));
+            let dns = find(Proto::Udp, 53);
+            assert_eq!((dns.pid, dns.addr.as_str(), dns.state.as_str()), (888, "127.0.0.53", ""));
+            assert!(!socks.iter().any(|s| s.proto == Proto::Udp && s.port != 53), "connected/unbound udp skipped");
+            assert!(!socks.iter().any(|s| s.port == 46264 || s.port == 46265), "non-listen tcp skipped");
+            assert!(scan(Path::new("/nonexistent/fat")).is_empty());
+        }
+
+        #[test]
+        fn reads_stat_with_odd_comm() {
+            let root = std::env::temp_dir().join(format!("fat-stat-{}", std::process::id()));
+            std::fs::create_dir_all(root.join("9")).unwrap();
+            std::fs::write(root.join("9/stat"), "9 (a) b (c)) R 42 9 9 0").unwrap();
+            assert_eq!(read_stat(&root, 9), Some(("a) b (c)".into(), 42)));
+            assert_eq!(read_stat(&root, 10), None);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn unit_detection() {
+            assert!(unit_managed("/system.slice/nginx.service"));
+            assert!(unit_managed("/user.slice/user-1000.slice/user@1000.service/app.slice/run-r3f2.service"));
+            assert!(unit_managed("/system.slice/foo.service/sub"));
+            assert!(!unit_managed("/user.slice/user-1000.slice/session-3.scope"));
+            assert!(!unit_managed(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-1a2b.scope"
+            ));
+            assert!(!unit_managed("/user.slice/user-1000.slice/user@1000.service/init.scope"));
+            assert!(!unit_managed("/"));
+            assert!(!unit_managed(""));
+        }
+
+        #[test]
+        fn linux_orphan_heuristic() {
+            let h = Some("/home/me");
+            let sess = "/user.slice/user-1000.slice/session-3.scope";
+            assert!(is_orphan_linux(1, "systemd", "node", "/usr/bin/node", "node vite", sess, h));
+            assert!(is_orphan_linux(1, "", "python3", "/usr/bin/python3.12", "python3 -m http.server", "/", h));
+            assert!(is_orphan_linux(812, "systemd", "api", "/home/me/code/api/target/debug/api", "", sess, h));
+            assert!(is_orphan_linux(1, "", "server", "/home/me/go/bin/server", "", "", h));
+            // systemd --user adopted it, terminal scope.
+            let vte = "/user.slice/user-1000.slice/user@1000.service/app.slice/vte-spawn-1.scope";
+            assert!(is_orphan_linux(1500, "systemd", "node", "/home/me/.nvm/versions/node/v22/bin/node", "", vte, h));
+            // Still attached to a shell / tmux.
+            assert!(!is_orphan_linux(500, "bash", "node", "/usr/bin/node", "", sess, h));
+            assert!(!is_orphan_linux(500, "tmux: server", "node", "/usr/bin/node", "", sess, h));
+            // Parent outside our pid namespace (docker exec).
+            assert!(!is_orphan_linux(0, "", "node", "/usr/bin/node", "", "/", h));
+            // systemd units.
+            assert!(!is_orphan_linux(1, "", "python3", "/usr/bin/python3", "", "/system.slice/jupyter.service", h));
+            assert!(!is_orphan_linux(
+                1500,
+                "systemd",
+                "node",
+                "/usr/bin/node",
+                "",
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/run-u7.service",
+                h
+            ));
+            // System daemons and IDE servers.
+            assert!(!is_orphan_linux(1, "", "sshd", "/usr/sbin/sshd", "", sess, h));
+            assert!(!is_orphan_linux(1, "", "node", "/home/me/.vscode-server/bin/abc/node", "", sess, h));
+            assert!(!is_orphan_linux(1, "", "postgres", "/usr/lib/postgresql/16/bin/postgres", "", sess, h));
+            assert!(!is_orphan_linux(1, "", "tool", "/home/me/.cache/x/tool", "", sess, h));
+        }
+    }
 }
 
 #[cfg(test)]

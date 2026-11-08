@@ -1,7 +1,7 @@
 //! Rendering. Only visible rows are materialized, so cost scales with the
 //! terminal height, not the process count.
 
-use crate::model::Proc;
+use crate::model::{Container, Proc};
 use crate::tui::app::{App, AskState, Modal, SortKey, Tab, ZOOMS, ZOOM_NAMES};
 use crate::tui::widgets::*;
 use ratatui::Frame;
@@ -124,7 +124,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     if area.height >= 4 {
         // line 3: memory
         let ratio = if sys.mem_total > 0 { sys.mem_used as f64 / sys.mem_total as f64 } else { 0.0 };
-        let bw = (w / 4).clamp(8, 40);
+        // Linux PSI takes room on this line; the memory bar gives some back.
+        let bw = if sys.psi.is_some() { (w / 6).clamp(8, 40) } else { (w / 4).clamp(8, 40) };
         let pc = pressure_color(&sys.mem_pressure);
         let mut l3 = vec![
             Span::styled("MEM ", Style::default().fg(ACCENT).bold()),
@@ -132,6 +133,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(format!(" {}/{} ", fmt_bytes(sys.mem_used), fmt_bytes(sys.mem_total))),
             Span::styled(if sys.mem_pressure.is_empty() { "unknown" } else { sys.mem_pressure.as_str() }, Style::default().fg(pc)),
         ];
+        if let Some(psi) = &sys.psi {
+            l3.extend(psi_spans(psi));
+        }
         if sys.swap_total > 0 || sys.swap_used > 0 {
             l3.push(Span::styled("  SWP ", Style::default().fg(ACCENT)));
             l3.push(Span::raw(format!("{}/{}", fmt_bytes(sys.swap_used), fmt_bytes(sys.swap_total))));
@@ -144,19 +148,16 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(l3));
 
         // line 4: power, thermal, io, battery
-        let mut l4 = vec![
-            Span::styled("PWR ", Style::default().fg(ACCENT).bold()),
-            Span::styled(fmt_power(sys.power_mw), power_style(sys.power_mw / 4.0)),
-            Span::styled("  THERM ", Style::default().fg(ACCENT)),
-            Span::styled(
-                if sys.thermal.is_empty() { "unknown" } else { sys.thermal.as_str() },
-                Style::default().fg(thermal_color(&sys.thermal)),
-            ),
+        let mut l4 = vec![Span::styled("PWR ", Style::default().fg(ACCENT).bold())];
+        l4.extend(power_spans(sys.power_mw, &sys.power_source));
+        l4.push(Span::styled("  THERM ", Style::default().fg(ACCENT)));
+        l4.extend(thermal_spans(&sys.thermal, sys.temp_c));
+        l4.extend([
             Span::styled("  NET ", Style::default().fg(ACCENT)),
             Span::raw(format!("↓{}/s ↑{}/s", fmt_bytes(sys.net_rx_bps), fmt_bytes(sys.net_tx_bps))),
             Span::styled("  DISK ", Style::default().fg(ACCENT)),
             Span::raw(format!("r{}/s w{}/s", fmt_bytes(sys.disk_read_bps), fmt_bytes(sys.disk_write_bps))),
-        ];
+        ]);
         if let Some(b) = sys.battery_pct {
             let src = match sys.on_battery {
                 Some(true) => " bat",
@@ -172,6 +173,65 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(l4));
     }
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// "PSI cpu▃12 mem▁0 io▆31": avg10 stall percentages as one-cell gauges. Stalls are bad well
+/// below 100%, so the gauge saturates at 25% (10% some-pressure is already noticeable).
+fn psi_spans(psi: &crate::model::Psi) -> Vec<Span<'static>> {
+    let mut v = vec![Span::styled("  PSI", Style::default().fg(ACCENT))];
+    for (label, val) in [("cpu", psi.cpu_some), ("mem", psi.mem_some.max(psi.mem_full)), ("io", psi.io_some)] {
+        let st = Style::default().fg(psi_color(val));
+        v.push(Span::raw(format!(" {label}")));
+        v.push(Span::styled(spark_char(val * 4.0).to_string(), st));
+        v.push(Span::styled(format!("{val:.0}"), st));
+    }
+    v
+}
+
+fn psi_color(pct: f32) -> Color {
+    if pct >= 20.0 {
+        Color::Red
+    } else if pct >= 5.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+/// Power with its provenance: "48.2W rapl" (measured package energy), "~8.0W est" (CPU-time
+/// model); macOS per-task energy ("rusage") stays unlabelled as before.
+fn power_spans(mw: f32, source: &str) -> Vec<Span<'static>> {
+    let st = power_style(mw / 4.0);
+    match source {
+        "estimate" if mw > 0.0 => vec![Span::styled(format!("~{}", fmt_power(mw)), st), Span::styled(" est", dim())],
+        "rapl" => vec![Span::styled(fmt_power(mw), st), Span::styled(" rapl", dim())],
+        _ => vec![Span::styled(fmt_power(mw), st)],
+    }
+}
+
+/// Thermal state word (macOS) and/or the hottest sensor (Linux hwmon / thermal zones).
+fn thermal_spans(thermal: &str, temp_c: Option<f32>) -> Vec<Span<'static>> {
+    let known = !thermal.is_empty() && thermal != "unknown";
+    let mut v = Vec::with_capacity(2);
+    if known || temp_c.is_none() {
+        v.push(Span::styled(
+            if thermal.is_empty() { "unknown".to_string() } else { thermal.to_string() },
+            Style::default().fg(thermal_color(thermal)),
+        ));
+    }
+    if let Some(t) = temp_c.filter(|t| t.is_finite()) {
+        let c = if t >= 90.0 {
+            Color::Red
+        } else if t >= 75.0 {
+            Color::LightRed
+        } else if t >= 60.0 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        v.push(Span::styled(format!("{}{t:.0}°C", if known { " " } else { "" }), Style::default().fg(c)));
+    }
+    v
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
@@ -218,11 +278,25 @@ enum Col {
     Disk,
     Thr,
     S,
+    Ctr,
     Name,
 }
 
-fn columns(width: u16) -> &'static [Col] {
+/// `containers`: some process runs in a container, so CONTAINER earns a column.
+fn columns(width: u16, containers: bool) -> &'static [Col] {
     use Col::*;
+    if containers {
+        return if width >= 100 {
+            &[Pid, User, Cpu, Mem, Power, Net, Disk, Thr, S, Ctr, Name]
+        } else if width >= 76 {
+            // Same width as USER + THR, which matter less than "which container".
+            &[Pid, Cpu, Mem, Power, Net, Disk, S, Ctr, Name]
+        } else if width >= 60 {
+            &[Pid, Cpu, Mem, S, Ctr, Name]
+        } else {
+            &[Pid, Cpu, Mem, S, Name]
+        };
+    }
     if width >= 76 {
         &[Pid, User, Cpu, Mem, Power, Net, Disk, Thr, S, Name]
     } else if width >= 60 {
@@ -240,6 +314,7 @@ fn col_width(c: Col) -> Constraint {
         Col::Mem | Col::Power | Col::Net | Col::Disk => Constraint::Length(7),
         Col::Thr => Constraint::Length(4),
         Col::S => Constraint::Length(1),
+        Col::Ctr => Constraint::Length(12),
         Col::Name => Constraint::Min(10),
     }
 }
@@ -255,6 +330,7 @@ fn col_title(c: Col, sort: SortKey, desc: bool) -> Cell<'static> {
         Col::Disk => ("DISK", Some(SortKey::Disk), true),
         Col::Thr => ("THR", None, true),
         Col::S => ("S", None, false),
+        Col::Ctr => ("CONTAINER", None, false),
         Col::Name => ("NAME / CMD", Some(SortKey::Name), false),
     };
     let sorted = key == Some(sort);
@@ -268,9 +344,18 @@ fn num(s: String, style: Style) -> Cell<'static> {
     Cell::from(Line::styled(s, style).alignment(Alignment::Right))
 }
 
-fn proc_cell<'a>(c: Col, p: &'a Proc, depth: u16, tree: bool) -> Cell<'a> {
+fn proc_cell<'a>(c: Col, p: &'a Proc, depth: u16, tree: bool, containers: &[Container]) -> Cell<'a> {
     let paused = p.status == "T";
     match c {
+        Col::Ctr => match &p.container {
+            Some(id) => {
+                let known = crate::fleet::find_container(containers, id);
+                let label = crate::fleet::container_label(containers, id);
+                let st = if known.is_some() { Style::default().fg(Color::LightBlue) } else { dim() };
+                Cell::from(Span::styled(clip(&label, 12).to_string(), st))
+            }
+            None => Cell::from(""),
+        },
         Col::Pid => num(p.pid.to_string(), Style::default()),
         Col::User => Cell::from(Span::styled(clip(&p.user, 8), dim())),
         // Another user's process without root: "?" rather than a misleading 0.
@@ -361,11 +446,12 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
         title.push(Span::styled(format!("· ⏪ {} ", fmt_clock(ts)), Style::default().fg(Color::Magenta).bold()));
     }
 
-    let cols = columns(area.width);
+    let cols = columns(area.width, app.has_containers);
+    let containers: &[Container] = if snap.containers.is_empty() { &app.containers } else { &snap.containers };
     let header = Row::new(cols.iter().map(|&c| col_title(c, app.sort, app.sort_desc)));
     let rows = app.rows.iter().enumerate().skip(app.offset).take(body_h).map(|(i, r)| {
         let p = &snap.procs[r.idx];
-        let mut row = Row::new(cols.iter().map(|&c| proc_cell(c, p, r.depth, app.tree)));
+        let mut row = Row::new(cols.iter().map(|&c| proc_cell(c, p, r.depth, app.tree, containers)));
         if i == app.sel {
             row = row.style(Style::default().bg(SEL_BG));
         }
@@ -459,8 +545,17 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
         rows.push(Row::new(vec![Cell::from("● local"), Cell::from("local"), Cell::from("sampling…")]));
     }
     let nc = app.containers.len();
+    // Linux: how many host processes we attribute to each container (via cgroups).
+    let mut per_ctr: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    if let Some(s) = app.live.as_ref() {
+        for id in s.procs.iter().filter_map(|p| p.container.as_deref()) {
+            *per_ctr.entry(id).or_default() += 1;
+        }
+    }
     for (i, c) in app.containers.iter().enumerate() {
         let glyph = if i + 1 == nc { "  └ " } else { "  ├ " };
+        let nprocs: usize = per_ctr.iter().filter(|(id, _)| !c.id.is_empty() && (id.starts_with(&c.id) || c.id.starts_with(**id))).map(|(_, n)| n).sum();
+        let detail = if nprocs > 0 { format!("{nprocs} procs · {} {}", c.image, c.ports) } else { format!("{} {}", c.image, c.ports) };
         let running = c.status.to_lowercase().starts_with("up") || c.status.to_lowercase().contains("running");
         rows.push(Row::new(vec![
             Cell::from(Line::from(vec![Span::styled(glyph, dim()), Span::raw(c.name.as_str())])),
@@ -468,7 +563,7 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
             Cell::from(Span::styled(clip(&c.status, 14), Style::default().fg(if running { Color::Green } else { Color::Gray }))),
             num(format!("{:.1}", c.cpu), cpu_style(c.cpu)),
             Cell::from(Span::styled(fmt_bytes(c.mem), mem_style(c.mem))),
-            Cell::from(Span::styled(format!("{} {}", c.image, c.ports), dim())),
+            Cell::from(Span::styled(detail, dim())),
         ]));
     }
     for h in &app.hosts {
@@ -513,7 +608,7 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
             }
             t.lines.push(Line::styled("No containers or remote hosts yet.", Style::default().bold()));
             t.lines.push(Line::raw(""));
-            t.lines.push(Line::raw("• Containers (docker / podman / orbstack) appear here automatically while they run."));
+            t.lines.push(Line::raw("• Containers (docker / podman / orbstack / nerdctl) appear here automatically while they run."));
             t.lines.push(Line::raw(format!("• Remote hosts: add them to {}", app.config_path)));
             t.lines.push(Line::styled("      [[hosts]]", Style::default().fg(Color::Green)));
             t.lines.push(Line::styled("      name = \"devbox\"", Style::default().fg(Color::Green)));
@@ -733,6 +828,26 @@ fn draw_why(f: &mut Frame, app: &App, area: Rect) {
     let Some(e) = &app.why else { return };
     let mut t = Text::default();
     t.lines.push(Line::styled(e.headline.as_str(), Style::default().fg(Color::Yellow).bold()));
+    if let Some(p) = app.view().and_then(|s| s.proc(e.pid)) {
+        let cs: &[Container] = match app.view() {
+            Some(s) if !s.containers.is_empty() => &s.containers,
+            _ => &app.containers,
+        };
+        if let Some(id) = &p.container {
+            let mut v = vec![Span::styled("container ", dim())];
+            match crate::fleet::find_container(cs, id) {
+                Some(c) => {
+                    v.push(Span::styled(c.name.clone(), Style::default().fg(Color::LightBlue).bold()));
+                    v.push(Span::styled(format!(" ({id}) {} · {}", c.image, c.runtime), dim()));
+                }
+                None => v.push(Span::styled(id.clone(), Style::default().fg(Color::LightBlue))),
+            }
+            t.lines.push(Line::from(v));
+        }
+        if !p.cgroup.is_empty() {
+            t.lines.push(Line::from(vec![Span::styled("cgroup ", dim()), Span::raw(short_cgroup(&p.cgroup))]));
+        }
+    }
     if !e.chain.is_empty() {
         t.lines.push(Line::raw(""));
         t.lines.push(Line::styled("Blame chain", Style::default().fg(ACCENT).bold()));
@@ -762,6 +877,32 @@ fn draw_why(f: &mut Frame, app: &App, area: Rect) {
         .title_bottom(Line::styled(" Esc close · PgUp/PgDn scroll ", dim()));
     f.render_widget(Clear, area);
     f.render_widget(Paragraph::new(t).block(block).wrap(Wrap { trim: false }).scroll((app.why_scroll, 0)), area);
+}
+
+/// Container cgroups embed 64-hex ids; show the 12-char form so the path fits one line:
+/// "/system.slice/docker-410892b21be2….scope".
+fn short_cgroup(cg: &str) -> String {
+    let mut out = String::with_capacity(cg.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() >= 32 {
+            out.push_str(&run[..12]);
+            out.push('…');
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for ch in cg.chars() {
+        if ch.is_ascii_hexdigit() {
+            run.push(ch);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 fn draw_ask(f: &mut Frame, app: &App, area: Rect) {
@@ -832,7 +973,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
             let t = Text::from(vec![
                 Line::styled("Ask about this machine in plain language", dim()),
                 Line::from(vec![Span::styled("> ", Style::default().fg(ACCENT).bold()), Span::raw(q.as_str()), Span::styled("▏", Style::default().fg(ACCENT))]),
-                Line::styled("e.g. why is my mac slow? · what is using port 3000? · Enter ask · Esc cancel", dim()),
+                Line::styled("e.g. why is this machine slow? · what is using port 3000? · Enter ask · Esc cancel", dim()),
             ]);
             f.render_widget(Clear, r);
             f.render_widget(Paragraph::new(t).wrap(Wrap { trim: true }).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)).title(" Ask ")), r);
@@ -845,7 +986,7 @@ const HELP: &[(&str, &str)] = &[
     ("↑↓ PgUp PgDn g G", "move selection"),
     ("c m p n d i N", "sort by cpu mem power net disk pid name (again = reverse)"),
     ("t", "toggle process tree"),
-    ("/", "filter by name or command (Esc clears)"),
+    ("/", "filter by name, command, container or cgroup (Esc clears)"),
     ("Enter / w", "why: blame chain for the selection"),
     ("space / z", "pause / resume (SIGSTOP/SIGCONT, undoable)"),
     ("r", "renice (default 10, undoable)"),
@@ -924,7 +1065,7 @@ fn centered(w: u16, h: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::model::{ActionKind, ActionRecord, Container, Explanation, Finding};
-    use crate::tui::app::tests::{proc, snap};
+    use crate::tui::app::tests::{linux_snap, proc, snap};
     use crate::tui::app::{HostRow, Modal};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -1147,6 +1288,101 @@ mod tests {
         a.set_filter("zzz".into());
         let out = render(&mut a, 80, 24);
         assert!(out.contains("no process matches"));
+    }
+
+    fn linux_app() -> App {
+        let mut a = App::new(1000);
+        for i in 0..10 {
+            let s = linux_snap(1_000_000 + i * 1000);
+            a.now = s.ts;
+            a.on_snapshot(s);
+        }
+        a
+    }
+
+    #[test]
+    fn linux_header_shows_psi_temp_and_power_source() {
+        for (w, h) in SIZES {
+            let mut a = linux_app();
+            let out = render(&mut a, w, h);
+            if h >= 24 {
+                assert!(out.contains("PSI cpu") && out.contains("io"), "{w}x{h}\n{out}");
+                assert!(out.contains("cpu▅12") && out.contains("io█31"), "psi values {w}x{h}\n{out}");
+                assert!(out.contains("48.2W rapl"), "{w}x{h}\n{out}");
+                assert!(out.contains("THERM 71°C"), "{w}x{h}\n{out}");
+                assert!(!out.contains("BAT"), "no battery on this box");
+            }
+        }
+        // estimate gets a tilde, macOS rusage stays unlabelled
+        let mut a = linux_app();
+        if let Some(l) = a.live.as_mut() {
+            l.system.power_source = "estimate".into();
+            l.system.thermal = "nominal".into();
+        }
+        let out = render(&mut a, 160, 48);
+        assert!(out.contains("~48.2W est") && out.contains("nominal 71°C"), "{out}");
+        let mut m = full_app();
+        let out = render(&mut m, 160, 48);
+        assert!(out.contains("PWR 23.4W  THERM nominal"), "macOS header unchanged\n{out}");
+        assert!(!out.contains("PSI") && !out.contains("CONTAINER"));
+    }
+
+    #[test]
+    fn linux_procs_show_container_column() {
+        for (w, h) in [(80u16, 24u16), (120, 40), (160, 48), (64, 20)] {
+            let mut a = linux_app();
+            let out = render(&mut a, w, h);
+            assert!(out.contains("CONTAINER"), "{w}x{h}\n{out}");
+            assert!(out.contains("db-1"), "known container by name {w}x{h}\n{out}");
+            assert!(out.contains("f592d553371f"), "unknown container by short id {w}x{h}\n{out}");
+            assert!(out.contains("postgres"));
+        }
+        let out = render(&mut linux_app(), 160, 48);
+        assert!(out.contains("USER") && out.contains("THR"), "wide keeps every column\n{out}");
+        // narrow: column dropped, still renders
+        let out = render(&mut linux_app(), 40, 10);
+        assert!(!out.contains("CONTAINER"));
+        // '/' filter by container name
+        let mut a = linux_app();
+        a.set_filter("db-1".into());
+        let out = render(&mut a, 80, 24);
+        assert!(out.contains("pg-worker") && !out.contains("clickhouse") && !out.contains("esbuild"), "{out}");
+    }
+
+    #[test]
+    fn linux_why_shows_cgroup_and_container() {
+        for (w, h) in SIZES {
+            let mut a = linux_app();
+            a.set_why(Explanation { pid: 500, headline: "postgres is busy".into(), chain: vec!["postgres (500)".into(), "containerd-shim".into()], ..Default::default() });
+            let out = render(&mut a, w, h);
+            if h >= 24 {
+                assert!(out.contains("container db-1"), "{w}x{h}\n{out}");
+                assert!(out.contains("cgroup /system.slice/docker-410892b21be2….scope"), "{w}x{h}\n{out}");
+            }
+        }
+        let mut a = linux_app();
+        a.set_why(Explanation { pid: 100, headline: "zsh".into(), ..Default::default() });
+        let out = render(&mut a, 160, 48);
+        assert!(out.contains("session-3.scope") && !out.contains("container "), "{out}");
+    }
+
+    #[test]
+    fn cgroup_ids_are_shortened() {
+        assert_eq!(
+            short_cgroup("/system.slice/docker-410892b21be2ffda255ceb4e7e2077d968864674cefc8174a3843e6f01c860f7.scope"),
+            "/system.slice/docker-410892b21be2….scope"
+        );
+        assert_eq!(short_cgroup("/user.slice/user-1000.slice/session-3.scope"), "/user.slice/user-1000.slice/session-3.scope");
+        assert_eq!(short_cgroup(""), "");
+    }
+
+    #[test]
+    fn linux_fleet_counts_container_procs() {
+        let mut a = linux_app();
+        a.switch_tab(Tab::Fleet);
+        a.set_fleet(Some(a.live.as_ref().unwrap().containers.clone()), Some(vec![]));
+        let out = render(&mut a, 80, 24);
+        assert!(out.contains("db-1") && out.contains("2 procs"), "{out}");
     }
 
     #[test]

@@ -46,6 +46,12 @@ pub struct Proc {
     /// without root). Those fields then read 0 but mean "unknown", not "idle".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub usage_unknown: bool,
+    /// Linux: cgroup v2 path from /proc/<pid>/cgroup (e.g. "/system.slice/docker-abc.scope"). Empty elsewhere.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cgroup: String,
+    /// Short container id (12 hex) when the process runs inside a container we can identify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -108,6 +114,26 @@ pub struct System {
     pub uptime: u64,
     pub battery_pct: Option<f32>,
     pub on_battery: Option<bool>,
+    /// Linux pressure stall information (avg10 percentages). None where unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psi: Option<Psi>,
+    /// Hottest temperature sensor in °C, if readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_c: Option<f32>,
+    /// Where system power came from: "rusage" (macOS per-task energy), "rapl" (Linux package
+    /// energy counters, apportioned to processes by CPU share), "estimate" (CPU-time model), or "".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub power_source: String,
+}
+
+/// Linux PSI: % of wall time (avg10) tasks were stalled on a resource.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct Psi {
+    pub cpu_some: f32,
+    pub mem_some: f32,
+    pub mem_full: f32,
+    pub io_some: f32,
+    pub io_full: f32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

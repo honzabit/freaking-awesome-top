@@ -19,6 +19,7 @@ const PROTECTED_NAMES: &[&str] = &["kernel_task", "launchd", "WindowServer", "lo
 /// Session and system daemons that other processes block on via IPC. Freezing or killing one
 /// can hang every app (including the agent that would issue the undo), so Pause/Term/Kill are
 /// refused for them whatever the uid. Renice and Resume stay allowed.
+#[cfg(not(target_os = "linux"))]
 const CRITICAL_NAMES: &[&str] = &[
     "kernel_task", "launchd", "WindowServer", "loginwindow", "logd", "runningboardd", "coreaudiod",
     "opendirectoryd", "mds", "mds_stores", "trustd", "syspolicyd", "secd", "securityd", "bluetoothd",
@@ -27,14 +28,41 @@ const CRITICAL_NAMES: &[&str] = &[
     "watchdogd", "hidd", "airportd", "sshd", "launchservicesd", "nsurlsessiond", "containermanagerd",
     "symptomsd", "thermalmonitord", "sandboxd", "authd", "keybagd", "apsd", "corebrightnessd",
 ];
+/// Linux: init/session plumbing, the display server and compositor, and the cluster agent.
+/// Names are matched against the kernel's 15-char `comm` too ("systemd-journald" shows up as
+/// "systemd-journal"). sshd, containerd and dockerd only warn (see [`WARN_NAMES`]): stopping a
+/// session's sshd or a container runtime is sometimes exactly what's wanted.
+#[cfg(target_os = "linux")]
+const CRITICAL_NAMES: &[&str] = &[
+    "systemd", "systemd-journald", "systemd-logind", "systemd-udevd", "systemd-resolved",
+    "systemd-networkd", "systemd-oomd", "dbus-daemon", "dbus-broker", "dbus-broker-launch", "Xorg", "Xwayland",
+    "gnome-shell", "gnome-session-binary", "kwin_wayland", "kwin_x11", "plasmashell", "gdm", "gdm3",
+    "gdm-session-worker", "sddm", "lightdm", "polkitd", "NetworkManager", "kubelet", "pipewire",
+    "wireplumber",
+];
 /// Process names that are allowed but deserve a warning.
+#[cfg(not(target_os = "linux"))]
 const WARN_NAMES: &[&str] = &["Finder", "Dock", "SystemUIServer"];
-/// Tolerance (seconds) when comparing snapshot vs live start times.
+#[cfg(target_os = "linux")]
+const WARN_NAMES: &[&str] = &["sshd", "containerd", "dockerd"];
+/// Tolerance (seconds) when comparing snapshot vs live start times. On Linux both sides use the
+/// same formula (btime + starttime / CLK_TCK, whole seconds), so they agree to within rounding.
+#[cfg(not(target_os = "linux"))]
 const START_TIME_SLACK: u64 = 2;
+#[cfg(target_os = "linux")]
+const START_TIME_SLACK: u64 = 1;
+
+/// `name` is `full`, or the kernel's truncation of it (Linux `comm` keeps 15 bytes).
+fn name_is(name: &str, full: &str) -> bool {
+    if name.eq_ignore_ascii_case(full) {
+        return true;
+    }
+    cfg!(target_os = "linux") && name.len() == 15 && full.len() > 15 && full.is_char_boundary(15) && full[..15].eq_ignore_ascii_case(name)
+}
 
 /// True for daemons whose loss or freeze stalls the login session (shared with blame).
 pub fn is_critical_name(name: &str) -> bool {
-    CRITICAL_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name))
+    CRITICAL_NAMES.iter().any(|n| name_is(name, n))
 }
 
 /// Refusal for actions that would freeze or end a critical daemon.
@@ -148,6 +176,7 @@ impl Actions {
         Actions { path, entries }
     }
 
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -429,6 +458,9 @@ fn self_and_ancestors() -> Vec<u32> {
 /// Pure name/pid policy. Err(reason) = refuse, Ok(Some(w)) = allowed with warning.
 pub fn protection(pid: u32, name: &str, ours: &[u32]) -> Result<Option<String>, String> {
     if pid == 0 || pid == 1 {
+        #[cfg(target_os = "linux")]
+        return Err(format!("refusing: pid {pid} is the kernel/init ({name})"));
+        #[cfg(not(target_os = "linux"))]
         return Err(format!("refusing: pid {pid} is the kernel/launchd"));
     }
     if pid == std::process::id() {
@@ -441,9 +473,38 @@ pub fn protection(pid: u32, name: &str, ours: &[u32]) -> Result<Option<String>, 
         return Err(format!("refusing: {name} is a protected system process"));
     }
     if WARN_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) {
-        return Ok(Some(format!("{name} is part of the desktop; macOS will relaunch it")));
+        return Ok(Some(warn_text(name)));
     }
     Ok(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn warn_text(name: &str) -> String {
+    format!("{name} is part of the desktop; macOS will relaunch it")
+}
+
+#[cfg(target_os = "linux")]
+fn warn_text(name: &str) -> String {
+    if name.eq_ignore_ascii_case("sshd") {
+        format!("{name}: the listener takes new ssh logins with it; a per-session sshd ends that session")
+    } else {
+        format!("{name} is a container runtime; every container it manages is affected")
+    }
+}
+
+/// Linux: kernel threads (PF_KTHREAD: kthreadd and its children) can't be meaningfully
+/// signalled, and pausing a kworker is never what anyone meant.
+#[cfg(target_os = "linux")]
+fn kernel_thread_refusal(pid: u32, name: &str) -> Result<(), String> {
+    match procfs::read_stat(Path::new("/proc"), pid) {
+        Some(st) if procfs::is_kernel_thread(&st) => Err(format!("refusing: pid {pid} ({name}) is a kernel thread")),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kernel_thread_refusal(_pid: u32, _name: &str) -> Result<(), String> {
+    Ok(())
 }
 
 /// Process names agree, allowing for kernel truncation (16-char p_comm vs full name).
@@ -483,6 +544,7 @@ fn check_target(
     let sp = snap.proc(pid);
     let name = sp.map(|p| p.name.as_str()).or(live.map(|l| l.name.as_str())).unwrap_or("?");
     let warning = protection(pid, name, &self_and_ancestors())?;
+    kernel_thread_refusal(pid, name)?;
     if let Some(r) = critical_refusal(kind, name) {
         return Err(r);
     }
@@ -609,28 +671,96 @@ fn renice(rec: &mut ActionRecord, pid: u32, nice: Option<i32>) {
     };
     rec.prev_nice = Some(prev);
     rec.new_nice = Some(new);
-    let root = is_root();
-    if new < prev && !root {
-        rec.message = if new < 0 {
-            format!("negative nice ({new}) requires root; try `sudo fat renice {pid} {new}`")
-        } else {
-            format!("lowering nice ({prev} -> {new}) requires root on macOS")
-        };
+    let root = nice_privileged();
+    if new < prev && !root && !can_lower_nice_to(new) {
+        rec.message = lower_nice_refusal(pid, prev, new);
         return;
     }
     match set_nice(pid, new) {
         Ok(()) => {
             rec.ok = true;
             rec.pids = vec![pid];
-            // Restoring a lower nice value later needs root unless we are root.
-            rec.undoable = root || new <= prev;
+            // Restoring a lower nice value later needs root unless we are root (or, on Linux,
+            // RLIMIT_NICE / CAP_SYS_NICE allow going back down to it).
+            rec.undoable = root || new <= prev || can_lower_nice_to(prev);
             rec.message = if rec.undoable {
                 format!("nice {prev} -> {new}")
             } else {
-                format!("nice {prev} -> {new} (undo needs root: lowering nice is privileged)")
+                format!("nice {prev} -> {new} (undo needs {}: lowering nice is privileged)", if cfg!(target_os = "linux") { "CAP_SYS_NICE (root)" } else { "root" })
             };
         }
         Err(e) => rec.message = e,
+    }
+}
+
+/// Whether we may lower any nice value. macOS: root. Linux: CAP_SYS_NICE, which root in a
+/// default Docker container does not have (so euid 0 alone is not enough there).
+#[cfg(not(target_os = "linux"))]
+fn nice_privileged() -> bool {
+    is_root()
+}
+
+#[cfg(target_os = "linux")]
+fn nice_privileged() -> bool {
+    has_cap_sys_nice()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn can_lower_nice_to(_nice: i32) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lower_nice_refusal(pid: u32, prev: i32, new: i32) -> String {
+    if new < 0 {
+        format!("negative nice ({new}) requires root; try `sudo fat renice {pid} {new}`")
+    } else {
+        format!("lowering nice ({prev} -> {new}) requires root on macOS")
+    }
+}
+
+/// Lowest nice an unprivileged caller may set: the kernel allows `nice` when
+/// `20 - nice <= RLIMIT_NICE` (rlimit 0, the usual default, means "never lower").
+#[cfg(target_os = "linux")]
+fn nice_floor() -> i32 {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit writes into a valid, owned rlimit struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NICE, &mut rl) } != 0 {
+        return 20;
+    }
+    if rl.rlim_cur == libc::RLIM_INFINITY {
+        return -20;
+    }
+    20 - (rl.rlim_cur.min(40) as i32)
+}
+
+/// CAP_SYS_NICE (bit 23) in our effective capability set.
+#[cfg(target_os = "linux")]
+fn has_cap_sys_nice() -> bool {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| procfs::status_field(&s, "CapEff").and_then(|v| u64::from_str_radix(v.trim(), 16).ok()))
+        .is_some_and(|caps| caps & (1 << 23) != 0)
+}
+
+#[cfg(target_os = "linux")]
+fn can_lower_nice_to(nice: i32) -> bool {
+    nice >= nice_floor() || has_cap_sys_nice()
+}
+
+#[cfg(target_os = "linux")]
+fn lower_nice_refusal(pid: u32, prev: i32, new: i32) -> String {
+    let floor = nice_floor();
+    let lim = if floor >= 20 { "RLIMIT_NICE is 0".to_string() } else { format!("RLIMIT_NICE allows down to {floor}") };
+    if is_root() {
+        return format!(
+            "lowering nice ({prev} -> {new}) requires CAP_SYS_NICE, which this root lacks (e.g. a container without --cap-add SYS_NICE; {lim})"
+        );
+    }
+    if new < 0 {
+        format!("negative nice ({new}) requires root or CAP_SYS_NICE ({lim}); try `sudo fat renice {pid} {new}`")
+    } else {
+        format!("lowering nice ({prev} -> {new}) requires root or CAP_SYS_NICE on Linux ({lim})")
     }
 }
 
@@ -653,6 +783,10 @@ fn kill_tree(rec: &mut ActionRecord, pid: u32, snap: &Snapshot) {
             continue;
         }
         if let Some(why) = critical_refusal(ActionKind::KillTree, &cname) {
+            skipped.push(format!("{cpid} ({why})"));
+            continue;
+        }
+        if let Err(why) = kernel_thread_refusal(cpid, &cname) {
             skipped.push(format!("{cpid} ({why})"));
             continue;
         }
@@ -799,7 +933,7 @@ pub fn live_proc(pid: u32) -> Option<LiveProc> {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn live_proc(pid: u32) -> Option<LiveProc> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
     let mut sys = System::new();
@@ -819,6 +953,168 @@ pub fn live_proc(pid: u32) -> Option<LiveProc> {
         start_time: pr.start_time(),
         stopped: pr.status() == ProcessStatus::Stop,
     })
+}
+
+/// Linux: straight from /proc/<pid>/stat and /status (no root needed for either).
+#[cfg(target_os = "linux")]
+pub fn live_proc(pid: u32) -> Option<LiveProc> {
+    live_proc_at(Path::new("/proc"), pid)
+}
+
+#[cfg(target_os = "linux")]
+fn live_proc_at(proc_root: &Path, pid: u32) -> Option<LiveProc> {
+    if pid == 0 {
+        return None;
+    }
+    let st = procfs::read_stat(proc_root, pid)?;
+    if matches!(st.state, 'Z' | 'X' | 'x') {
+        return None;
+    }
+    let status = fs::read_to_string(proc_root.join(pid.to_string()).join("status")).unwrap_or_default();
+    // /proc/<tid> also resolves thread ids (hidden from readdir); a thread is not a process
+    // target, and signalling it would hit its whole thread group.
+    if let Some(tgid) = procfs::status_field(&status, "Tgid").and_then(|v| v.trim().parse::<u32>().ok())
+        && tgid != pid
+    {
+        return None;
+    }
+    let (ruid, euid) = procfs::uids(&status).unwrap_or((u32::MAX, u32::MAX));
+    Some(LiveProc {
+        pid,
+        ppid: st.ppid,
+        uid: euid,
+        ruid,
+        name: st.comm.clone(),
+        start_time: procfs::start_epoch_at(proc_root, &st),
+        stopped: st.state == 'T',
+    })
+}
+
+/// Minimal procfs readers shared by actions and `fat run` (Linux). Never panic: every reader
+/// returns None on a missing file, a permission error or an unexpected format.
+#[cfg(target_os = "linux")]
+pub(crate) mod procfs {
+    use std::io::Read;
+    use std::path::Path;
+    use std::sync::OnceLock;
+
+    /// PF_KTHREAD in /proc/<pid>/stat `flags` (include/linux/sched.h).
+    pub const PF_KTHREAD: u64 = 0x0020_0000;
+
+    /// The fields of /proc/<pid>/stat that fat uses. Times are in clock ticks.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct Stat {
+        pub pid: u32,
+        pub comm: String,
+        pub state: char,
+        pub ppid: u32,
+        pub pgrp: i32,
+        pub flags: u64,
+        pub utime: u64,
+        pub stime: u64,
+        /// Already-reaped (waited-for) children, cumulative. Signed in the kernel format.
+        pub cutime: u64,
+        pub cstime: u64,
+        pub nice: i32,
+        pub num_threads: u32,
+        /// Ticks after boot.
+        pub starttime: u64,
+        pub rss_pages: u64,
+    }
+
+    /// Parse one /proc/<pid>/stat line, e.g. (Linux 6.x):
+    /// `1234 (my (odd) prog) S 1 1234 1234 0 -1 4194560 2717 0 0 0 12 5 3 1 20 0 1 0 98765 8851456 924 18446744073709551615 ...`
+    /// `comm` may contain spaces and parentheses, so fields are split after the *last* ')'.
+    pub fn parse_stat(s: &str) -> Option<Stat> {
+        let open = s.find('(')?;
+        let close = s.rfind(')')?;
+        if close < open {
+            return None;
+        }
+        let pid: u32 = s[..open].trim().parse().ok()?;
+        let comm = s[open + 1..close].to_string();
+        let f: Vec<&str> = s[close + 1..].split_ascii_whitespace().collect();
+        // f[0] is field 3 (state); field N is f[N - 3].
+        let num = |i: usize| -> Option<i64> { f.get(i)?.parse::<i64>().ok() };
+        let unum = |i: usize| -> Option<u64> { f.get(i)?.parse::<u64>().ok() };
+        Some(Stat {
+            pid,
+            comm,
+            state: f.first()?.chars().next()?,
+            ppid: num(1)?.max(0) as u32,
+            pgrp: num(2)? as i32,
+            flags: unum(6)?,
+            utime: unum(11)?,
+            stime: unum(12)?,
+            cutime: num(13)?.max(0) as u64,
+            cstime: num(14)?.max(0) as u64,
+            nice: num(16)? as i32,
+            num_threads: num(17)?.max(0) as u32,
+            starttime: unum(19)?,
+            rss_pages: num(21)?.max(0) as u64,
+        })
+    }
+
+    /// Read and parse `<proc_root>/<pid>/stat`.
+    pub fn read_stat(proc_root: &Path, pid: u32) -> Option<Stat> {
+        let mut buf = String::with_capacity(512);
+        std::fs::File::open(proc_root.join(pid.to_string()).join("stat")).ok()?.read_to_string(&mut buf).ok()?;
+        parse_stat(&buf)
+    }
+
+    pub fn is_kernel_thread(st: &Stat) -> bool {
+        st.flags & PF_KTHREAD != 0
+    }
+
+    /// `Key:\tvalue` from /proc/<pid>/status.
+    pub fn status_field<'a>(status: &'a str, key: &str) -> Option<&'a str> {
+        status.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(':'))
+    }
+
+    /// (real, effective) uid from the `Uid:` line (`Uid:\t1000\t1000\t1000\t1000`).
+    pub fn uids(status: &str) -> Option<(u32, u32)> {
+        let mut it = status_field(status, "Uid")?.split_ascii_whitespace().map(|v| v.parse::<u32>().ok());
+        Some((it.next()??, it.next()??))
+    }
+
+    pub fn clk_tck() -> u64 {
+        static T: OnceLock<u64> = OnceLock::new();
+        // SAFETY: sysconf has no preconditions.
+        *T.get_or_init(|| match unsafe { libc::sysconf(libc::_SC_CLK_TCK) } {
+            n if n > 0 => n as u64,
+            _ => 100,
+        })
+    }
+
+    pub fn page_size() -> u64 {
+        static P: OnceLock<u64> = OnceLock::new();
+        // SAFETY: sysconf has no preconditions.
+        *P.get_or_init(|| match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+            n if n > 0 => n as u64,
+            _ => 4096,
+        })
+    }
+
+    pub fn ticks_to_ns(t: u64) -> u64 {
+        t.saturating_mul(1_000_000_000 / clk_tck().max(1))
+    }
+
+    /// `btime` (boot time, epoch seconds) from `<proc_root>/stat`.
+    pub fn read_btime(proc_root: &Path) -> Option<u64> {
+        let s = std::fs::read_to_string(proc_root.join("stat")).ok()?;
+        s.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
+    }
+
+    fn btime_at(proc_root: &Path) -> Option<u64> {
+        static B: OnceLock<Option<u64>> = OnceLock::new();
+        if proc_root == Path::new("/proc") { *B.get_or_init(|| read_btime(proc_root)) } else { read_btime(proc_root) }
+    }
+
+    /// Process start in epoch seconds, exactly as the collector reports `Proc::start_time`:
+    /// `btime + starttime / CLK_TCK` (integer seconds). 0 when btime is unreadable.
+    pub fn start_epoch_at(proc_root: &Path, st: &Stat) -> u64 {
+        btime_at(proc_root).map(|b| b + st.starttime / clk_tck()).unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -871,7 +1167,10 @@ mod tests {
         assert!(protection(std::process::id(), "fat", &[]).is_err());
         assert!(protection(4242, "zsh", &[4242]).is_err());
         assert!(protection(4242, "WindowServer", &[]).is_err());
+        #[cfg(not(target_os = "linux"))]
         assert!(matches!(protection(4242, "Finder", &[]), Ok(Some(_))));
+        #[cfg(target_os = "linux")]
+        assert!(matches!(protection(4242, "dockerd", &[]), Ok(Some(_))));
         assert_eq!(protection(4242, "node", &[]), Ok(None));
     }
 
@@ -934,9 +1233,11 @@ mod tests {
         assert_eq!(n.prev_nice, Some(before));
         assert_eq!(get_nice(pid), Ok(target));
         if !is_root() {
-            assert_eq!(n.undoable, target <= before);
-            let neg = a.apply(ActionKind::Renice, pid, Some(-5), &snap);
-            assert!(!neg.ok && neg.message.contains("root"), "{neg:?}");
+            assert_eq!(n.undoable, target <= before || can_lower_nice_to(before));
+            if !can_lower_nice_to(-5) {
+                let neg = a.apply(ActionKind::Renice, pid, Some(-5), &snap);
+                assert!(!neg.ok && neg.message.contains("root"), "{neg:?}");
+            }
         }
 
         let t = a.apply(ActionKind::Term, pid, None, &snap);
@@ -960,6 +1261,7 @@ mod tests {
         false
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn critical_daemons_refused_for_freeze_and_kill() {
         for n in ["cfprefsd", "distnoted", "secd", "trustd", "usernoted", "notifyd", "WindowServer"] {
@@ -1088,6 +1390,129 @@ mod tests {
         let mut a = Actions::open_at(&path);
         assert!(!a.undo(999).ok);
         assert!(a.undo_last().is_none());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_critical_and_warn_names() {
+        for n in ["systemd", "systemd-journald", "systemd-journal", "systemd-logind", "dbus-daemon", "dbus-broker", "Xorg", "Xwayland", "gnome-shell", "kwin_wayland", "plasmashell", "gdm", "sddm", "polkitd", "NetworkManager", "kubelet"] {
+            assert!(is_critical_name(n), "{n}");
+            assert!(critical_refusal(ActionKind::Pause, n).is_some(), "{n}");
+            assert!(critical_refusal(ActionKind::Kill, n).is_some(), "{n}");
+            assert!(critical_refusal(ActionKind::Renice, n).is_none(), "{n}");
+            assert!(critical_refusal(ActionKind::Resume, n).is_none(), "{n}");
+        }
+        // Truncated comm of dbus-broker-launch; but not every 15-char prefix of anything.
+        assert!(is_critical_name("dbus-broker-lau"));
+        assert!(!is_critical_name("systemd-journ"));
+        for n in ["containerd-shim", "sshd-session", "node", "systemd-run"] {
+            assert!(!is_critical_name(n), "{n}");
+        }
+        for n in ["sshd", "containerd", "dockerd"] {
+            assert!(!is_critical_name(n), "{n}");
+            assert!(matches!(protection(4242, n, &[]), Ok(Some(_))), "{n}");
+        }
+        assert!(protection(1, "systemd", &[]).unwrap_err().contains("init"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_proc(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("fat-actions-procfs-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // Real /proc/stat excerpt (Linux 6.8): cpu lines, then btime.
+        fs::write(root.join("stat"), "cpu  1162 0 1460 466436 75 0 52 0 0 0\ncpu0 290 0 365 116619 18 0 13 0 0 0\nintr 1\nctxt 2\nbtime 1762650000\nprocesses 3\n").unwrap();
+        root
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_pid(root: &Path, pid: u32, stat: &str, uid_line: &str, tgid: u32) {
+        let d = root.join(pid.to_string());
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("stat"), stat).unwrap();
+        fs::write(d.join("status"), format!("Name:\tx\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t1\n{uid_line}\nGid:\t1000\t1000\t1000\t1000\n")).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_procfs_parsing() {
+        // comm with spaces and a ')' inside: split after the last ')'.
+        let line = "4321 (tmux: server) x)) T 1 4321 4321 0 -1 4194624 300 0 0 0 250 50 -3 7 20 5 3 0 123456 9000000 1500 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 2 0 0 0 0 0\n";
+        let st = procfs::parse_stat(line).unwrap();
+        assert_eq!(st.pid, 4321);
+        assert_eq!(st.comm, "tmux: server) x)");
+        assert_eq!(st.state, 'T');
+        assert_eq!((st.ppid, st.pgrp, st.utime, st.stime, st.cutime, st.cstime), (1, 4321, 250, 50, 0, 7));
+        assert_eq!((st.nice, st.num_threads, st.starttime, st.rss_pages), (5, 3, 123456, 1500));
+        assert!(!procfs::is_kernel_thread(&st));
+        assert!(procfs::parse_stat("garbage").is_none());
+        assert!(procfs::parse_stat("12 (x) S").is_none());
+
+        let root = fixture_proc("parse");
+        // kworker: flags 0x04208060 has PF_KTHREAD; ppid 2.
+        let kw = "57 (kworker/0:1-events) I 2 0 0 0 -1 69238880 0 0 0 0 0 31 0 0 20 0 1 0 41 0 0 18446744073709551615 0 0 0 0 0 0 0 2147483647 0 0 0 0 17 0 0 0 0 0 0\n";
+        fixture_pid(&root, 57, kw, "Uid:\t0\t0\t0\t0", 57);
+        let tck = procfs::clk_tck();
+        let sl = format!("900 (sleep) S 1 900 900 0 -1 4194304 90 0 0 0 0 0 0 0 20 0 1 0 {} 2412544 220 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 1 0 0 0 0 0\n", 345 * tck + tck / 2);
+        fixture_pid(&root, 900, &sl, "Uid:\t1000\t1001\t1000\t1000", 900);
+        // A thread id of 900: reachable as /proc/901 but not a process.
+        fixture_pid(&root, 901, &sl.replacen("900", "901", 1), "Uid:\t1000\t1000\t1000\t1000", 900);
+        fixture_pid(&root, 902, "902 (defunct) Z 900 900 900 0 -1 4227084 0 0 0 0 0 0 0 0 20 0 1 0 50 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 1 0 0 0 0 0\n", "Uid:\t1000\t1000\t1000\t1000", 902);
+
+        let l = live_proc_at(&root, 900).unwrap();
+        assert_eq!((l.ppid, l.ruid, l.uid, l.name.as_str(), l.stopped), (1, 1000, 1001, "sleep", false));
+        assert_eq!(l.start_time, 1_762_650_000 + 345, "btime + starttime / CLK_TCK, whole seconds");
+        assert!(live_proc_at(&root, 901).is_none(), "thread ids are not processes");
+        assert!(live_proc_at(&root, 902).is_none(), "zombies are gone");
+        assert!(live_proc_at(&root, 0).is_none());
+        assert!(live_proc_at(&root, 77777).is_none());
+        let kst = procfs::read_stat(&root, 57).unwrap();
+        assert!(procfs::is_kernel_thread(&kst));
+        assert_eq!(kst.ppid, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_live_start_time_matches_ps() {
+        // Our formula agrees with procps' (which also uses btime + starttime / HZ).
+        let kid = spawn_sleep();
+        let pid = kid.0.id();
+        let l = live_proc(pid).unwrap();
+        assert_eq!(l.name, "sleep");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert!(l.start_time.abs_diff(now) <= 2, "{} vs now {now}", l.start_time);
+        if let Ok(out) = Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).env("LC_ALL", "C").env("TZ", "UTC").output()
+            && let Ok(d) = Command::new("date").args(["-u", "-d", String::from_utf8_lossy(&out.stdout).trim(), "+%s"]).output()
+            && let Ok(ps_start) = String::from_utf8_lossy(&d.stdout).trim().parse::<u64>()
+        {
+            assert!(ps_start.abs_diff(l.start_time) <= 1, "ps says {ps_start}, we say {}", l.start_time);
+        }
+        // Kernel threads are refused when visible (not in a container's pid namespace).
+        if let Some(kt) = live_proc(2).filter(|l| l.name == "kthreadd") {
+            assert!(kernel_thread_refusal(kt.pid, &kt.name).is_err());
+        }
+        assert!(kernel_thread_refusal(pid, "sleep").is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_unprivileged_cannot_lower_nice() {
+        if nice_privileged() || can_lower_nice_to(0) {
+            return;
+        }
+        let kid = spawn_sleep();
+        let pid = kid.0.id();
+        let snap = snap_with(pid);
+        let path = tmp_journal("lnice");
+        let mut a = Actions::open_at(&path);
+        let up = a.apply(ActionKind::Renice, pid, Some(10), &snap);
+        assert!(up.ok && !up.undoable, "{up:?}");
+        assert!(up.message.contains("undo needs CAP_SYS_NICE"), "{}", up.message);
+        let down = a.apply(ActionKind::Renice, pid, Some(5), &snap);
+        assert!(!down.ok && down.message.contains("RLIMIT_NICE"), "{down:?}");
+        assert_eq!(get_nice(pid), Ok(10));
         let _ = fs::remove_file(&path);
     }
 }

@@ -821,6 +821,7 @@ impl History {
     }
 
     /// Number of recorded samples.
+    #[allow(dead_code)]
     pub fn sample_count(&self) -> anyhow::Result<u64> {
         Ok(self.conn.query_row("SELECT count(*) FROM system", [], |r| r.get::<_, i64>(0))? as u64)
     }
@@ -937,6 +938,8 @@ impl History {
                 user: info.5,
                 virt: 0,
                 usage_unknown: false,
+                cgroup: String::new(),
+                container: None,
             });
         }
         procs.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(a.pid.cmp(&b.pid)));
@@ -1043,7 +1046,9 @@ fn select_interesting<'a>(snap: &'a Snapshot, sticky: &HashSet<u32>, is_key: boo
 
     let port_pids: HashSet<u32> = snap.ports.iter().map(|p| p.pid).collect();
     for (i, p) in procs.iter().enumerate() {
-        if port_pids.contains(&p.pid) || p.status == "T" {
+        // Linux: also keep processes in uninterruptible sleep (D, shown as "U") so `fat doctor`
+        // can tell how long one has been stuck even when it uses no CPU.
+        if port_pids.contains(&p.pid) || p.status == "T" || (cfg!(target_os = "linux") && p.status == "U") {
             take(i, &mut chosen);
         }
     }

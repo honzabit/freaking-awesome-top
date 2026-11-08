@@ -27,9 +27,12 @@ pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation
     };
 
     let now = now_of(snap);
+    let os = platform(snap);
     let descendants = snap.descendants(pid);
     let ancestors = snap.ancestors(pid);
     let tree = TreeCost::of(p, &descendants);
+    let kthread = os == Os::Linux && is_kernel_thread(p);
+    let cg = if os == Os::Linux { parse_cgroup(&p.cgroup) } else { CgInfo::default() };
     let series = hist.and_then(|h| h.proc_series(pid, now - 30 * MIN_MS, now).ok()).unwrap_or_default();
     let streak = hot_streak(&series, HOT_CPU, now);
 
@@ -50,16 +53,30 @@ pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation
     }
 
     // ---- chain: symptom → process → ancestry → cause ----
-    let mut chain = vec![symptom(snap, p, &tree)];
+    let mut chain = vec![symptom(snap, os, p, &tree)];
     let mut proc_step = format!("{} (pid {})", p.name, p.pid);
     if !p.cmd.is_empty() && p.cmd != p.name {
         proc_step.push_str(&format!(": `{}`", truncate(&p.cmd, 90)));
     }
     chain.push(proc_step);
-    if let Some(a) = ancestry_step(&ancestors) {
+    if kthread {
+        chain.push(
+            "kernel thread (child of kthreadd): it does kernel work for the whole system, not for one program; its cost is caused by something else"
+                .into(),
+        );
+    } else if let Some(a) = ancestry_step(&ancestors, os) {
         chain.push(a);
     }
-    let causes = cause_steps(snap, p, &tree, hist, now);
+    if os == Os::Linux {
+        chain.extend(placement_steps(snap, p, &cg));
+    }
+    if is_dstate(p) && os != Os::Mac {
+        chain.push(
+            "it is in uninterruptible sleep (D): blocked inside the kernel waiting for IO (disk, NFS/FUSE/network mount, or a stuck device); signals, even kill -9, wait until that IO returns"
+                .into(),
+        );
+    }
+    let causes = cause_steps(snap, os, p, &tree, hist, now);
     chain.extend(causes.steps);
     if let Some((start, dur)) = streak {
         let mut s = format!("hot for the last {}, started {}", human_dur_ms(dur), clock(start));
@@ -133,6 +150,15 @@ pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation
         evidence.push(format!("cwd {}", p.cwd));
     }
     evidence.push(format!("status {}", status_word(&p.status)));
+    if !p.cgroup.is_empty() && p.cgroup != "/" {
+        evidence.push(format!("cgroup {}", p.cgroup));
+    }
+    if let Some(ps) = snap.system.psi.filter(|_| os == Os::Linux) {
+        evidence.push(format!(
+            "system pressure (PSI avg10): cpu {:.0}%, memory {:.0}% some / {:.0}% full, io {:.0}% some / {:.0}% full",
+            ps.cpu_some, ps.mem_some, ps.mem_full, ps.io_some, ps.io_full
+        ));
+    }
     if series.len() >= 2 {
         let peak = series.iter().map(|s| s.1).fold(0.0f32, f32::max);
         let avg = series.iter().map(|s| s.1).sum::<f32>() / series.len() as f32;
@@ -143,18 +169,41 @@ pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation
     // ---- suggestions ----
     let mut suggestions = Vec::new();
     suggestions.extend(causes.suggestions);
+    if is_dstate(p) && os == Os::Linux {
+        suggestions.push(format!(
+            "see what it waits on: cat /proc/{pid}/wchan (sudo cat /proc/{pid}/stack for the full kernel stack); check `dmesg` for IO errors or hung-task warnings"
+        ));
+    }
     if is_stopped(p) {
         suggestions.push(format!("it is paused; resume it: fat resume {pid}"));
         suggestions.push(format!("or stop it for good: fat kill {pid}{}", tree_flag(&descendants)));
-    } else if is_system_critical(p) {
+    } else if kthread {
         suggestions.push(format!(
-            "{} is part of macOS; don't kill it. Address the cause above instead.",
+            "{} is a kernel thread: it can't be paused or killed, and renicing it doesn't help. Address the cause above instead.",
             p.name
         ));
+    } else if is_system_critical_on(os, p) {
+        let msg = match os {
+            Os::Linux if is_package_manager(p) => format!(
+                "{} is installing or updating packages; interrupting it can leave packages half-configured. Let it finish.",
+                p.name
+            ),
+            Os::Linux if p.pid == 1 => format!(
+                "{} is pid 1, the init of this machine or container; don't kill it. Address the cause above instead.",
+                p.name
+            ),
+            Os::Linux => format!("{} is a core Linux system/session service; don't kill it. Address the cause above instead.", p.name),
+            Os::Other => format!("{} is a core system process; don't kill it. Address the cause above instead.", p.name),
+            Os::Mac => format!("{} is part of macOS; don't kill it. Address the cause above instead.", p.name),
+        };
+        suggestions.push(msg);
         if p.pid != 0 && p.pid != 1 && p.name != "kernel_task" {
             suggestions.push(format!("if it's hurting right now, lower its priority: fat renice {pid} 10"));
         }
     } else {
+        if os == Os::Linux {
+            suggestions.extend(placement_suggestions(snap, &cg, p));
+        }
         suggestions.push(format!("pause it (reversible): fat pause {pid}"));
         suggestions.push(format!("lower its priority (reversible): fat renice {pid} 10"));
         if descendants.is_empty() {
@@ -170,31 +219,105 @@ pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation
 /// Ranked findings, most severe first.
 pub fn diagnose(snap: &Snapshot, hist: Option<&History>) -> Vec<Finding> {
     let now = now_of(snap);
+    let os = platform(snap);
     let mut out = Vec::new();
 
-    rule_memory(snap, &mut out);
+    rule_memory(snap, os, &mut out);
     rule_swap(snap, &mut out);
-    rule_thermal(snap, &mut out);
-    rule_cpu(snap, hist, now, &mut out);
-    rule_power(snap, &mut out);
+    rule_thermal(snap, os, &mut out);
+    rule_cpu(snap, os, hist, now, &mut out);
+    rule_power(snap, os, &mut out);
     rule_orphans(snap, &mut out);
     rule_stopped(snap, hist, now, &mut out);
     rule_zombies(snap, &mut out);
-    rule_swarms(snap, &mut out);
-    rule_disk(snap, &mut out);
-    rule_net(snap, &mut out);
-    rule_load(snap, &mut out);
-    rule_unattributed(snap, &mut out);
+    rule_swarms(snap, os, &mut out);
+    rule_disk(snap, os, &mut out);
+    rule_net(snap, os, &mut out);
+    rule_load(snap, os, &mut out);
+    rule_unattributed(snap, os, &mut out);
+    if os != Os::Mac {
+        rule_psi(snap, os, &mut out);
+        rule_temp(snap, os, &mut out);
+        rule_dstate(snap, os, hist, now, &mut out);
+    }
+    rule_containers(snap, &mut out);
 
     out.sort_by_key(|f| std::cmp::Reverse(severity_rank(&f.severity)));
     out
 }
 
-/// Human explanation for well-known system daemons (mds_stores, kernel_task, ...).
+/// Human explanation for well-known system daemons (mds_stores, kernel_task, kswapd0, ...)
+/// on the platform fat was built for.
+#[allow(dead_code)]
 pub fn known(name: &str) -> Option<&'static str> {
+    known_for(name, host_os())
+}
+
+/// [`known`] for a specific platform (a snapshot may come from a remote Linux host).
+fn known_for(name: &str, os: Os) -> Option<&'static str> {
     let n = name.trim();
     let lower = n.to_ascii_lowercase();
-    KNOWN.iter().find(|k| k.matches(n, &lower)).map(|k| k.text)
+    KNOWN.iter().find(|k| k.os.is_none_or(|o| o == os) && k.matches(n, &lower)).map(|k| k.text)
+}
+
+/// Like [`known_for`] but also looks at the command line, for processes whose name alone is
+/// generic (`java` running the Gradle daemon, `chrome --type=renderer`).
+fn known_proc(p: &Proc, os: Os) -> Option<&'static str> {
+    let lname = p.name.to_ascii_lowercase();
+    KNOWN_CMD
+        .iter()
+        .find(|(names, needle, _)| names.contains(&lname.as_str()) && p.cmd.contains(needle))
+        .map(|(_, _, text)| *text)
+        .or_else(|| known_for(&p.name, os))
+}
+
+// ======================================================================
+// Platform
+// ======================================================================
+
+/// Which OS a snapshot describes. Blame is pure logic over snapshots, which may come from
+/// another host (fleet, history), so this is decided from the data, not only from `cfg!`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Os {
+    Mac,
+    Linux,
+    Other,
+}
+
+fn host_os() -> Os {
+    if cfg!(target_os = "macos") {
+        Os::Mac
+    } else if cfg!(target_os = "linux") {
+        Os::Linux
+    } else {
+        Os::Other
+    }
+}
+
+fn platform(snap: &Snapshot) -> Os {
+    let os = snap.system.os.to_ascii_lowercase();
+    if os.contains("macos") || os.contains("mac os") || os.contains("darwin") || os.contains("os x") {
+        return Os::Mac;
+    }
+    const DISTROS: &[&str] = &[
+        "linux", "ubuntu", "debian", "fedora", "arch", "alpine", "centos", "red hat", "rhel", "nixos", "suse",
+        "mint", "pop!_os", "rocky", "alma", "gentoo", "amazon",
+    ];
+    if DISTROS.iter().any(|d| os.contains(d)) {
+        return Os::Linux;
+    }
+    if snap.system.psi.is_some() || snap.procs.iter().any(|p| !p.cgroup.is_empty()) {
+        return Os::Linux;
+    }
+    for p in &snap.procs {
+        if (p.pid == 1 && p.name == "launchd") || p.name == "kernel_task" {
+            return Os::Mac;
+        }
+        if (p.pid == 1 && p.name == "systemd") || (p.pid == 2 && p.name == "kthreadd") {
+            return Os::Linux;
+        }
+    }
+    host_os()
 }
 
 // ======================================================================
@@ -212,6 +335,8 @@ enum M {
 
 struct Known {
     m: M,
+    /// Only on this platform (None = everywhere).
+    os: Option<Os>,
     text: &'static str,
 }
 
@@ -227,12 +352,90 @@ impl Known {
 
 macro_rules! k {
     ($kind:ident $pat:literal => $text:literal) => {
-        Known { m: M::$kind($pat), text: $text }
+        Known { m: M::$kind($pat), os: None, text: $text }
+    };
+    (linux $kind:ident $pat:literal => $text:literal) => {
+        Known { m: M::$kind($pat), os: Some(Os::Linux), text: $text }
     };
 }
 
-/// Order matters: more specific patterns first.
+/// (lowercase process names, substring of cmd, explanation). Checked before [`KNOWN`].
+static KNOWN_CMD: &[(&[&str], &str, &str)] = &[
+    (&["java"], "GradleDaemon", "Gradle build daemon: a long-lived JVM that runs your Gradle builds and keeps GBs of heap warm between them. `gradle --stop` (or `./gradlew --stop`) frees it."),
+    (&["java"], "KotlinCompileDaemon", "Kotlin compile daemon, started by Gradle/IntelliJ builds. Idle ones hold a lot of RAM; `gradle --stop` ends them."),
+    (&["chrome", "chromium", "chromium-browser", "google-chrome"], "--type=renderer", "A Chrome/Chromium tab or extension renderer. One heavy renderer is usually one heavy tab (video, ads, a runaway script). Shift+Esc opens Chrome's Task Manager to find it."),
+    (&["chrome", "chromium", "chromium-browser", "google-chrome"], "--type=gpu-process", "Chrome's GPU process: compositing and video decode for all tabs."),
+];
+
+/// Order matters: more specific patterns first. Linux kernel/daemon names come from
+/// /proc/<pid>/comm, which the kernel truncates to 15 chars ("systemd-journal",
+/// "unattended-upgr", "containerd-shim"), hence the prefixes.
 static KNOWN: &[Known] = &[
+    // ---- Linux-only overrides of names that also exist on macOS ----
+    k!(linux Eq "cargo" => "Rust build tool. Spawns rustc/build scripts; heavy CPU while building, and creates large target/ trees that file watchers (inotify), desktop indexers (tracker, baloo) and backups then react to."),
+    k!(linux Prefix "orbstack-agent" => "OrbStack's in-VM agent: connects this Linux machine to the macOS host (file sharing, networking, port forwarding)."),
+    // ---- Linux kernel threads ----
+    k!(Prefix "kswapd" => "Kernel memory reclaim thread. A busy kswapd means you're short on RAM: the kernel is evicting page cache and swapping to free memory. Find the memory hog, not kswapd."),
+    k!(Prefix "kworker/" => "Kernel worker thread running queued kernel work: block IO completion, filesystem writeback, driver and interrupt bottom halves. The suffix names the queue (-kblockd = disk, -events = misc). Look at disk IO and interrupts, not the thread."),
+    k!(Prefix "ksoftirqd/" => "Per-CPU soft-interrupt handler. Busy means heavy network or interrupt load: high packet rates, a traffic flood, or a NIC whose interrupts all land on one CPU."),
+    k!(Prefix "kcompactd" => "Kernel memory compaction: defragments RAM so large/huge-page allocations succeed. Busy under memory pressure or fragmentation; often seen with khugepaged."),
+    k!(Eq "khugepaged" => "Transparent Huge Pages collapser: merges 4 KB pages into 2 MB huge pages in the background. Heavy activity can stall latency-sensitive apps; THP=madvise avoids it."),
+    k!(Prefix "jbd2/" => "ext4 journaling thread for one filesystem (jbd2/<device>). Busy means an fsync-heavy workload (databases, package managers, builds, editors saving often) is forcing journal commits."),
+    k!(Eq "kthreadd" => "Kernel thread daemon (pid 2): the parent of every kernel thread. It does no real work itself."),
+    k!(Prefix "irq/" => "Threaded interrupt handler for one device (irq/<n>-<device>). Busy means that device (NIC, NVMe, GPU) is raising a lot of interrupts."),
+    k!(Prefix "rcu_" => "Kernel RCU grace-period thread. Rarely busy; sustained CPU here points at a kernel or driver problem."),
+    k!(Prefix "migration/" => "Per-CPU scheduler thread that moves tasks between CPUs. Normally idle."),
+    k!(Prefix "btrfs" => "Btrfs filesystem kernel worker (transaction commits, cleaner, scrub/balance). Busy during heavy writes, snapshot deletion, or a running scrub/balance."),
+    // ---- Linux system daemons ----
+    k!(Prefix "systemd-journal" => "systemd-journald: collects every service's logs. High CPU or disk writes mean something is logging furiously; find the noisy unit and fix or rate-limit it."),
+    k!(Prefix "systemd-oomd" => "systemd's userspace OOM killer: watches memory pressure (PSI) and kills whole cgroups before the machine thrashes."),
+    k!(Prefix "systemd-udevd" => "Device manager: handles hotplug and device events. CPU spikes mean a device event storm (flaky USB, docking, a udev rule loop)."),
+    k!(Eq "systemd" => "systemd: as pid 1 it starts and supervises every service; as `systemd --user` it runs your session's services. Processes re-parented to it lost their original launcher. High CPU usually means a unit is crash-looping or a flood of D-Bus/udev events."),
+    k!(Eq "rsyslogd" => "Traditional syslog daemon writing /var/log/syslog. Busy when a program floods syslog; same root cause as a busy journald."),
+    k!(Eq "dbus-daemon" => "D-Bus message bus: IPC between system/desktop services. High CPU means some service is spamming messages (`busctl monitor` shows who)."),
+    k!(Eq "dbus-broker" => "D-Bus message bus: IPC between system/desktop services. High CPU means some service is spamming messages (`busctl monitor` shows who)."),
+    k!(Prefix "containerd-shim" => "Per-container shim: parent of one container's processes, keeps it running across containerd restarts. Its cost is the container below it."),
+    k!(Eq "containerd" => "containerd: the container runtime under Docker and Kubernetes. Its own CPU is image pulls/unpacking and container lifecycle; workloads run as separate processes under containerd-shim."),
+    k!(Eq "runc" => "OCI runtime that creates containers. Short-lived; seeing it often means containers are being (re)started, maybe a restart loop."),
+    k!(Eq "conmon" => "Podman container monitor: parent of one container's processes. Its cost is the container below it."),
+    k!(Eq "kubelet" => "Kubernetes node agent: starts pods, runs probes, reports status. High CPU usually means many pods, aggressive probes, or churn from crash-looping pods."),
+    k!(Eq "snapd" => "Snap package daemon: refreshes snaps in the background (downloads, squashfs mounts). `snap changes` shows what it is doing."),
+    k!(Eq "packagekitd" => "PackageKit: package metadata refreshes and updates for desktop software centers. Busy while refreshing caches or installing updates."),
+    k!(Prefix "unattended-upgr" => "unattended-upgrades: automatic security updates via apt, run daily by a systemd timer. Heavy disk/CPU while installing; let it finish (interrupting can leave dpkg half-configured)."),
+    k!(Eq "apt" => "apt package manager: downloading, unpacking or configuring packages. Let it finish."),
+    k!(Eq "apt-get" => "apt package manager: downloading, unpacking or configuring packages. Let it finish."),
+    k!(Prefix "dpkg" => "Debian package manager unpacking/configuring packages. Heavy disk IO while it runs; don't kill it mid-run (packages can be left half-configured)."),
+    k!(Prefix "updatedb" => "updatedb (locate database): walks every directory to index file names, daily from a timer. Heavy IO on big trees; add build/dependency dirs to PRUNEPATHS in /etc/updatedb.conf."),
+    k!(Prefix "plocate-update" => "plocate's updatedb: walks every directory to index file names, daily from a timer. Heavy IO on big trees; add build/dependency dirs to PRUNEPATHS in /etc/updatedb.conf."),
+    k!(Prefix "tracker-miner" => "GNOME Tracker file indexer (search in Files/Activities). Busy after lots of new files appear (node_modules, target/, unpacked archives), like Spotlight on macOS."),
+    k!(Prefix "tracker-extract" => "GNOME Tracker metadata extractor: reads new/changed files for search. Busy after big file trees change."),
+    k!(Prefix "baloo_file" => "KDE Baloo file indexer. Busy after many new or changed files; `balooctl suspend` pauses it."),
+    k!(Eq "gnome-shell" => "GNOME's compositor and desktop shell: draws every window. Rises with animations, many/high-refresh displays and misbehaving extensions; steadily growing RAM is usually an extension leak."),
+    k!(Prefix "kwin_" => "KDE's window manager and compositor: draws every window. Rises with effects, many/high-refresh displays, and apps that redraw constantly."),
+    k!(Eq "Xorg" => "X11 display server: draws windows for X clients. High CPU means some app redraws constantly, or the GPU driver is missing (software rendering)."),
+    k!(Eq "Xwayland" => "X11 compatibility server for older apps on Wayland. Its cost is the X11 apps drawing through it (games, older Electron/Java apps)."),
+    k!(Prefix "pipewire" => "PipeWire: audio/video routing (sound, screen sharing, cameras). Spikes with many streams, Bluetooth audio, or a buggy client."),
+    k!(Eq "wireplumber" => "PipeWire session manager: decides which app goes to which audio/video device."),
+    k!(Eq "pulseaudio" => "PulseAudio sound server: all sound in/out. Spikes with resampling, many streams, or Bluetooth headsets."),
+    k!(Eq "NetworkManager" => "Network configuration daemon (Wi-Fi, VPN, DHCP). Busy during Wi-Fi scans/roaming, flapping links, or VPN reconnect loops."),
+    k!(Eq "irqbalance" => "Spreads hardware interrupts across CPUs. Wakes periodically; rarely costly."),
+    k!(Eq "thermald" => "Intel thermal daemon: throttles the CPU to keep temperatures in check. Activity here means the machine is running hot."),
+    k!(Prefix "fwupd" => "Firmware update daemon (LVFS): checks and applies device firmware updates. Brief activity during metadata refresh."),
+    k!(Eq "Web Content" => "A Firefox content process (one or more tabs). A heavy one is a single busy page; about:processes shows which tab."),
+    k!(Prefix "Isolated Web" => "A Firefox site-isolated content process (one site's tabs). A heavy one is a single busy page; about:processes shows which tab."),
+    k!(Prefix "firefox" => "Firefox browser main process; tabs run as 'Web Content' / 'Isolated Web Co' processes (about:processes maps them to tabs)."),
+    k!(Eq "chrome" => "Chrome: every tab, extension and the GPU run as separate `chrome --type=...` processes. A heavy renderer is one heavy tab; Shift+Esc opens Chrome's Task Manager."),
+    k!(Prefix "chromium" => "Chromium: every tab, extension and the GPU run as separate processes. A heavy renderer is one heavy tab; Shift+Esc opens its Task Manager."),
+    k!(Prefix "rust-analyzer-" => "rust-analyzer's proc-macro server: expands your crates' procedural macros for the editor."),
+    k!(Eq "cc1plus" => "GCC's C++ compiler proper, spawned by g++ from make/ninja/cmake. Many at once = a parallel C++ build; each can take 1-2 GB RAM on template-heavy code."),
+    k!(Eq "cc1" => "GCC's C compiler proper, spawned by gcc from a build."),
+    k!(Eq "ld" => "The linker: joins object files into the final binary. RAM-hungry and mostly single-threaded on big C++/Rust binaries; lld or mold are much faster."),
+    k!(Prefix "ld." => "The linker (bfd/gold/lld): joins object files into the final binary. RAM-hungry on big C++/Rust binaries; lld or mold are much faster."),
+    k!(Eq "mold" => "mold, a fast parallel linker: short bursts of all-core CPU at the end of a build are normal."),
+    k!(Eq "gradle" => "Gradle build tool; the real work runs in a long-lived Gradle daemon (java ... GradleDaemon) that keeps GBs of heap between builds. `gradle --stop` frees it."),
+    k!(Eq "java" => "Java VM: IDEs (IntelliJ), build daemons (Gradle, Kotlin, Maven), or servers (Elasticsearch, Kafka). The main class in its cmd says which. Heap is reserved up front, so RAM stays high even when idle."),
+    k!(Prefix "python" => "Python interpreter: a script, dev server (Django/Flask/FastAPI), notebook kernel, ML job or agent tool. Check its cmd and cwd."),
+    // ---- macOS and cross-platform ----
     k!(Eq "mds_stores" => "Spotlight index writer. Busy after lots of new files appear (node_modules, target/, .git, downloads, unpacked archives) or after an OS update/reindex."),
     k!(Prefix "mdworker" => "Spotlight importer: reads new or changed files to extract searchable metadata. Swarms of these mean a big tree of files just changed."),
     k!(Eq "mds" => "Spotlight metadata server: coordinates indexing. High CPU usually means a reindex or a flood of new files (node_modules, target/, .git)."),
@@ -336,7 +539,7 @@ impl TreeCost {
 }
 
 /// First chain step: what the user is actually noticing.
-fn symptom(snap: &Snapshot, p: &Proc, tree: &TreeCost) -> String {
+fn symptom(snap: &Snapshot, os: Os, p: &Proc, tree: &TreeCost) -> String {
     let sys = &snap.system;
     let cores = sys.cores.max(1) as f32;
     let mut parts = Vec::new();
@@ -363,6 +566,12 @@ fn symptom(snap: &Snapshot, p: &Proc, tree: &TreeCost) -> String {
     }
     if parts.is_empty() && p.usage_unknown {
         let owner = if p.user.is_empty() { "another user".to_string() } else { format!("user {}", p.user) };
+        if os == Os::Linux {
+            return format!(
+                "usage unknown: owned by {owner}; this system hides other users' /proc details (hidepid or ptrace limits), so only root can measure it (try `sudo fat why {}`)",
+                p.pid
+            );
+        }
         return format!(
             "usage unknown: owned by {owner}; macOS only lets root measure another user's CPU/memory (try `sudo fat why {}`)",
             p.pid
@@ -383,13 +592,14 @@ enum Launcher {
     Agent,
     Remote,
     Init,
+    Container,
     Other,
 }
 
 fn classify_launcher(p: &Proc) -> Launcher {
     let n = p.name.to_ascii_lowercase();
     let n = n.trim_start_matches('-'); // login shells show as "-zsh"
-    if p.pid == 1 || n == "launchd" {
+    if p.pid == 1 || n == "launchd" || n == "systemd" || n == "init" {
         return Launcher::Init;
     }
     const SHELLS: &[&str] = &["zsh", "bash", "fish", "sh", "dash", "nu", "tcsh", "ksh", "pwsh", "xonsh", "elvish"];
@@ -398,9 +608,10 @@ fn classify_launcher(p: &Proc) -> Launcher {
     }
     const TERMS: &[&str] = &[
         "terminal", "iterm2", "alacritty", "kitty", "wezterm", "wezterm-gui", "ghostty", "warp", "stable", "hyper",
-        "tmux", "screen", "zellij", "tabby", "rio", "login",
+        "tmux", "screen", "zellij", "tabby", "rio", "login", "konsole", "xterm", "foot", "terminator", "tilix",
+        "xfce4-terminal", "kgx", "urxvt", "ptyxis", "ptyxis-agent",
     ];
-    if TERMS.contains(&n) || n.starts_with("tmux") || n.starts_with("iterm") {
+    if TERMS.contains(&n) || n.starts_with("tmux") || n.starts_with("iterm") || n.starts_with("gnome-terminal") {
         return Launcher::Terminal;
     }
     const IDES: &[&str] = &["code", "cursor", "zed", "xcode", "windsurf", "sublime_text", "nvim", "vim", "emacs", "helix", "hx"];
@@ -424,12 +635,15 @@ fn classify_launcher(p: &Proc) -> Launcher {
     if n == "sshd" || n.starts_with("sshd-") || n == "mosh-server" {
         return Launcher::Remote;
     }
+    if n.starts_with("containerd-shim") || n == "conmon" || n == "runc" || n == "crun" {
+        return Launcher::Container;
+    }
     Launcher::Other
 }
 
 /// "started from zsh (pid 10) ← Ghostty (pid 9) ← launchd". Collapses uninteresting
 /// intermediate processes, but always keeps the direct parent.
-fn ancestry_step(ancestors: &[&Proc]) -> Option<String> {
+fn ancestry_step(ancestors: &[&Proc], os: Os) -> Option<String> {
     if ancestors.is_empty() {
         return None;
     }
@@ -445,6 +659,7 @@ fn ancestry_step(ancestors: &[&Proc]) -> Option<String> {
                 Launcher::Ide => s.push_str(" editor/IDE"),
                 Launcher::Agent => s.push_str(" agent"),
                 Launcher::Remote => s.push_str(" ssh session"),
+                Launcher::Container => s.push_str(" container runtime"),
                 Launcher::Init | Launcher::Other => {}
             }
             if skipped > 0 && i > 0 {
@@ -459,7 +674,18 @@ fn ancestry_step(ancestors: &[&Proc]) -> Option<String> {
     let direct_init = classify_launcher(ancestors[0]) == Launcher::Init;
     let mut out = format!("launched by {}", picked.join(" ← "));
     if direct_init {
-        out.push_str(" (directly under launchd: a system/app service, or its original launcher exited)");
+        let a = ancestors[0];
+        match os {
+            Os::Mac => out.push_str(" (directly under launchd: a system/app service, or its original launcher exited)"),
+            _ if a.pid == 1 && a.name == "systemd" => {
+                out.push_str(" (directly under systemd: a system service, or its original launcher exited)")
+            }
+            _ if a.pid == 1 => out.push_str(&format!(
+                " (directly under pid 1 ({}): a service or container entrypoint, or its original launcher exited)",
+                a.name
+            )),
+            _ => out.push_str(" (directly under the user's systemd manager: a user service, or its original launcher exited)"),
+        }
     }
     Some(out)
 }
@@ -475,7 +701,8 @@ struct Causes {
 const FILE_CHURNERS: &[&str] = &[
     "npm", "pnpm", "yarn", "bun", "cargo", "rustc", "git", "pip", "pip3", "uv", "poetry", "brew", "xcodebuild",
     "swift-build", "go", "gradle", "java", "mvn", "tar", "unzip", "ditto", "rsync", "cp", "docker", "bazel", "make",
-    "cmake", "ninja", "clang", "webpack", "esbuild", "vite", "tsc", "next",
+    "cmake", "ninja", "clang", "webpack", "esbuild", "vite", "tsc", "next", "cc1plus", "cc1", "dpkg", "apt",
+    "apt-get",
 ];
 
 fn is_file_churner(p: &Proc) -> bool {
@@ -493,14 +720,18 @@ fn is_file_churner(p: &Proc) -> bool {
     false
 }
 
-fn cause_steps(snap: &Snapshot, p: &Proc, tree: &TreeCost, hist: Option<&History>, now: Ts) -> Causes {
+fn cause_steps(snap: &Snapshot, os: Os, p: &Proc, tree: &TreeCost, hist: Option<&History>, now: Ts) -> Causes {
     let mut c = Causes::default();
     let name = p.name.as_str();
     let lname = name.to_ascii_lowercase();
-    let known_text = known(name);
+    let known_text = known_proc(p, os);
 
     if let Some(t) = known_text {
         c.steps.push(t.to_string());
+    }
+
+    if os == Os::Linux && linux_causes(snap, p, &lname, hist, now, &mut c) {
+        return c;
     }
 
     let spotlight = lname == "mds" || lname == "mds_stores" || lname.starts_with("mdworker") || lname == "corespotlightd";
@@ -668,10 +899,69 @@ fn is_system_critical(p: &Proc) -> bool {
     crate::actions::is_critical_name(&p.name) || p.pid <= 1
 }
 
+/// macOS session/system daemons (mirrors actions.rs's macOS list, so a macOS snapshot is
+/// judged the same wherever fat runs).
+const MAC_CRITICAL: &[&str] = &[
+    "kernel_task", "launchd", "WindowServer", "loginwindow", "logd", "runningboardd", "coreaudiod",
+    "opendirectoryd", "mds", "mds_stores", "trustd", "syspolicyd", "secd", "securityd", "bluetoothd",
+    "configd", "notifyd", "distnoted", "cfprefsd", "usernoted", "UserEventAgent", "coreservicesd",
+    "lsd", "tccd", "powerd", "diskarbitrationd", "fseventsd", "mDNSResponder", "kernelmanagerd",
+    "watchdogd", "hidd", "airportd", "sshd", "launchservicesd", "nsurlsessiond", "containermanagerd",
+    "symptomsd", "thermalmonitord", "sandboxd", "authd", "keybagd", "apsd", "corebrightnessd",
+];
+
+/// Linux processes whose loss takes down the session or the machine's plumbing (blame only
+/// uses this to avoid suggesting pause/kill; actions.rs does the enforcing). Full names; the
+/// kernel's 15-char `comm` truncation is matched too.
+const LINUX_CRITICAL: &[&str] = &[
+    "systemd", "systemd-journald", "systemd-logind", "systemd-udevd", "systemd-resolved", "systemd-networkd",
+    "systemd-oomd", "systemd-timesyncd", "dbus-daemon", "dbus-broker", "dbus-broker-launch", "polkitd", "Xorg",
+    "Xwayland", "gnome-shell", "gnome-session-binary", "kwin_wayland", "kwin_x11", "plasmashell", "gdm", "gdm3",
+    "gdm-session-worker", "sddm", "lightdm", "NetworkManager", "wpa_supplicant", "containerd", "dockerd", "kubelet",
+    "pipewire", "wireplumber", "udisksd", "accounts-daemon", "agetty",
+];
+
+fn name_in(list: &[&str], name: &str) -> bool {
+    list.iter().any(|full| {
+        full.eq_ignore_ascii_case(name)
+            || (name.len() == 15 && full.len() > 15 && full.is_char_boundary(15) && full[..15].eq_ignore_ascii_case(name))
+    })
+}
+
+fn is_package_manager(p: &Proc) -> bool {
+    let n = p.name.to_ascii_lowercase();
+    matches!(n.as_str(), "apt" | "apt-get" | "aptitude" | "dnf" | "yum" | "rpm" | "zypper" | "pacman")
+        || n.starts_with("dpkg")
+        || n.starts_with("unattended-upgr")
+}
+
+fn is_system_critical_on(os: Os, p: &Proc) -> bool {
+    if is_system_critical(p) {
+        return true;
+    }
+    match os {
+        Os::Mac => MAC_CRITICAL.iter().any(|n| n.eq_ignore_ascii_case(&p.name)),
+        Os::Linux => name_in(LINUX_CRITICAL, &p.name) || is_kernel_thread(p) || is_package_manager(p),
+        Os::Other => false,
+    }
+}
+
+/// Linux kernel thread: kthreadd (pid 2) or one of its children. Kernel threads have no
+/// command line (collectors report it empty or as `[name]`).
+fn is_kernel_thread(p: &Proc) -> bool {
+    (p.pid == 2 && p.name == "kthreadd")
+        || (p.ppid == 2 && (p.cmd.is_empty() || p.cmd.starts_with('[') || p.cmd == p.name) && p.exe.is_empty())
+}
+
+/// Uninterruptible sleep. Linux reports 'D'; sysinfo maps it to 'U'.
+fn is_dstate(p: &Proc) -> bool {
+    p.status.starts_with('D') || p.status.starts_with('U')
+}
+
 /// CPU the system reports as busy that no measurable process accounts for. Unprivileged, the
 /// kernel hides other users' (root/system daemons') usage, so name the gap instead of
 /// pretending those processes are idle.
-fn rule_unattributed(snap: &Snapshot, out: &mut Vec<Finding>) {
+fn rule_unattributed(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
     let unknown: Vec<&Proc> = snap.procs.iter().filter(|p| p.usage_unknown).collect();
     if unknown.is_empty() {
         return;
@@ -683,6 +973,11 @@ fn rule_unattributed(snap: &Snapshot, out: &mut Vec<Finding>) {
         return;
     }
     let sev = if gap >= 200.0 { "warn" } else { "info" };
+    let why = if os == Os::Linux {
+        "hide their usage from this user (/proc mounted with hidepid, or ptrace restrictions)"
+    } else {
+        "can't be measured without root"
+    };
     let mut names: Vec<&str> = unknown.iter().map(|p| p.name.as_str()).filter(|n| !n.is_empty()).collect();
     names.sort_unstable();
     names.dedup();
@@ -692,7 +987,7 @@ fn rule_unattributed(snap: &Snapshot, out: &mut Vec<Finding>) {
         format!("{:.1} cores of CPU unattributed (other users' processes need root)", gap / 100.0),
         format!(
             "The system is {:.0}% busy but measurable processes account for only {:.1} cores. {} processes owned by other users \
-             (e.g. {sample}) can't be measured without root. Run `sudo fat` or `sudo fat doctor` to see which one it is.",
+             (e.g. {sample}) {why}. Run `sudo fat` or `sudo fat doctor` to see which one it is.",
             snap.system.cpu,
             attributed / 100.0,
             unknown.len()
@@ -710,6 +1005,8 @@ fn status_word(s: &str) -> String {
         Some('T') => "paused/stopped (T)",
         Some('Z') => "zombie (exited, parent hasn't reaped it)",
         Some('U') => "uninterruptible wait (U)",
+        Some('D') => "uninterruptible IO wait (D)",
+        Some('t') => "stopped by a debugger (t)",
         _ => "unknown",
     };
     w.to_string()
@@ -750,8 +1047,8 @@ fn list_procs(ps: &[&Proc], f: impl Fn(&Proc) -> String) -> String {
 }
 
 /// Safe default action for a process: pause unless it's part of macOS.
-fn safe_action(p: &Proc, snap: &Snapshot) -> Option<String> {
-    if is_system_critical(p) {
+fn safe_action(os: Os, p: &Proc, snap: &Snapshot) -> Option<String> {
+    if is_system_critical_on(os, p) {
         None
     } else if snap.descendants(p.pid).is_empty() {
         Some(format!("pause {}", p.pid))
@@ -760,7 +1057,7 @@ fn safe_action(p: &Proc, snap: &Snapshot) -> Option<String> {
     }
 }
 
-fn rule_memory(snap: &Snapshot, out: &mut Vec<Finding>) {
+fn rule_memory(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
     let sys = &snap.system;
     let ratio = if sys.mem_total > 0 { sys.mem_used as f64 / sys.mem_total as f64 } else { 0.0 };
     let sev = match sys.mem_pressure.as_str() {
@@ -772,7 +1069,7 @@ fn rule_memory(snap: &Snapshot, out: &mut Vec<Finding>) {
     };
     let Some(sev) = sev else { return };
     let top: Vec<&Proc> = top_by(snap, |p| p.mem as f32, 5).into_iter().filter(|p| p.mem > 0).collect();
-    let first = top.iter().find(|p| !is_system_critical(p)).copied();
+    let first = top.iter().find(|p| !is_system_critical_on(os, p)).copied();
     out.push(finding(
         sev,
         format!("Memory pressure is {}", if sev == "crit" { "critical" } else { "elevated" }),
@@ -812,7 +1109,7 @@ fn rule_swap(snap: &Snapshot, out: &mut Vec<Finding>) {
     ));
 }
 
-fn rule_thermal(snap: &Snapshot, out: &mut Vec<Finding>) {
+fn rule_thermal(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
     let sev = match snap.system.thermal.as_str() {
         "critical" => "crit",
         "serious" => "warn",
@@ -822,7 +1119,12 @@ fn rule_thermal(snap: &Snapshot, out: &mut Vec<Finding>) {
     let hot: Vec<&Proc> =
         top_by(snap, |p| p.cpu, 4).into_iter().filter(|p| p.cpu >= 50.0 && p.name != "kernel_task").collect();
     let kt = snap.procs.iter().find(|p| p.name == "kernel_task" && p.cpu >= 50.0);
-    let mut detail = format!("Thermal state is {}; macOS is throttling the CPU to cool down.", snap.system.thermal);
+    let mut detail = if os == Os::Mac {
+        format!("Thermal state is {}; macOS is throttling the CPU to cool down.", snap.system.thermal)
+    } else {
+        let t = snap.system.temp_c.map(|t| format!(" (hottest sensor {t:.0}°C)")).unwrap_or_default();
+        format!("Thermal state is {}{t}; the CPU is being throttled to cool down.", snap.system.thermal)
+    };
     if let Some(k) = kt {
         detail.push_str(&format!(" kernel_task is reserving {:.0}% CPU to shed heat.", k.cpu));
     }
@@ -834,11 +1136,11 @@ fn rule_thermal(snap: &Snapshot, out: &mut Vec<Finding>) {
         "Thermal throttling".into(),
         detail,
         hot.iter().map(|p| p.pid).collect(),
-        hot.iter().find(|p| !is_system_critical(p)).map(|p| format!("renice {} 10", p.pid)),
+        hot.iter().find(|p| !is_system_critical_on(os, p)).map(|p| format!("renice {} 10", p.pid)),
     ));
 }
 
-fn rule_cpu(snap: &Snapshot, hist: Option<&History>, now: Ts, out: &mut Vec<Finding>) {
+fn rule_cpu(snap: &Snapshot, os: Os, hist: Option<&History>, now: Ts, out: &mut Vec<Finding>) {
     for p in &snap.procs {
         if is_stopped(p) {
             continue;
@@ -871,16 +1173,16 @@ fn rule_cpu(snap: &Snapshot, hist: Option<&History>, now: Ts, out: &mut Vec<Find
             ),
         };
         let mut detail = detail;
-        if let Some(k) = known(&p.name) {
+        if let Some(k) = known_proc(p, os) {
             detail.push(' ');
             detail.push_str(k);
         }
         detail.push_str(&format!(" Details: fat why {}", p.pid));
-        out.push(finding("warn", title, detail, vec![p.pid], safe_action(p, snap)));
+        out.push(finding("warn", title, detail, vec![p.pid], safe_action(os, p, snap)));
     }
 }
 
-fn rule_power(snap: &Snapshot, out: &mut Vec<Finding>) {
+fn rule_power(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
     let sys = &snap.system;
     let heavy: Vec<&Proc> = snap.procs.iter().filter(|p| p.power_mw > 5000.0).collect();
     for p in &heavy {
@@ -889,7 +1191,7 @@ fn rule_power(snap: &Snapshot, out: &mut Vec<Finding>) {
             format!("{} is drawing {}", p.name, human_watts(p.power_mw)),
             format!("{} (pid {}) is the kind of load that drains a battery in a couple of hours.", p.name, p.pid),
             vec![p.pid],
-            safe_action(p, snap),
+            safe_action(os, p, snap),
         ));
     }
     if sys.on_battery == Some(true)
@@ -905,7 +1207,7 @@ fn rule_power(snap: &Snapshot, out: &mut Vec<Finding>) {
                         list_procs(&top, |p| human_watts(p.power_mw))
                     ),
                     top.iter().map(|p| p.pid).collect(),
-                    top.iter().find(|p| !is_system_critical(p)).map(|p| format!("pause {}", p.pid)),
+                    top.iter().find(|p| !is_system_critical_on(os, p)).map(|p| format!("pause {}", p.pid)),
                 ));
             }
 }
@@ -994,18 +1296,44 @@ fn rule_zombies(snap: &Snapshot, out: &mut Vec<Finding>) {
     let (parent, n) = by_parent.iter().max_by_key(|(_, n)| **n).map(|(a, b)| (*a, *b)).unwrap_or((0, 0));
     let pname = snap.proc(parent).map(|p| p.name.clone()).unwrap_or_else(|| "?".into());
     let sev = if z.len() >= 20 { "warn" } else { "info" };
+    // Linux: a container's pid 1 (e.g. `sleep infinity` as the entrypoint) never reaps the
+    // orphans re-parented to it. Killing it would stop the whole container, so say that instead.
+    let container_init = (platform(snap) == Os::Linux)
+        .then(|| snap.proc(parent))
+        .flatten()
+        .and_then(|pp| {
+            let c = pp.container.as_deref()?;
+            let grand_same = snap.proc(pp.ppid).is_some_and(|g| g.container.as_deref() == Some(c));
+            (!grand_same).then(|| c.to_string())
+        });
+    // Inside a container (own pid namespace) the entrypoint is pid 1 and has no container id.
+    let reaper_pid1 = platform(snap) == Os::Linux
+        && parent == 1
+        && container_init.is_none()
+        && snap.proc(1).is_some_and(|p| !matches!(p.name.as_str(), "systemd" | "init" | "tini" | "dumb-init" | "docker-init" | "s6-svscan" | "runit" | "catatonit"));
+    let detail = match &container_init {
+        None if reaper_pid1 => format!(
+            "Exited processes not reaped by their parent; most ({n}) belong to {pname} (pid 1), which is not an init and doesn't reap orphans (typical for a container whose entrypoint is a plain program). They hold no memory but leak pid slots; restarting the container clears them, and running it with an init (`docker run --init`, tini) prevents it."
+        ),
+        Some(c) => format!(
+            "Exited processes not reaped by their parent; most ({n}) belong to {pname} (pid {parent}), the init process of container {}, which doesn't reap orphans. They hold no memory but leak pid slots; restarting the container clears them, and running it with an init (`docker run --init`, tini) prevents it.",
+            container_label(snap, c)
+        ),
+        None => format!(
+            "Exited processes not reaped by their parent; most ({n}) belong to {pname} (pid {parent}). They hold no memory but leak pid slots; restarting the parent clears them."
+        ),
+    };
+    let protected = platform(snap) == Os::Linux && snap.proc(parent).is_some_and(|pp| is_system_critical_on(Os::Linux, pp));
     out.push(finding(
         sev,
         format!("{} zombie process{}", z.len(), if z.len() == 1 { "" } else { "es" }),
-        format!(
-            "Exited processes not reaped by their parent; most ({n}) belong to {pname} (pid {parent}). They hold no memory but leak pid slots; restarting the parent clears them."
-        ),
+        detail,
         z.iter().map(|p| p.pid).collect(),
-        (parent > 1).then(|| format!("kill {parent}")),
+        (parent > 1 && container_init.is_none() && !protected).then(|| format!("kill {parent}")),
     ));
 }
 
-fn rule_swarms(snap: &Snapshot, out: &mut Vec<Finding>) {
+fn rule_swarms(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
     let mut groups: HashMap<&str, Vec<&Proc>> = HashMap::new();
     for p in &snap.procs {
         groups.entry(p.name.as_str()).or_default().push(p);
@@ -1014,7 +1342,14 @@ fn rule_swarms(snap: &Snapshot, out: &mut Vec<Finding>) {
     names.sort_by_key(|(n, v)| (std::cmp::Reverse(v.len()), *n));
     for (name, ps) in names {
         // Browsers and the OS legitimately run many helpers; still report, but as info.
-        let benign = name.contains("Helper") || name.contains("WebContent") || name.starts_with("mdworker") || name.starts_with("com.apple");
+        let benign = name.contains("Helper")
+            || name.contains("WebContent")
+            || name.starts_with("mdworker")
+            || name.starts_with("com.apple")
+            || (os == Os::Linux
+                && (matches!(name, "chrome" | "chromium" | "Web Content" | "code" | "electron")
+                    || name.starts_with("Isolated Web")
+                    || ps.iter().all(|p| is_kernel_thread(p))));
         let cpu: f32 = ps.iter().map(|p| p.cpu).sum();
         let mem: u64 = ps.iter().map(|p| p.mem).sum();
         // Common parent (if most share one) is the thing to kill.
@@ -1033,7 +1368,11 @@ fn rule_swarms(snap: &Snapshot, out: &mut Vec<Finding>) {
             let pname = snap.proc(pp).map(|p| p.name.as_str()).unwrap_or("?");
             detail.push_str(&format!(" {cnt} share parent {pname} (pid {pp})."));
         } else if pp == 1 && !benign {
-            detail.push_str(" Most were re-parented to launchd: likely leaked workers.");
+            detail.push_str(if os == Os::Mac {
+                " Most were re-parented to launchd: likely leaked workers."
+            } else {
+                " Most were re-parented to init/systemd: likely leaked workers."
+            });
         }
         out.push(finding(
             if benign { "info" } else { "warn" },
@@ -1045,7 +1384,7 @@ fn rule_swarms(snap: &Snapshot, out: &mut Vec<Finding>) {
     }
 }
 
-fn rule_disk(snap: &Snapshot, out: &mut Vec<Finding>) {
+fn rule_disk(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
     const STORM: u64 = 100 * MB;
     let writers: Vec<&Proc> = snap.procs.iter().filter(|p| p.disk_write_bps >= STORM).collect();
     for p in &writers {
@@ -1059,7 +1398,7 @@ fn rule_disk(snap: &Snapshot, out: &mut Vec<Finding>) {
                 if p.cwd.is_empty() { String::new() } else { format!(" in {}", p.cwd) }
             ),
             vec![p.pid],
-            safe_action(p, snap),
+            safe_action(os, p, snap),
         ));
     }
     if writers.is_empty() && snap.system.disk_write_bps >= STORM {
@@ -1074,7 +1413,7 @@ fn rule_disk(snap: &Snapshot, out: &mut Vec<Finding>) {
     }
 }
 
-fn rule_net(snap: &Snapshot, out: &mut Vec<Finding>) {
+fn rule_net(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
     const BIG: u64 = 10 * MB;
     for p in snap.procs.iter().filter(|p| p.net_rx_bps + p.net_tx_bps >= BIG) {
         let dir = if p.net_tx_bps > p.net_rx_bps { "uploading" } else { "downloading" };
@@ -1085,7 +1424,7 @@ fn rule_net(snap: &Snapshot, out: &mut Vec<Finding>) {
             human_rate(p.net_rx_bps),
             human_rate(p.net_tx_bps)
         );
-        if let Some(k) = known(&p.name) {
+        if let Some(k) = known_proc(p, os) {
             detail.push(' ');
             detail.push_str(k);
         }
@@ -1093,7 +1432,7 @@ fn rule_net(snap: &Snapshot, out: &mut Vec<Finding>) {
     }
 }
 
-fn rule_load(snap: &Snapshot, out: &mut Vec<Finding>) {
+fn rule_load(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
     let cores = snap.system.cores;
     if cores == 0 {
         return;
@@ -1122,8 +1461,756 @@ fn rule_load(snap: &Snapshot, out: &mut Vec<Finding>) {
             list_procs(&top, |p| format!("{:.0}%", p.cpu))
         ),
         top.iter().map(|p| p.pid).collect(),
-        top.iter().find(|p| !is_system_critical(p)).map(|p| format!("renice {} 10", p.pid)),
+        top.iter().find(|p| !is_system_critical_on(os, p)).map(|p| format!("renice {} 10", p.pid)),
     ));
+}
+
+// ======================================================================
+// Linux: cgroups, containers, systemd units
+// ======================================================================
+//
+// Pure parsing over `Proc::cgroup` (the cgroup v2 path from /proc/<pid>/cgroup, "0::<path>").
+// Real-world paths this understands:
+//   /init.scope                                                    systemd (pid 1)
+//   /system.slice/nginx.service                                    a system service
+//   /system.slice/systemd-udevd.service/udev                       sub-cgroup of a service
+//   /system.slice/docker-<64 hex>.scope                            docker, systemd cgroup driver
+//   /docker/<64 hex>                                               docker, cgroupfs driver (OrbStack, older hosts)
+//   /machine.slice/libpod-<64 hex>.scope                           podman
+//   /kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid_with_underscores>.slice/cri-containerd-<64 hex>.scope
+//   /kubepods/besteffort/pod<uid>/<64 hex>                         kubernetes, cgroupfs driver
+//   /lxc.payload.<name>                                            LXC/Incus
+//   /user.slice/user-1000.slice/session-3.scope                    a login session (ssh, tty, desktop)
+//   /user.slice/user-1000.slice/user@1000.service/init.scope       the `systemd --user` manager
+//   /user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-firefox-4242.scope   desktop app
+//   /user.slice/user-1000.slice/user@1000.service/app.slice/syncthing.service             user unit
+
+#[derive(Debug, Default, Clone, PartialEq)]
+struct CgInfo {
+    /// Short (12 hex) container id.
+    container_id: Option<String>,
+    runtime: Option<&'static str>,
+    lxc: Option<String>,
+    /// (pod uid, QoS class).
+    pod: Option<(String, &'static str)>,
+    /// Deepest systemd unit (*.service / *.scope) that is not a container scope.
+    unit: Option<String>,
+    uid: Option<u32>,
+    /// Under user@UID.service (the per-user systemd manager).
+    user_manager: bool,
+}
+
+fn is_hex_id(s: &str) -> bool {
+    s.len() >= 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn container_component(comp: &str, comps: &[&str]) -> Option<(String, Option<&'static str>)> {
+    // cgroupfs + systemd driver mixes: "kubepods-besteffort-pod<uid>.slice:cri-containerd:<id>"
+    let c = comp.rsplit(':').next().unwrap_or(comp);
+    const PREFIXES: &[(&str, &str)] =
+        &[("docker-", "docker"), ("cri-containerd-", "containerd"), ("crio-", "cri-o"), ("libpod-", "podman")];
+    for (pre, rt) in PREFIXES {
+        if let Some(rest) = c.strip_prefix(pre) {
+            let id = rest.strip_suffix(".scope").unwrap_or(rest);
+            if is_hex_id(id) {
+                return Some((id[..12].to_string(), Some(*rt)));
+            }
+        }
+    }
+    if is_hex_id(c) {
+        let rt = if comps.contains(&"docker") {
+            Some("docker")
+        } else if comps.iter().any(|x| x.starts_with("kubepods")) {
+            Some("kubernetes")
+        } else if comps.iter().any(|x| x.starts_with("libpod")) {
+            Some("podman")
+        } else {
+            None
+        };
+        return Some((c[..12].to_string(), rt));
+    }
+    None
+}
+
+fn pod_uid(comp: &str) -> Option<String> {
+    let rest = comp.strip_suffix(".slice").unwrap_or(comp);
+    let uid = rest.rsplit_once("-pod").map(|x| x.1).or_else(|| rest.strip_prefix("pod"))?;
+    let ok = uid.len() >= 32 && uid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-' || b == b'_');
+    ok.then(|| uid.replace('_', "-"))
+}
+
+fn parse_cgroup(path: &str) -> CgInfo {
+    let mut cg = CgInfo::default();
+    let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    for comp in &comps {
+        let comp = *comp;
+        if let Some((id, rt)) = container_component(comp, &comps) {
+            cg.container_id = Some(id);
+            cg.runtime = rt;
+            continue;
+        }
+        if let Some(n) = comp.strip_prefix("lxc.payload.") {
+            cg.lxc = Some(n.to_string());
+            continue;
+        }
+        if let Some(uid) = pod_uid(comp) {
+            let qos = if comps.iter().any(|c| c.contains("besteffort")) {
+                "BestEffort"
+            } else if comps.iter().any(|c| c.contains("burstable")) {
+                "Burstable"
+            } else {
+                "Guaranteed"
+            };
+            cg.pod = Some((uid, qos));
+            continue;
+        }
+        if let Some(uid) = comp.strip_prefix("user-").and_then(|r| r.strip_suffix(".slice")).and_then(|u| u.parse().ok()) {
+            cg.uid = Some(uid);
+            continue;
+        }
+        if let Some(uid) = comp.strip_prefix("user@").and_then(|r| r.strip_suffix(".service")) {
+            cg.user_manager = true;
+            if cg.uid.is_none() {
+                cg.uid = uid.parse().ok();
+            }
+            continue;
+        }
+        if comp.starts_with("libpod-conmon-") || comp.starts_with("crio-conmon-") {
+            continue;
+        }
+        if comp.ends_with(".service") || comp.ends_with(".scope") {
+            cg.unit = Some(comp.to_string());
+        }
+    }
+    cg
+}
+
+/// Container id of a process: the collector's, else derived from its cgroup path.
+fn container_of(p: &Proc) -> Option<(String, Option<&'static str>)> {
+    let cg = if p.cgroup.is_empty() { CgInfo::default() } else { parse_cgroup(&p.cgroup) };
+    match (&p.container, cg.container_id) {
+        (Some(id), _) if !id.is_empty() => Some((id.clone(), cg.runtime)),
+        (_, Some(id)) => Some((id, cg.runtime)),
+        _ => None,
+    }
+}
+
+fn find_container<'a>(snap: &'a Snapshot, id: &str) -> Option<&'a crate::model::Container> {
+    let id = id.trim_start_matches("sha256:");
+    snap.containers.iter().find(|c| {
+        let cid = c.id.trim_start_matches("sha256:");
+        !cid.is_empty() && !id.is_empty() && (cid.starts_with(id) || id.starts_with(cid))
+    })
+}
+
+fn short_id(id: &str) -> &str {
+    let id = id.trim_start_matches("sha256:");
+    &id[..id.len().min(12)]
+}
+
+/// "runs in container 1c5d10a36e64 (web, image nginx:1.27) [docker]"
+fn container_phrase(snap: &Snapshot, id: &str, runtime: Option<&str>) -> String {
+    let ct = find_container(snap, id);
+    let mut s = format!("runs in container {}", short_id(id));
+    match ct {
+        Some(c) if !c.name.is_empty() && !c.image.is_empty() => s.push_str(&format!(" ({}, image {})", c.name, c.image)),
+        Some(c) if !c.name.is_empty() => s.push_str(&format!(" ({})", c.name)),
+        _ => {}
+    }
+    let rt = ct.map(|c| c.runtime.as_str()).filter(|r| !r.is_empty()).or(runtime);
+    if let Some(rt) = rt {
+        s.push_str(&format!(" [{rt}]"));
+    }
+    s
+}
+
+/// Container CLI to suggest for a runtime.
+fn container_cli(rt: Option<&str>) -> &'static str {
+    match rt {
+        Some("podman") => "podman",
+        Some("cri-o") | Some("containerd") | Some("kubernetes") => "crictl",
+        _ => "docker",
+    }
+}
+
+/// `pid1` is the name of pid 1 when known (systemd, or e.g. a VM/container supervisor).
+fn unit_phrase(cg: &CgInfo, is_pid1: bool, pid1: Option<&str>) -> Option<String> {
+    let unit = cg.unit.as_deref()?;
+    let uid = cg.uid.map(|u| format!(" (uid {u})")).unwrap_or_default();
+    Some(if unit == "init.scope" {
+        if cg.user_manager {
+            format!("part of the per-user systemd manager (user@{}.service)", cg.uid.map(|u| u.to_string()).unwrap_or_else(|| "?".into()))
+        } else if is_pid1 {
+            "in the init scope: the init system's own cgroup".into()
+        } else {
+            let who = pid1.map(|n| format!(" ({n})")).unwrap_or_default();
+            format!("in the init scope: started by the init system (pid 1{who}) itself, not by a systemd unit")
+        }
+    } else if unit.starts_with("session-") && unit.ends_with(".scope") {
+        format!("in your login session scope {unit}{uid}: started from an ssh, console or desktop login")
+    } else if cg.user_manager && unit.ends_with(".service") {
+        format!("started by your user systemd unit {unit}{uid}")
+    } else if cg.user_manager && (unit.starts_with("app-") || unit.starts_with("snap.") || unit.starts_with("flatpak-")) {
+        format!("in desktop app scope {unit}{uid}: launched from your desktop or app launcher")
+    } else if unit.starts_with("run-") {
+        format!("in transient scope {unit}: started with systemd-run")
+    } else if cg.user_manager {
+        format!("in user scope {unit}{uid}")
+    } else if unit.ends_with(".service") {
+        format!("started by systemd unit {unit}")
+    } else {
+        format!("in systemd scope {unit}")
+    })
+}
+
+/// Chain steps saying where a Linux process lives: container / pod / systemd unit.
+fn placement_steps(snap: &Snapshot, p: &Proc, cg: &CgInfo) -> Vec<String> {
+    let mut v = Vec::new();
+    let container = container_of(p);
+    if let Some((id, rt)) = &container {
+        v.push(container_phrase(snap, id, *rt));
+    } else if let Some(n) = &cg.lxc {
+        v.push(format!("runs in LXC container {n}"));
+    }
+    if let Some((uid, qos)) = &cg.pod {
+        v.push(format!("part of Kubernetes pod {uid} (QoS {qos}): kubelet restarts its containers if they die"));
+    }
+    let pid1 = snap.proc(1).map(|q| q.name.as_str());
+    if container.is_none() && cg.lxc.is_none() && cg.pod.is_none()
+        && let Some(u) = unit_phrase(cg, p.pid == 1, pid1) {
+            v.push(u);
+        }
+    v
+}
+
+/// Lifecycle-aware ways to stop/restart it (before the generic pause/kill suggestions).
+fn placement_suggestions(snap: &Snapshot, cg: &CgInfo, p: &Proc) -> Vec<String> {
+    let mut v = Vec::new();
+    if let Some((id, rt)) = container_of(p) {
+        let ct = find_container(snap, &id);
+        let rt = ct.map(|c| c.runtime.as_str()).filter(|r| !r.is_empty()).or(rt);
+        let label = ct.map(|c| c.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| short_id(&id).to_string());
+        if cg.pod.is_some() || rt == Some("kubernetes") {
+            v.push("it belongs to a Kubernetes pod: fix or scale the pod (kubectl); kubelet restarts killed containers".into());
+        } else {
+            let cli = container_cli(rt);
+            v.push(format!(
+                "it belongs to container {label}: watch it with `{cli} stats {label}`, stop the whole container with `{cli} stop {label}` (killing one process may just restart it)"
+            ));
+        }
+        return v;
+    }
+    if let Some(unit) = cg.unit.as_deref().filter(|u| u.ends_with(".service")) {
+        if cg.user_manager {
+            v.push(format!("it's your user service: `systemctl --user restart {unit}` or `systemctl --user stop {unit}`"));
+        } else {
+            v.push(format!(
+                "it's a systemd service: `sudo systemctl restart {unit}` or `sudo systemctl stop {unit}` (a plain kill may just trigger Restart=)"
+            ));
+        }
+    }
+    v
+}
+
+struct ContainerLoad<'a> {
+    id: String,
+    runtime: Option<&'static str>,
+    cpu: f32,
+    mem: u64,
+    procs: Vec<&'a Proc>,
+}
+
+/// Processes grouped by container, busiest first.
+fn container_loads(snap: &Snapshot) -> Vec<ContainerLoad<'_>> {
+    let mut by: HashMap<String, ContainerLoad<'_>> = HashMap::new();
+    for p in &snap.procs {
+        if let Some((id, rt)) = container_of(p) {
+            let e = by.entry(id.clone()).or_insert_with(|| ContainerLoad { id, runtime: rt, cpu: 0.0, mem: 0, procs: Vec::new() });
+            e.cpu += p.cpu;
+            e.mem += p.mem;
+            e.runtime = e.runtime.or(rt);
+            e.procs.push(p);
+        }
+    }
+    let mut v: Vec<ContainerLoad<'_>> = by.into_values().collect();
+    for c in &mut v {
+        c.procs.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.mem.cmp(&a.mem)));
+    }
+    v.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.mem.cmp(&a.mem)).then(a.id.cmp(&b.id)));
+    v
+}
+
+fn container_label(snap: &Snapshot, id: &str) -> String {
+    find_container(snap, id).map(|c| c.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| short_id(id).to_string())
+}
+
+// ======================================================================
+// Linux: cause analysis for kernel threads and daemons
+// ======================================================================
+
+fn busiest(snap: &Snapshot, key: impl Fn(&Proc) -> f32, n: usize, skip: u32) -> Vec<&Proc> {
+    top_by(snap, &key, n + 1).into_iter().filter(|q| q.pid != skip && key(q) > 0.0).take(n).collect()
+}
+
+fn psi_mem_text(snap: &Snapshot) -> Option<String> {
+    snap.system.psi.map(|ps| format!("memory stalls (PSI avg10): {:.0}% some / {:.0}% full", ps.mem_some, ps.mem_full))
+}
+
+/// Linux-specific blame for kernel threads and system daemons. Returns true when it fully
+/// explained the process (the caller then skips the generic analysis).
+fn linux_causes(snap: &Snapshot, p: &Proc, lname: &str, hist: Option<&History>, now: Ts, c: &mut Causes) -> bool {
+    let sys = &snap.system;
+    let io = |q: &Proc| (q.disk_read_bps + q.disk_write_bps) as f32;
+    let net = |q: &Proc| (q.net_rx_bps + q.net_tx_bps) as f32;
+
+    // Daemons that only matter when they are busy: idle ones get no invented root cause.
+    let reactive = lname.starts_with("kswapd")
+        || lname.starts_with("kcompactd")
+        || lname == "khugepaged"
+        || lname.starts_with("kworker/")
+        || lname.starts_with("irq/")
+        || lname.starts_with("ksoftirqd/")
+        || lname.starts_with("jbd2/")
+        || lname.starts_with("systemd-journal")
+        || lname == "rsyslogd"
+        || matches!(lname, "gnome-shell" | "xorg" | "xwayland")
+        || lname.starts_with("kwin_");
+    if reactive && p.cpu < 5.0 && io(p) < MB as f32 && !p.usage_unknown {
+        c.steps.push("it is quiet right now: nothing to blame".into());
+        return true;
+    }
+
+    // Memory reclaim / compaction: the cause is whoever holds the RAM.
+    if lname.starts_with("kswapd") || lname.starts_with("kcompactd") || lname == "khugepaged" {
+        let swap = if sys.swap_total > 0 {
+            format!(", swap {} of {}", human_bytes(sys.swap_used), human_bytes(sys.swap_total))
+        } else {
+            String::new()
+        };
+        c.steps.push(format!(
+            "root cause: memory is short: {} of {} RAM used{swap}",
+            human_bytes(sys.mem_used),
+            human_bytes(sys.mem_total)
+        ));
+        let top: Vec<&Proc> =
+            busiest(snap, |q| q.mem as f32, 4, p.pid).into_iter().filter(|q| !is_kernel_thread(q)).take(3).collect();
+        if !top.is_empty() {
+            c.steps.push(format!("biggest memory users: {}", list_procs(&top, |q| human_bytes(q.mem))));
+        }
+        if let Some(t) = psi_mem_text(snap) {
+            c.evidence.push(t);
+        }
+        if let Some(q) = top.iter().find(|q| !is_system_critical_on(Os::Linux, q)) {
+            c.suggestions.push(format!("free memory: fat why {} ({}, {}), then pause or end it", q.pid, q.name, human_bytes(q.mem)));
+        }
+        c.suggestions.push("check swap and cache: `free -h`, `swapon --show`".into());
+        return true;
+    }
+
+    // Kernel work queues and threaded IRQs: usually disk IO, sometimes a device.
+    if lname.starts_with("kworker/") || lname.starts_with("irq/") {
+        if let Some(dev) = lname.strip_prefix("irq/").and_then(|r| r.split_once('-')).map(|x| x.1) {
+            c.steps.push(format!("root cause: device {dev} is raising a lot of interrupts"));
+        } else {
+            c.steps.push("root cause: whatever generates the kernel work; disk IO and writeback are the usual suspects".into());
+        }
+        let top = busiest(snap, io, 3, p.pid);
+        if !top.is_empty() {
+            c.steps.push(format!("busiest disk users: {}", list_procs(&top, |q| human_rate(io(q) as u64))));
+        }
+        if let Some(ps) = sys.psi {
+            c.evidence.push(format!("io stalls (PSI avg10): {:.0}% some / {:.0}% full", ps.io_some, ps.io_full));
+        }
+        let d = snap.procs.iter().filter(|q| is_dstate(q)).count();
+        if d > 0 {
+            c.evidence.push(format!("{d} processes in uninterruptible IO wait (D)"));
+        }
+        c.suggestions.push(format!(
+            "see which work it does: `sudo cat /proc/{}/stack` or `sudo perf top`; interrupts: `watch -d cat /proc/interrupts`",
+            p.pid
+        ));
+        return true;
+    }
+
+    if lname.starts_with("ksoftirqd/") {
+        c.steps.push("root cause: heavy network or interrupt load (packet rate, not just bytes)".into());
+        let top = busiest(snap, net, 3, p.pid);
+        if !top.is_empty() {
+            c.steps.push(format!("busiest network users: {}", list_procs(&top, |q| human_rate(net(q) as u64))));
+        }
+        if sys.net_rx_bps + sys.net_tx_bps > 0 {
+            c.evidence.push(format!("system network rx {} tx {}", human_rate(sys.net_rx_bps), human_rate(sys.net_tx_bps)));
+        }
+        c.suggestions.push("check `cat /proc/softirqs` (NET_RX/NET_TX) and `ip -s link`; spread NIC interrupts across CPUs (irqbalance, RSS)".into());
+        return true;
+    }
+
+    if let Some(dev) = lname.strip_prefix("jbd2/") {
+        let dev = dev.rsplit_once('-').map(|x| x.0).unwrap_or(dev);
+        c.steps.push(format!("root cause: fsync-heavy writes to {dev} are forcing ext4 journal commits"));
+        let top = busiest(snap, |q| q.disk_write_bps as f32, 3, p.pid);
+        if !top.is_empty() {
+            c.steps.push(format!("top writers: {}", list_procs(&top, |q| human_rate(q.disk_write_bps))));
+        }
+        c.suggestions.push("the writers above are the cause (databases, package managers, builds, editors); `sudo iotop -o` shows them live; put scratch data on tmpfs".into());
+        return true;
+    }
+
+    if lname.starts_with("systemd-journal") || lname == "rsyslogd" {
+        c.steps.push("root cause: some unit or program is logging at a very high rate (or crash-looping and logging each restart)".into());
+        c.suggestions.push(
+            "find the noisy unit: `journalctl --since '5 min ago' -o short | awk '{print $5}' | sort | uniq -c | sort -rn | head`"
+                .into(),
+        );
+        c.suggestions.push("then fix or rate-limit it: LogRateLimitIntervalSec=/LogRateLimitBurst= on the unit, or RateLimitBurst= in /etc/systemd/journald.conf".into());
+        return true;
+    }
+
+    let indexer = if lname.starts_with("tracker-miner") || lname.starts_with("tracker-extract") {
+        Some(("GNOME Tracker indexing", "drop an empty `.trackerignore` (or `.nomedia`) file into build/dependency dirs, or remove them in Settings > Search > Search Locations"))
+    } else if lname.starts_with("baloo_file") {
+        Some(("KDE Baloo indexing", "exclude build/dependency dirs in System Settings > Search > File Search; `balooctl suspend` pauses it now"))
+    } else if lname.starts_with("updatedb") || lname.starts_with("plocate-update") {
+        Some(("the locate database rebuild", "add build/dependency dirs to /etc/updatedb.conf (PRUNENAMES=\"node_modules target .git\", or PRUNEPATHS)"))
+    } else {
+        None
+    };
+    if let Some((what, fix)) = indexer {
+        c.steps.push(format!("{what} is reacting to many new or changed files"));
+        let churners = recent_churners(snap, hist, now);
+        if churners.is_empty() {
+            c.steps.push("likely cause: a large file tree was created recently (no build/install tool running right now)".into());
+        } else {
+            let list: Vec<String> = churners.iter().take(4).cloned().collect();
+            c.steps.push(format!("likely cause: {}", list.join("; ")));
+            c.evidence.push(format!("file-churning tools seen: {}", churners.join("; ")));
+        }
+        c.suggestions.push(fix.into());
+        c.suggestions.push("it finishes on its own".into());
+        return true;
+    }
+
+    if is_package_manager(p) || lname == "packagekitd" || lname == "snapd" {
+        c.steps.push("root cause: packages are being downloaded, unpacked or configured".into());
+        let how = if lname == "snapd" {
+            "see progress: `snap changes`; it finishes on its own"
+        } else if lname == "packagekitd" {
+            "see progress: `pkcon get-transactions` or your software center; it finishes on its own"
+        } else if lname.starts_with("unattended-upgr") {
+            "see progress: `systemctl status unattended-upgrades apt-daily-upgrade.service` and /var/log/unattended-upgrades/; it finishes on its own"
+        } else {
+            "let it finish; its terminal (or /var/log/dpkg.log) shows progress"
+        };
+        c.suggestions.push(how.into());
+        return true;
+    }
+
+    let shim = lname.starts_with("containerd-shim") || lname == "conmon";
+    if shim {
+        let desc = snap.descendants(p.pid);
+        let heavy = desc.iter().max_by(|a, b| a.cpu.total_cmp(&b.cpu)).copied();
+        let id = desc.iter().find_map(|q| container_of(q));
+        let what = match &id {
+            Some((id, _)) => format!("container {}", container_label(snap, id)),
+            None => "the container".into(),
+        };
+        c.steps.push(format!("root cause: the processes of {what} below it ({} procs)", desc.len()));
+        if let Some(h) = heavy.filter(|h| h.cpu > 0.0) {
+            c.steps.push(format!("heaviest: {} (pid {}) at {:.0}%", h.name, h.pid, h.cpu));
+            c.suggestions.push(format!("drill down: fat why {}", h.pid));
+        }
+        return true;
+    }
+
+    if matches!(lname, "dockerd" | "containerd" | "kubelet" | "podman" | "runc" | "crun" | "crio") {
+        let loads = container_loads(snap);
+        let busy: Vec<String> = loads
+            .iter()
+            .filter(|l| l.cpu > 1.0 || l.mem > 256 * MB)
+            .take(4)
+            .map(|l| format!("{} {:.0}% CPU {}", container_label(snap, &l.id), l.cpu, human_bytes(l.mem)))
+            .collect();
+        if busy.is_empty() {
+            c.steps.push("no container is busy right now: its own work is image pulls/builds, log handling, or API calls (e.g. a monitoring tool polling it)".into());
+        } else {
+            c.steps.push(format!("containers run as ordinary processes on this machine; busiest: {}", busy.join(", ")));
+        }
+        if let Some(l) = loads.first().filter(|l| l.cpu > 1.0)
+            && let Some(q) = l.procs.first() {
+                c.suggestions.push(format!("drill into the busiest container's top process: fat why {}", q.pid));
+            }
+        c.suggestions.push("inspect containers: fat fleet (or docker stats)".into());
+        return true;
+    }
+
+    let chrome_renderer = (lname == "chrome" || lname.starts_with("chromium") || lname == "google-chrome") && p.cmd.contains("--type=renderer");
+    let firefox_content = lname == "web content" || lname.starts_with("isolated web");
+    if chrome_renderer || firefox_content {
+        c.steps.push("root cause: one browser tab/extension is doing heavy work".into());
+        c.suggestions.push(if chrome_renderer {
+            "find the tab: Shift+Esc opens Chrome's Task Manager; close or reload it".into()
+        } else {
+            "find the tab: open about:processes in Firefox; close or reload it".into()
+        });
+        return true;
+    }
+
+    if matches!(lname, "gnome-shell" | "xorg" | "xwayland") || lname.starts_with("kwin_") {
+        c.steps.push("root cause: something is redrawing the screen a lot (or rendering without GPU acceleration)".into());
+        c.suggestions.push("close or minimize apps with animations/video; disable shell extensions (`gnome-extensions list --enabled`); check `glxinfo -B` does not report llvmpipe (software rendering)".into());
+        return true;
+    }
+
+    if lname == "systemd" && p.cpu >= 20.0 {
+        c.steps.push("root cause: probably a crash-looping unit or an event storm (udev, D-Bus, mounts)".into());
+        c.suggestions.push("look for restarting units: `systemctl list-units --failed` and `journalctl -b -p warning --since '10 min ago'`".into());
+        return true;
+    }
+    false
+}
+
+// ======================================================================
+// Linux diagnose rules (PSI, temperature, D state, containers)
+// ======================================================================
+
+/// Pressure stall information: % of the last 10 s that tasks were stalled on a resource.
+/// Example /proc/pressure/memory on a thrashing box:
+///   some avg10=34.50 avg60=20.12 avg300=8.03 total=123456789
+///   full avg10=12.07 avg60=6.40 avg300=2.10 total=45678901
+fn rule_psi(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
+    let Some(ps) = snap.system.psi else { return };
+    let sys = &snap.system;
+
+    if ps.cpu_some >= 20.0 {
+        let top = busiest(snap, |q| q.cpu, 3, u32::MAX);
+        out.push(finding(
+            if ps.cpu_some >= 80.0 { "crit" } else { "warn" },
+            format!("CPU contention: tasks waited for a CPU {:.0}% of the time", ps.cpu_some),
+            format!(
+                "PSI cpu some avg10 is {:.0}%: runnable tasks are queueing for a CPU (load {:.1} on {} cores), so everything gets slower. Top CPU users: {}",
+                ps.cpu_some,
+                sys.load[0],
+                sys.cores,
+                list_procs(&top, |q| format!("{:.0}%", q.cpu))
+            ),
+            top.iter().map(|q| q.pid).collect(),
+            top.iter().find(|q| !is_system_critical_on(os, q)).map(|q| format!("renice {} 10", q.pid)),
+        ));
+    }
+
+    if ps.mem_full >= 5.0 || ps.mem_some >= 20.0 {
+        let top: Vec<&Proc> =
+            busiest(snap, |q| q.mem as f32, 6, u32::MAX).into_iter().filter(|q| !is_kernel_thread(q)).take(5).collect();
+        let first = top.iter().find(|q| !is_system_critical_on(os, q)).copied();
+        let title = if ps.mem_full >= 5.0 {
+            "Memory stalls: the system is thrashing"
+        } else {
+            "Memory stalls: tasks are waiting on memory reclaim"
+        };
+        let mut detail = format!(
+            "PSI memory {:.0}% some / {:.0}% full (avg10): tasks spend that much time waiting for the kernel to free memory{}. {} of {} RAM used",
+            ps.mem_some,
+            ps.mem_full,
+            if ps.mem_full >= 5.0 { " (\"full\" = every non-idle task stalled at once)" } else { "" },
+            human_bytes(sys.mem_used),
+            human_bytes(sys.mem_total)
+        );
+        if sys.swap_total > 0 {
+            detail.push_str(&format!(", swap {} of {}", human_bytes(sys.swap_used), human_bytes(sys.swap_total)));
+        }
+        detail.push('.');
+        let kswapd: f32 = snap.procs.iter().filter(|q| q.name.starts_with("kswapd")).map(|q| q.cpu).sum();
+        if kswapd >= 5.0 {
+            detail.push_str(&format!(" kswapd is burning {kswapd:.0}% CPU reclaiming."));
+        }
+        detail.push_str(&format!(" Biggest consumers: {}", list_procs(&top, |q| human_bytes(q.mem))));
+        out.push(finding(
+            if ps.mem_full >= 20.0 { "crit" } else { "warn" },
+            title.into(),
+            detail,
+            top.iter().map(|q| q.pid).collect(),
+            first.map(|q| format!("kill {}{}", q.pid, tree_flag(&snap.descendants(q.pid)))),
+        ));
+    }
+
+    if ps.io_full >= 10.0 {
+        let io = |q: &Proc| (q.disk_read_bps + q.disk_write_bps) as f32;
+        let top = busiest(snap, io, 3, u32::MAX);
+        let d: Vec<&Proc> = snap.procs.iter().filter(|q| is_dstate(q)).take(5).collect();
+        let mut detail = format!(
+            "PSI io {:.0}% some / {:.0}% full (avg10): tasks are stalled on disk/filesystem IO. Top disk users: {}.",
+            ps.io_some,
+            ps.io_full,
+            list_procs(&top, |q| human_rate(io(q) as u64))
+        );
+        if !d.is_empty() {
+            let names = d.iter().map(|q| format!("{} (pid {})", q.name, q.pid)).collect::<Vec<_>>().join(", ");
+            detail.push_str(&format!(" Blocked in IO wait (D): {names}."));
+        }
+        detail.push_str(" Usual causes: an fsync-heavy job (database, package manager, build), a slow or failing disk, or a saturated network mount.");
+        let mut pids: Vec<u32> = top.iter().map(|q| q.pid).collect();
+        pids.extend(d.iter().map(|q| q.pid).filter(|x| !pids.contains(x)).collect::<Vec<_>>());
+        out.push(finding(
+            if ps.io_full >= 30.0 { "crit" } else { "warn" },
+            format!("IO stalls: all tasks blocked on IO {:.0}% of the time", ps.io_full),
+            detail,
+            pids,
+            top.first().filter(|q| io(q) >= MB as f32).and_then(|q| safe_action(os, q, snap)),
+        ));
+    }
+}
+
+/// Hottest sensor temperature (hwmon/thermal zones). Skipped when the thermal-state rule
+/// already reports throttling, and on macOS where Apple silicon routinely runs ~100°C.
+fn rule_temp(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
+    let Some(t) = snap.system.temp_c else { return };
+    if matches!(snap.system.thermal.as_str(), "fair" | "serious" | "critical") {
+        return;
+    }
+    let sev = if t >= 98.0 {
+        "crit"
+    } else if t >= 90.0 {
+        "warn"
+    } else if t >= 85.0 {
+        "info"
+    } else {
+        return;
+    };
+    let hot: Vec<&Proc> = top_by(snap, |q| q.cpu, 4).into_iter().filter(|q| q.cpu >= 50.0).collect();
+    let mut detail = format!(
+        "Hottest sensor reads {t:.0}°C; most CPUs throttle around 95-100°C, which slows everything down."
+    );
+    if !hot.is_empty() {
+        detail.push_str(&format!(" Heat sources: {}.", list_procs(&hot, |q| format!("{:.0}%", q.cpu))));
+    }
+    detail.push_str(" Check fans and vents; `sensors` lists every sensor.");
+    out.push(finding(
+        sev,
+        format!("Running hot: {t:.0}°C"),
+        detail,
+        hot.iter().map(|q| q.pid).collect(),
+        hot.iter().find(|q| !is_system_critical_on(os, q)).map(|q| format!("renice {} 10", q.pid)),
+    ));
+}
+
+/// How long each D-state pid has been continuously in D, from the flight recorder: probe a
+/// few past samples (one `History::at` each, shared by all pids) and stop at the first sample
+/// where the process was not in D (or was a different process with the same pid).
+fn dstate_durations(d: &[&Proc], hist: Option<&History>, now: Ts) -> HashMap<u32, i64> {
+    let mut dur: HashMap<u32, i64> = HashMap::new();
+    let Some(h) = hist else { return dur };
+    let mut alive: Vec<&Proc> = d.to_vec();
+    const PROBES_S: &[i64] = &[30, 60, 120, 300, 600, 1200, 1800];
+    for off in PROBES_S {
+        if alive.is_empty() {
+            break;
+        }
+        let at = now - off * 1000;
+        let Ok(Some(old)) = h.at(at) else { break };
+        if now - old.ts < off * 500 {
+            break; // nearest recorded sample is too recent to say anything about `at`
+        }
+        alive.retain(|p| match old.proc(p.pid) {
+            Some(o) if is_dstate(o) && (o.start_time == 0 || p.start_time == 0 || o.start_time.abs_diff(p.start_time) <= 2) => {
+                dur.insert(p.pid, now - old.ts);
+                true
+            }
+            _ => false,
+        });
+    }
+    dur
+}
+
+fn rule_dstate(snap: &Snapshot, os: Os, hist: Option<&History>, now: Ts, out: &mut Vec<Finding>) {
+    let d: Vec<&Proc> = snap.procs.iter().filter(|p| is_dstate(p)).collect();
+    if d.is_empty() {
+        return;
+    }
+    let dur = dstate_durations(&d, hist, now);
+    let mut stuck: Vec<(&Proc, i64)> =
+        d.iter().filter_map(|p| dur.get(&p.pid).filter(|ms| **ms >= 2 * MIN_MS).map(|ms| (*p, *ms))).collect();
+    stuck.sort_by_key(|(p, ms)| (std::cmp::Reverse(*ms), p.pid));
+    let hint = if os == Os::Linux {
+        " Check `dmesg` for IO errors or hung-task warnings, and `cat /proc/<pid>/wchan` for what each waits on."
+    } else {
+        ""
+    };
+    if let Some(&(_, longest)) = stuck.first() {
+        let list = stuck
+            .iter()
+            .take(6)
+            .map(|(p, ms)| format!("{} (pid {}) {}", p.name, p.pid, human_dur_ms(*ms)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(finding(
+            if longest >= 10 * MIN_MS { "crit" } else { "warn" },
+            format!(
+                "{} process{} stuck in uninterruptible IO wait for {}+",
+                stuck.len(),
+                if stuck.len() == 1 { "" } else { "es" },
+                human_dur_ms(longest)
+            ),
+            format!(
+                "In D state across recorded samples: {list}. They are blocked inside the kernel on IO: a slow or failing disk, a hung NFS/FUSE/network mount, or a stuck driver. They ignore signals (even kill -9) until the IO returns.{hint}"
+            ),
+            stuck.iter().map(|(p, _)| p.pid).collect(),
+            None,
+        ));
+    } else if d.len() >= 8 {
+        out.push(finding(
+            "info",
+            format!("{} processes waiting on IO (D state)", d.len()),
+            format!(
+                "Many processes are in uninterruptible IO wait at once ({}): the disk or a mount is slow to respond.{hint}",
+                d.iter().take(6).map(|p| format!("{} (pid {})", p.name, p.pid)).collect::<Vec<_>>().join(", ")
+            ),
+            d.iter().map(|p| p.pid).collect(),
+            None,
+        ));
+    }
+}
+
+/// Containers whose processes (grouped by `Proc::container` / cgroup) are hogging the host.
+fn rule_containers(snap: &Snapshot, out: &mut Vec<Finding>) {
+    let total = snap.system.mem_total;
+    for l in container_loads(snap) {
+        let mem_share = if total > 0 { l.mem as f64 / total as f64 } else { 0.0 };
+        if l.cpu < 150.0 && !(mem_share >= 0.25 && l.mem >= GB) {
+            continue;
+        }
+        let ct = find_container(snap, &l.id);
+        let label = container_label(snap, &l.id);
+        let rt = ct.map(|c| c.runtime.as_str()).filter(|r| !r.is_empty()).or(l.runtime);
+        let mut what = format!("container {}", short_id(&l.id));
+        if let Some(c) = ct {
+            match (c.name.is_empty(), c.image.is_empty()) {
+                (false, false) => what.push_str(&format!(" ({}, image {})", c.name, c.image)),
+                (false, true) => what.push_str(&format!(" ({})", c.name)),
+                _ => {}
+            }
+        }
+        let heavy: Vec<&Proc> = l.procs.iter().take(3).copied().collect();
+        let cli = container_cli(rt);
+        let how = if rt == Some("kubernetes") {
+            "Inspect it with `kubectl top pod -A`.".to_string()
+        } else {
+            format!("Watch it: `{cli} stats {label}`; stop it: `{cli} stop {label}`.")
+        };
+        out.push(finding(
+            "warn",
+            format!("Container {label} is using {:.1} cores, {}", l.cpu / 100.0, human_bytes(l.mem)),
+            format!(
+                "{} processes in {what} together use {:.0}% CPU and {} RAM ({:.0}% of the machine's). Heaviest: {}. {how}",
+                l.procs.len(),
+                l.cpu,
+                human_bytes(l.mem),
+                mem_share * 100.0,
+                list_procs(&heavy, |q| format!("{:.0}% {}", q.cpu, human_bytes(q.mem)))
+            ),
+            l.procs.iter().map(|q| q.pid).collect(),
+            None,
+        ));
+    }
 }
 
 // ======================================================================
@@ -1199,7 +2286,7 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Port, Proto, System};
+    use crate::model::{Port, Proto, Psi, System};
 
     const NOW: Ts = 1_800_000_000_000;
 
@@ -1366,7 +2453,7 @@ mod tests {
         let mut ps = base_procs();
         ps.push(pr(700, 1, "node", 5.0, 100 * MB));
         let s = snap(ps);
-        let step = ancestry_step(&s.ancestors(700)).unwrap();
+        let step = ancestry_step(&s.ancestors(700), Os::Mac).unwrap();
         assert!(step.contains("directly under launchd"));
     }
 
@@ -1378,7 +2465,7 @@ mod tests {
         ps.push(pr(802, 801, "worker", 0.0, MB));
         ps.push(pr(803, 802, "leaf", 99.0, MB));
         let s = snap(ps);
-        let step = ancestry_step(&s.ancestors(803)).unwrap();
+        let step = ancestry_step(&s.ancestors(803), Os::Mac).unwrap();
         assert!(step.starts_with("launched by worker (pid 802)"), "{step}");
         assert!(step.contains("…2 more…"), "{step}");
         assert!(step.contains("-zsh (pid 102) shell"));
@@ -1525,6 +2612,24 @@ mod tests {
     }
 
     #[test]
+    fn linux_zombies_under_container_init_suggest_no_kill() {
+        let mut procs = vec![
+            Proc { pid: 1, ppid: 0, name: "systemd".into(), status: "S".into(), ..Default::default() },
+            Proc { pid: 50, ppid: 1, name: "containerd-shim-runc-v2".into(), status: "S".into(), ..Default::default() },
+            Proc { pid: 60, ppid: 50, name: "sleep".into(), status: "S".into(), container: Some("410892b21be2".into()), ..Default::default() },
+        ];
+        for i in 0..25 {
+            procs.push(Proc { pid: 100 + i, ppid: 60, name: "yes".into(), status: "Z".into(), container: Some("410892b21be2".into()), ..Default::default() });
+        }
+        let mut snap = Snapshot { procs, ..Default::default() };
+        snap.system.os = "Debian GNU/Linux 12 (bookworm)".into();
+        let f = diagnose(&snap, None);
+        let z = f.iter().find(|x| x.title.contains("zombie")).expect("zombie finding");
+        assert!(z.detail.contains("init process of container"), "{}", z.detail);
+        assert_eq!(z.action, None);
+    }
+
+    #[test]
     fn diagnose_stopped_and_zombies() {
         let mut ps = base_procs();
         let mut t = pr(940, 102, "vim", 0.0, 50 * MB);
@@ -1624,5 +2729,480 @@ mod tests {
         assert_eq!(human_dur_ms(26 * 60 * MIN_MS), "1d2h");
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(status_word("Z"), "zombie (exited, parent hasn't reaped it)");
+    }
+
+    // ------------------------------------------------------------------
+    // Linux
+    // ------------------------------------------------------------------
+
+    const CID: &str = "1c5d10a36e643dfc79ca9514c31b8fb651d4c4b2741fb0bef58d591761db6384";
+
+    fn kt(pid: u32, name: &str, cpu: f32) -> Proc {
+        Proc { pid, ppid: 2, name: name.into(), user: "root".into(), cpu, status: "S".into(), ..Default::default() }
+    }
+
+    fn linux_procs() -> Vec<Proc> {
+        let mut sysd = pr(1, 0, "systemd", 0.1, 12 * MB);
+        sysd.cgroup = "/init.scope".into();
+        let mut kthreadd = pr(2, 0, "kthreadd", 0.0, 0);
+        kthreadd.cmd = String::new();
+        let mut sshd = pr(700, 1, "sshd", 0.0, 8 * MB);
+        sshd.cgroup = "/system.slice/ssh.service".into();
+        let mut sess = pr(710, 700, "sshd-session", 0.0, 6 * MB);
+        sess.cgroup = "/user.slice/user-1000.slice/session-3.scope".into();
+        let mut bash = pr(720, 710, "bash", 0.0, 4 * MB);
+        bash.cgroup = "/user.slice/user-1000.slice/session-3.scope".into();
+        vec![sysd, kthreadd, sshd, sess, bash]
+    }
+
+    fn linux_snap(procs: Vec<Proc>) -> Snapshot {
+        let mut s = snap(procs);
+        s.system.os = "Linux 12 Debian GNU/Linux".into();
+        s.system.mem_pressure = "unknown".into();
+        s.system.thermal = "unknown".into();
+        s.system.psi = Some(Psi::default());
+        s
+    }
+
+    #[test]
+    fn linux_known_table() {
+        let l = Os::Linux;
+        assert!(known_for("kswapd0", l).unwrap().contains("short on RAM"));
+        assert!(known_for("kworker/u8:2-events_unbound", l).unwrap().contains("disk IO"));
+        assert!(known_for("ksoftirqd/3", l).unwrap().contains("network"));
+        assert!(known_for("jbd2/nvme0n1p2-8", l).unwrap().contains("fsync"));
+        assert!(known_for("kcompactd0", l).is_some());
+        assert!(known_for("khugepaged", l).is_some());
+        // comm is truncated to 15 chars by the kernel
+        assert!(known_for("systemd-journal", l).unwrap().contains("noisy unit"));
+        assert!(known_for("unattended-upgr", l).unwrap().contains("security updates"));
+        assert!(known_for("containerd-shim", l).unwrap().contains("container"));
+        assert!(known_for("tracker-miner-f", l).unwrap().contains("Tracker"));
+        assert!(known_for("plocate-updated", l).unwrap().contains("updatedb"));
+        assert!(known_for("Isolated Web Co", l).unwrap().contains("about:processes"));
+        assert!(known_for("Web Content", l).unwrap().contains("Firefox"));
+        for n in [
+            "rsyslogd", "dockerd", "containerd", "runc", "kubelet", "snapd", "packagekitd", "apt", "dpkg", "updatedb",
+            "baloo_file", "gnome-shell", "Xorg", "Xwayland", "pipewire", "pulseaudio", "NetworkManager", "sshd",
+            "irqbalance", "thermald", "fwupd", "node", "python3", "python3.12", "java", "chrome", "firefox",
+            "rust-analyzer", "cargo", "rustc", "cc1plus", "ld", "ld.lld", "gradle", "systemd",
+        ] {
+            assert!(known_for(n, l).is_some(), "{n}");
+        }
+        // Platform-specific text for the same name.
+        assert!(!known_for("cargo", l).unwrap().contains("Spotlight"));
+        assert!(known_for("cargo", Os::Mac).unwrap().contains("Spotlight"));
+        // Command-line refinements.
+        let mut g = pr(10, 1, "java", 0.0, 0);
+        g.cmd = "/usr/lib/jvm/bin/java -Xmx2g org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10".into();
+        assert!(known_proc(&g, l).unwrap().contains("Gradle"));
+        let mut r = pr(11, 1, "chrome", 0.0, 0);
+        r.cmd = "/opt/google/chrome/chrome --type=renderer --lang=en-US".into();
+        assert!(known_proc(&r, l).unwrap().contains("Shift+Esc"));
+        let linux_only = KNOWN.iter().filter(|k| k.os == Some(Os::Linux)).count();
+        assert!(KNOWN.len() >= 100 && linux_only >= 1, "{}", KNOWN.len());
+    }
+
+    #[test]
+    fn platform_detection() {
+        let mut s = Snapshot::default();
+        s.system.os = "macOS 15.6 Sequoia".into();
+        assert_eq!(platform(&s), Os::Mac);
+        s.system.os = "Linux 24.04 Ubuntu".into();
+        assert_eq!(platform(&s), Os::Linux);
+        s.system.os = String::new();
+        s.procs = base_procs();
+        assert_eq!(platform(&s), Os::Mac, "launchd as pid 1");
+        s.procs = linux_procs();
+        assert_eq!(platform(&s), Os::Linux, "cgroups present");
+        s.procs = vec![pr(1, 0, "systemd", 0.0, 0)];
+        assert_eq!(platform(&s), Os::Linux);
+        s.procs.clear();
+        s.system.psi = Some(Psi::default());
+        assert_eq!(platform(&s), Os::Linux);
+    }
+
+    #[test]
+    fn cgroup_parsing() {
+        let c = parse_cgroup("/system.slice/nginx.service");
+        assert_eq!(c.unit.as_deref(), Some("nginx.service"));
+        assert!(c.container_id.is_none() && !c.user_manager);
+        let c = parse_cgroup("/system.slice/systemd-udevd.service/udev");
+        assert_eq!(c.unit.as_deref(), Some("systemd-udevd.service"));
+        let c = parse_cgroup(&format!("/system.slice/docker-{CID}.scope"));
+        assert_eq!(c.container_id.as_deref(), Some("1c5d10a36e64"));
+        assert_eq!(c.runtime, Some("docker"));
+        assert!(c.unit.is_none(), "container scope is not a unit");
+        let c = parse_cgroup(&format!("/docker/{CID}"));
+        assert_eq!((c.container_id.as_deref(), c.runtime), (Some("1c5d10a36e64"), Some("docker")));
+        let c = parse_cgroup(&format!("/machine.slice/libpod-{CID}.scope"));
+        assert_eq!(c.runtime, Some("podman"));
+        let c = parse_cgroup(&format!("/machine.slice/libpod-conmon-{CID}.scope"));
+        assert!(c.container_id.is_none() && c.unit.is_none());
+        let c = parse_cgroup(&format!(
+            "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod0f2a1b3c_4d5e_6f70_8192_a3b4c5d6e7f8.slice/cri-containerd-{CID}.scope"
+        ));
+        assert_eq!(c.container_id.as_deref(), Some("1c5d10a36e64"));
+        assert_eq!(c.runtime, Some("containerd"));
+        assert_eq!(c.pod, Some(("0f2a1b3c-4d5e-6f70-8192-a3b4c5d6e7f8".to_string(), "Burstable")));
+        let c = parse_cgroup(&format!("/kubepods/besteffort/pod0f2a1b3c-4d5e-6f70-8192-a3b4c5d6e7f8/{CID}"));
+        assert_eq!((c.runtime, c.pod.as_ref().map(|p| p.1)), (Some("kubernetes"), Some("BestEffort")));
+        let c = parse_cgroup("/lxc.payload.devbox");
+        assert_eq!(c.lxc.as_deref(), Some("devbox"));
+        let c = parse_cgroup("/user.slice/user-1000.slice/session-3.scope");
+        assert_eq!((c.unit.as_deref(), c.uid, c.user_manager), (Some("session-3.scope"), Some(1000), false));
+        let c = parse_cgroup("/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-firefox-4242.scope");
+        assert_eq!((c.unit.as_deref(), c.uid, c.user_manager), (Some("app-gnome-firefox-4242.scope"), Some(1000), true));
+        assert!(unit_phrase(&c, false, None).unwrap().contains("desktop app scope"));
+        let c = parse_cgroup("/user.slice/user-501.slice/user@501.service/init.scope");
+        assert!(unit_phrase(&c, false, None).unwrap().contains("per-user systemd manager"));
+        assert!(unit_phrase(&parse_cgroup("/init.scope"), true, Some("systemd")).unwrap().contains("own cgroup"));
+        let u = unit_phrase(&parse_cgroup("/init.scope"), false, Some("simplevisor")).unwrap();
+        assert!(u.contains("pid 1 (simplevisor)"), "{u}");
+        assert_eq!(parse_cgroup("/"), CgInfo::default());
+        assert_eq!(parse_cgroup(""), CgInfo::default());
+        assert_eq!(parse_cgroup("/.lxc"), CgInfo::default());
+    }
+
+    #[test]
+    fn linux_explain_systemd_service() {
+        let mut ps = linux_procs();
+        let mut n = pr(800, 1, "nginx", 160.0, 300 * MB);
+        n.cgroup = "/system.slice/nginx.service".into();
+        n.user = "www-data".into();
+        ps.push(n);
+        let e = explain(&linux_snap(ps), 800, None);
+        let chain = e.chain.join("\n");
+        assert!(chain.contains("started by systemd unit nginx.service"), "{chain}");
+        assert!(chain.contains("directly under systemd: a system service"), "{chain}");
+        assert!(!chain.contains("launchd"));
+        assert!(e.evidence.iter().any(|x| x == "cgroup /system.slice/nginx.service"));
+        assert!(e.evidence.iter().any(|x| x.contains("PSI")));
+        let sg = e.suggestions.join("\n");
+        assert!(sg.contains("sudo systemctl restart nginx.service"), "{sg}");
+        assert!(sg.contains("fat pause 800"));
+    }
+
+    #[test]
+    fn linux_explain_login_session_and_ssh_chain() {
+        let mut ps = linux_procs();
+        let mut c = pr(900, 720, "cargo", 30.0, 200 * MB);
+        c.cgroup = "/user.slice/user-1000.slice/session-3.scope".into();
+        ps.push(c);
+        let e = explain(&linux_snap(ps), 900, None);
+        let chain = e.chain.join("\n");
+        assert!(chain.contains("in your login session scope session-3.scope (uid 1000)"), "{chain}");
+        assert!(chain.contains("bash (pid 720) shell"));
+        assert!(chain.contains("sshd-session (pid 710) ssh session"));
+        assert!(!chain.contains("Spotlight"), "{chain}");
+    }
+
+    #[test]
+    fn linux_explain_container_process() {
+        let mut ps = linux_procs();
+        let mut shim = pr(1000, 1, "containerd-shim", 0.5, 10 * MB);
+        shim.cgroup = "/system.slice/containerd.service".into();
+        let mut w = pr(1001, 1000, "nginx", 220.0, GB);
+        w.cgroup = format!("/system.slice/docker-{CID}.scope");
+        ps.push(shim);
+        ps.push(w);
+        let mut s = linux_snap(ps);
+        s.containers.push(crate::model::Container {
+            id: "1c5d10a36e64".into(),
+            name: "web".into(),
+            image: "nginx:1.27".into(),
+            runtime: "docker".into(),
+            status: "running".into(),
+            ..Default::default()
+        });
+        let e = explain(&s, 1001, None);
+        let chain = e.chain.join("\n");
+        assert!(chain.contains("runs in container 1c5d10a36e64 (web, image nginx:1.27) [docker]"), "{chain}");
+        assert!(chain.contains("containerd-shim (pid 1000) container runtime"), "{chain}");
+        assert!(!chain.contains("systemd unit"), "container wins over unit: {chain}");
+        assert!(e.suggestions.iter().any(|x| x.contains("docker stop web")), "{:?}", e.suggestions);
+        // The shim blames its container.
+        let e = explain(&s, 1000, None);
+        let chain = e.chain.join("\n");
+        assert!(chain.contains("container web"), "{chain}");
+        assert!(e.suggestions.iter().any(|x| x == "drill down: fat why 1001"));
+        // Collector-provided id without a cgroup path works too; unknown name shows the id.
+        let mut p = pr(1002, 1, "redis-server", 5.0, MB);
+        p.container = Some("abcdef012345".into());
+        s.procs.push(p);
+        let e = explain(&s, 1002, None);
+        assert!(e.chain.iter().any(|c| c == "runs in container abcdef012345"), "{:?}", e.chain);
+        assert!(e.suggestions.iter().any(|x| x.contains("docker stats abcdef012345")));
+    }
+
+    #[test]
+    fn linux_explain_kswapd_kernel_thread() {
+        let mut ps = linux_procs();
+        ps.push(kt(90, "kswapd0", 85.0));
+        let mut j = pr(950, 720, "java", 120.0, 40 * GB);
+        j.cgroup = "/user.slice/user-1000.slice/session-3.scope".into();
+        ps.push(j);
+        let mut s = linux_snap(ps);
+        s.system.mem_used = 63 * GB;
+        s.system.psi = Some(Psi { mem_some: 40.0, mem_full: 12.0, ..Default::default() });
+        let e = explain(&s, 90, None);
+        let chain = e.chain.join("\n");
+        assert!(chain.contains("kernel thread (child of kthreadd)"), "{chain}");
+        assert!(chain.contains("memory is short: 63.0G of 64.0G"), "{chain}");
+        assert!(chain.contains("java (pid 950) 40.0G"), "{chain}");
+        assert!(e.evidence.iter().any(|x| x.contains("40% some / 12% full")));
+        let sg = e.suggestions.join("\n");
+        assert!(sg.contains("fat why 950"));
+        assert!(sg.contains("can't be paused or killed"), "{sg}");
+        assert!(!sg.contains("fat pause 90") && !sg.contains("fat kill 90") && !sg.contains("renice 90"), "{sg}");
+    }
+
+    #[test]
+    fn linux_explain_kworker_and_journald() {
+        let mut ps = linux_procs();
+        ps.push(kt(91, "kworker/u8:3-events_unbound", 60.0));
+        let mut dd = pr(960, 720, "dd", 20.0, MB);
+        dd.disk_write_bps = 300 * MB;
+        ps.push(dd);
+        let mut jd = pr(130, 1, "systemd-journal", 70.0, 60 * MB);
+        jd.cgroup = "/system.slice/systemd-journald.service".into();
+        ps.push(jd);
+        let s = linux_snap(ps);
+        let e = explain(&s, 91, None);
+        assert!(e.chain.iter().any(|c| c.contains("busiest disk users: dd (pid 960) 300M/s")), "{:?}", e.chain);
+        let e = explain(&s, 130, None);
+        assert!(e.chain.iter().any(|c| c.contains("logging at a very high rate")));
+        assert!(e.suggestions.iter().any(|x| x.contains("journalctl")));
+        assert!(e.suggestions.iter().any(|x| x.contains("core Linux")), "{:?}", e.suggestions);
+        assert!(!e.suggestions.iter().any(|x| x.contains("fat pause 130")));
+        // Idle daemons get no invented root cause.
+        let mut s = s;
+        s.procs.iter_mut().find(|q| q.pid == 130).unwrap().cpu = 0.5;
+        let e = explain(&s, 130, None);
+        assert!(e.chain.iter().any(|c| c.contains("quiet right now")), "{:?}", e.chain);
+        assert!(!e.chain.iter().any(|c| c.contains("logging at a very high rate")));
+    }
+
+    #[test]
+    fn linux_explain_dstate() {
+        let mut ps = linux_procs();
+        let mut p = pr(970, 720, "rsync", 1.0, 30 * MB);
+        p.status = "D".into();
+        ps.push(p);
+        let e = explain(&linux_snap(ps), 970, None);
+        assert!(e.chain.iter().any(|c| c.contains("uninterruptible sleep (D)")));
+        assert!(e.suggestions.iter().any(|x| x.contains("/proc/970/wchan")));
+        assert!(e.evidence.iter().any(|x| x == "status uninterruptible IO wait (D)"));
+        // sysinfo maps D to U: same explanation.
+        let mut ps = linux_procs();
+        let mut p = pr(971, 720, "cp", 1.0, MB);
+        p.status = "U".into();
+        ps.push(p);
+        assert!(explain(&linux_snap(ps), 971, None).chain.iter().any(|c| c.contains("(D)")));
+    }
+
+    #[test]
+    fn linux_package_manager_not_killed() {
+        let mut ps = linux_procs();
+        ps.push(pr(980, 1, "dpkg", 60.0, 50 * MB));
+        let s = linux_snap(ps);
+        let e = explain(&s, 980, None);
+        assert!(e.suggestions.iter().any(|x| x.contains("Let it finish")), "{:?}", e.suggestions);
+        assert!(!e.suggestions.iter().any(|x| x.contains("fat kill 980") || x.contains("fat pause 980")));
+    }
+
+    #[test]
+    fn linux_quiet_machine_is_empty() {
+        let mut s = linux_snap(linux_procs());
+        s.system.psi = Some(Psi { cpu_some: 2.0, mem_some: 0.5, mem_full: 0.1, io_some: 3.0, io_full: 1.0 });
+        s.system.temp_c = Some(55.0);
+        let f = diagnose(&s, None);
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn linux_diagnose_psi() {
+        let mut ps = linux_procs();
+        let mut hog = pr(1100, 720, "stress-ng", 790.0, 100 * MB);
+        hog.cgroup = "/user.slice/user-1000.slice/session-3.scope".into();
+        ps.push(hog);
+        let mut fat = pr(1101, 720, "python3", 50.0, 50 * GB);
+        fat.cgroup = hog_cg();
+        ps.push(fat);
+        let mut w = pr(1102, 720, "postgres", 10.0, GB);
+        w.disk_write_bps = 80 * MB;
+        ps.push(w);
+        let mut d = pr(1103, 720, "tar", 2.0, MB);
+        d.status = "D".into();
+        ps.push(d);
+        ps.push(kt(90, "kswapd0", 40.0));
+        let mut s = linux_snap(ps);
+        s.system.psi = Some(Psi { cpu_some: 35.0, mem_some: 30.0, mem_full: 8.0, io_some: 60.0, io_full: 40.0 });
+        let f = diagnose(&s, None);
+        let cpu = f.iter().find(|x| x.title.starts_with("CPU contention")).expect("cpu psi");
+        assert_eq!(cpu.severity, "warn");
+        assert!(cpu.title.contains("35%"));
+        assert_eq!(cpu.action.as_deref(), Some("renice 1100 10"));
+        let mem = f.iter().find(|x| x.title.contains("thrashing")).expect("mem psi");
+        assert_eq!(mem.severity, "warn");
+        assert!(mem.detail.contains("kswapd is burning 40% CPU"), "{}", mem.detail);
+        assert_eq!(mem.pids[0], 1101);
+        assert_eq!(mem.action.as_deref(), Some("kill 1101"));
+        let io = f.iter().find(|x| x.title.starts_with("IO stalls")).expect("io psi");
+        assert_eq!(io.severity, "crit");
+        assert!(io.detail.contains("postgres (pid 1102) 80M/s"), "{}", io.detail);
+        assert!(io.detail.contains("Blocked in IO wait (D): tar (pid 1103)"), "{}", io.detail);
+        assert!(io.pids.contains(&1103));
+        assert_eq!(f[0].severity, "crit");
+        // Below thresholds: nothing.
+        s.system.psi = Some(Psi { cpu_some: 19.0, mem_some: 19.0, mem_full: 4.9, io_some: 50.0, io_full: 9.9 });
+        assert!(!diagnose(&s, None).iter().any(|x| x.title.contains("contention") || x.title.contains("stalls")));
+    }
+
+    fn hog_cg() -> String {
+        "/user.slice/user-1000.slice/user@1000.service/app.slice/app-jupyter.scope".into()
+    }
+
+    #[test]
+    fn linux_diagnose_temperature() {
+        let mut ps = linux_procs();
+        ps.push(pr(1200, 720, "ffmpeg", 600.0, GB));
+        let mut s = linux_snap(ps);
+        s.system.temp_c = Some(92.0);
+        let f = diagnose(&s, None);
+        let t = f.iter().find(|x| x.title == "Running hot: 92°C").expect("temp");
+        assert_eq!(t.severity, "warn");
+        assert!(t.detail.contains("ffmpeg (pid 1200)"));
+        assert_eq!(t.action.as_deref(), Some("renice 1200 10"));
+        s.system.temp_c = Some(99.0);
+        assert!(diagnose(&s, None).iter().any(|x| x.title.starts_with("Running hot") && x.severity == "crit"));
+        // Thermal-state rule already covers it: no duplicate.
+        s.system.thermal = "serious".into();
+        let f = diagnose(&s, None);
+        assert!(!f.iter().any(|x| x.title.starts_with("Running hot")));
+        let th = f.iter().find(|x| x.title == "Thermal throttling").unwrap();
+        assert!(th.detail.contains("hottest sensor 99°C") && !th.detail.contains("macOS"), "{}", th.detail);
+        // macOS: Apple silicon runs ~100°C routinely; temp alone is not a finding.
+        let mut m = snap(base_procs());
+        m.system.temp_c = Some(101.0);
+        assert!(diagnose(&m, None).is_empty());
+    }
+
+    #[test]
+    fn linux_diagnose_containers() {
+        let mut ps = linux_procs();
+        for (i, cpu) in [120.0f32, 90.0, 40.0].iter().enumerate() {
+            let mut p = pr(1300 + i as u32, 1, "node", *cpu, 2 * GB);
+            p.cgroup = format!("/system.slice/docker-{CID}.scope");
+            ps.push(p);
+        }
+        let mut quiet = pr(1310, 1, "redis-server", 3.0, 100 * MB);
+        quiet.container = Some("aaaaaaaaaaaa".into());
+        ps.push(quiet);
+        let mut s = linux_snap(ps);
+        s.containers.push(crate::model::Container {
+            id: CID.into(),
+            name: "api".into(),
+            image: "node:22".into(),
+            runtime: "docker".into(),
+            ..Default::default()
+        });
+        let f = diagnose(&s, None);
+        let c: Vec<&Finding> = f.iter().filter(|x| x.title.starts_with("Container")).collect();
+        assert_eq!(c.len(), 1, "{f:?}");
+        assert_eq!(c[0].title, "Container api is using 2.5 cores, 6.0G");
+        assert!(c[0].detail.contains("3 processes in container 1c5d10a36e64 (api, image node:22)"), "{}", c[0].detail);
+        assert!(c[0].detail.contains("docker stop api"));
+        assert_eq!(c[0].pids, vec![1300, 1301, 1302]);
+        // dockerd's why points at the busy container.
+        s.procs.push(pr(600, 1, "dockerd", 15.0, 100 * MB));
+        let e = explain(&s, 600, None);
+        assert!(e.chain.iter().any(|x| x.contains("busiest: api 250% CPU")), "{:?}", e.chain);
+        assert!(e.suggestions.iter().any(|x| x == "drill into the busiest container's top process: fat why 1300"));
+    }
+
+    fn tmp_hist() -> (std::path::PathBuf, History) {
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let p = std::env::temp_dir().join(format!("fat-blame-{}-{n}.db", std::process::id()));
+        let h = History::open(Some(p.to_str().unwrap())).unwrap();
+        (p, h)
+    }
+
+    #[test]
+    fn linux_diagnose_dstate_with_history() {
+        let (path, mut h) = tmp_hist();
+        let mk = |ts: Ts, nfs_d: bool, cp_d: bool| {
+            let mut ps = linux_procs();
+            let mut a = pr(1400, 720, "ls", 0.0, 4 * MB);
+            a.status = if nfs_d { "D".into() } else { "S".into() };
+            let mut b = pr(1401, 720, "cp", 1.0, 8 * MB);
+            b.status = if cp_d { "D".into() } else { "R".into() };
+            ps.push(a);
+            ps.push(b);
+            let mut s = linux_snap(ps);
+            s.ts = ts;
+            s
+        };
+        // ls stuck in D for 11 minutes; cp only for the last minute.
+        let mut t = NOW - 11 * MIN_MS;
+        while t < NOW {
+            h.record(&mk(t, true, t >= NOW - MIN_MS)).unwrap();
+            t += 30_000;
+        }
+        let now = mk(NOW, true, true);
+        h.record(&now).unwrap();
+        let f = diagnose(&now, Some(&h));
+        let d = f.iter().find(|x| x.title.contains("uninterruptible IO wait")).expect("dstate finding");
+        assert_eq!(d.pids, vec![1400], "{d:?}");
+        assert_eq!(d.severity, "crit");
+        assert!(d.title.starts_with("1 process stuck"), "{}", d.title);
+        assert!(d.detail.contains("ls (pid 1400) 1"), "{}", d.detail);
+        assert!(d.detail.contains("dmesg"));
+        // Without the recorder, two D processes are just a moment in time.
+        assert!(!diagnose(&now, None).iter().any(|x| x.title.contains("IO wait")));
+        drop(h);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
+    #[test]
+    fn linux_swarm_and_wording() {
+        let mut ps = linux_procs();
+        ps.push(pr(1500, 720, "chrome", 5.0, 300 * MB));
+        for i in 0..35 {
+            let mut r = pr(1501 + i, 1500, "chrome", 1.0, 100 * MB);
+            r.cmd = "/opt/google/chrome/chrome --type=renderer".into();
+            ps.push(r);
+        }
+        for i in 0..32 {
+            ps.push(pr(1600 + i, 1, "worker", 1.0, 10 * MB));
+        }
+        let s = linux_snap(ps);
+        let f = diagnose(&s, None);
+        let c = f.iter().find(|x| x.title == "36 copies of chrome").unwrap();
+        assert_eq!(c.severity, "info");
+        assert!(c.action.is_none());
+        let w = f.iter().find(|x| x.title == "32 copies of worker").unwrap();
+        assert!(w.detail.contains("re-parented to init/systemd"), "{}", w.detail);
+        // A renderer's why is about the tab.
+        let e = explain(&s, 1501, None);
+        assert!(e.suggestions.iter().any(|x| x.contains("Shift+Esc")));
+    }
+
+    #[test]
+    fn linux_unattributed_wording() {
+        let mut s = linux_snap(linux_procs());
+        s.system.cores = 4;
+        s.system.cpu = 90.0;
+        let mut hidden = pr(1700, 1, "postgres", 0.0, 0);
+        hidden.usage_unknown = true;
+        hidden.user = "postgres".into();
+        s.procs.push(hidden);
+        let f = diagnose(&s, None);
+        let u = f.iter().find(|x| x.title.contains("unattributed")).unwrap();
+        assert!(u.detail.contains("hidepid") && u.detail.contains("sudo fat"), "{}", u.detail);
+        let e = explain(&s, 1700, None);
+        assert!(e.chain[0].contains("hidepid"), "{}", e.chain[0]);
     }
 }

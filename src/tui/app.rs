@@ -163,6 +163,8 @@ pub struct App {
     pub filter: String,
     filter_lower: String,
     pub rows: Vec<Row>,
+    /// Some process in the current view runs in a container (shows the CONTAINER column).
+    pub has_containers: bool,
     rows_dirty: bool,
     pub sel_pid: Option<u32>,
     /// Glue the selection to `sel_pid` across refreshes. Only after the user
@@ -230,6 +232,7 @@ impl App {
             tree: false,
             filter: String::new(),
             filter_lower: String::new(),
+            has_containers: false,
             rows: Vec::new(),
             rows_dirty: true,
             sel_pid: None,
@@ -310,6 +313,9 @@ impl App {
 
     pub fn set_fleet(&mut self, containers: Option<Vec<Container>>, hosts: Option<Vec<HostRow>>) {
         if let Some(c) = containers {
+            if !self.filter.is_empty() && c != self.containers {
+                self.rows_dirty = true; // the filter also matches container names
+            }
             self.containers = c;
         }
         if let Some(h) = hosts {
@@ -440,14 +446,20 @@ impl App {
             return;
         }
         self.rows_dirty = false;
-        let (rows, ports) = match self.view() {
-            Some(s) => (
-                build_rows(&s.procs, self.sort, self.sort_desc, self.tree, &self.filter_lower),
-                port_order(s),
-            ),
-            None => (Vec::new(), Vec::new()),
+        let (rows, ports, has_ctr) = match self.view() {
+            Some(s) => {
+                // Rewound snapshots carry their own container list; live ones get the fleet's.
+                let cs = if s.containers.is_empty() { &self.containers } else { &s.containers };
+                (
+                    build_rows_in(&s.procs, cs, self.sort, self.sort_desc, self.tree, &self.filter_lower),
+                    port_order(s),
+                    s.procs.iter().any(|p| p.container.is_some()),
+                )
+            }
+            None => (Vec::new(), Vec::new(), false),
         };
         self.rows = rows;
+        self.has_containers = has_ctr;
         self.port_rows = ports;
         self.port_sel = self.port_sel.min(self.port_rows.len().saturating_sub(1));
         // keep the selection glued to the same pid across refreshes
@@ -1057,19 +1069,41 @@ fn cmp_proc(a: &Proc, b: &Proc, key: SortKey) -> Ordering {
     o.then(a.pid.cmp(&b.pid))
 }
 
-fn proc_matches(p: &Proc, filter_lower: &str) -> bool {
-    filter_lower.is_empty() || contains_ci(&p.name, filter_lower) || contains_ci(&p.cmd, filter_lower)
+/// Filter match: name, command line, and (Linux) the cgroup path, container id and container
+/// name, so `/postgres` finds every process of a `postgres` container and `/nginx.service`
+/// finds a systemd unit's processes.
+fn proc_matches(p: &Proc, containers: &[Container], filter_lower: &str) -> bool {
+    if filter_lower.is_empty() || contains_ci(&p.name, filter_lower) || contains_ci(&p.cmd, filter_lower) {
+        return true;
+    }
+    if !p.cgroup.is_empty() && contains_ci(&p.cgroup, filter_lower) {
+        return true;
+    }
+    match &p.container {
+        Some(id) => {
+            contains_ci(id, filter_lower)
+                || crate::fleet::find_container(containers, id)
+                    .is_some_and(|c| contains_ci(&c.name, filter_lower) || contains_ci(&c.image, filter_lower))
+        }
+        None => false,
+    }
 }
 
 /// Sorted (and optionally tree-ordered, filtered) row order for a proc list.
 /// In tree mode a filter keeps matching processes plus their ancestors.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_rows(procs: &[Proc], key: SortKey, desc: bool, tree: bool, filter_lower: &str) -> Vec<Row> {
+    build_rows_in(procs, &[], key, desc, tree, filter_lower)
+}
+
+/// [`build_rows`] with the container list the filter can match names against.
+pub fn build_rows_in(procs: &[Proc], containers: &[Container], key: SortKey, desc: bool, tree: bool, filter_lower: &str) -> Vec<Row> {
     let ord = |a: usize, b: usize| {
         let o = cmp_proc(&procs[a], &procs[b], key);
         if desc { o.reverse() } else { o }
     };
     if !tree {
-        let mut v: Vec<usize> = (0..procs.len()).filter(|&i| proc_matches(&procs[i], filter_lower)).collect();
+        let mut v: Vec<usize> = (0..procs.len()).filter(|&i| proc_matches(&procs[i], containers, filter_lower)).collect();
         v.sort_by(|&a, &b| ord(a, b));
         return v.into_iter().map(|idx| Row { idx, depth: 0 }).collect();
     }
@@ -1078,7 +1112,7 @@ pub fn build_rows(procs: &[Proc], key: SortKey, desc: bool, tree: bool, filter_l
     let mut keep = vec![filter_lower.is_empty(); procs.len()];
     if !filter_lower.is_empty() {
         for (i, p) in procs.iter().enumerate() {
-            if proc_matches(p, filter_lower) {
+            if proc_matches(p, containers, filter_lower) {
                 keep[i] = true;
                 let mut cur = p.ppid;
                 let mut guard = 0;
@@ -1224,6 +1258,7 @@ pub(crate) mod tests {
                 uptime: 3 * 86400 + 4 * 3600,
                 battery_pct: Some(85.0),
                 on_battery: Some(false),
+                ..Default::default()
             },
             procs: vec![
                 proc(1, 0, "launchd", 0.1, 20 << 20),
@@ -1239,6 +1274,73 @@ pub(crate) mod tests {
             ],
             containers: vec![],
         }
+    }
+
+    /// A Linux-flavoured snapshot: PSI, RAPL power, a hwmon temperature, cgroups and two
+    /// docker containers (one known to the runtime, one only by its cgroup id).
+    pub fn linux_snap(ts: Ts) -> Snapshot {
+        let mut s = snap(ts);
+        s.system.os = "Ubuntu 24.04".into();
+        s.system.cpu_model = "AMD EPYC 7763".into();
+        s.system.mem_pressure = "normal".into();
+        s.system.thermal = String::new();
+        s.system.gpus.clear();
+        s.system.battery_pct = None;
+        s.system.on_battery = None;
+        s.system.psi = Some(crate::model::Psi { cpu_some: 12.5, mem_some: 0.4, mem_full: 0.1, io_some: 31.0, io_full: 8.0 });
+        s.system.temp_c = Some(71.0);
+        s.system.power_mw = 48_200.0;
+        s.system.power_source = "rapl".into();
+        s.procs[0].name = "systemd".into();
+        s.procs[0].cgroup = "/init.scope".into();
+        for p in s.procs.iter_mut().skip(1) {
+            p.cgroup = "/user.slice/user-1000.slice/session-3.scope".into();
+        }
+        let ctr = "/system.slice/docker-410892b21be2ffda255ceb4e7e2077d968864674cefc8174a3843e6f01c860f7.scope";
+        s.procs.push(Proc { cgroup: ctr.into(), container: Some("410892b21be2".into()), ..proc(500, 1, "postgres", 22.0, 400 << 20) });
+        s.procs.push(Proc { cgroup: ctr.into(), container: Some("410892b21be2".into()), ..proc(501, 500, "pg-worker", 3.0, 60 << 20) });
+        s.procs.push(Proc {
+            cgroup: "/system.slice/docker-f592d553371ffde52670af3ebf50d462cf46a69dde69dc441c816a077198847a.scope".into(),
+            container: Some("f592d553371f".into()),
+            ..proc(600, 1, "clickhouse", 9.0, 2 << 30)
+        });
+        s.containers = vec![Container {
+            id: "410892b21be2".into(),
+            name: "db-1".into(),
+            image: "postgres:16".into(),
+            runtime: "docker".into(),
+            status: "Up 2 hours".into(),
+            cpu: 25.0,
+            mem: 460 << 20,
+            ports: "5432/tcp".into(),
+        }];
+        s
+    }
+
+    #[test]
+    fn filter_matches_container_name_id_and_cgroup() {
+        let mut a = App::new(1000);
+        a.on_snapshot(linux_snap(1_000_000));
+        a.ensure_rows();
+        assert!(a.has_containers);
+        a.set_filter("db-1".into());
+        a.ensure_rows();
+        let mut n = names(&a);
+        n.sort();
+        assert_eq!(n, vec!["pg-worker", "postgres"]);
+        a.set_filter("postgres:16".into()); // image
+        a.ensure_rows();
+        assert_eq!(a.rows.len(), 2);
+        a.set_filter("f592d5".into()); // id of a container the runtime didn't report
+        a.ensure_rows();
+        assert_eq!(names(&a), vec!["clickhouse"]);
+        a.set_filter("init.scope".into());
+        a.ensure_rows();
+        assert_eq!(names(&a), vec!["systemd"]);
+        // macOS snapshot: no containers, column hidden
+        let mut m = app();
+        m.ensure_rows();
+        assert!(!m.has_containers);
     }
 
     fn key(c: char) -> KeyEvent {

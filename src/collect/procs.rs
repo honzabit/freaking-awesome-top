@@ -7,6 +7,9 @@
 //!   * `getpriority(PRIO_PROCESS)` -> nice
 //!
 //! All of them fail with EPERM for other users' processes when unprivileged; we skip silently.
+//!
+//! On Linux `counters` / `ident` / `threads` read procfs (see `linux.rs`): utime+stime and
+//! `io` read/write bytes, no energy (`has_energy: false` -> cpu-time power model).
 
 use std::collections::HashMap;
 
@@ -65,6 +68,7 @@ pub fn rates(prev: &Counters, cur: &Counters, dt_s: f64) -> Rates {
 }
 
 /// Map sysinfo's status to the single-char codes in `Proc::status`.
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux reads these via linux::ProcFs
 pub fn status_char(s: ProcessStatus) -> &'static str {
     match s {
         ProcessStatus::Run => "R",
@@ -103,6 +107,7 @@ impl DeltaTracker {
 }
 
 /// Nice value via getpriority; None if it fails (no such process / not permitted).
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux reads these via linux::ProcFs
 pub fn nice(pid: u32) -> Option<i32> {
     // getpriority legitimately returns -1, so errno must be cleared and checked.
     // SAFETY: getpriority has no pointer args; errno access is thread-local.
@@ -124,6 +129,7 @@ unsafe fn set_errno(v: i32) {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 unsafe fn set_errno(v: i32) {
     // SAFETY: __errno_location returns a valid pointer to this thread's errno.
     unsafe { *libc::__errno_location() = v }
@@ -287,13 +293,18 @@ mod mac {
     }
 }
 
-/// Kernel counters for `pid` (macOS only; None elsewhere or when not permitted).
+/// Kernel counters for `pid` (macOS rusage, Linux procfs; None elsewhere, or when not permitted
+/// on macOS. On Linux disk counters read 0 when `/proc/<pid>/io` is not ours to read).
 pub fn counters(pid: u32) -> Option<Counters> {
     #[cfg(target_os = "macos")]
     {
         mac::counters(pid)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        super::linux::counters(std::path::Path::new("/proc"), pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = pid;
         None
@@ -302,6 +313,7 @@ pub fn counters(pid: u32) -> Option<Counters> {
 
 /// Identity readable without privileges even for other users' processes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux reads these via linux::ProcFs
 pub struct Ident {
     pub ppid: u32,
     pub uid: u32,
@@ -309,14 +321,19 @@ pub struct Ident {
     pub start_time: u64,
 }
 
-/// ppid, uid and start time for `pid` (macOS only), used when sysinfo cannot read a process.
+/// ppid, uid and start time for `pid` (macOS bsdinfo/sysctl, Linux procfs).
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux reads these via linux::ProcFs
 pub fn ident(pid: u32) -> Option<Ident> {
     #[cfg(target_os = "macos")]
     {
         let (ppid, uid) = mac::short_bsd(pid)?;
         Some(Ident { ppid, uid, start_time: mac::start_time(pid).unwrap_or(0) })
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        super::linux::ident(std::path::Path::new("/proc"), pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = pid;
         None
@@ -324,12 +341,17 @@ pub fn ident(pid: u32) -> Option<Ident> {
 }
 
 /// Thread count for `pid` if obtainable.
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux reads these via linux::ProcFs
 pub fn threads(pid: u32) -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
         mac::threads(pid)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        super::linux::threads(std::path::Path::new("/proc"), pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = pid;
         None
@@ -408,6 +430,21 @@ mod tests {
             let c = counters(me).expect("rusage on self");
             assert!(c.cpu_ns > 0);
             assert!(threads(me).unwrap_or(0) >= 1);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Spin past the 10ms clock-tick granularity first.
+            let t = std::time::Instant::now();
+            while t.elapsed().as_millis() < 40 {
+                std::hint::black_box(0u64);
+            }
+            let c = counters(me).expect("procfs counters on self");
+            assert!(c.cpu_ns > 0);
+            assert!(!c.has_energy);
+            assert!(threads(me).unwrap_or(0) >= 1);
+            let id = ident(me).expect("ident self");
+            assert_eq!(id.ppid, std::os::unix::process::parent_id());
+            assert!(id.start_time > 1_000_000_000);
         }
     }
 }

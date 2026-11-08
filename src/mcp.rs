@@ -18,7 +18,7 @@ use crate::actions::Actions;
 use crate::collect::Collector;
 use crate::config::Config;
 use crate::history::History;
-use crate::model::{ActionKind, ActionRecord, Proc, Snapshot, now_ms};
+use crate::model::{ActionKind, ActionRecord, Container, Proc, Snapshot, now_ms};
 
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const DEFAULT_PROTOCOL: &str = "2025-06-18";
@@ -36,13 +36,17 @@ Use it to answer 'what is my machine doing, why, and what can I safely do about 
 Start with `doctor` (ranked findings) or `snapshot` (system totals + top processes; sort by cpu/mem/power/net/disk). \
 Use `why {pid}` for a blame chain explaining why a process exists and what it costs, `process {pid}` for full details, \
 `ports` / `find_port_owner {port}` for listeners (orphaned dev servers are flagged), `history` for the always-on flight \
-recorder (timeline, spikes, or a past snapshot via at_minutes_ago; needs `fat record` running), `containers` for docker/podman, \
+recorder (timeline, spikes, or a past snapshot via at_minutes_ago; needs `fat record` running), `containers` for docker/podman/nerdctl \
+(on Linux, `snapshot {container}` lists the host processes inside one container, joined via cgroups), \
 and `ask {question}` for a plain-language answer. Actions are reversible where possible and journaled: prefer `pause` \
 (SIGSTOP, undo with `resume` or `undo`) or `renice` over `kill`; every action returns an id usable with `undo`. \
 Pass the `start_time` (and `name`) you saw in snapshot/process with every action, so a pid that was reused by another \
 process in the meantime is refused instead of signalled. Processes with `usage_unknown: true` belong to other users and \
 can't be measured without root: their zero cpu/mem means unknown, not idle. \
-CPU percent is per-core (100 = one full core); memory/disk/net values are bytes and bytes/sec; power is milliwatts.";
+CPU percent is per-core (100 = one full core); memory/disk/net values are bytes and bytes/sec; power is milliwatts \
+(`system.power_source` says how it was obtained: rusage = macOS per-task energy, rapl = Linux package energy counters, \
+estimate = CPU-time model). On Linux, `system.psi` gives pressure-stall percentages (avg10): sustained cpu/mem/io stalls \
+are the most direct sign that the machine is overloaded.";
 
 /// Long-lived server state. Every field is optional so the dispatcher can run
 /// (and be tested) without any collector/history/actions backend.
@@ -62,6 +66,7 @@ const WARMUP: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl State {
     /// State with no backends attached (used by tests and as a fallback).
+    #[allow(dead_code)]
     pub fn empty() -> State {
         State { collector: None, history: None, actions: None, config: Config::default(), last: None, samples: 0 }
     }
@@ -335,13 +340,16 @@ pub fn tools() -> Vec<Value> {
         tool(
             "snapshot",
             "System snapshot",
-            "Current machine state: system totals (cpu %, memory, swap, memory pressure, thermal state, GPU, power mW, net/disk bytes/sec, battery) plus the top processes. \
-             Sort by cpu (default), mem, power, net or disk. CPU is per-core percent (100 = one core). Use `filter` to match a substring of the process name or command line.",
+            "Current machine state: system totals (cpu %, memory, swap, memory pressure, thermal state and hottest temperature `temp_c`, GPU, power mW with `power_source`, \
+             net/disk bytes/sec, battery, and on Linux `psi` pressure-stall percentages) plus the top processes. \
+             Sort by cpu (default), mem, power, net or disk. CPU is per-core percent (100 = one core). Use `filter` to match a substring of the process name, command line, cgroup or container; \
+             use `container` (name or id prefix) to list only the processes running inside one container. Processes in containers carry `container` (12-char id) and `container_name`.",
             schema(
                 json!({
                     "sort": { "type": "string", "enum": ["cpu", "mem", "power", "net", "disk"], "default": "cpu", "description": "Ranking key for the process list." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 30, "description": "Max processes to return." },
-                    "filter": { "type": "string", "description": "Case-insensitive substring matched against process name and command line." }
+                    "filter": { "type": "string", "description": "Case-insensitive substring matched against process name, command line, cgroup path and container name/id." },
+                    "container": { "type": "string", "description": "Only processes inside this container: a container name (exact, case-insensitive) or an id prefix." }
                 }),
                 &[],
             ),
@@ -350,14 +358,14 @@ pub fn tools() -> Vec<Value> {
         tool(
             "process",
             "Process details",
-            "Everything known about one process: full record (cmd, exe, cwd, user, cpu, mem, disk/net rates, power, threads, status, nice) plus its ancestor chain (names up to launchd) and child counts.",
+            "Everything known about one process: full record (cmd, exe, cwd, user, cpu, mem, disk/net rates, power, threads, status, nice) plus its ancestor chain (names up to launchd / systemd / pid 1), child counts, and on Linux its cgroup and container.",
             schema(json!({ "pid": pid_schema() }), &["pid"]),
             false,
         ),
         tool(
             "ports",
             "Listening ports",
-            "All TCP listeners and bound UDP sockets with owning pid/process and a human note. `orphan: true` marks dev-server-like listeners whose launching terminal/agent is gone (re-parented to launchd) — prime candidates for cleanup.",
+            "All TCP listeners and bound UDP sockets with owning pid/process and a human note. `orphan: true` marks dev-server-like listeners whose launching terminal/agent is gone (re-parented to launchd, init or a systemd user manager) — prime candidates for cleanup.",
             schema(json!({ "only_orphans": { "type": "boolean", "default": false, "description": "Return only orphaned listeners." } }), &[]),
             false,
         ),
@@ -399,7 +407,7 @@ pub fn tools() -> Vec<Value> {
         tool(
             "pause",
             "Pause process",
-            "Freeze a process with SIGSTOP. Reversible (resume or undo) — prefer this over kill to test whether a process is the culprit. Refused for system/session daemons (cfprefsd, distnoted, WindowServer, ...) that other apps block on. Pass `start_time` from snapshot so a reused pid is never hit. Returns an action record with an id for `undo`.",
+            "Freeze a process with SIGSTOP. Reversible (resume or undo) — prefer this over kill to test whether a process is the culprit. Refused for system/session daemons (launchd, WindowServer, cfprefsd on macOS; init, systemd, dbus, the display server on Linux, ...) that other apps block on. Pass `start_time` from snapshot so a reused pid is never hit. Returns an action record with an id for `undo`.",
             schema(target_schema(json!({})), &["pid"]),
             true,
         ),
@@ -445,14 +453,14 @@ pub fn tools() -> Vec<Value> {
         tool(
             "containers",
             "Containers",
-            "Running docker/podman/orbstack containers with image, status, cpu, memory and published ports. Empty if no container runtime is reachable.",
+            "Running containers (docker, podman, OrbStack, colima, nerdctl/containerd) with 12-char id, name, image, runtime, status, cpu, memory and published ports. Empty if no container runtime is reachable. On Linux, pass a name or id to `snapshot {container}` to see its processes.",
             schema(json!({}), &[]),
             false,
         ),
         tool(
             "ask",
             "Ask in plain language",
-            "Ask a plain-language question about this machine ('why is my mac slow?', 'what is using port 3000?'). Answered from a fresh snapshot plus doctor findings.",
+            "Ask a plain-language question about this machine ('why is this machine slow?', 'what is using port 3000?', 'which container is eating memory?'). Answered from a fresh snapshot plus doctor findings.",
             schema(json!({ "question": { "type": "string", "minLength": 1, "description": "The question." } }), &["question"]),
             false,
         ),
@@ -518,13 +526,41 @@ fn sort_key(p: &Proc, sort: &str) -> f64 {
 }
 
 /// Filter by substring (case-insensitive, name or cmd), sort descending, truncate.
+#[cfg(test)]
 fn top_procs<'a>(procs: &'a [Proc], sort: &str, limit: usize, filter: Option<&str>) -> (usize, Vec<&'a Proc>) {
+    top_procs_in(procs, &[], sort, limit, filter, None)
+}
+
+/// [`top_procs`] that can also match containers: `filter` additionally matches cgroup path and
+/// container id/name; `container` keeps only processes in containers whose name equals it
+/// (case-insensitive) or whose id starts with it.
+fn top_procs_in<'a>(
+    procs: &'a [Proc],
+    containers: &[Container],
+    sort: &str,
+    limit: usize,
+    filter: Option<&str>,
+    container: Option<&str>,
+) -> (usize, Vec<&'a Proc>) {
     let needle = filter.map(str::to_lowercase).filter(|s| !s.is_empty());
+    let want = container.map(|c| c.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let ctr_name = |p: &Proc| p.container.as_deref().and_then(|id| crate::fleet::find_container(containers, id)).map(|c| c.name.to_lowercase());
     let mut v: Vec<&Proc> = procs
         .iter()
         .filter(|p| match &needle {
-            Some(n) => p.name.to_lowercase().contains(n) || p.cmd.to_lowercase().contains(n),
+            Some(n) => {
+                p.name.to_lowercase().contains(n)
+                    || p.cmd.to_lowercase().contains(n)
+                    || p.cgroup.to_lowercase().contains(n)
+                    || p.container.as_deref().is_some_and(|id| id.contains(n.as_str()))
+                    || ctr_name(p).is_some_and(|c| c.contains(n.as_str()))
+            }
             None => true,
+        })
+        .filter(|p| match (&want, p.container.as_deref()) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(w), Some(id)) => id.starts_with(w.as_str()) || ctr_name(p).is_some_and(|c| &c == w),
         })
         .collect();
     let matched = v.len();
@@ -559,19 +595,71 @@ fn tool_snapshot(state: &mut State, args: &Value) -> Result<Value> {
     }
     let limit = arg_u64(args, "limit")?.unwrap_or(30).clamp(1, 1000) as usize;
     let filter = arg_str(args, "filter")?;
+    let container = arg_str(args, "container")?.map(str::trim).filter(|c| !c.is_empty());
     let snap = state.snapshot()?;
-    let (matched, procs) = top_procs(&snap.procs, sort, limit, filter);
-    Ok(json!({
+    // Container names only matter when some process is in a container (Linux cgroups) or the
+    // caller asked for one; fleet::containers() is cached, so this is cheap after the first call.
+    let in_containers = snap.procs.iter().any(|p| p.container.is_some());
+    let containers = if !snap.containers.is_empty() {
+        snap.containers.clone()
+    } else if in_containers || container.is_some() {
+        crate::fleet::containers()
+    } else {
+        Vec::new()
+    };
+    let snap = &state.last.as_ref().expect("snapshot cached").1;
+    Ok(snapshot_value(snap, &containers, sort, limit, filter, container))
+}
+
+/// The `snapshot` tool's result (pure, for tests).
+fn snapshot_value(snap: &Snapshot, containers: &[Container], sort: &str, limit: usize, filter: Option<&str>, container: Option<&str>) -> Value {
+    let (matched, procs) = top_procs_in(&snap.procs, containers, sort, limit, filter, container);
+    let procs: Vec<Value> = procs
+        .into_iter()
+        .map(|p| {
+            let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
+            if let Some(c) = p.container.as_deref().and_then(|id| crate::fleet::find_container(containers, id))
+                && !c.name.is_empty()
+            {
+                v["container_name"] = json!(c.name);
+            }
+            v
+        })
+        .collect();
+    let s = &snap.system;
+    let mut out = json!({
         "ts": snap.ts,
         "host": snap.host,
-        "system": snap.system,
+        "system": s,
         "sort": sort,
         "total_procs": snap.procs.len(),
         "matched_procs": matched,
         "procs": procs,
         "listening_ports": snap.ports.len(),
         "orphan_ports": snap.ports.iter().filter(|p| p.orphan).count(),
-    }))
+        // Also inside `system`; repeated at the top level (null when unavailable) so agents
+        // can rely on the keys being present on every platform.
+        "psi": s.psi,
+        "temp_c": s.temp_c,
+        "power_source": s.power_source,
+    });
+    if let Some(c) = container {
+        out["container"] = json!(c);
+        if let Some(found) = containers
+            .iter()
+            .find(|x| x.name.eq_ignore_ascii_case(c) || (!x.id.is_empty() && x.id.starts_with(&c.to_lowercase())))
+        {
+            out["container_info"] = json!(found);
+        }
+        if matched == 0 {
+            out["note"] = json!(if snap.procs.iter().any(|p| p.container.is_some()) {
+                "no process matches that container; see the `containers` tool for names and ids"
+            } else {
+                "no process is attributed to any container on this machine (needs Linux with cgroups v2 and a host pid namespace view)"
+            });
+        }
+    }
+    out
 }
 
 fn tool_process(state: &mut State, args: &Value) -> Result<Value> {
@@ -582,8 +670,11 @@ fn tool_process(state: &mut State, args: &Value) -> Result<Value> {
     let children = snap.procs.iter().filter(|c| c.ppid == pid && c.pid != pid).count();
     let descendants = snap.descendants(pid).len();
     let ports: Vec<_> = snap.ports.iter().filter(|x| x.pid == pid).collect();
+    let containers = if p.container.is_some() && snap.containers.is_empty() { crate::fleet::containers() } else { snap.containers.clone() };
+    let container = p.container.as_deref().and_then(|id| crate::fleet::find_container(&containers, id));
     Ok(json!({
         "process": p,
+        "container_info": container,
         "ancestors": ancestors,
         "children_count": children,
         "descendants_count": descendants,
@@ -899,6 +990,68 @@ mod tests {
         let (n, v) = top_procs(&procs, "cpu", 10, Some("NODE"));
         assert_eq!(n, 2);
         assert_eq!(v.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![2, 4]);
+    }
+
+    fn linuxish() -> Snapshot {
+        let mk = |pid, name: &str, cpu, ctr: Option<&str>| Proc {
+            pid,
+            name: name.into(),
+            cpu,
+            cgroup: match ctr {
+                Some(id) => format!("/system.slice/docker-{id}0000000000000000.scope"),
+                None => "/user.slice/user-1000.slice/session-2.scope".into(),
+            },
+            container: ctr.map(str::to_string),
+            ..Default::default()
+        };
+        Snapshot {
+            system: crate::model::System {
+                psi: Some(crate::model::Psi { cpu_some: 4.5, mem_some: 0.0, mem_full: 0.0, io_some: 12.0, io_full: 3.0 }),
+                temp_c: Some(64.0),
+                power_source: "rapl".into(),
+                ..Default::default()
+            },
+            procs: vec![
+                mk(1, "systemd", 0.1, None),
+                mk(10, "postgres", 30.0, Some("410892b21be2")),
+                mk(11, "postgres", 5.0, Some("410892b21be2")),
+                mk(20, "redis-server", 2.0, Some("f592d553371f")),
+                mk(30, "bash", 1.0, None),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn snapshot_filters_by_container_and_reports_linux_fields() {
+        let snap = linuxish();
+        let cs = vec![Container { id: "410892b21be2".into(), name: "db-1".into(), image: "postgres:16".into(), runtime: "docker".into(), ..Default::default() }];
+        let v = snapshot_value(&snap, &cs, "cpu", 30, None, Some("DB-1"));
+        assert_eq!(v["matched_procs"], 2);
+        assert_eq!(v["procs"][0]["pid"], 10);
+        assert_eq!(v["procs"][0]["container_name"], "db-1");
+        assert_eq!(v["procs"][0]["container"], "410892b21be2");
+        assert_eq!(v["container_info"]["image"], "postgres:16");
+        assert_eq!(v["psi"]["io_some"], 12.0);
+        assert_eq!(v["system"]["psi"]["cpu_some"], 4.5);
+        assert_eq!(v["temp_c"], 64.0);
+        assert_eq!(v["power_source"], "rapl");
+        // id prefix works even for a container the runtime didn't report
+        let v = snapshot_value(&snap, &cs, "cpu", 30, None, Some("f592"));
+        assert_eq!(v["matched_procs"], 1);
+        assert!(v["procs"][0].get("container_name").is_none());
+        let v = snapshot_value(&snap, &cs, "cpu", 30, None, Some("nope"));
+        assert_eq!(v["matched_procs"], 0);
+        assert!(v["note"].as_str().unwrap().contains("containers"));
+        // filter matches container names and cgroup paths
+        let v = snapshot_value(&snap, &cs, "cpu", 30, Some("db-1"), None);
+        assert_eq!(v["matched_procs"], 2);
+        let v = snapshot_value(&snap, &cs, "cpu", 30, Some("session-2.scope"), None);
+        assert_eq!(v["matched_procs"], 2);
+        // macOS-shaped snapshot: keys present, null
+        let v = snapshot_value(&Snapshot::default(), &[], "cpu", 30, None, None);
+        assert!(v["psi"].is_null() && v["temp_c"].is_null());
+        assert!(v.get("container").is_none());
     }
 
     #[test]

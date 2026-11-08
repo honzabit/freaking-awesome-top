@@ -1,4 +1,12 @@
 //! Local sampling. OWNER: collect-core agent (mod.rs, procs.rs, system.rs).
+//!
+//! Process table: macOS (and other non-Linux) goes through sysinfo plus the rusage calls in
+//! `procs`; Linux reads procfs directly (`linux::ProcFs`) — cpu% from utime+stime deltas is live
+//! on the second sample, and threads/nice/cgroup/container come for free. Linux power is RAPL
+//! package energy apportioned by cpu share when readable (root), else the cpu-time estimate.
+//! Compiled in tests on every OS so its fixture tests run on macOS too.
+#[cfg(any(target_os = "linux", test))]
+pub mod linux;
 pub mod net;
 pub mod ports;
 pub mod procs;
@@ -7,10 +15,9 @@ pub mod system;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use sysinfo::{
-    CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, UpdateKind,
-    Users,
-};
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, Users};
+#[cfg(not(target_os = "linux"))]
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 
 use crate::model::{Proc, Snapshot, System, now_ms};
 
@@ -27,6 +34,12 @@ pub struct Collector {
     last_sample: Option<Instant>,
     net: net::NetSampler,
     extras: system::ExtrasCache,
+    #[cfg(target_os = "linux")]
+    procfs: linux::ProcFs,
+    #[cfg(target_os = "linux")]
+    rapl: linux::Rapl,
+    #[cfg(target_os = "linux")]
+    meminfo: Option<linux::MemInfo>,
     hostname: String,
     os: String,
     cpu_model: String,
@@ -38,6 +51,7 @@ impl Default for Collector {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn proc_refresh_kind() -> ProcessRefreshKind {
     let kind = ProcessRefreshKind::nothing()
         .with_memory()
@@ -84,6 +98,12 @@ impl Collector {
             last_sample: None,
             net: net::NetSampler::start(),
             extras: system::ExtrasCache::start(),
+            #[cfg(target_os = "linux")]
+            procfs: linux::ProcFs::new(std::path::Path::new("/proc")),
+            #[cfg(target_os = "linux")]
+            rapl: linux::Rapl::discover(std::path::Path::new("/")),
+            #[cfg(target_os = "linux")]
+            meminfo: None,
             hostname,
             os,
             cpu_model,
@@ -118,12 +138,99 @@ impl Collector {
         self.last_sample = Some(now);
 
         self.sys.refresh_cpu_usage();
-        self.sys.refresh_memory();
+        #[cfg(target_os = "linux")]
+        let (list, power_source) = {
+            self.meminfo = linux::meminfo(std::path::Path::new("/proc"));
+            if self.meminfo.is_none() {
+                self.sys.refresh_memory();
+            }
+            self.sample_procs_linux(dt)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (list, power_source) = {
+            self.sys.refresh_memory();
+            self.sample_procs_sysinfo(dt)
+        };
+
+        let system = self.build_system(&list, power_source);
+        let ports = ports::ports(&list);
+        Snapshot {
+            ts: now_ms(),
+            host: "local".into(),
+            system,
+            procs: list,
+            ports,
+            containers: Vec::new(),
+        }
+    }
+
+    /// Linux process table straight from procfs. Returns (procs sorted by pid, power source).
+    #[cfg(target_os = "linux")]
+    fn sample_procs_linux(&mut self, dt: f64) -> (Vec<Proc>, &'static str) {
+        let net = self.net.latest();
+        let gpu = system::proc_gpu();
+        let raw = self.procfs.scan();
+        let mut alive = HashSet::with_capacity(raw.len());
+        let mut list = Vec::with_capacity(raw.len());
+        for r in raw {
+            // Keyed by raw starttime ticks: finer than seconds, so a recycled pid never inherits.
+            let rt = self.deltas.update(r.pid, r.start_ticks, r.counters, dt);
+            alive.insert((r.pid, r.start_ticks));
+            let user = self.user_name(r.uid);
+            let (net_rx_bps, net_tx_bps) = net.get(&r.pid).copied().unwrap_or((0, 0));
+            list.push(Proc {
+                pid: r.pid,
+                ppid: r.ppid,
+                name: r.name,
+                cmd: r.cmd,
+                exe: r.exe,
+                cwd: r.cwd,
+                user,
+                cpu: rt.cpu,
+                mem: r.mem,
+                virt: r.virt,
+                // An unreadable io file (other user's process) leaves these 0; cpu/mem are still
+                // real, so usage_unknown stays false.
+                disk_read_bps: rt.disk_read_bps,
+                disk_write_bps: rt.disk_write_bps,
+                net_rx_bps,
+                net_tx_bps,
+                power_mw: rt.power_mw,
+                gpu: gpu.get(&r.pid).copied(),
+                threads: r.threads,
+                start_time: r.start_time,
+                status: r.status.to_string(),
+                nice: r.nice,
+                usage_unknown: false,
+                cgroup: r.cgroup,
+                container: r.container,
+            });
+        }
+        self.deltas.retain(&alive);
+        list.sort_by_key(|p| p.pid);
+        if !self.rapl.available() {
+            return (list, "estimate");
+        }
+        // Package power, split by cpu share. On the first sample (no delta yet) the per-process
+        // estimate values are all zero anyway.
+        if let Some(total) = self.rapl.sample_mw(dt) {
+            let cpu: Vec<f32> = list.iter().map(|p| p.cpu).collect();
+            for (p, mw) in list.iter_mut().zip(linux::apportion(total, &cpu)) {
+                p.power_mw = mw;
+            }
+        }
+        (list, self.rapl.source)
+    }
+
+    /// sysinfo-based process table (macOS and other non-Linux). Returns (procs, power source).
+    #[cfg(not(target_os = "linux"))]
+    fn sample_procs_sysinfo(&mut self, dt: f64) -> (Vec<Proc>, &'static str) {
         self.sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_refresh_kind());
 
         let net = self.net.latest();
         let mut alive = HashSet::new();
         let mut list = Vec::with_capacity(self.sys.processes().len());
+        let (mut any_energy, mut any_counters) = (false, false);
 
         // Collect the sysinfo view first (immutable borrow), then enrich.
         let raw: Vec<_> = self
@@ -186,6 +293,8 @@ impl Collector {
             alive.insert((pr.pid, pr.start_time));
             match procs::counters(pr.pid) {
                 Some(c) => {
+                    any_energy |= c.has_energy;
+                    any_counters = true;
                     let r = self.deltas.update(pr.pid, pr.start_time, c, dt);
                     pr.cpu = r.cpu;
                     pr.power_mw = r.power_mw;
@@ -210,23 +319,30 @@ impl Collector {
         }
         self.deltas.retain(&alive);
         list.sort_by_key(|p| p.pid);
-
-        let system = self.build_system(&list);
-        let ports = ports::ports(&list);
-        Snapshot {
-            ts: now_ms(),
-            host: "local".into(),
-            system,
-            procs: list,
-            ports,
-            containers: Vec::new(),
-        }
+        // macOS: "rusage" when the kernel's per-task energy counter (V6) is there, "estimate"
+        // when only the V4 cpu-time fallback is.
+        let source = match (any_counters, any_energy) {
+            (_, true) => "rusage",
+            (true, false) => "estimate",
+            _ => "",
+        };
+        (list, source)
     }
 
-    fn build_system(&self, list: &[Proc]) -> System {
+    fn build_system(&self, list: &[Proc], power_source: &str) -> System {
         let extras = self.extras.get();
         let load = sysinfo::System::load_average();
         let per_core: Vec<f32> = self.sys.cpus().iter().map(|c| c.cpu_usage()).collect();
+        let from_sysinfo =
+            || (self.sys.total_memory(), self.sys.used_memory(), self.sys.total_swap(), self.sys.used_swap());
+        // Linux: used = MemTotal - MemAvailable straight from /proc/meminfo.
+        #[cfg(target_os = "linux")]
+        let (mem_total, mem_used, swap_total, swap_used) = match self.meminfo {
+            Some(m) => (m.total, m.used(), m.swap_total, m.swap_used()),
+            None => from_sysinfo(),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (mem_total, mem_used, swap_total, swap_used) = from_sysinfo();
         System {
             hostname: self.hostname.clone(),
             os: self.os.clone(),
@@ -235,10 +351,10 @@ impl Collector {
             per_core,
             cpu: self.sys.global_cpu_usage(),
             load: [load.one, load.five, load.fifteen],
-            mem_total: self.sys.total_memory(),
-            mem_used: self.sys.used_memory(),
-            swap_total: self.sys.total_swap(),
-            swap_used: self.sys.used_swap(),
+            mem_total,
+            mem_used,
+            swap_total,
+            swap_used,
             mem_pressure: system::mem_pressure(),
             thermal: extras.thermal,
             gpus: extras.gpus,
@@ -250,6 +366,9 @@ impl Collector {
             uptime: sysinfo::System::uptime(),
             battery_pct: extras.battery_pct,
             on_battery: extras.on_battery,
+            psi: system::psi(),
+            temp_c: extras.temp_c,
+            power_source: power_source.to_string(),
         }
     }
 }
@@ -355,5 +474,78 @@ mod tests {
         assert!(p.cmd.contains("300"));
         assert_eq!(p.status, "T");
         assert_eq!(p.nice, 0);
+    }
+
+    /// Linux: cpu% is live on the 2nd sample, threads/start/cgroup are filled, mem matches
+    /// /proc/meminfo, and the power source is reported.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_procfs_sample() {
+        let mut c = Collector::new();
+        let _ = c.sample();
+        // Keep this thread busy for 300ms so our own pid has measurable cpu.
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(300) {
+            std::hint::black_box(0u64);
+        }
+        let s = c.sample();
+        let me = s.proc(std::process::id()).expect("self");
+        eprintln!("self: {me:?}\nsystem: power_source={} psi={:?} temp={:?}", s.system.power_source, s.system.psi, s.system.temp_c);
+        assert!(me.cpu > 20.0, "own cpu {}", me.cpu);
+        assert!(me.threads >= 1);
+        assert!(me.start_time > 1_000_000_000);
+        assert!(!me.user.is_empty());
+        assert!(!me.cgroup.is_empty());
+        assert!(!me.usage_unknown);
+        assert!(me.power_mw > 0.0);
+        assert!(matches!(s.system.power_source.as_str(), "rapl" | "estimate"));
+        assert!(s.system.mem_used > 0 && s.system.mem_used <= s.system.mem_total);
+        let mi = linux::meminfo(std::path::Path::new("/proc")).unwrap();
+        assert_eq!(s.system.mem_total, mi.total);
+        assert!(s.system.mem_used.abs_diff(mi.used()) < mi.total / 20);
+        let init = s.proc(1).expect("pid 1");
+        assert_eq!(init.ppid, 0);
+        assert!(!init.user.is_empty());
+        let total: f32 = s.procs.iter().map(|p| p.power_mw).sum();
+        assert!((s.system.power_mw - total).abs() < 1.0);
+    }
+
+    /// Linux perf: `FAT_BENCH_N` (default 1000) own `sleep` children, then time steady samples.
+    /// Run with `cargo test --release linux_sample_bench -- --ignored --nocapture`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn linux_sample_bench() {
+        let n: usize = std::env::var("FAT_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+        let mut kids: Vec<_> =
+            (0..n).filter_map(|_| std::process::Command::new("sleep").arg("300").spawn().ok()).collect();
+        let mut c = Collector::new();
+        let t0 = Instant::now();
+        let s = c.sample();
+        let first = t0.elapsed();
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(200));
+            let t = Instant::now();
+            let _ = c.sample();
+            times.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let mut scan = Vec::new();
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(200));
+            let t = Instant::now();
+            let _ = c.procfs.scan();
+            scan.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let t = Instant::now();
+        let ports = ports::ports(&s.procs).len();
+        let ports_ms = t.elapsed().as_secs_f64() * 1e3;
+        eprintln!("procfs scan only ms={scan:.1?}; ports::ports {ports} in {ports_ms:.1}ms");
+        for k in &mut kids {
+            let _ = k.kill();
+            let _ = k.wait();
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!("procs={} first={first:?} steady_ms={times:.1?} median={:.1}ms", s.procs.len(), times[2]);
     }
 }

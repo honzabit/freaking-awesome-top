@@ -1,5 +1,9 @@
 //! Containers + remote hosts in one tree. OWNER: fleet agent.
 //!
+//! Runtimes: docker (and contexts: orbstack, colima, rancher, lima, rootless), podman (also when
+//! `docker` is the podman-docker shim), and on Linux nerdctl/containerd as a fallback. Ids are
+//! normalized to the 12-hex short form so they join `Proc.container` from cgroup paths.
+//!
 //! Every external command runs under a hard timeout (the docker CLI blocks forever when the
 //! daemon is down). Container results are cached so the TUI can call `containers()` on every
 //! refresh: a fresh cache is returned directly, a stale one is returned immediately while a
@@ -8,7 +12,7 @@ use crate::config::HostCfg;
 use crate::model::{Container, Snapshot};
 use serde_json::Value;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,21 +55,66 @@ fn store(list: Vec<Container>) {
     }
 }
 
-/// Query docker and podman in parallel; combine whatever responds.
+/// Query docker and podman in parallel; combine whatever responds. On Linux, fall back to
+/// nerdctl (containerd) when neither docker nor podman produced anything.
 fn collect_all() -> Vec<Container> {
-    let docker = find_bin("docker").map(|b| std::thread::spawn(move || collect_runtime(&b, true)));
-    let podman = find_bin("podman").map(|b| std::thread::spawn(move || collect_runtime(&b, false)));
+    let docker_bin = find_bin("docker");
+    // A `docker` that is really podman (podman-docker shim) would list the same containers twice.
+    let docker_is_podman = docker_bin.as_ref().is_some_and(is_podman_shim);
+    let podman_bin = find_bin("podman").filter(|_| !docker_is_podman);
+    let docker = docker_bin.map(|b| std::thread::spawn(move || collect_runtime(&b, if docker_is_podman { Rt::Podman } else { Rt::Docker })));
+    let podman = podman_bin.map(|b| std::thread::spawn(move || collect_runtime(&b, Rt::Podman)));
     let mut out = Vec::new();
     for h in [docker, podman].into_iter().flatten() {
         if let Ok(v) = h.join() {
             out.extend(v);
         }
     }
-    out
+    #[cfg(target_os = "linux")]
+    if out.is_empty()
+        && let Some(b) = find_bin("nerdctl")
+    {
+        out.extend(collect_runtime(&b, Rt::Nerdctl));
+    }
+    dedupe(out)
 }
 
-fn collect_runtime(bin: &PathBuf, is_docker: bool) -> Vec<Container> {
-    let runtime = if is_docker { docker_runtime_name(bin) } else { "podman".to_string() };
+/// Drop repeated ids (the same container reported by two CLIs talking to one daemon).
+fn dedupe(list: Vec<Container>) -> Vec<Container> {
+    let mut seen = std::collections::HashSet::new();
+    list.into_iter().filter(|c| c.id.is_empty() || seen.insert(c.id.clone())).collect()
+}
+
+/// True when `bin` resolves to podman (e.g. /usr/bin/docker -> podman, or the podman-docker
+/// wrapper script that execs podman).
+fn is_podman_shim(bin: &PathBuf) -> bool {
+    if let Ok(real) = std::fs::canonicalize(bin)
+        && real.file_name().is_some_and(|n| n.to_string_lossy().contains("podman"))
+    {
+        return true;
+    }
+    // podman-docker ships a tiny shell script; peek at its head without reading a big binary.
+    let mut head = [0u8; 512];
+    match std::fs::File::open(bin).and_then(|mut f| f.read(&mut head)) {
+        Ok(n) => head[..n].starts_with(b"#!") && String::from_utf8_lossy(&head[..n]).contains("podman"),
+        Err(_) => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rt {
+    Docker,
+    Podman,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Nerdctl,
+}
+
+fn collect_runtime(bin: &Path, rt: Rt) -> Vec<Container> {
+    let runtime = match rt {
+        Rt::Docker => docker_runtime_name(bin),
+        Rt::Podman => "podman".to_string(),
+        Rt::Nerdctl => "containerd".to_string(),
+    };
     let ps = match run_with_timeout(bin.to_str().unwrap_or("docker"), &["ps", "--format", "{{json .}}"], CMD_TIMEOUT) {
         Ok(o) if o.success() => o.stdout,
         _ => return Vec::new(),
@@ -82,7 +131,7 @@ fn collect_runtime(bin: &PathBuf, is_docker: bool) -> Vec<Container> {
 }
 
 /// "orbstack" when the active docker context is OrbStack, else "docker".
-fn docker_runtime_name(bin: &PathBuf) -> String {
+fn docker_runtime_name(bin: &Path) -> String {
     if bin.to_string_lossy().contains(".orbstack") {
         return "orbstack".into();
     }
@@ -100,6 +149,12 @@ fn runtime_from_context(ctx: &str) -> String {
         "colima".into()
     } else if c.contains("podman") {
         "podman".into()
+    } else if c.contains("rancher") {
+        "rancher".into()
+    } else if c.contains("lima") {
+        "lima".into()
+    } else if c.contains("rootless") {
+        "docker-rootless".into()
     } else {
         "docker".into()
     }
@@ -202,11 +257,8 @@ pub(crate) fn parse_ps_lines(out: &str, runtime: &str) -> Vec<Container> {
     out.lines()
         .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
         .filter(|v| v.is_object())
-        .map(|v| {
-            let mut id = text(field(&v, &["ID", "Id"]));
-            id.truncate(12);
-            Container {
-                id,
+        .map(|v| Container {
+                id: normalize_id(&text(field(&v, &["ID", "Id"]))),
                 name: text(field(&v, &["Names", "Name"])),
                 image: text(field(&v, &["Image"])),
                 runtime: runtime.to_string(),
@@ -214,9 +266,36 @@ pub(crate) fn parse_ps_lines(out: &str, runtime: &str) -> Vec<Container> {
                 cpu: 0.0,
                 mem: 0,
                 ports: text(field(&v, &["Ports"])),
-            }
         })
         .collect()
+}
+
+/// Container ids are compared as the 12-hex short form `docker ps` prints, which is also what
+/// the Linux collector extracts from cgroup paths (`/docker/<64 hex>`,
+/// `/system.slice/docker-<64 hex>.scope`, `.../libpod-<64 hex>.scope`). Podman and
+/// `--no-trunc` print the full 64; some tools prefix `sha256:`.
+pub fn normalize_id(id: &str) -> String {
+    let id = id.trim();
+    let id = id.strip_prefix("sha256:").unwrap_or(id);
+    id.chars().take(12).collect::<String>().to_ascii_lowercase()
+}
+
+/// The container a process belongs to, by (short or full) id. Prefix match either way so
+/// a 12-char id joins a 64-char one.
+pub fn find_container<'a>(containers: &'a [Container], id: &str) -> Option<&'a Container> {
+    let id = normalize_id(id);
+    if id.is_empty() {
+        return None;
+    }
+    containers.iter().find(|c| !c.id.is_empty() && (c.id.starts_with(&id) || id.starts_with(&c.id)))
+}
+
+/// Human label for a process's container: the runtime's name when known, else the short id.
+pub fn container_label(containers: &[Container], id: &str) -> String {
+    match find_container(containers, id) {
+        Some(c) if !c.name.is_empty() => c.name.clone(),
+        _ => normalize_id(id),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -233,7 +312,7 @@ pub(crate) fn parse_stats_lines(out: &str) -> Vec<Stat> {
         .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
         .filter(|v| v.is_object())
         .map(|v| Stat {
-            id: text(field(&v, &["ID", "Container"])),
+            id: normalize_id(&text(field(&v, &["ID", "Container"]))),
             name: text(field(&v, &["Name"])),
             cpu: parse_percent(&text(field(&v, &["CPUPerc", "CPU"]))),
             mem: parse_mem_usage(&text(field(&v, &["MemUsage"]))),
@@ -373,6 +452,9 @@ not json
         assert_eq!(runtime_from_context("orbstack"), "orbstack");
         assert_eq!(runtime_from_context("colima"), "colima");
         assert_eq!(runtime_from_context("desktop-linux"), "docker");
+        assert_eq!(runtime_from_context("default"), "docker");
+        assert_eq!(runtime_from_context("rootless"), "docker-rootless");
+        assert_eq!(runtime_from_context("rancher-desktop"), "rancher");
     }
 
     #[test]
@@ -392,6 +474,46 @@ not json
         assert!(t.elapsed() < Duration::from_secs(5));
         let ok = run_with_timeout("echo", &["hi"], Duration::from_secs(2)).unwrap();
         assert_eq!(ok.stdout.trim(), "hi");
+    }
+
+    #[test]
+    fn ids_normalize_and_join_cgroup_short_ids() {
+        assert_eq!(normalize_id("sha256:ABCDEF0123456789aa"), "abcdef012345");
+        assert_eq!(normalize_id(" 410892b21be2 "), "410892b21be2");
+        // podman prints the full 64-hex id; procs carry the 12-char prefix from their cgroup.
+        let line = r#"{"Id":"410892b21be2ffda255ceb4e7e2077d968864674cefc8174a3843e6f01c860f7","Names":["fat-linux"],"Image":"debian","State":"running"}"#;
+        let cs = parse_ps_lines(line, "podman");
+        assert_eq!(cs[0].id, "410892b21be2");
+        assert_eq!(find_container(&cs, "410892b21be2").map(|c| c.name.as_str()), Some("fat-linux"));
+        assert_eq!(find_container(&cs, "410892b21be2ffda255ceb4e7e2077d968864674cefc8174a3843e6f01c860f7").map(|c| c.name.as_str()), Some("fat-linux"));
+        assert!(find_container(&cs, "").is_none());
+        assert!(find_container(&cs, "deadbeef0000").is_none());
+        assert_eq!(container_label(&cs, "410892b21be2"), "fat-linux");
+        assert_eq!(container_label(&cs, "DEADBEEF00001111"), "deadbeef0000");
+    }
+
+    #[test]
+    fn nerdctl_shape_and_dedupe() {
+        let line = r#"{"Command":"\"nginx -g 'daemon off;'\"","CreatedAt":"2024-05-01 10:00:00 +0000 UTC","ID":"0a1b2c3d4e5f","Image":"docker.io/library/nginx:latest","Names":"web","Ports":"0.0.0.0:8080->80/tcp","Status":"Up"}"#;
+        let a = parse_ps_lines(line, "containerd");
+        assert_eq!(a[0].id, "0a1b2c3d4e5f");
+        assert_eq!(a[0].name, "web");
+        let both = dedupe([a.clone(), a].concat());
+        assert_eq!(both.len(), 1);
+    }
+
+    #[test]
+    fn podman_shim_detection() {
+        let dir = std::env::temp_dir().join(format!("fat-fleet-shim-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let shim = dir.join("docker");
+        std::fs::write(&shim, "#!/bin/sh\n[ -e /etc/containers/nodocker ] || echo emulate\nexec /usr/bin/podman \"$@\"\n").unwrap();
+        assert!(is_podman_shim(&shim));
+        let real = dir.join("docker-real");
+        std::fs::write(&real, [0x7fu8, b'E', b'L', b'F', 0, 0]).unwrap();
+        assert!(!is_podman_shim(&real));
+        assert!(!is_podman_shim(&dir.join("missing")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

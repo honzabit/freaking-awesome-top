@@ -50,7 +50,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Ask in plain language ("why is my mac slow?").
+    /// Ask in plain language ("why is this machine slow?").
     Ask { question: Vec<String> },
     /// Run the always-on flight recorder (foreground).
     Record,
@@ -68,6 +68,10 @@ enum Cmd {
         json: bool,
     },
     /// Run a command under a resource budget.
+    ///
+    /// On Linux, --cpu and --mem are enforced by the kernel through a cgroup v2 when one can be
+    /// had (root, or a systemd user scope); otherwise, and on macOS, by polling every 500ms.
+    /// FAT_BUDGET_MODE=auto|cgroup|poll overrides the choice.
     Run {
         /// Max CPU percent across the tree (100 = 1 core).
         #[arg(long)]
@@ -193,6 +197,17 @@ fn main() -> Result<()> {
                     sys.load[1],
                     sys.load[2]
                 );
+                // Linux-only extras; absent (and not printed) on macOS.
+                let mut extra = Vec::new();
+                if let Some(p) = &sys.psi {
+                    extra.push(format!("psi some cpu {:.1} mem {:.1} io {:.1}", p.cpu_some, p.mem_some, p.io_some));
+                }
+                if let Some(t) = sys.temp_c {
+                    extra.push(format!("temp {t:.0}°C"));
+                }
+                if !extra.is_empty() {
+                    println!("{}", extra.join("  "));
+                }
                 let mut procs = s.procs.clone();
                 procs.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
                 println!("{:>7} {:>6} {:>8} {:>7}  NAME", "PID", "CPU%", "MEM", "POWER");
@@ -241,7 +256,11 @@ fn main() -> Result<()> {
             }
         }
         Some(Cmd::Doctor { json }) => {
-            let s = sample();
+            let mut s = sample();
+            // Container names for container findings, fetched only when something runs in one.
+            if cfg.containers && s.procs.iter().any(|p| p.container.is_some()) {
+                s.containers = fleet::containers();
+            }
             let h = history::History::open(cfg.history_path.as_deref()).ok();
             let f = blame::diagnose(&s, h.as_ref());
             if json {

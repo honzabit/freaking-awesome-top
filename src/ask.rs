@@ -19,7 +19,14 @@ question. Answer concisely and concretely from that data: name the processes res
 pid and numbers. When an action would help, recommend fat commands such as `fat pause PID` \
 (reversible SIGSTOP), `fat resume PID`, `fat renice PID 10`, `fat why PID`, `fat ports`, or \
 `fat kill PID`, preferring reversible actions first. Only mention pids that appear in the data; never \
-invent pids, processes or numbers. If the data cannot answer the question, say what is missing.";
+invent pids, processes or numbers. If the data cannot answer the question, say what is missing. \
+Tailor advice to the operating system in system.os: macOS-only remedies (Spotlight, launchctl, Activity Monitor) \
+do not apply on Linux, and Linux ones (systemctl, journalctl, cgroup limits, docker update) do not apply on macOS. \
+Linux digests may add: system.psi (pressure stall information, avg10 % of time tasks waited on cpu, memory or io; \
+above ~10% means real contention, and mem_full or io_full above a few % means the machine is thrashing), \
+system.temp_c (hottest sensor), system.power_source (rapl = measured package energy, estimate = CPU-time model, \
+rusage = macOS per-task energy), and per process `ctr` (the container it runs in) and `cgroup` (systemd unit or slice). \
+Attribute load to containers or systemd units when the processes involved share one.";
 
 /// Answer a question. Uses Claude API if ANTHROPIC_API_KEY is set (cfg.ask.enabled), else a
 /// rule-based answer built from findings. Never panics; errors become explanatory text.
@@ -172,6 +179,25 @@ pub(crate) fn redact_cmd(cmd: &str) -> String {
 }
 
 fn proc_json(snap: &Snapshot, p: &Proc, cmd_len: usize) -> Value {
+    proc_json_in(snap, &snap.containers, p, cmd_len)
+}
+
+/// Compact cgroup label: the systemd unit or slice that matters ("nginx.service",
+/// "user@1000.service/app.slice/code.scope"), not the whole hierarchy.
+fn cgroup_label(cg: &str) -> String {
+    let parts: Vec<&str> = cg.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    match parts.as_slice() {
+        [] => String::new(),
+        [only] => only.to_string(),
+        _ => {
+            // Skip leading *.slice levels; keep from the first unit-ish component.
+            let start = parts.iter().position(|s| !s.ends_with(".slice")).unwrap_or(parts.len() - 1);
+            trunc(&parts[start..].join("/"), 60)
+        }
+    }
+}
+
+fn proc_json_in(snap: &Snapshot, containers: &[crate::model::Container], p: &Proc, cmd_len: usize) -> Value {
     let parent = snap.proc(p.ppid).map(|pp| pp.name.as_str()).unwrap_or("");
     let mut v = json!({
         "pid": p.pid,
@@ -189,6 +215,14 @@ fn proc_json(snap: &Snapshot, p: &Proc, cmd_len: usize) -> Value {
     if p.status == "T" {
         v["stopped"] = json!(true);
     }
+    if let Some(id) = &p.container {
+        v["ctr"] = json!(crate::fleet::container_label(containers, id));
+    } else if cmd_len > 0 && !p.cgroup.is_empty() {
+        let cg = cgroup_label(&p.cgroup);
+        if !cg.is_empty() && cg != "init.scope" {
+            v["cgroup"] = json!(cg);
+        }
+    }
     v
 }
 
@@ -203,7 +237,10 @@ fn context_with(snap: &Snapshot, findings: &[Finding], scale: usize, cmd_len: us
     let s = &snap.system;
     let lim = |n: usize| (n * scale / 4).max(1);
     let list = |ps: Vec<&Proc>| ps.into_iter().map(|p| proc_json(snap, p, cmd_len)).collect::<Vec<_>>();
-    json!({
+    let ctr_procs = |c: &crate::model::Container| {
+        snap.procs.iter().filter(|p| p.container.as_deref().is_some_and(|id| !c.id.is_empty() && (id.starts_with(&c.id) || c.id.starts_with(id)))).count()
+    };
+    let mut v = json!({
         "host": snap.host,
         "system": {
             "hostname": s.hostname, "os": s.os, "cpu_model": s.cpu_model, "cores": s.cores,
@@ -227,13 +264,35 @@ fn context_with(snap: &Snapshot, findings: &[Finding], scale: usize, cmd_len: us
             "proto": p.proto, "addr": p.addr, "port": p.port, "pid": p.pid, "process": trunc(&p.process, 30),
             "orphan": p.orphan, "note": trunc(&p.note, 80),
         })).collect::<Vec<_>>(),
-        "containers": snap.containers.iter().take(lim(20)).map(|c| json!({
-            "name": c.name, "image": trunc(&c.image, 50), "runtime": c.runtime, "cpu": r1(c.cpu), "mem_mb": mb(c.mem), "status": c.status,
-        })).collect::<Vec<_>>(),
+        "containers": snap.containers.iter().take(lim(20)).map(|c| {
+            let mut cv = json!({
+                "name": c.name, "image": trunc(&c.image, 50), "runtime": c.runtime, "cpu": r1(c.cpu), "mem_mb": mb(c.mem), "status": c.status,
+            });
+            let n = ctr_procs(c);
+            if n > 0 {
+                cv["id"] = json!(c.id);
+                cv["procs"] = json!(n);
+            }
+            cv
+        }).collect::<Vec<_>>(),
         "findings": findings.iter().take(lim(20)).map(|f| json!({
             "severity": f.severity, "title": f.title, "detail": trunc(&f.detail, 300), "pids": f.pids, "action": f.action,
         })).collect::<Vec<_>>(),
-    })
+    });
+    // Linux-only fields: added only when present so macOS digests stay as they were.
+    if let Some(psi) = &s.psi {
+        v["system"]["psi"] = json!({
+            "cpu_some": r1(psi.cpu_some), "mem_some": r1(psi.mem_some), "mem_full": r1(psi.mem_full),
+            "io_some": r1(psi.io_some), "io_full": r1(psi.io_full),
+        });
+    }
+    if let Some(t) = s.temp_c {
+        v["system"]["temp_c"] = json!(r1(t));
+    }
+    if !s.power_source.is_empty() {
+        v["system"]["power_source"] = json!(s.power_source);
+    }
+    v
 }
 
 /// Compact JSON digest of the snapshot, kept under ~20KB by shrinking lists if needed.
@@ -258,6 +317,7 @@ pub(crate) enum Topic {
     Ports,
     Disk,
     Network,
+    Containers,
 }
 
 pub(crate) fn topics(question: &str) -> Vec<Topic> {
@@ -282,6 +342,9 @@ pub(crate) fn topics(question: &str) -> Vec<Topic> {
     }
     if has(&["network", "net", "bandwidth", "upload", "download", "traffic", "internet"]) {
         t.push(Topic::Network);
+    }
+    if has(&["container", "docker", "podman", "pod", "k8s", "kubernetes", "cgroup", "compose", "nerdctl"]) {
+        t.push(Topic::Containers);
     }
     t
 }
@@ -331,10 +394,18 @@ pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding]) -> 
     for t in &topics {
         match t {
             Topic::Cpu => {
+                let thermal = match s.temp_c {
+                    Some(t) if s.thermal.is_empty() || s.thermal == "unknown" => format!("{t:.0}°C"),
+                    Some(t) => format!("{} ({t:.0}°C)", s.thermal),
+                    None => or_unknown(&s.thermal).to_string(),
+                };
                 out.push(format!(
-                    "CPU {:.0}% across {} cores, load {:.2} {:.2} {:.2}, thermal {}.",
-                    s.cpu, s.cores, s.load[0], s.load[1], s.load[2], or_unknown(&s.thermal)
+                    "CPU {:.0}% across {} cores, load {:.2} {:.2} {:.2}, thermal {thermal}.",
+                    s.cpu, s.cores, s.load[0], s.load[1], s.load[2]
                 ));
+                if let Some(psi) = &s.psi {
+                    out.push(format!("CPU pressure: tasks waited for a CPU {:.1}% of the last 10s{}.", psi.cpu_some, stall_hint(psi.cpu_some)));
+                }
                 push_top(&mut out, "Top CPU:", top_by(snap, 5, |p| p.cpu as f64), |p| format!("{:.1}% cpu", p.cpu));
             }
             Topic::Power => {
@@ -343,7 +414,12 @@ pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding]) -> 
                     (Some(pct), _) => format!("battery {pct:.0}% (plugged in)"),
                     _ => "battery unknown".to_string(),
                 };
-                out.push(format!("Estimated process power {:.1} W, {batt}.", s.power_mw / 1000.0));
+                let what = match s.power_source.as_str() {
+                    "rapl" => "Measured CPU package power (RAPL)",
+                    "estimate" => "Estimated power (CPU-time model)",
+                    _ => "Estimated process power",
+                };
+                out.push(format!("{what} {:.1} W, {batt}.", s.power_mw / 1000.0));
                 push_top(&mut out, "Top power:", top_by(snap, 5, |p| p.power_mw as f64), |p| {
                     format!("{:.0} mW, {:.1}% cpu", p.power_mw, p.cpu)
                 });
@@ -357,6 +433,14 @@ pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding]) -> 
                     human(s.swap_total),
                     or_unknown(&s.mem_pressure)
                 ));
+                if let Some(psi) = &s.psi {
+                    out.push(format!(
+                        "Memory pressure: some tasks stalled {:.1}%, all tasks stalled {:.1}% of the last 10s{}.",
+                        psi.mem_some,
+                        psi.mem_full,
+                        stall_hint(psi.mem_some.max(psi.mem_full * 4.0))
+                    ));
+                }
                 push_top(&mut out, "Top memory:", top_by(snap, 5, |p| p.mem as f64), |p| format!("{} rss", human(p.mem)));
             }
             Topic::Ports => {
@@ -376,6 +460,9 @@ pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding]) -> 
             }
             Topic::Disk => {
                 out.push(format!("Disk read {}/s, write {}/s.", human(s.disk_read_bps), human(s.disk_write_bps)));
+                if let Some(psi) = &s.psi {
+                    out.push(format!("IO pressure: some tasks waited on io {:.1}%, all {:.1}% of the last 10s{}.", psi.io_some, psi.io_full, stall_hint(psi.io_some)));
+                }
                 push_top(&mut out, "Top disk:", top_by(snap, 5, |p| (p.disk_read_bps + p.disk_write_bps) as f64), |p| {
                     format!("r {}/s w {}/s", human(p.disk_read_bps), human(p.disk_write_bps))
                 });
@@ -386,6 +473,7 @@ pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding]) -> 
                     format!("in {}/s out {}/s", human(p.net_rx_bps), human(p.net_tx_bps))
                 });
             }
+            Topic::Containers => container_section(&mut out, snap),
         }
         out.push(String::new());
     }
@@ -398,6 +486,51 @@ pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding]) -> 
     }
     out.push(KEY_HINT.to_string());
     out.join("\n")
+}
+
+fn stall_hint(pct: f32) -> &'static str {
+    if pct >= 20.0 {
+        " — heavy contention"
+    } else if pct >= 5.0 {
+        " — noticeable contention"
+    } else {
+        ""
+    }
+}
+
+/// Containers and the host processes attributed to each (Linux cgroups).
+fn container_section(out: &mut Vec<String>, snap: &Snapshot) {
+    use std::collections::BTreeMap;
+    let mut by_ctr: BTreeMap<String, (f32, u64, usize)> = BTreeMap::new();
+    for p in &snap.procs {
+        if let Some(id) = &p.container {
+            let e = by_ctr.entry(crate::fleet::container_label(&snap.containers, id)).or_default();
+            e.0 += p.cpu;
+            e.1 += p.mem;
+            e.2 += 1;
+        }
+    }
+    if snap.containers.is_empty() && by_ctr.is_empty() {
+        out.push("No containers found (no reachable docker / podman / nerdctl, and no process in a container cgroup).".into());
+        return;
+    }
+    if !snap.containers.is_empty() {
+        out.push(format!("{} running containers:", snap.containers.len()));
+        let mut cs: Vec<_> = snap.containers.iter().collect();
+        cs.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
+        for c in cs.iter().take(10) {
+            out.push(format!("  {:<24} {:>6.1}% cpu {:>8}  {} ({})", trunc(&c.name, 24), c.cpu, human(c.mem), trunc(&c.image, 40), c.runtime));
+        }
+    }
+    if !by_ctr.is_empty() {
+        let mut v: Vec<_> = by_ctr.into_iter().collect();
+        v.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        out.push("Host processes by container:".into());
+        for (name, (cpu, mem, n)) in v.iter().take(10) {
+            out.push(format!("  {:<24} {:>6.1}% cpu {:>8}  {n} procs", trunc(name, 24), cpu, human(*mem)));
+        }
+        out.push(format!("  → `fat snapshot --json` lists them; in the TUI type /{} to filter", v[0].0));
+    }
 }
 
 fn or_unknown(s: &str) -> &str {
@@ -489,6 +622,68 @@ mod tests {
         }
         let many: Vec<Finding> = (0..50).map(|_| Finding { detail: "z".repeat(400), ..findings()[0].clone() }).collect();
         assert!(build_context(&s, &many).len() <= MAX_CONTEXT_BYTES);
+    }
+
+    fn linux_snap() -> Snapshot {
+        let mut s = snap();
+        s.system.os = "Ubuntu 24.04".into();
+        s.system.psi = Some(crate::model::Psi { cpu_some: 23.0, mem_some: 1.0, mem_full: 0.5, io_some: 7.0, io_full: 2.0 });
+        s.system.temp_c = Some(81.0);
+        s.system.thermal = String::new();
+        s.system.power_source = "rapl".into();
+        s.system.power_mw = 61_000.0;
+        s.procs[1].cgroup = "/system.slice/docker-410892b21be2ffda.scope".into();
+        s.procs[1].container = Some("410892b21be2".into());
+        s.procs[2].cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/code.scope".into();
+        s.containers = vec![crate::model::Container { id: "410892b21be2".into(), name: "api-1".into(), image: "node:22".into(), runtime: "docker".into(), cpu: 180.0, ..Default::default() }];
+        s
+    }
+
+    #[test]
+    fn context_carries_linux_fields_compactly() {
+        let ctx = build_context(&linux_snap(), &findings());
+        let v: Value = serde_json::from_str(&ctx).unwrap();
+        assert_eq!(v["system"]["psi"]["cpu_some"], 23.0);
+        assert_eq!(v["system"]["temp_c"], 81.0);
+        assert_eq!(v["system"]["power_source"], "rapl");
+        assert_eq!(v["top_cpu"][0]["ctr"], "api-1");
+        assert!(v["top_cpu"][0].get("cgroup").is_none(), "container procs skip the long cgroup");
+        let w = v["top_cpu"].as_array().unwrap().iter().find(|p| p["pid"] == 1000).cloned();
+        // worker0 has cpu 0 so it is not in top_cpu; check top_mem instead
+        let w = w.or_else(|| v["top_mem"].as_array().unwrap().iter().find(|p| p["pid"] == 1000).cloned());
+        if let Some(w) = w {
+            assert_eq!(w["cgroup"], "user@1000.service/app.slice/code.scope");
+        }
+        assert_eq!(v["containers"][0]["procs"], 1);
+        // macOS digest is unchanged: no Linux keys
+        let m: Value = serde_json::from_str(&build_context(&snap(), &findings())).unwrap();
+        assert!(m["system"].get("psi").is_none() && m["system"].get("temp_c").is_none() && m["system"].get("power_source").is_none());
+        assert!(m["top_cpu"][0].get("ctr").is_none() && m["top_cpu"][0].get("cgroup").is_none());
+    }
+
+    #[test]
+    fn cgroup_labels() {
+        assert_eq!(cgroup_label("/system.slice/nginx.service"), "nginx.service");
+        assert_eq!(cgroup_label("/user.slice/user-1000.slice/session-3.scope"), "session-3.scope");
+        assert_eq!(cgroup_label("/init.scope"), "init.scope");
+        assert_eq!(cgroup_label("/"), "");
+        assert_eq!(cgroup_label("/a.slice/b.slice"), "b.slice");
+    }
+
+    #[test]
+    fn offline_linux_answers_use_psi_and_containers() {
+        let s = linux_snap();
+        let a = offline_answer("why is the cpu so slow", &s, &[]);
+        assert!(a.contains("CPU pressure") && a.contains("23.0%") && a.contains("heavy contention"), "{a}");
+        assert!(a.contains("81°C"), "{a}");
+        let a = offline_answer("battery power?", &s, &[]);
+        assert!(a.contains("RAPL") && a.contains("61.0 W"), "{a}");
+        let a = offline_answer("which docker container is busy", &s, &[]);
+        assert!(a.contains("api-1") && a.contains("Host processes by container"), "{a}");
+        assert!(topics("is a pod hogging io").contains(&Topic::Containers));
+        // macOS answers keep their wording
+        let m = offline_answer("battery power?", &snap(), &[]);
+        assert!(m.contains("Estimated process power") && !m.contains("pressure:"));
     }
 
     #[test]
