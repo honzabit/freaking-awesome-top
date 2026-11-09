@@ -101,11 +101,15 @@ struct Entry {
     /// Ids this record undid or made moot (an undo, a resume, a kill of a paused process).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     resolves: Vec<u64>,
+    /// Renice on Linux: nice is per thread, so the previous value of every thread
+    /// (tid, nice) we changed, for undo to restore each one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    thread_nice: Vec<(u32, i32)>,
 }
 
 impl Entry {
     fn new(rec: ActionRecord, start_time: Option<u64>) -> Entry {
-        Entry { rec, start_time, resolves: Vec::new() }
+        Entry { rec, start_time, resolves: Vec::new(), thread_nice: Vec::new() }
     }
 }
 
@@ -211,11 +215,12 @@ impl Actions {
         let mut rec = blank(kind, pid, &name);
         let start_time = live.as_ref().map(|l| l.start_time);
         let mut resolves = Vec::new();
+        let mut thread_nice = Vec::new();
 
         match check_target(kind, pid, live.as_ref(), snap, expect) {
             Err(msg) => rec.message = msg,
             Ok(warning) => {
-                execute(&mut rec, kind, pid, nice, snap);
+                thread_nice = execute(&mut rec, kind, pid, nice, snap);
                 if rec.ok {
                     resolves = self.close_pauses(kind, &rec, start_time);
                     if !resolves.is_empty() {
@@ -230,6 +235,7 @@ impl Actions {
         }
         let mut entry = Entry::new(rec, start_time);
         entry.resolves = resolves;
+        entry.thread_nice = thread_nice;
         self.write(entry, journal)
     }
 
@@ -317,7 +323,11 @@ impl Actions {
                     Ok(cur) => {
                         rec.prev_nice = Some(cur);
                         rec.new_nice = Some(prev);
-                        match set_nice(o.pid, prev) {
+                        #[cfg(target_os = "linux")]
+                        let res = restore_thread_nices(o.pid, prev, &orig.thread_nice);
+                        #[cfg(not(target_os = "linux"))]
+                        let res = set_nice(o.pid, prev);
+                        match res {
                             Ok(()) => {
                                 rec.ok = true;
                                 rec.pids = vec![o.pid];
@@ -585,7 +595,11 @@ fn check_target(
 
 // ---- execution ----
 
-fn execute(rec: &mut ActionRecord, kind: ActionKind, pid: u32, nice: Option<i32>, snap: &Snapshot) {
+/// Returns, for a renice, the previous nice of each thread changed (Linux; empty otherwise).
+fn execute(rec: &mut ActionRecord, kind: ActionKind, pid: u32, nice: Option<i32>, snap: &Snapshot) -> Vec<(u32, i32)> {
+    if kind == ActionKind::Renice {
+        return renice(rec, pid, nice);
+    }
     match kind {
         ActionKind::Pause => signal_one(rec, pid, libc::SIGSTOP, "paused (SIGSTOP)", true),
         ActionKind::Resume => resume(rec, pid, snap),
@@ -596,9 +610,10 @@ fn execute(rec: &mut ActionRecord, kind: ActionKind, pid: u32, nice: Option<i32>
             }
         }
         ActionKind::Kill => signal_one(rec, pid, libc::SIGKILL, "sent SIGKILL", false),
-        ActionKind::Renice => renice(rec, pid, nice),
+        ActionKind::Renice => {}
         ActionKind::KillTree => kill_tree(rec, pid, snap),
     }
+    Vec::new()
 }
 
 /// A stopped process keeps TERM pending until continued; continue it so the signal lands.
@@ -656,25 +671,28 @@ fn resume(rec: &mut ActionRecord, pid: u32, snap: &Snapshot) {
     }
 }
 
-fn renice(rec: &mut ActionRecord, pid: u32, nice: Option<i32>) {
+fn renice(rec: &mut ActionRecord, pid: u32, nice: Option<i32>) -> Vec<(u32, i32)> {
     let Some(new) = nice else {
         rec.message = "renice needs a nice value (-20..20)".into();
-        return;
+        return Vec::new();
     };
     let new = new.clamp(-20, 20);
     let prev = match get_nice(pid) {
         Ok(p) => p,
         Err(e) => {
             rec.message = e;
-            return;
+            return Vec::new();
         }
     };
+    // Linux: every thread's own nice (they can differ); elsewhere empty.
+    let threads = thread_nices(pid);
+    let lowest = threads.iter().map(|&(_, n)| n).chain(std::iter::once(prev)).min().unwrap_or(prev);
     rec.prev_nice = Some(prev);
     rec.new_nice = Some(new);
     let root = nice_privileged();
     if new < prev && !root && !can_lower_nice_to(new) {
         rec.message = lower_nice_refusal(pid, prev, new);
-        return;
+        return Vec::new();
     }
     match set_nice(pid, new) {
         Ok(()) => {
@@ -682,14 +700,95 @@ fn renice(rec: &mut ActionRecord, pid: u32, nice: Option<i32>) {
             rec.pids = vec![pid];
             // Restoring a lower nice value later needs root unless we are root (or, on Linux,
             // RLIMIT_NICE / CAP_SYS_NICE allow going back down to it).
-            rec.undoable = root || new <= prev || can_lower_nice_to(prev);
+            rec.undoable = root || new <= lowest || can_lower_nice_to(lowest);
+            let scope = if threads.len() > 1 { format!(" ({} threads)", threads.len()) } else { String::new() };
             rec.message = if rec.undoable {
-                format!("nice {prev} -> {new}")
+                format!("nice {prev} -> {new}{scope}")
             } else {
-                format!("nice {prev} -> {new} (undo needs {}: lowering nice is privileged)", if cfg!(target_os = "linux") { "CAP_SYS_NICE (root)" } else { "root" })
+                format!("nice {prev} -> {new}{scope} (undo needs {}: lowering nice is privileged)", if cfg!(target_os = "linux") { "CAP_SYS_NICE (root)" } else { "root" })
             };
         }
-        Err(e) => rec.message = e,
+        Err(e) => {
+            // The main thread changed but some others did not: report it as a partial
+            // success (still undoable) instead of claiming nothing happened.
+            if e.starts_with("partial:") && get_nice(pid) == Ok(new) {
+                rec.ok = true;
+                rec.pids = vec![pid];
+                rec.undoable = root || new <= lowest || can_lower_nice_to(lowest);
+                rec.message = format!("nice {prev} -> {new} ({e})");
+            } else {
+                rec.message = e;
+            }
+        }
+    }
+    threads
+}
+
+/// The (tid, nice) of every thread of `pid`. Linux only: nice is a per-thread attribute there
+/// and setpriority(PRIO_PROCESS, pid) changes only the thread whose tid == pid.
+#[cfg(target_os = "linux")]
+fn thread_nices(pid: u32) -> Vec<(u32, i32)> {
+    let mut v: Vec<(u32, i32)> = list_tids(pid).into_iter().filter_map(|t| get_nice(t).ok().map(|n| (t, n))).collect();
+    v.sort_unstable();
+    v
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_nices(_pid: u32) -> Vec<(u32, i32)> {
+    Vec::new()
+}
+
+/// Thread ids of `pid` from /proc/<pid>/task (always includes `pid` itself while it lives).
+#[cfg(target_os = "linux")]
+fn list_tids(pid: u32) -> Vec<u32> {
+    let mut v: Vec<u32> = fs::read_dir(format!("/proc/{pid}/task"))
+        .map(|d| d.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect())
+        .unwrap_or_default();
+    if !v.contains(&pid) {
+        v.push(pid);
+    }
+    v
+}
+
+/// Set one task's nice (a thread on Linux, the whole process on macOS).
+fn set_nice_one(id: u32, nice: i32) -> Result<(), i32> {
+    // SAFETY: setpriority has no memory preconditions.
+    let r = unsafe { libc::setpriority(libc::PRIO_PROCESS, id as libc::id_t, nice) };
+    if r == 0 { Ok(()) } else { Err(errno()) }
+}
+
+fn nice_error(e: i32, pid: u32, nice: i32) -> String {
+    if e == libc::EACCES || e == libc::EPERM {
+        format!("pid {pid}: setting nice {nice} requires root")
+    } else {
+        describe_errno(e, pid)
+    }
+}
+
+/// Restore each thread to its recorded nice (Linux undo). Threads that exited are skipped;
+/// threads created since the renice get the main thread's previous value.
+#[cfg(target_os = "linux")]
+fn restore_thread_nices(pid: u32, prev_main: i32, saved: &[(u32, i32)]) -> Result<(), String> {
+    let tids = list_tids(pid);
+    let mut failed = Vec::new();
+    let mut last_err = 0;
+    // Main thread first: if it fails, nothing else is attempted.
+    set_nice_one(pid, prev_main).map_err(|e| nice_error(e, pid, prev_main))?;
+    for &t in tids.iter().filter(|&&t| t != pid) {
+        let want = saved.iter().find(|&&(s, _)| s == t).map(|&(_, n)| n).unwrap_or(prev_main);
+        match set_nice_one(t, want) {
+            Ok(()) => {}
+            Err(e) if e == libc::ESRCH => {}
+            Err(e) => {
+                failed.push(t);
+                last_err = e;
+            }
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} of {} threads not restored ({})", failed.len(), tids.len(), nice_error(last_err, pid, prev_main)))
     }
 }
 
@@ -876,19 +975,30 @@ pub fn get_nice(pid: u32) -> Result<i32, String> {
     }
 }
 
+/// Set the nice value of process `pid`. On Linux nice is per thread, so this sets every
+/// thread in /proc/<pid>/task; an error names how many threads could not be changed.
 pub fn set_nice(pid: u32, nice: i32) -> Result<(), String> {
-    // SAFETY: setpriority has no memory preconditions.
-    let r = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice) };
-    if r == 0 {
-        Ok(())
-    } else {
-        let e = errno();
-        if e == libc::EACCES || e == libc::EPERM {
-            Err(format!("pid {pid}: setting nice {nice} requires root"))
-        } else {
-            Err(describe_errno(e, pid))
+    set_nice_one(pid, nice).map_err(|e| nice_error(e, pid, nice))?;
+    #[cfg(target_os = "linux")]
+    {
+        let tids = list_tids(pid);
+        let mut failed = 0;
+        let mut last = 0;
+        for &t in tids.iter().filter(|&&t| t != pid) {
+            match set_nice_one(t, nice) {
+                Ok(()) => {}
+                Err(e) if e == libc::ESRCH => {} // thread exited meanwhile
+                Err(e) => {
+                    failed += 1;
+                    last = e;
+                }
+            }
+        }
+        if failed > 0 {
+            return Err(format!("partial: {failed} of {} threads not changed ({})", tids.len(), nice_error(last, pid, nice)));
         }
     }
+    Ok(())
 }
 
 /// Read live process info straight from the kernel.
@@ -1494,6 +1604,40 @@ mod tests {
             assert!(kernel_thread_refusal(kt.pid, &kt.name).is_err());
         }
         assert!(kernel_thread_refusal(pid, "sleep").is_ok());
+    }
+
+    /// Linux nice is per thread: renice must reach every thread, and undo must restore each.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_renice_reaches_every_thread() {
+        let script = "import threading,time\nfor _ in range(3): threading.Thread(target=time.sleep,args=(300,),daemon=True).start()\ntime.sleep(300)";
+        let Ok(child) = Command::new("python3").args(["-c", script]).spawn() else { return };
+        let kid = Kid(child);
+        let pid = kid.0.id();
+        let t0 = std::time::Instant::now();
+        while list_tids(pid).len() < 4 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(list_tids(pid).len() >= 4, "threads did not start");
+        let snap = snap_with(pid);
+        let path = tmp_journal("tnice");
+        let mut a = Actions::open_at(&path);
+        let before = get_nice(pid).unwrap();
+        let target = (before + 7).min(19);
+        let r = a.apply(ActionKind::Renice, pid, Some(target), &snap);
+        assert!(r.ok, "{r:?}");
+        assert!(r.message.contains("threads"), "{}", r.message);
+        for (t, n) in thread_nices(pid) {
+            assert_eq!(n, target, "thread {t} kept its nice");
+        }
+        if r.undoable {
+            let u = a.undo(r.id);
+            assert!(u.ok, "{u:?}");
+            for (t, n) in thread_nices(pid) {
+                assert_eq!(n, before, "thread {t} not restored");
+            }
+        }
+        let _ = fs::remove_file(&path);
     }
 
     #[cfg(target_os = "linux")]

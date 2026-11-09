@@ -26,6 +26,8 @@ const WAIT_SLICE: Duration = Duration::from_millis(50);
 const KILL_GRACE: Duration = Duration::from_secs(3);
 /// Consecutive over-budget CPU samples before it counts (filters one-off spikes).
 const CPU_STRIKES: u32 = 2;
+/// Share of cpu.max periods throttled within one poll that counts as "wants more than its budget".
+const THROTTLED_OVER: f32 = 0.5;
 
 /// Split "1.5g" into (1.5, "g").
 fn split_num(s: &str) -> anyhow::Result<(f64, String)> {
@@ -207,6 +209,9 @@ struct Usage {
     procs: usize,
     /// Every tracked member is stopped (the whole job is frozen).
     stopped: bool,
+    /// Linux cgroup with cpu.max: share of scheduler periods in which the job was throttled
+    /// (it wanted more than its quota). Always 0 when polling.
+    throttled: f32,
 }
 
 /// One tracked process of the job.
@@ -411,6 +416,12 @@ impl Tracker {
         u
     }
 
+    /// Every tracked member.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn pids(&self) -> Vec<u32> {
+        self.members.keys().copied().collect()
+    }
+
     /// Members that left the job's process group (setsid, `set -m`, daemonizing tools):
     /// `kill(-pgid)` doesn't reach them, so they're signalled one by one.
     fn escaped(&self) -> Vec<(u32, u64)> {
@@ -466,10 +477,18 @@ impl Kind {
 fn violations(b: &Budget, u: &Usage, elapsed: Duration, cpu_strikes: &mut u32) -> Vec<(Kind, String)> {
     let mut v = Vec::new();
     if let Some(lim) = b.cpu {
-        if u.cpu > lim {
+        // Under cpu.max the job can't measure "over": it is held at the quota. Being throttled
+        // in most periods while running at (about) the quota means it wants more than that.
+        let held = u.throttled >= THROTTLED_OVER && u.cpu >= lim * 0.8;
+        if u.cpu > lim || held {
             *cpu_strikes += 1;
             if *cpu_strikes >= CPU_STRIKES {
-                v.push((Kind::Cpu, format!("cpu {:.0}% > budget {:.0}%", u.cpu, lim)));
+                let why = if u.cpu > lim {
+                    format!("cpu {:.0}% > budget {:.0}%", u.cpu, lim)
+                } else {
+                    format!("cpu demand > budget {:.0}% (held at {:.0}% by cpu.max, throttled in {:.0}% of periods)", lim, u.cpu, u.throttled * 100.0)
+                };
+                v.push((Kind::Cpu, why));
             }
         } else {
             *cpu_strikes = 0;
@@ -607,7 +626,8 @@ fn supervise(cmd: &[String], budget: &Budget, enforce: Mode) -> anyhow::Result<R
     let pid = child.id();
     // We reap the child ourselves with waitpid(WUNTRACED) to see job-control stops.
     drop(child);
-    kernel.attach(pid, budget);
+    // May re-spawn the command directly when a wrapper (systemd-run) failed before running it.
+    let pid = kernel.attach(pid, budget, prog, args)?;
     let pgid = pid as i32;
     CHILD_PGID.store(pgid, Ordering::SeqCst);
     FORWARDED.store(0, Ordering::SeqCst);
@@ -630,8 +650,7 @@ fn supervise(cmd: &[String], budget: &Budget, enforce: Mode) -> anyhow::Result<R
     let mut tracker = Tracker::new(pid, pgid);
     tracker.sample(&sampler.table(), &kernel.members());
     let mut cpu_ref = Usage::default();
-    kernel.sample(&mut cpu_ref);
-    let limits = kernel.effective(budget);
+    kernel.sample(&mut cpu_ref, &tracker.pids());
 
     let mut peak = Usage::default();
     let mut fired: Vec<Kind> = Vec::new();
@@ -716,7 +735,10 @@ fn supervise(cmd: &[String], budget: &Budget, enforce: Mode) -> anyhow::Result<R
         }
         next_sample = Instant::now() + POLL;
         let mut u = tracker.sample(&sampler.table(), &kernel.members());
-        if let Some(n) = kernel.sample(&mut u) {
+        let oom = kernel.sample(&mut u, &tracker.pids());
+        // Members can leave the job's cgroup (a nested systemd-run --scope): polling takes over.
+        let limits = kernel.effective(budget);
+        if let Some(n) = oom {
             let lim = budget.mem.map(fmt_bytes).unwrap_or_default();
             eprintln!("fat run: budget exceeded: mem > budget {lim}; the kernel OOM-killed inside the job ({n} oom_kill event(s), memory.max)");
             if !fired.contains(&Kind::Mem) {
@@ -803,7 +825,7 @@ fn supervise(cmd: &[String], budget: &Budget, enforce: Mode) -> anyhow::Result<R
     if status.signal() == Some(libc::SIGKILL) && !killed_hard {
         kernel.sigkilled();
     }
-    if let Some(n) = kernel.sample(&mut Usage::default()) {
+    if let Some(n) = kernel.sample(&mut Usage::default(), &[]) {
         let lim = budget.mem.map(fmt_bytes).unwrap_or_default();
         eprintln!("fat run: budget exceeded: mem > budget {lim}; the kernel OOM-killed inside the job ({n} oom_kill event(s), memory.max)");
         if !fired.contains(&Kind::Mem) {
@@ -849,11 +871,13 @@ impl Kernel {
         c.args(args).process_group(0);
         Ok(c)
     }
-    fn attach(&mut self, _pid: u32, _b: &Budget) {}
+    fn attach(&mut self, pid: u32, _b: &Budget, _prog: &str, _args: &[String]) -> anyhow::Result<u32> {
+        Ok(pid)
+    }
     fn members(&self) -> Vec<u32> {
         Vec::new()
     }
-    fn sample(&mut self, _u: &mut Usage) -> Option<u64> {
+    fn sample(&mut self, _u: &mut Usage, _tracked: &[u32]) -> Option<u64> {
         None
     }
     fn effective(&self, b: &Budget) -> Budget {
@@ -867,17 +891,32 @@ impl Kernel {
     }
 }
 
-/// Linux: the job runs in its own cgroup v2 when we can get one, and the kernel enforces cpu
-/// (cpu.max: the job is throttled, never over budget) and memory (memory.max: the kernel
-/// reclaims, then OOM-kills inside the job only). Ways to get a cgroup, in order:
-/// 1. root (or a writable cgroup root): /sys/fs/cgroup/fat.slice/run-<fatpid>-<n>, the child
-///    moving itself in from `pre_exec` so not a single instruction of the job runs outside it;
+/// Linux: the job runs in its own cgroup v2 when we can get one, and the kernel backs the
+/// budget so a fork bomb or a sudden allocation can't outrun the poll:
+/// - cpu: cpu.max holds the job at its quota; a job throttled in most periods "wants more" and
+///   that is still a cpu violation (so pause/kill fire as on macOS, warn only reports);
+/// - memory, policy kill: memory.max at the budget (the kernel reclaims, then OOM-kills the
+///   whole job with memory.oom.group);
+/// - memory, policy pause: memory.high a little above the budget (throttle and reclaim, never
+///   kill) and memory.max well above it only as a backstop, while the poll pauses the job on
+///   the breach, keeping the pause reversible;
+/// - procs: pids.max as a generous fork-bomb backstop (it counts threads); the exact process
+///   count is polled.
+///
+/// Ways to get a cgroup, in order:
+/// 1. root (or a writable cgroup root): /sys/fs/cgroup/fat.slice/run-<fatpid>-<random>, the
+///    child moving itself in from `pre_exec` so not a single instruction of the job runs outside it;
 /// 2. a systemd scope (`systemd-run --user --scope -p CPUQuota=.. -p MemoryMax=..`, or the
 ///    system manager when root), which is how an unprivileged user gets a delegated cgroup;
 /// 3. none: polling enforces everything, as on macOS.
 ///
+/// Neither is used when fat itself runs in a cgroup with limits (inside another `fat run`, or a
+/// container with --memory/--cpus) that the new cgroup would not be under: the job stays where
+/// fat is, bound by those limits, and this budget is polled.
+///
 /// Polling always runs too: it reports (with exact cgroup cpu/memory numbers when in one), and
-/// enforces the wall-time and process-count budgets and whatever the kernel couldn't take.
+/// enforces the wall-time and process-count budgets and whatever the kernel couldn't take,
+/// including for members that leave the job's cgroup.
 #[cfg(target_os = "linux")]
 struct Kernel {
     job: Option<cgroup::Job>,
@@ -885,13 +924,15 @@ struct Kernel {
     why_not: String,
     /// Any budget at all, i.e. whether to announce the mechanism.
     announce: bool,
+    /// Some tracked member is outside the job's cgroup: the kernel limits don't cover it.
+    escaped: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl Kernel {
     fn prepare(b: &Budget, policy: &str, mode: Mode) -> anyhow::Result<Kernel> {
         let announce = b.cpu.is_some() || b.mem.is_some() || b.time.is_some() || b.procs.is_some();
-        let wants_cgroup = b.cpu.is_some() || b.mem.is_some();
+        let wants_cgroup = b.cpu.is_some() || b.mem.is_some() || b.procs.is_some();
         let (job, why_not) = match mode {
             Mode::Poll => (None, "FAT_BUDGET_MODE=poll".to_string()),
             Mode::Auto if !wants_cgroup => (None, String::new()),
@@ -899,9 +940,12 @@ impl Kernel {
                 let want = cgroup::Want {
                     cpu_pct: b.cpu,
                     mem: b.mem,
+                    procs: b.procs,
                     // warn means "tell me", not "stop me": measure in a cgroup, don't limit.
                     limits: policy != "warn",
                     oom_group: policy == "kill",
+                    // pause must stay reversible: no memory.max OOM kill at the budget.
+                    mem_soft: policy == "pause",
                 };
                 match cgroup::Job::create(want) {
                     Ok(j) => (Some(j), String::new()),
@@ -910,7 +954,7 @@ impl Kernel {
                 }
             }
         };
-        Ok(Kernel { job, why_not, announce })
+        Ok(Kernel { job, why_not, announce, escaped: false })
     }
 
     fn command(&self, prog: &str, args: &[String]) -> anyhow::Result<Command> {
@@ -924,15 +968,28 @@ impl Kernel {
         }
     }
 
-    fn attach(&mut self, pid: u32, b: &Budget) {
+    /// Confirm the job is in its cgroup. If systemd-run failed before it ran the command (a
+    /// D-Bus error, a rejected property, a unit name in use), the command is started directly
+    /// and polled instead; returns the pid to supervise.
+    fn attach(&mut self, pid: u32, b: &Budget, prog: &str, args: &[String]) -> anyhow::Result<u32> {
+        let mut pid = pid;
         if let Some(j) = &mut self.job
             && let Err(e) = j.attach(pid)
         {
             self.why_not = format!("cgroup v2 setup failed: {e}");
+            let wrapper = j.is_systemd();
             self.job = None; // dropping removes the directory we made
+            if wrapper && let Some(st) = cgroup::reap_failed_wrapper(pid, prog) {
+                eprintln!("fat run: systemd-run failed ({st}) before starting {prog:?}; starting it directly");
+                let mut c = Command::new(prog);
+                c.args(args).process_group(0);
+                let child = c.spawn().with_context(|| format!("failed to start {prog:?}"))?;
+                pid = child.id();
+                drop(child);
+            }
         }
         if !self.announce {
-            return;
+            return Ok(pid);
         }
         let pct = |p: f32| format!("{p:.0}%");
         match &self.job {
@@ -943,17 +1000,27 @@ impl Kernel {
                     if j.cpu_enforced { kern.push(format!("cpu {} (cpu.max {})", pct(c), cgroup::cpu_max(c))) } else { poll.push("cpu") }
                 }
                 if let Some(m) = b.mem {
-                    if j.mem_enforced { kern.push(format!("mem {} (memory.max)", fmt_bytes(m))) } else { poll.push("mem") }
+                    match (j.mem_enforced, j.want.mem_soft) {
+                        (true, true) => {
+                            let (high, max) = cgroup::soft_mem(m);
+                            kern.push(format!("mem {} (memory.high {}, memory.max backstop {}; pause on breach)", fmt_bytes(m), fmt_bytes(high), fmt_bytes(max)))
+                        }
+                        (true, false) => kern.push(format!("mem {} (memory.max)", fmt_bytes(m))),
+                        _ => poll.push("mem"),
+                    }
                 }
                 if b.time.is_some() {
                     poll.push("time");
                 }
-                if b.procs.is_some() {
+                if let Some(p) = b.procs {
+                    if j.pids_enforced {
+                        kern.push(format!("tasks <= {} (pids.max backstop)", cgroup::pids_max(p)));
+                    }
                     poll.push("procs");
                 }
                 let poll = if poll.is_empty() { String::new() } else { format!("; polling: {}", poll.join(", ")) };
                 if kern.is_empty() {
-                    let why = if j.want.limits { "the cpu/memory controllers aren't delegated here" } else { "warn only, no kernel limits" };
+                    let why = if j.want.limits { "the cpu/memory/pids controllers aren't delegated here" } else { "warn only, no kernel limits" };
                     eprintln!("fat run: measuring via cgroup v2 ({}, {why}){poll}", j.describe());
                 } else {
                     eprintln!("fat run: enforcing via cgroup v2 (kernel, {}): {}{poll}", j.describe(), kern.join(", "));
@@ -964,28 +1031,45 @@ impl Kernel {
                 eprintln!("fat run: enforcing via polling every {}ms{why}", POLL.as_millis());
             }
         }
+        Ok(pid)
     }
 
     fn members(&self) -> Vec<u32> {
         self.job.as_ref().map(|j| j.members()).unwrap_or_default()
     }
 
-    /// Exact cpu from the cgroup's own counter; returns newly seen OOM kills.
-    fn sample(&mut self, u: &mut Usage) -> Option<u64> {
-        self.job.as_mut()?.sample(u)
+    /// Exact cpu/memory from the cgroup's own counters (never lower than polling saw), and
+    /// a check that every tracked member is still inside the cgroup. Returns new OOM kills.
+    fn sample(&mut self, u: &mut Usage, tracked: &[u32]) -> Option<u64> {
+        let j = self.job.as_mut()?;
+        if !self.escaped {
+            let out = j.outside(tracked);
+            if !out.is_empty() {
+                self.escaped = true;
+                let list: Vec<String> = out.iter().take(5).map(|p| p.to_string()).collect();
+                eprintln!(
+                    "fat run: {} process(es) of the job left its cgroup (pid {}; e.g. a nested `fat run` or `systemd-run --scope`); the kernel limits don't cover them, enforcing cpu/mem by polling",
+                    out.len(),
+                    list.join(", ")
+                );
+            }
+        }
+        j.sample(u)
     }
 
     /// The budget polling still enforces: minus what the kernel holds.
     fn effective(&self, b: &Budget) -> Budget {
         let mut e = b.clone();
-        if let Some(j) = &self.job {
-            if j.cpu_enforced {
-                e.cpu = None; // throttled, so it can't be "over"
-            }
-            if j.mem_enforced {
-                e.mem = None; // the kernel reclaims or OOM-kills at memory.max
-            }
+        if let Some(j) = &self.job
+            && !self.escaped
+            && j.mem_enforced
+            && !j.want.mem_soft
+        {
+            // kill: the kernel reclaims or OOM-kills at memory.max. (pause keeps polling: the
+            // breach pauses the job, memory.high only buys the poll time.)
+            e.mem = None;
         }
+        // cpu stays: under cpu.max a throttled job "wants more" (see violations()).
         e
     }
 
@@ -1020,6 +1104,9 @@ impl Kernel {
         if st.mem_peak > 0 {
             parts.push(format!("cgroup mem peak {} (incl. page cache)", fmt_bytes(st.mem_peak)));
         }
+        if self.escaped {
+            parts.push("some processes left the cgroup".to_string());
+        }
         if let Some(d) = st.dir.as_ref().filter(|_| !st.removed && j.owns_dir()) {
             parts.push(format!("{} still has processes; left in place", d.display()));
         }
@@ -1052,10 +1139,99 @@ mod cgroup {
     pub struct Want {
         pub cpu_pct: Option<f32>,
         pub mem: Option<u64>,
-        /// Write cpu.max / memory.max (false: accounting only).
+        pub procs: Option<usize>,
+        /// Write cpu.max / memory.max / pids.max (false: accounting only).
         pub limits: bool,
         /// memory.oom.group=1: an OOM kills the whole job, not just its biggest process.
         pub oom_group: bool,
+        /// Memory as memory.high (throttle, no kill) near the budget plus a memory.max backstop
+        /// well above it, for policies that must stay reversible (pause).
+        pub mem_soft: bool,
+    }
+
+    /// pause: (memory.high, memory.max) for a memory budget. The breach itself is caught by
+    /// the poll (and pauses the job); high sits a little above the budget so the job reaches
+    /// it unthrottled, then slows down hard enough that the poll is never outrun; max is only
+    /// the backstop against runaway allocation.
+    pub fn soft_mem(budget: u64) -> (u64, u64) {
+        let high = budget.saturating_add((budget / 16).max(8 << 20));
+        let max = budget.saturating_add((budget / 4).max(64 << 20));
+        (high, max)
+    }
+
+    /// pids.max for a --procs budget: a backstop against fork bombs, not the budget itself
+    /// (it counts tasks, i.e. threads too, so it gets generous headroom; the poll enforces
+    /// the exact process count).
+    pub fn pids_max(procs: usize) -> u64 {
+        (procs as u64).saturating_mul(16).saturating_add(256)
+    }
+
+    /// A short random hex id, unique across pid namespaces sharing one cgroup tree or one
+    /// systemd user manager (fat's pid alone is not: containers all have small pids).
+    pub fn rand_id() -> String {
+        use std::io::Read;
+        let mut b = [0u8; 6];
+        let ok = fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_ok();
+        if !ok {
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            let x = t ^ ((std::process::id() as u128) << 64) ^ (SEQ.load(Ordering::Relaxed) as u128) << 32;
+            b.copy_from_slice(&x.to_le_bytes()[..6]);
+        }
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// A cgroup directory `fat run` made for a job (root mode or a systemd scope).
+    pub fn is_fat_job(name: &str) -> bool {
+        name.starts_with("run-") || (name.starts_with("fat-run-") && name.ends_with(".scope"))
+    }
+
+    /// The deepest cgroup on `own`'s path (`/a/b/c`, relative to `root`) that carries a limit
+    /// a job made elsewhere would escape: cpu.max, memory.max or memory.high, or pids.max of an
+    /// enclosing fat job. (pids.max elsewhere is ignored: systemd sets TasksMax on every user
+    /// slice, and escaping that would rule out every cgroup.) Returns the path, e.g.
+    /// `/docker/<id>` for `docker run --memory 1g`, or the outer job of a nested `fat run`.
+    pub fn limited_ancestor(root: &Path, own: &str) -> Option<String> {
+        let mut path = own.trim_end_matches('/').to_string();
+        while !path.is_empty() && path != "/" {
+            let dir = root.join(path.trim_start_matches('/'));
+            let name = path.rsplit('/').next().unwrap_or("");
+            let limited = ["cpu.max", "memory.max", "memory.high"].iter().any(|f| limit_in_force(&dir, f))
+                || (is_fat_job(name) && limit_in_force(&dir, "pids.max"));
+            if limited {
+                return Some(path);
+            }
+            path.truncate(path.rfind('/').unwrap_or(0));
+        }
+        None
+    }
+
+    /// `path` is `anc` or below it (cgroup paths, `/`-separated).
+    pub fn under(path: &str, anc: &str) -> bool {
+        let anc = anc.trim_end_matches('/');
+        anc.is_empty() || path == anc || path.strip_prefix(anc).is_some_and(|r| r.starts_with('/'))
+    }
+
+    fn own_cgroup() -> Option<String> {
+        fs::read_to_string("/proc/self/cgroup").ok().and_then(|t| unified_path(&t).map(str::to_string))
+    }
+
+    /// systemd-run (our job's wrapper, `pid`) exited without exec'ing `prog`: reap it and
+    /// return its exit status. None when it ran the command (or may have), so nothing is ever
+    /// started twice.
+    pub fn reap_failed_wrapper(pid: u32, prog: &str) -> Option<String> {
+        let st = crate::actions::procfs::read_stat(Path::new("/proc"), pid)?;
+        let base = Path::new(prog).file_name().and_then(|n| n.to_str()).unwrap_or(prog);
+        // comm is still "systemd-run" only if it never exec'd (comm is cut at 15 bytes).
+        if st.state != 'Z' || st.comm != "systemd-run" || base.starts_with("systemd-run") {
+            return None;
+        }
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid on our own (zombie) child with a valid status out-pointer.
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if r != pid as libc::pid_t {
+            return None;
+        }
+        Some(if libc::WIFEXITED(status) { format!("exit {}", libc::WEXITSTATUS(status)) } else { format!("signal {}", libc::WTERMSIG(status)) })
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1075,7 +1251,10 @@ mod cgroup {
         procs_fd: Option<OwnedFd>,
         pub cpu_enforced: bool,
         pub mem_enforced: bool,
+        pub pids_enforced: bool,
         prev: Option<(u64, Instant)>,
+        /// cpu.stat (nr_periods, nr_throttled) at the previous sample.
+        prev_periods: Option<(u64, u64)>,
         /// Latest counters, cached because a systemd scope's directory disappears the moment
         /// the job's last process exits (before we can read it in finish()).
         nr_throttled: u64,
@@ -1123,6 +1302,50 @@ mod cgroup {
         fs::read_to_string(dir.join(file)).map(|s| !s.trim().is_empty() && !s.trim().starts_with("max")).unwrap_or(false)
     }
 
+    /// Share of cpu.max periods that were throttled (0 when there were none).
+    pub fn throttled_share(periods: u64, throttled: u64) -> f32 {
+        if periods == 0 { 0.0 } else { (throttled.min(periods) as f64 / periods as f64) as f32 }
+    }
+
+    fn procs_of(dir: &Path) -> Vec<u32> {
+        fs::read_to_string(dir.join("cgroup.procs")).unwrap_or_default().lines().filter_map(|l| l.trim().parse().ok()).collect()
+    }
+
+    /// Changes `create_dir` made outside its own run dir: undone when setup fails, so a failed
+    /// attempt leaves the hierarchy exactly as it was.
+    #[derive(Default)]
+    pub struct Undo {
+        /// (dir, controller) we enabled in dir's cgroup.subtree_control.
+        pub enabled: Vec<(PathBuf, String)>,
+        /// Directories we created.
+        pub dirs: Vec<PathBuf>,
+    }
+
+    impl Undo {
+        pub fn revert(&mut self) {
+            // Children first: a controller can't be disabled while a child still uses it.
+            for d in self.dirs.drain(..).rev() {
+                let _ = fs::remove_dir(&d);
+            }
+            for (d, c) in self.enabled.drain(..).rev() {
+                let _ = fs::write(d.join("cgroup.subtree_control"), format!("-{c}"));
+            }
+        }
+    }
+
+    /// [`enable`], recording each controller it turned on in `undo`.
+    pub fn enable_tracked(dir: &Path, wanted: &[&str], undo: &mut Undo) -> Result<(), String> {
+        let before = controllers(dir, "cgroup.subtree_control");
+        let r = enable(dir, wanted);
+        let after = controllers(dir, "cgroup.subtree_control");
+        for c in wanted {
+            if after.contains(*c) && !before.contains(*c) {
+                undo.enabled.push((dir.to_path_buf(), c.to_string()));
+            }
+        }
+        r
+    }
+
     /// Enable `wanted` controllers for `dir`'s children (each separately: one missing
     /// controller must not block the others). Errors only if a wanted one stays off.
     pub fn enable(dir: &Path, wanted: &[&str]) -> Result<(), String> {
@@ -1160,17 +1383,24 @@ mod cgroup {
         std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| exec_ok(&d.join(prog))))
     }
 
-    /// Remove leftover run-<pid>-<n> dirs of fat processes that no longer exist (a fat that was
-    /// SIGKILLed can't clean up). rmdir only succeeds on empty cgroups, so this never disturbs a job.
+    /// A run dir this old and empty is abandoned (its fat was SIGKILLed). Age, not "is the
+    /// owner pid alive": the owner may live in another pid namespace that shares this tree, and
+    /// a live job's dir is only empty for the moment between mkdir and its child moving in.
+    const GC_AGE: Duration = Duration::from_secs(600);
+
+    /// Remove abandoned run-* dirs: unpopulated and older than [`GC_AGE`]. rmdir only succeeds
+    /// on empty cgroups, so this never disturbs a job.
     fn gc(slice: &Path) {
         let Ok(rd) = fs::read_dir(slice) else { return };
         for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let Some(owner) = name.strip_prefix("run-").and_then(|r| r.split('-').next()).and_then(|p| p.parse::<u32>().ok()) else {
+            if !e.file_name().to_string_lossy().starts_with("run-") {
                 continue;
-            };
-            if !Path::new(&format!("/proc/{owner}")).exists() {
-                let _ = fs::remove_dir(e.path());
+            }
+            let p = e.path();
+            let old = fs::metadata(&p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a > GC_AGE);
+            let empty = fs::read_to_string(p.join("cgroup.events")).ok().and_then(|t| kv(&t, "populated")) == Some(0);
+            if old && empty {
+                let _ = fs::remove_dir(&p);
             }
         }
     }
@@ -1180,6 +1410,14 @@ mod cgroup {
             let root = Path::new(ROOT);
             if !root.join("cgroup.controllers").exists() {
                 return Err(anyhow!("no cgroup v2 hierarchy at {ROOT}"));
+            }
+            // A cgroup made elsewhere must not let the job out of limits that bind fat itself.
+            let own = own_cgroup().unwrap_or_default();
+            if let Some(d) = limited_ancestor(root, &own) {
+                let what = if Path::new(&d).file_name().and_then(|n| n.to_str()).is_some_and(is_fat_job) { "another fat run job" } else { "a limited cgroup" };
+                return Err(anyhow!(
+                    "fat runs inside {what} ({d}); a new cgroup would escape its limits, so the job stays there under them"
+                ));
             }
             let mut errs = Vec::new();
             match Job::create_dir(root, want.clone()) {
@@ -1202,7 +1440,13 @@ mod cgroup {
                 unsafe { libc::access(p.as_ptr(), libc::W_OK) == 0 }
             };
             if !writable {
-                return Err(if is_root() { format!("{ROOT} is read-only here") } else { "not root".to_string() });
+                return Err(if is_root() { format!("{} is read-only here", root.display()) } else { "not root".to_string() });
+            }
+            // A cgroup namespace root (a container's /sys/fs/cgroup) that holds processes can't
+            // have domain controllers enabled for children (no-internal-process rule); touching
+            // its subtree_control would only break cgroups others create there later.
+            if root.join("cgroup.type").exists() && !procs_of(root).is_empty() {
+                return Err(format!("{} is a cgroup namespace root that holds processes (a container); not touching it", root.display()));
             }
             let mut ctrls: Vec<&str> = Vec::new();
             if want.cpu_pct.is_some() {
@@ -1211,18 +1455,46 @@ mod cgroup {
             if want.mem.is_some() {
                 ctrls.push("memory");
             }
-            enable(root, &ctrls)?;
+            // pids is a backstop: best effort, its absence doesn't cost the job its cgroup.
+            let opt: &[&str] = if want.procs.is_some() { &["pids"] } else { &[] };
+            // Everything we change outside our own run dir, undone if setup fails.
+            let mut undo = Undo::default();
+            let r = enable_tracked(root, &ctrls, &mut undo);
+            if let Err(e) = r {
+                undo.revert();
+                return Err(e);
+            }
+            let _ = enable_tracked(root, opt, &mut undo);
             let slice = root.join(SLICE);
             match fs::create_dir(&slice) {
-                Ok(()) => {}
+                Ok(()) => undo.dirs.push(slice.clone()),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(format!("mkdir {}: {e}", slice.display())),
+                Err(e) => {
+                    undo.revert();
+                    return Err(format!("mkdir {}: {e}", slice.display()));
+                }
             }
-            enable(&slice, &ctrls)?;
+            if let Err(e) = enable_tracked(&slice, &ctrls, &mut undo) {
+                undo.revert();
+                return Err(e);
+            }
+            let _ = enable_tracked(&slice, opt, &mut undo);
             gc(&slice);
-            let dir = slice.join(format!("run-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
-            let _ = fs::remove_dir(&dir);
-            fs::create_dir(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+            // A fresh, namespace-unique name; an existing dir is never reused or removed.
+            let mut dir = PathBuf::new();
+            let mut made = Err(std::io::Error::other("no attempt"));
+            for _ in 0..8 {
+                dir = slice.join(format!("run-{}-{}", std::process::id(), rand_id()));
+                made = fs::create_dir(&dir);
+                if !matches!(&made, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists) {
+                    break;
+                }
+            }
+            if let Err(e) = made {
+                undo.revert();
+                return Err(format!("mkdir {}: {e}", dir.display()));
+            }
+            SEQ.fetch_add(1, Ordering::Relaxed);
             let mut job = Job {
                 via: Via::Root,
                 want,
@@ -1231,7 +1503,9 @@ mod cgroup {
                 procs_fd: None,
                 cpu_enforced: false,
                 mem_enforced: false,
+                pids_enforced: false,
                 prev: None,
+                prev_periods: None,
                 nr_throttled: 0,
                 throttled_usec: 0,
                 oom_total: 0,
@@ -1241,20 +1515,46 @@ mod cgroup {
                 cleaned: false,
                 killed: false,
             };
-            if job.want.limits {
+            // From here on, failing drops `job`, which removes its (empty) dir.
+            let set = |job: &Job| -> Result<(), String> {
+                if !job.want.limits {
+                    return Ok(());
+                }
                 if let Some(p) = job.want.cpu_pct {
                     fs::write(dir.join("cpu.max"), cpu_max(p)).map_err(|e| format!("cpu.max: {e}"))?;
                 }
                 if let Some(m) = job.want.mem {
-                    fs::write(dir.join("memory.max"), m.to_string()).map_err(|e| format!("memory.max: {e}"))?;
+                    if job.want.mem_soft {
+                        let (high, max) = soft_mem(m);
+                        fs::write(dir.join("memory.max"), max.to_string()).map_err(|e| format!("memory.max: {e}"))?;
+                        fs::write(dir.join("memory.high"), high.to_string()).map_err(|e| format!("memory.high: {e}"))?;
+                    } else {
+                        fs::write(dir.join("memory.max"), m.to_string()).map_err(|e| format!("memory.max: {e}"))?;
+                    }
                     // Without this the job would page out to swap instead of meeting the limit.
                     let _ = fs::write(dir.join("memory.swap.max"), "0");
                     if job.want.oom_group {
                         let _ = fs::write(dir.join("memory.oom.group"), "1");
                     }
                 }
+                if let Some(n) = job.want.procs {
+                    let _ = fs::write(dir.join("pids.max"), pids_max(n).to_string());
+                }
+                Ok(())
+            };
+            if let Err(e) = set(&job) {
+                drop(job);
+                undo.revert();
+                return Err(e);
             }
-            let f = fs::OpenOptions::new().write(true).open(dir.join("cgroup.procs")).map_err(|e| format!("open cgroup.procs: {e}"))?;
+            let f = match fs::OpenOptions::new().write(true).open(dir.join("cgroup.procs")) {
+                Ok(f) => f,
+                Err(e) => {
+                    drop(job);
+                    undo.revert();
+                    return Err(format!("open cgroup.procs: {e}"));
+                }
+            };
             job.procs_fd = Some(f.into());
             job.read_enforced();
             Ok(job)
@@ -1276,6 +1576,8 @@ mod cgroup {
             } else if !Path::new("/run/systemd/system").exists() {
                 return Err("systemd is not the init system".into());
             }
+            // (Job::create already refused when fat sits in a limited cgroup: a scope from the
+            // manager would land outside it, e.g. a nested `fat run` escaping the outer one.)
             // Probe once: the user manager can be absent even when the socket is there.
             let mut probe = Command::new("systemd-run");
             if user {
@@ -1299,7 +1601,9 @@ mod cgroup {
                 let who = if user { "systemd --user" } else { "systemd" };
                 return Err(format!("{who} would not start a scope"));
             }
-            let unit = format!("fat-run-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+            // Unique even when several pid namespaces share one user manager (toolbox, distrobox).
+            SEQ.fetch_add(1, Ordering::Relaxed);
+            let unit = format!("fat-run-{}-{}", std::process::id(), rand_id());
             Ok(Job {
                 via: Via::Systemd { user },
                 want,
@@ -1308,7 +1612,9 @@ mod cgroup {
                 procs_fd: None,
                 cpu_enforced: false,
                 mem_enforced: false,
+                pids_enforced: false,
                 prev: None,
+                prev_periods: None,
                 nr_throttled: 0,
                 throttled_usec: 0,
                 oom_total: 0,
@@ -1322,6 +1628,30 @@ mod cgroup {
 
         pub fn owns_dir(&self) -> bool {
             self.via == Via::Root
+        }
+
+        pub fn is_systemd(&self) -> bool {
+            matches!(self.via, Via::Systemd { .. })
+        }
+
+        /// Tracked pids that are alive but not in the job's cgroup (or below it): they left it,
+        /// e.g. through `systemd-run --scope`, so its kernel limits no longer cover them.
+        pub fn outside(&self, tracked: &[u32]) -> Vec<u32> {
+            let Some(d) = &self.dir else { return Vec::new() };
+            let Ok(rel) = d.strip_prefix(ROOT) else { return Vec::new() };
+            let job = format!("/{}", rel.display());
+            let mut v: Vec<u32> = tracked
+                .iter()
+                .copied()
+                .filter(|&pid| {
+                    fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                        .ok()
+                        .and_then(|t| unified_path(&t).map(|p| !under(p, &job)))
+                        .unwrap_or(false)
+                })
+                .collect();
+            v.sort_unstable();
+            v
         }
 
         pub fn describe(&self) -> String {
@@ -1360,13 +1690,22 @@ mod cgroup {
                     if user {
                         c.arg("--user");
                     }
-                    c.args(["--scope", "--quiet", "--collect", "--unit", &self.unit, "-p", "CPUAccounting=yes", "-p", "MemoryAccounting=yes"]);
+                    c.args(["--scope", "--quiet", "--collect", "--unit", &self.unit, "-p", "CPUAccounting=yes", "-p", "MemoryAccounting=yes", "-p", "TasksAccounting=yes"]);
                     if self.want.limits {
                         if let Some(p) = self.want.cpu_pct {
                             c.args(["-p", &format!("CPUQuota={}%", (p.max(1.0)).round() as u64)]);
                         }
                         if let Some(m) = self.want.mem {
-                            c.args(["-p", &format!("MemoryMax={m}"), "-p", "MemorySwapMax=0"]);
+                            if self.want.mem_soft {
+                                let (high, max) = soft_mem(m);
+                                c.args(["-p", &format!("MemoryHigh={high}"), "-p", &format!("MemoryMax={max}")]);
+                            } else {
+                                c.args(["-p", &format!("MemoryMax={m}")]);
+                            }
+                            c.args(["-p", "MemorySwapMax=0"]);
+                        }
+                        if let Some(n) = self.want.procs {
+                            c.args(["-p", &format!("TasksMax={}", pids_max(n))]);
                         }
                     }
                     c.arg("--").arg(prog).args(args).process_group(0);
@@ -1384,15 +1723,33 @@ mod cgroup {
                     let dir = self.dir.clone().ok_or("no cgroup dir")?;
                     if !self.contains(pid) {
                         // pre_exec's write failed (e.g. a seccomp or LSM rule); try from here.
-                        fs::write(dir.join("cgroup.procs"), pid.to_string()).map_err(|e| format!("moving pid {pid}: {e}"))?;
+                        if let Err(e) = fs::write(dir.join("cgroup.procs"), pid.to_string()) {
+                            // A job that already finished (`true`) has left cgroup.procs: nothing
+                            // to enforce, not a setup failure.
+                            let done = crate::actions::procfs::read_stat(Path::new("/proc"), pid).is_none_or(|s| s.state == 'Z');
+                            if !done {
+                                return Err(format!("moving pid {pid}: {e}"));
+                            }
+                        }
                     }
                     Ok(())
                 }
                 Via::Systemd { .. } => {
                     let want = format!("/{}.scope", self.unit);
                     let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut first: Option<String> = None;
                     loop {
                         let cg = fs::read_to_string(format!("/proc/{pid}/cgroup")).map_err(|_| "the job exited before systemd placed it".to_string())?;
+                        let now_in = unified_path(&cg).unwrap_or("").to_string();
+                        // Placed and already gone elsewhere (the job is itself `systemd-run
+                        // --scope`): our scope is empty and systemd collects it; stop waiting.
+                        if let Some(f) = &first
+                            && *f != now_in
+                            && !now_in.ends_with(&want)
+                        {
+                            return Err(format!("the job moved itself out of {}.scope (into {now_in})", self.unit));
+                        }
+                        first.get_or_insert(now_in);
                         if let Some(p) = unified_path(&cg).filter(|p| p.ends_with(&want)) {
                             let dir = Path::new(ROOT).join(p.trim_start_matches('/'));
                             if !dir.exists() {
@@ -1424,7 +1781,11 @@ mod cgroup {
         fn read_enforced(&mut self) {
             let Some(d) = &self.dir else { return };
             self.cpu_enforced = self.want.limits && self.want.cpu_pct.is_some() && limit_in_force(d, "cpu.max");
-            self.mem_enforced = self.want.limits && self.want.mem.is_some() && limit_in_force(d, "memory.max");
+            self.mem_enforced = self.want.limits
+                && self.want.mem.is_some()
+                && limit_in_force(d, "memory.max")
+                && (!self.want.mem_soft || limit_in_force(d, "memory.high"));
+            self.pids_enforced = self.want.limits && self.want.procs.is_some() && limit_in_force(d, "pids.max");
         }
 
         pub fn members(&self) -> Vec<u32> {
@@ -1471,19 +1832,32 @@ mod cgroup {
             }
         }
 
-        /// Replace the polled cpu with the cgroup's exact usage_usec rate; track memory peak.
-        /// Returns the number of OOM kills since the last call, if any.
+        /// Raise the polled cpu to the cgroup's exact usage_usec rate and the polled memory to
+        /// the cgroup's non-reclaimable usage (never lower: members that left the cgroup only
+        /// show in polling); measure throttling; track memory peak. Returns the number of OOM
+        /// kills since the last call, if any.
         pub fn sample(&mut self, u: &mut Usage) -> Option<u64> {
             self.dir.as_ref()?;
             let now = Instant::now();
-            if let Some(usage) = kv(&self.read("cpu.stat"), "usage_usec") {
+            let stat = self.read("cpu.stat");
+            if let Some(usage) = kv(&stat, "usage_usec") {
                 if let Some((prev, t)) = self.prev {
                     let dt = now.duration_since(t).as_secs_f64();
                     if dt > 0.0 {
-                        u.cpu = (usage.saturating_sub(prev) as f64 / 1e6 / dt * 100.0) as f32;
+                        u.cpu = u.cpu.max((usage.saturating_sub(prev) as f64 / 1e6 / dt * 100.0) as f32);
                     }
                 }
                 self.prev = Some((usage, now));
+            }
+            if let (Some(p), Some(t)) = (kv(&stat, "nr_periods"), kv(&stat, "nr_throttled")) {
+                if let Some((pp, pt)) = self.prev_periods {
+                    u.throttled = throttled_share(p.saturating_sub(pp), t.saturating_sub(pt));
+                }
+                self.prev_periods = Some((p, t));
+            }
+            if let Ok(cur) = self.read("memory.current").trim().parse::<u64>() {
+                let file = kv(&self.read("memory.stat"), "file").unwrap_or(0);
+                u.mem = u.mem.max(cur.saturating_sub(file));
             }
             self.tick();
             let new = self.oom_total.saturating_sub(self.oom_seen);
@@ -1602,12 +1976,12 @@ mod tests {
     fn violation_logic() {
         let b = Budget { cpu: Some(50.0), mem: Some(1000), time: Some(5), procs: Some(2), on_violation: "warn".into() };
         let mut strikes = 0;
-        let hot = Usage { cpu: 99.0, mem: 10, procs: 1, stopped: false };
+        let hot = Usage { cpu: 99.0, mem: 10, procs: 1, ..Default::default() };
         assert!(violations(&b, &hot, Duration::from_secs(1), &mut strikes).is_empty());
         let v = violations(&b, &hot, Duration::from_secs(1), &mut strikes);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].0, Kind::Cpu);
-        let big = Usage { cpu: 0.0, mem: 5000, procs: 3, stopped: false };
+        let big = Usage { cpu: 0.0, mem: 5000, procs: 3, ..Default::default() };
         let kinds: Vec<Kind> = violations(&b, &big, Duration::from_secs(6), &mut strikes).into_iter().map(|x| x.0).collect();
         assert_eq!(kinds, vec![Kind::Mem, Kind::Time, Kind::Procs]);
         assert_eq!(strikes, 0);
@@ -1811,19 +2185,121 @@ mod tests {
         }
     }
 
+    #[test]
+    fn throttled_job_is_a_cpu_violation() {
+        // Held at the quota by cpu.max and throttled in most periods: it wants more.
+        let b = Budget { cpu: Some(50.0), on_violation: "kill".into(), ..Default::default() };
+        let mut strikes = 0;
+        let held = Usage { cpu: 49.0, throttled: 0.9, ..Default::default() };
+        assert!(violations(&b, &held, Duration::from_secs(1), &mut strikes).is_empty());
+        let v = violations(&b, &held, Duration::from_secs(1), &mut strikes);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].1.contains("cpu.max"), "{}", v[0].1);
+        // Occasionally throttled bursts, or throttled while far below the quota: not over.
+        let mut strikes = 0;
+        for u in [Usage { cpu: 45.0, throttled: 0.2, ..Default::default() }, Usage { cpu: 10.0, throttled: 1.0, ..Default::default() }] {
+            assert!(violations(&b, &u, Duration::from_secs(1), &mut strikes).is_empty());
+            assert!(violations(&b, &u, Duration::from_secs(1), &mut strikes).is_empty());
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn cgroup_throttles_cpu_instead_of_violating() {
-        let b = Budget { cpu: Some(50.0), time: Some(2), on_violation: "kill".into(), ..Default::default() };
+    fn cgroup_pure_helpers() {
+        let (high, max) = cgroup::soft_mem(64 << 20);
+        assert!(high > 64 << 20 && high < max && max >= (64 << 20) + (64 << 20), "{high} {max}");
+        let (high, max) = cgroup::soft_mem(4 << 30);
+        assert_eq!(high, (4u64 << 30) + (256 << 20));
+        assert_eq!(max, 5u64 << 30);
+        assert_eq!(cgroup::pids_max(20), 576);
+        assert_eq!(cgroup::throttled_share(0, 0), 0.0);
+        assert_eq!(cgroup::throttled_share(10, 5), 0.5);
+        assert_eq!(cgroup::throttled_share(4, 9), 1.0);
+        let ids: HashSet<String> = (0..50).map(|_| cgroup::rand_id()).collect();
+        assert_eq!(ids.len(), 50);
+        assert!(cgroup::under("/a/b/c", "/a/b"));
+        assert!(cgroup::under("/a/b", "/a/b"));
+        assert!(!cgroup::under("/a/bc", "/a/b"));
+        assert!(cgroup::under("/x", "/"));
+        assert!(cgroup::is_fat_job("run-7-0a1b2c3d4e5f"));
+        assert!(cgroup::is_fat_job("fat-run-3013-ab12cd.scope"));
+        assert!(!cgroup::is_fat_job("session-1.scope"));
+    }
+
+    /// Escape guard: a job cgroup made at the root must not let a job out of limits that bind
+    /// fat (docker --memory, an outer `fat run`). Fixture tree in the cgroupfs file format.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_limited_ancestor_fixture() {
+        let root = std::env::temp_dir().join(format!("fat-cg-fixture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mk = |rel: &str, files: &[(&str, &str)]| {
+            let d = root.join(rel);
+            std::fs::create_dir_all(&d).unwrap();
+            for (f, v) in files {
+                std::fs::write(d.join(f), v).unwrap();
+            }
+        };
+        let open = [("cpu.max", "max 100000\n"), ("memory.max", "max\n"), ("memory.high", "max\n"), ("pids.max", "max\n")];
+        // systemd user slice: only TasksMax, which doesn't count.
+        mk("user.slice/user-1000.slice", &[("cpu.max", "max 100000\n"), ("memory.max", "max\n"), ("pids.max", "38019\n")]);
+        mk("user.slice/user-1000.slice/session-2.scope", &open);
+        assert_eq!(cgroup::limited_ancestor(&root, "/user.slice/user-1000.slice/session-2.scope"), None);
+        // docker run --memory 256m: memory.max on the container's cgroup.
+        mk("docker/abc", &[("cpu.max", "max 100000\n"), ("memory.max", "268435456\n"), ("memory.high", "max\n")]);
+        assert_eq!(cgroup::limited_ancestor(&root, "/docker/abc"), Some("/docker/abc".to_string()));
+        // An outer fat job with only --procs (pids.max) still binds a nested fat.
+        mk("fat.slice/run-7-aa", &[("cpu.max", "max 100000\n"), ("memory.max", "max\n"), ("pids.max", "336\n")]);
+        assert_eq!(cgroup::limited_ancestor(&root, "/fat.slice/run-7-aa"), Some("/fat.slice/run-7-aa".to_string()));
+        // The deepest limited one wins.
+        mk("docker/abc/inner", &[("cpu.max", "50000 100000\n")]);
+        assert_eq!(cgroup::limited_ancestor(&root, "/docker/abc/inner"), Some("/docker/abc/inner".to_string()));
+        assert_eq!(cgroup::limited_ancestor(&root, "/"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// As root in a container's private cgroup namespace (its root holds processes), fat must
+    /// not touch the root's subtree_control nor leave fat.slice behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_namespace_root_with_processes_is_left_alone() {
+        let root = std::env::temp_dir().join(format!("fat-cg-nsroot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for (f, v) in [("cgroup.controllers", "cpuset cpu io memory pids\n"), ("cgroup.subtree_control", ""), ("cgroup.type", "domain\n"), ("cgroup.procs", "1\n57\n")] {
+            std::fs::write(root.join(f), v).unwrap();
+        }
+        let want = cgroup::Want { cpu_pct: Some(50.0), limits: true, ..Default::default() };
+        let e = cgroup::Job::create_dir(&root, want).err().expect("must refuse");
+        assert!(e.contains("namespace root"), "{e}");
+        assert_eq!(std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap(), "");
+        assert!(!root.join("fat.slice").exists());
+        // Undo reverts in reverse order (dirs first, then controllers).
+        let mut u = cgroup::Undo::default();
+        let d = root.join("made");
+        std::fs::create_dir(&d).unwrap();
+        u.dirs.push(d.clone());
+        u.enabled.push((root.clone(), "cpu".into()));
+        u.revert();
+        assert!(!d.exists());
+        assert_eq!(std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap(), "-cpu");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_throttles_cpu_and_kill_still_fires() {
+        let b = Budget { cpu: Some(50.0), time: Some(8), on_violation: "kill".into(), ..Default::default() };
         let t = Instant::now();
         let Some(r) = cgroup_run(&["sh", "-c", "yes > /dev/null"], &b) else { return };
-        assert!(t.elapsed() < Duration::from_secs(10));
+        assert!(t.elapsed() < Duration::from_secs(12));
         assert!(r.kernel.via.is_some(), "{r:?}");
         if !r.kernel.cpu_enforced {
             eprintln!("skipping: cpu controller not delegated ({r:?})");
             return;
         }
-        assert_eq!(r.fired, vec![Kind::Time], "cpu is throttled, never a violation: {r:?}");
+        assert_eq!(r.fired, vec![Kind::Cpu], "a throttled runaway is still a cpu violation: {r:?}");
+        assert!(t.elapsed() < Duration::from_secs(6), "kill came from the time budget: {:?}", t.elapsed());
         assert_eq!(r.code, 128 + libc::SIGTERM);
         assert!(r.kernel.throttled > 0, "{r:?}");
         assert!(r.peak.cpu < 80.0, "kernel quota is 50%: {r:?}");
@@ -1850,6 +2326,38 @@ mod tests {
         assert_eq!(r.code, 128 + libc::SIGKILL, "{r:?}");
         assert!(r.kernel.oom_kills >= 1, "{r:?}");
         assert!(r.fired.contains(&Kind::Mem), "{r:?}");
+    }
+
+    /// pause must stay reversible: memory.high + a backstop, never an OOM kill at the budget.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_memory_pause_pauses_instead_of_oom() {
+        if !have_perl() {
+            return;
+        }
+        let b = Budget { mem: Some(parse_bytes("64M").unwrap()), time: Some(4), on_violation: "pause".into(), ..Default::default() };
+        // Touch 160MB, then idle: past the budget, under the backstop's reach only if unthrottled.
+        let Some(r) = cgroup_run(&["perl", "-e", "$x = 'a' x (160*1024*1024); sleep 30"], &b) else { return };
+        if !r.kernel.mem_enforced {
+            eprintln!("skipping: memory controller not delegated ({r:?})");
+            return;
+        }
+        assert_eq!(r.kernel.oom_kills, 0, "pause must not OOM-kill: {r:?}");
+        assert!(r.fired.contains(&Kind::Mem), "{r:?}");
+        // Paused until the wall-time budget ended it.
+        assert!(r.fired.contains(&Kind::Time), "{r:?}");
+        assert_eq!(r.code, 128 + libc::SIGTERM, "{r:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_procs_backstop_and_poll() {
+        let b = Budget { procs: Some(5), time: Some(10), on_violation: "kill".into(), ..Default::default() };
+        let Some(r) = cgroup_run(&["sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 30 & done; wait"], &b) else { return };
+        assert!(r.fired.contains(&Kind::Procs), "{r:?}");
+        if r.kernel.via == Some("cgroup") {
+            assert!(r.kernel.removed, "{r:?}");
+        }
     }
 
     #[cfg(target_os = "linux")]

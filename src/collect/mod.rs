@@ -40,6 +40,22 @@ pub struct Collector {
     rapl: linux::Rapl,
     #[cfg(target_os = "linux")]
     meminfo: Option<linux::MemInfo>,
+    /// Latest RAPL package power (mW): the system total, measured, not a sum over processes.
+    #[cfg(target_os = "linux")]
+    rapl_mw: Option<f64>,
+    /// System-wide disk/net rates from /proc/diskstats and /proc/net/dev.
+    #[cfg(target_os = "linux")]
+    sysio: linux::SysIo,
+    #[cfg(target_os = "linux")]
+    sysio_rates: Option<[u64; 4]>,
+    /// fat's own cgroup limits (a container's --memory/--cpus), re-read every sample.
+    #[cfg(target_os = "linux")]
+    cg: linux::CgView,
+    /// (usage_usec, when) of the cpu-limiting cgroup at the previous sample.
+    #[cfg(target_os = "linux")]
+    cg_cpu_prev: Option<(u64, Instant)>,
+    #[cfg(target_os = "linux")]
+    cg_cpu_pct: Option<f32>,
     hostname: String,
     os: String,
     cpu_model: String,
@@ -104,6 +120,18 @@ impl Collector {
             rapl: linux::Rapl::discover(std::path::Path::new("/")),
             #[cfg(target_os = "linux")]
             meminfo: None,
+            #[cfg(target_os = "linux")]
+            rapl_mw: None,
+            #[cfg(target_os = "linux")]
+            sysio: linux::SysIo::default(),
+            #[cfg(target_os = "linux")]
+            sysio_rates: None,
+            #[cfg(target_os = "linux")]
+            cg: linux::CgView::default(),
+            #[cfg(target_os = "linux")]
+            cg_cpu_prev: None,
+            #[cfg(target_os = "linux")]
+            cg_cpu_pct: None,
             hostname,
             os,
             cpu_model,
@@ -144,6 +172,8 @@ impl Collector {
             if self.meminfo.is_none() {
                 self.sys.refresh_memory();
             }
+            self.sysio_rates = self.sysio.sample(std::path::Path::new("/"));
+            self.sample_cgroup();
             self.sample_procs_linux(dt)
         };
         #[cfg(not(target_os = "linux"))]
@@ -211,15 +241,41 @@ impl Collector {
         if !self.rapl.available() {
             return (list, "estimate");
         }
-        // Package power, split by cpu share. On the first sample (no delta yet) the per-process
-        // estimate values are all zero anyway.
-        if let Some(total) = self.rapl.sample_mw(dt) {
+        // Package power, split by share of cpu capacity (idle/uncore draw stays unattributed).
+        // On the first sample (no delta yet) the per-process estimate values are all zero anyway.
+        self.rapl_mw = self.rapl.sample_mw(dt);
+        if let Some(total) = self.rapl_mw {
             let cpu: Vec<f32> = list.iter().map(|p| p.cpu).collect();
-            for (p, mw) in list.iter_mut().zip(linux::apportion(total, &cpu)) {
+            let cores = self.sys.cpus().len();
+            for (p, mw) in list.iter_mut().zip(linux::apportion_capacity(total, &cpu, cores)) {
                 p.power_mw = mw;
             }
         }
         (list, self.rapl.source)
+    }
+
+    /// Re-read the limits of fat's own cgroup and the cpu use of the one that sets cpu.max.
+    #[cfg(target_os = "linux")]
+    fn sample_cgroup(&mut self) {
+        let own = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("0::")).map(|p| p.trim().to_string()));
+        self.cg = own.map(|o| linux::cgroup_view(std::path::Path::new("/sys/fs/cgroup"), &o)).unwrap_or_default();
+        self.cg_cpu_pct = None;
+        let usage = self.cg.cpu_dir.as_deref().and_then(linux::cg_usage_usec);
+        let now = Instant::now();
+        if let (Some(u), Some(q)) = (usage, self.cg.cpu_quota) {
+            if let Some((pu, pt)) = self.cg_cpu_prev {
+                let dt = now.duration_since(pt).as_secs_f64();
+                if dt > 0.0 && q > 0.0 {
+                    let cores_used = u.saturating_sub(pu) as f64 / 1e6 / dt;
+                    self.cg_cpu_pct = Some((cores_used / q * 100.0).clamp(0.0, 100.0) as f32);
+                }
+            }
+            self.cg_cpu_prev = Some((u, now));
+        } else {
+            self.cg_cpu_prev = None;
+        }
     }
 
     /// sysinfo-based process table (macOS and other non-Linux). Returns (procs, power source).
@@ -343,30 +399,90 @@ impl Collector {
         };
         #[cfg(not(target_os = "linux"))]
         let (mem_total, mem_used, swap_total, swap_used) = from_sysinfo();
+        #[allow(unused_mut)]
+        let mut cpu = self.sys.global_cpu_usage();
+        #[allow(unused_mut)]
+        let mut per_core = per_core;
+        #[allow(unused_mut)]
+        let mut mem_pressure = system::mem_pressure();
+        #[allow(unused_mut)]
+        let mut psi = system::psi();
+        // Linux in a limited cgroup (a container with --memory / --cpus / --cpuset-cpus): its
+        // limits are what this machine is, not the host's /proc/meminfo and cpu count.
+        #[cfg(target_os = "linux")]
+        let (mem_total, mem_used) = {
+            let (mut total, mut used) = (mem_total, mem_used);
+            let mut cg_psi = false;
+            if let (Some(max), Some(dir)) = (self.cg.mem_max, self.cg.mem_dir.as_deref())
+                && max < total
+                && let Some(u) = linux::cg_mem_used(dir)
+            {
+                total = max;
+                used = u.min(max);
+                let cpsi = linux::cg_psi(dir);
+                mem_pressure = match cpsi.filter(|_| dir.join("memory.pressure").exists()) {
+                    Some(p) => system::lx::pressure_from_psi(&p).to_string(),
+                    None => system::lx::pressure_from_meminfo(max / 1024, max.saturating_sub(used) / 1024).to_string(),
+                };
+                if cpsi.is_some() {
+                    psi = cpsi;
+                    cg_psi = true;
+                }
+            }
+            if let Some(cpus) = self.cg.cpus.as_ref().filter(|c| c.len() < per_core.len() && c.iter().all(|&i| i < per_core.len())) {
+                per_core = cpus.iter().map(|&i| per_core[i]).collect();
+                cpu = per_core.iter().sum::<f32>() / per_core.len().max(1) as f32;
+            }
+            if self.cg.cpu_quota.is_some_and(|q| q < per_core.len() as f64) {
+                // % of the cpu this cgroup may use (cpu.max), not of the host's cores.
+                if let Some(p) = self.cg_cpu_pct {
+                    cpu = p;
+                }
+                if !cg_psi {
+                    psi = self.cg.cpu_dir.as_deref().and_then(linux::cg_psi).or(psi);
+                }
+            }
+            (total, used)
+        };
+        #[cfg(target_os = "linux")]
+        let rapl_mw = self.rapl_mw;
+        #[cfg(not(target_os = "linux"))]
+        let rapl_mw: Option<f64> = None;
+        // Linux: totals from the world-readable system counters (an unprivileged user can't
+        // read other users' /proc/<pid>/io, and ss -p sees only their own sockets).
+        #[cfg(target_os = "linux")]
+        let sysio = self.sysio_rates;
+        #[cfg(not(target_os = "linux"))]
+        let sysio: Option<[u64; 4]> = None;
+        let sum = |f: fn(&Proc) -> u64| list.iter().map(f).sum::<u64>();
+        let (disk_read_bps, disk_write_bps, net_rx_bps, net_tx_bps) = match sysio {
+            Some([r, w, rx, tx]) => (r, w, rx, tx),
+            None => (sum(|p| p.disk_read_bps), sum(|p| p.disk_write_bps), sum(|p| p.net_rx_bps), sum(|p| p.net_tx_bps)),
+        };
         System {
             hostname: self.hostname.clone(),
             os: self.os.clone(),
             cpu_model: self.cpu_model.clone(),
             cores: per_core.len(),
             per_core,
-            cpu: self.sys.global_cpu_usage(),
+            cpu,
             load: [load.one, load.five, load.fifteen],
             mem_total,
             mem_used,
             swap_total,
             swap_used,
-            mem_pressure: system::mem_pressure(),
+            mem_pressure,
             thermal: extras.thermal,
             gpus: extras.gpus,
-            power_mw: list.iter().map(|p| p.power_mw).sum(),
-            net_rx_bps: list.iter().map(|p| p.net_rx_bps).sum(),
-            net_tx_bps: list.iter().map(|p| p.net_tx_bps).sum(),
-            disk_read_bps: list.iter().map(|p| p.disk_read_bps).sum(),
-            disk_write_bps: list.iter().map(|p| p.disk_write_bps).sum(),
+            power_mw: rapl_mw.map(|m| m as f32).unwrap_or_else(|| list.iter().map(|p| p.power_mw).sum()),
+            net_rx_bps,
+            net_tx_bps,
+            disk_read_bps,
+            disk_write_bps,
             uptime: sysinfo::System::uptime(),
             battery_pct: extras.battery_pct,
             on_battery: extras.on_battery,
-            psi: system::psi(),
+            psi,
             temp_c: extras.temp_c,
             power_source: power_source.to_string(),
         }
@@ -507,7 +623,12 @@ mod tests {
         assert_eq!(init.ppid, 0);
         assert!(!init.user.is_empty());
         let total: f32 = s.procs.iter().map(|p| p.power_mw).sum();
-        assert!((s.system.power_mw - total).abs() < 1.0);
+        if s.system.power_source == "rapl" {
+            // Measured package power; processes get their capacity share, never more.
+            assert!(total <= s.system.power_mw + 1.0);
+        } else {
+            assert!((s.system.power_mw - total).abs() < 1.0);
+        }
     }
 
     /// Linux perf: `FAT_BENCH_N` (default 1000) own `sleep` children, then time steady samples.

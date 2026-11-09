@@ -11,7 +11,8 @@
 //! (`ino:`) and tcp_info counters (`bytes_received:`, `bytes_acked:`). Counters are
 //! diffed per socket (keyed by inode, else the 4-tuple) and summed per pid, so a
 //! socket closing between samples never yields a negative rate. Without root, ss only
-//! reports pids for our own processes; other sockets are ignored. UDP is skipped:
+//! reports pids for our own processes; other sockets are ignored. As root, each other
+//! network namespace (containers) is sampled too via `nsenter -n -t <pid> ss`. UDP is skipped:
 //! the kernel keeps no per-socket byte counters for it. If ss is missing the map
 //! simply stays empty.
 use std::collections::HashMap;
@@ -23,6 +24,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const INTERVAL: Duration = Duration::from_secs(2);
+/// Linux, root: most container network namespaces sampled per interval (one nsenter+ss each).
+#[cfg(target_os = "linux")]
+const MAX_NETNS: usize = 16;
 /// Sleep granularity so Drop doesn't wait a full interval.
 const TICK: Duration = Duration::from_millis(100);
 
@@ -77,9 +81,26 @@ impl Drop for NetSampler {
 fn sampler_loop(rates: Arc<Mutex<Rates>>, stop: Arc<AtomicBool>, slot: Arc<Mutex<Option<Child>>>) {
     let mut prev: Option<(Instant, linux::Sockets)> = None;
     let mut failures = 0u32;
+    // SAFETY: geteuid has no preconditions.
+    let root = unsafe { libc::geteuid() } == 0;
+    let nsenter = root && std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("nsenter").is_file()));
     while !stop.load(Ordering::SeqCst) {
         match run_capture(&slot, &stop, "ss", &["-tinpeH"]) {
-            Some(out) => {
+            Some(mut out) => {
+                // Root: also every container's network namespace (ss only sees its own).
+                // `nsenter -n` switches only the netns, so pids stay ours.
+                if root && nsenter {
+                    for (_, pid) in super::ports::foreign_netns(MAX_NETNS) {
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let t = pid.to_string();
+                        if let Some(more) = run_capture(&slot, &stop, "nsenter", &["-n", "-t", &t, "ss", "-tinpeH"]) {
+                            out.push('\n');
+                            out.push_str(&more);
+                        }
+                    }
+                }
                 failures = 0;
                 let at = Instant::now();
                 let cur = linux::parse_ss(&out);

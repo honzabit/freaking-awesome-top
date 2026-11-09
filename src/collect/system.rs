@@ -552,41 +552,60 @@ pub mod lx {
         valid_c(c).then_some(c)
     }
 
-    /// 0 nominal, 1 fair (>= 80% of passive), 2 serious (>= passive), 3 critical (>= critical).
+    /// For a CPU package sensor (unknown trips default to Tjmax-like values): 0 nominal, 1 fair
+    /// (>= passive: throttling has begun), 2 serious (halfway from passive to critical, at most
+    /// passive + 10), 3 critical (>= critical). Below the passive trip is always nominal: a CPU
+    /// at 80°C under a build is hot, not throttled.
     pub fn level_for(t: f32, passive: Option<f32>, crit: Option<f32>) -> u8 {
         let crit = crit.unwrap_or(DEFAULT_CRIT_C);
-        let passive = passive.filter(|p| *p < crit).unwrap_or_else(|| {
-            if crit <= DEFAULT_CRIT_C { (crit - 10.0).min(DEFAULT_PASSIVE_C) } else { DEFAULT_PASSIVE_C }
+        let passive = passive.filter(|p| *p < crit).unwrap_or(DEFAULT_PASSIVE_C.min(crit));
+        level_trips(t, Some(passive), None, Some(crit))
+    }
+
+    /// Level from real trip points only (no defaults): a missing passive/hot trip means that
+    /// sensor can't say "throttling", only "critical" (if it has that trip).
+    fn level_trips(t: f32, passive: Option<f32>, hot: Option<f32>, crit: Option<f32>) -> u8 {
+        if crit.is_some_and(|c| t >= c) {
+            return 3;
+        }
+        let Some(p) = passive.or(hot) else { return 0 };
+        let serious = hot.filter(|h| *h > p).unwrap_or_else(|| match crit {
+            Some(c) if c > p => (p + (c - p) / 2.0).min(p + 10.0),
+            _ => p + 10.0,
         });
-        if t >= crit {
-            3
-        } else if t >= passive {
+        if t >= serious {
             2
-        } else if t >= 0.8 * passive {
+        } else if t >= p {
             1
         } else {
             0
         }
     }
 
+    /// hwmon drivers that measure the CPU package/die (their _max/_crit are the CPU's own
+    /// throttling points). Others (nvme, iwlwifi, amdgpu, acpi fan…) only feed `max_c`.
+    const CPU_HWMON: [&str; 5] = ["coretemp", "k10temp", "zenpower", "cpu_thermal", "cpu-thermal"];
+
     const LEVELS: [&str; 4] = ["nominal", "fair", "serious", "critical"];
 
-    /// `class` is normally /sys/class. Reads:
+    /// `class` is normally /sys/class. `max_c` is the hottest sensor of any kind; `level` (the
+    /// throttling state) only comes from CPU sources, each at its own real throttle points:
     /// * thermal/thermal_zone*/temp (m°C) with trip_point_N_{temp,type}; types are
     ///   active (fan steps, ignored) | passive (throttling starts) | hot | critical (shutdown).
     ///   e.g. x86_pkg_temp: temp=48000, trip_point_0_type=passive, trip_point_0_temp=95000;
-    ///   acpitz: trip_point_0_type=critical, trip_point_0_temp=119000.
-    /// * hwmon/hwmon*/temp*_input with temp*_max (as passive) / temp*_crit, e.g. coretemp
-    ///   temp1_input=52000 temp1_max=100000 temp1_crit=100000; k10temp only temp1_input (Tctl).
+    ///   acpitz: trip_point_0_type=critical, trip_point_0_temp=119000 (critical only).
+    /// * hwmon/hwmon*/temp*_input with temp*_max (as passive) / temp*_crit of CPU drivers, e.g.
+    ///   coretemp temp1_input=52000 temp1_max=100000 temp1_crit=100000; k10temp only
+    ///   temp1_input (Tctl). An NVMe's temp1_max (~82°C) is the drive's, not a CPU throttle.
     ///   `drivetemp` (SATA disks via SMART) is skipped: reading it can be slow / wake disks.
     pub fn read_thermal(class: &Path) -> Thermal {
         let mut max_c: Option<f32> = None;
         let mut level = 0u8;
         let mut any = false;
-        let mut see = |t: f32, passive: Option<f32>, crit: Option<f32>| {
+        let mut see = |t: f32, lvl: u8| {
             any = true;
             max_c = Some(max_c.map_or(t, |m: f32| m.max(t)));
-            level = level.max(level_for(t, passive, crit));
+            level = level.max(lvl);
         };
         for z in entries(&class.join("thermal"), "thermal_zone") {
             let Some(t) = milli(&z.join("temp")) else { continue };
@@ -605,12 +624,14 @@ pub mod lx {
                 };
                 *slot = Some(slot.map_or(tt, |c: f32| c.min(tt)));
             }
-            see(t, passive.or(hot), crit);
+            see(t, level_trips(t, passive, hot, crit));
         }
         for h in entries(&class.join("hwmon"), "hwmon") {
-            if rd(&h.join("name")).is_some_and(|n| n == "drivetemp") {
+            let name = rd(&h.join("name")).unwrap_or_default();
+            if name == "drivetemp" {
                 continue;
             }
+            let cpu = CPU_HWMON.contains(&name.as_str());
             let Ok(dir) = fs::read_dir(&h) else { continue };
             let mut inputs: Vec<String> = dir
                 .flatten()
@@ -623,7 +644,7 @@ pub mod lx {
                 let Some(t) = milli(&h.join(&n)) else { continue };
                 let max = milli(&h.join(format!("{base}_max"))).filter(|c| *c > 0.0);
                 let crit = milli(&h.join(format!("{base}_crit"))).filter(|c| *c > 0.0);
-                see(t, max, crit);
+                see(t, if cpu { level_for(t, max, crit) } else { 0 });
             }
         }
         Thermal { max_c, level: if any { LEVELS[level as usize] } else { "unknown" } }
@@ -1293,13 +1314,30 @@ mod tests {
             .put("class/hwmon/hwmon3/temp1_input", "99000\n"); // skipped
         let t = lx::read_thermal(&f.p("class"));
         assert_eq!(t, lx::Thermal { max_c: Some(52.0), level: "nominal" });
-        f.put("class/thermal/thermal_zone1/temp", "80000\n"); // >= 0.8*95 = 76
-        assert_eq!(lx::read_thermal(&f.p("class")).level, "fair");
-        f.put("class/thermal/thermal_zone1/temp", "96000\n");
+        f.put("class/thermal/thermal_zone1/temp", "80000\n"); // hot under a build, below the trip
+        assert_eq!(lx::read_thermal(&f.p("class")).level, "nominal");
+        f.put("class/hwmon/hwmon2/temp1_input", "90000\n"); // coretemp below its Tjmax-ish 95
+        assert_eq!(lx::read_thermal(&f.p("class")).level, "nominal");
+        f.put("class/hwmon/hwmon2/temp1_input", "52000\n");
+        f.put("class/thermal/thermal_zone1/temp", "96000\n"); // passive trip 95 reached
         let t = lx::read_thermal(&f.p("class"));
-        assert_eq!((t.max_c, t.level), (Some(96.0), "serious"));
+        assert_eq!((t.max_c, t.level), (Some(96.0), "fair"));
+        f.put("class/thermal/thermal_zone1/temp", "100500\n"); // halfway to critical 105
+        assert_eq!(lx::read_thermal(&f.p("class")).level, "serious");
+        f.put("class/thermal/thermal_zone1/temp", "60000\n");
         f.put("class/hwmon/hwmon2/temp1_input", "101000\n");
         assert_eq!(lx::read_thermal(&f.p("class")).level, "critical");
+        // A hot NVMe (temp1_max 81.85) is a hot sensor, not CPU throttling.
+        f.put("class/hwmon/hwmon2/temp1_input", "52000\n")
+            .put("class/hwmon/hwmon4/name", "nvme\n")
+            .put("class/hwmon/hwmon4/temp1_label", "Composite\n")
+            .put("class/hwmon/hwmon4/temp1_input", "70850\n")
+            .put("class/hwmon/hwmon4/temp1_max", "81850\n")
+            .put("class/hwmon/hwmon4/temp1_crit", "84850\n");
+        let t = lx::read_thermal(&f.p("class"));
+        assert_eq!((t.max_c, t.level), (Some(70.85), "nominal"));
+        f.put("class/hwmon/hwmon4/temp1_input", "86000\n");
+        assert_eq!(lx::read_thermal(&f.p("class")).level, "nominal");
         // Bogus/unreadable sensors are ignored.
         let g = Fixture::new("therm2");
         g.put("class/hwmon/hwmon0/name", "k10temp\n")
@@ -1307,8 +1345,12 @@ mod tests {
             .put("class/hwmon/hwmon1/temp1_input", "-273000\n")
             .put("class/thermal/thermal_zone0/temp", "");
         assert_eq!(lx::read_thermal(&g.p("class")), lx::Thermal { max_c: Some(61.25), level: "nominal" });
-        assert_eq!(lx::level_for(80.0, None, None), 1); // defaults: passive 95, crit 105
-        assert_eq!(lx::level_for(85.0, None, Some(90.0)), 2); // nvme: crit 90 -> passive 80
+        assert_eq!(lx::level_for(80.0, None, None), 0); // defaults: passive 95, crit 105
+        assert_eq!(lx::level_for(76.0, Some(95.0), Some(100.0)), 0);
+        assert_eq!(lx::level_for(95.0, None, None), 1);
+        assert_eq!(lx::level_for(100.0, None, None), 2);
+        assert_eq!(lx::level_for(85.0, None, Some(90.0)), 0); // crit 90 -> passive 90 capped: nominal
+        assert_eq!(lx::level_for(90.0, None, Some(90.0)), 3);
     }
 
     #[test]

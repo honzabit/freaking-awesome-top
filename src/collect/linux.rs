@@ -497,7 +497,10 @@ struct Zone {
 /// Package energy meter. Sources, in order:
 ///   1. `/sys/class/powercap/intel-rapl:<N>/energy_uj` — top-level package zones only
 ///      (`intel-rapl:N:M` subzones are parts of the package and would double count). AMD Zen
-///      also exposes its package counter under this name with the same driver.
+///      also exposes its package counter under this name with the same driver. Top-level
+///      zones are told apart by their `name`: `package-N` (one per socket, summed) and, on
+///      Skylake+ laptops, `psys` (the whole platform, which already contains the package:
+///      used alone, only when there is no package zone).
 ///   2. `/sys/class/powercap/intel-rapl-mmio:<N>` — same package via MMIO, only if (1) is absent.
 ///   3. `/sys/class/hwmon/hwmon*/energy*_input` (µJ) — e.g. the `amd_energy` driver
 ///      (`Esocket0` labels; `Ecore*` per-core inputs are skipped as they're part of the socket).
@@ -523,14 +526,21 @@ impl Rapl {
                 .filter(|n| n.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())))
                 .collect();
             v.sort();
-            v.into_iter()
-                .filter_map(|n| {
-                    let d = pc.join(n);
-                    let e = d.join("energy_uj");
-                    read_u64(&e)?;
-                    Some(Zone { path: e, max_range: read_u64(&d.join("max_energy_range_uj")).unwrap_or(0), last: None })
-                })
-                .collect()
+            let (mut package, mut psys) = (Vec::new(), Vec::new());
+            for n in v {
+                let d = pc.join(n);
+                let e = d.join("energy_uj");
+                if read_u64(&e).is_none() {
+                    continue;
+                }
+                let z = Zone { path: e, max_range: read_u64(&d.join("max_energy_range_uj")).unwrap_or(0), last: None };
+                // `dram` etc. are subzones; a top-level zone is a package unless it says psys.
+                match fs::read_to_string(d.join("name")).map(|s| s.trim().to_string()).unwrap_or_default().as_str() {
+                    "psys" => psys.push(z),
+                    _ => package.push(z),
+                }
+            }
+            if package.is_empty() { psys } else { package }
         };
         let zones = pick("intel-rapl:");
         if !zones.is_empty() {
@@ -597,13 +607,237 @@ impl Rapl {
     }
 }
 
+/// Split `total_mw` across processes by their share of the machine's cpu *capacity*
+/// (`cores` × 100%), not of the busy total: the package's idle and uncore draw stays
+/// unattributed instead of landing on whichever process happens to be busiest. A process
+/// using one of 8 cores fully gets 1/8 of package power; the parts never exceed the total.
+pub fn apportion_capacity(total_mw: f64, cpu: &[f32], cores: usize) -> Vec<f32> {
+    let cap = (cores.max(1) * 100) as f64;
+    let sum: f64 = cpu.iter().map(|&c| c.max(0.0) as f64).sum();
+    // cpu% can briefly exceed the capacity (sampling skew); then fall back to shares.
+    let denom = cap.max(sum);
+    if denom <= 0.0 {
+        return vec![0.0; cpu.len()];
+    }
+    cpu.iter().map(|&c| (total_mw * c.max(0.0) as f64 / denom) as f32).collect()
+}
+
 /// Split `total_mw` across processes proportionally to their cpu%.
+#[allow(dead_code)]
 pub fn apportion(total_mw: f64, cpu: &[f32]) -> Vec<f32> {
     let sum: f64 = cpu.iter().map(|&c| c.max(0.0) as f64).sum();
     if sum <= 0.0 {
         return vec![0.0; cpu.len()];
     }
     cpu.iter().map(|&c| (total_mw * c.max(0.0) as f64 / sum) as f32).collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// System-wide disk and network totals (world-readable, unlike other users' /proc/<pid>/io)
+
+/// A whole physical disk (not a partition, nor a virtual device stacked on disks we already
+/// count: loop, ram, zram, dm-*, md*). `blocks`: the names in /sys/block when readable
+/// (partitions are not listed there); otherwise a name heuristic.
+fn whole_disk(name: &str, blocks: Option<&HashSet<String>>) -> bool {
+    const VIRTUAL: [&str; 7] = ["loop", "ram", "zram", "dm-", "md", "sr", "nbd"];
+    if VIRTUAL.iter().any(|v| name.starts_with(v)) {
+        return false;
+    }
+    if let Some(b) = blocks {
+        return b.contains(name);
+    }
+    // nvme0n1 / mmcblk0 are disks, nvme0n1p1 / mmcblk0p1 partitions; sda / vdb / xvda disks,
+    // sda1 partitions.
+    if name.starts_with("nvme") || name.starts_with("mmcblk") {
+        return !name.rsplit_once('p').is_some_and(|(head, tail)| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) && head.ends_with(|c: char| c.is_ascii_digit()));
+    }
+    !name.ends_with(|c: char| c.is_ascii_digit())
+}
+
+/// Total (read, written) bytes of whole disks from /proc/diskstats. Real line (6.x):
+/// `259       0 nvme0n1 1123590 340987 75470062 210342 2265339 1270322 152637400 1871215 0 1106676 2149853 0 0 0 0 102340 68296`
+/// (major minor name reads merged sectors_read ms writes merged sectors_written ...);
+/// sectors are always 512 bytes.
+pub fn parse_diskstats(s: &str, blocks: Option<&HashSet<String>>) -> (u64, u64) {
+    let (mut r, mut w) = (0u64, 0u64);
+    for l in s.lines() {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() < 10 || !whole_disk(f[2], blocks) {
+            continue;
+        }
+        r = r.saturating_add(f[5].parse::<u64>().unwrap_or(0).saturating_mul(512));
+        w = w.saturating_add(f[9].parse::<u64>().unwrap_or(0).saturating_mul(512));
+    }
+    (r, w)
+}
+
+/// Total (rx, tx) bytes of every interface but `lo` from /proc/net/dev (fat's own network
+/// namespace). Real content:
+/// ```text
+/// Inter-|   Receive                                                |  Transmit
+///  face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+///     lo:  123456     789    0    0    0     0          0         0   123456     789    0    0    0     0       0          0
+///   eth0: 98765432  65432    0    0    0     0          0         0  1234567   9876    0    0    0     0       0          0
+/// ```
+pub fn parse_net_dev(s: &str) -> (u64, u64) {
+    let (mut rx, mut tx) = (0u64, 0u64);
+    for l in s.lines() {
+        let Some((name, rest)) = l.split_once(':') else { continue };
+        if name.trim() == "lo" || name.contains('|') {
+            continue;
+        }
+        let f: Vec<u64> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        if f.len() >= 9 {
+            rx = rx.saturating_add(f[0]);
+            tx = tx.saturating_add(f[8]);
+        }
+    }
+    (rx, tx)
+}
+
+/// Rates of the system-wide counters between samples.
+#[derive(Default)]
+pub struct SysIo {
+    prev: Option<([u64; 4], std::time::Instant)>,
+}
+
+impl SysIo {
+    /// (disk_read, disk_write, net_rx, net_tx) bytes/s since the previous call; None on the
+    /// first call or when the files are unreadable. `root` is normally "/".
+    pub fn sample(&mut self, root: &Path) -> Option<[u64; 4]> {
+        let blocks: Option<HashSet<String>> = fs::read_dir(root.join("sys/block"))
+            .ok()
+            .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
+            .filter(|b: &HashSet<String>| !b.is_empty());
+        let disk = fs::read_to_string(root.join("proc/diskstats")).ok().map(|t| parse_diskstats(&t, blocks.as_ref()));
+        let net = fs::read_to_string(root.join("proc/net/dev")).ok().map(|t| parse_net_dev(&t));
+        let (Some((r, w)), Some((rx, tx))) = (disk, net) else {
+            self.prev = None;
+            return None;
+        };
+        let cur = [r, w, rx, tx];
+        let now = std::time::Instant::now();
+        let out = self.prev.and_then(|(p, t)| {
+            let dt = now.duration_since(t).as_secs_f64();
+            (dt > 0.0).then(|| {
+                let mut o = [0u64; 4];
+                for i in 0..4 {
+                    o[i] = (cur[i].saturating_sub(p[i]) as f64 / dt) as u64;
+                }
+                o
+            })
+        });
+        self.prev = Some((cur, now));
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// cgroup v2 limits on fat itself (a container started with --memory / --cpus)
+
+/// The limits that bind the cgroup fat runs in, from its own cgroup up to the namespace root
+/// (each level can limit; the tightest wins). `cg_root` is normally /sys/fs/cgroup and `own`
+/// the unified path from /proc/self/cgroup (`/` in a container's private cgroup namespace).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CgView {
+    /// Tightest memory.max on the path, and the cgroup that sets it.
+    pub mem_max: Option<u64>,
+    pub mem_dir: Option<PathBuf>,
+    /// Tightest cpu.max as cores (quota / period), and the cgroup that sets it.
+    pub cpu_quota: Option<f64>,
+    pub cpu_dir: Option<PathBuf>,
+    /// cpuset.cpus.effective of fat's own cgroup.
+    pub cpus: Option<Vec<usize>>,
+}
+
+/// "0-3,8,10-11" -> [0,1,2,3,8,10,11].
+pub fn parse_cpu_list(s: &str) -> Vec<usize> {
+    let mut v = Vec::new();
+    for part in s.trim().split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>())
+                    && a <= b
+                    && b - a < 4096
+                {
+                    v.extend(a..=b);
+                }
+            }
+            None => v.extend(part.trim().parse::<usize>().ok()),
+        }
+    }
+    v
+}
+
+pub fn cgroup_view(cg_root: &Path, own: &str) -> CgView {
+    let mut view = CgView::default();
+    let mut path = own.trim().trim_end_matches('/').to_string();
+    let mut first = true;
+    loop {
+        let dir = cg_root.join(path.trim_start_matches('/'));
+        // The real root has no limit files (and no cgroup.type); a namespace root does.
+        if dir.join("cgroup.type").exists() || !path.is_empty() {
+            if let Some(m) = fs::read_to_string(dir.join("memory.max")).ok().and_then(|t| t.trim().parse::<u64>().ok())
+                && view.mem_max.is_none_or(|cur| m < cur)
+            {
+                view.mem_max = Some(m);
+                view.mem_dir = Some(dir.clone());
+            }
+            if let Ok(t) = fs::read_to_string(dir.join("cpu.max")) {
+                let mut it = t.split_whitespace();
+                if let (Some(Ok(q)), Some(Ok(p))) = (it.next().map(str::parse::<f64>), it.next().map(str::parse::<f64>))
+                    && p > 0.0
+                    && view.cpu_quota.is_none_or(|cur| q / p < cur)
+                {
+                    view.cpu_quota = Some(q / p);
+                    view.cpu_dir = Some(dir.clone());
+                }
+            }
+            if first {
+                view.cpus = fs::read_to_string(dir.join("cpuset.cpus.effective")).ok().map(|t| parse_cpu_list(&t)).filter(|v| !v.is_empty());
+            }
+        }
+        first = false;
+        if path.is_empty() {
+            break;
+        }
+        path.truncate(path.rfind('/').unwrap_or(0));
+    }
+    view
+}
+
+/// Memory a cgroup really uses: memory.current minus inactive page cache (what `docker stats`
+/// shows; the kernel reclaims inactive_file before it OOMs).
+pub fn cg_mem_used(dir: &Path) -> Option<u64> {
+    let cur: u64 = fs::read_to_string(dir.join("memory.current")).ok()?.trim().parse().ok()?;
+    let inactive = fs::read_to_string(dir.join("memory.stat"))
+        .ok()
+        .and_then(|t| t.lines().find_map(|l| l.strip_prefix("inactive_file ").and_then(|v| v.trim().parse::<u64>().ok())))
+        .unwrap_or(0);
+    Some(cur.saturating_sub(inactive))
+}
+
+/// cgroup cpu.stat usage_usec.
+pub fn cg_usage_usec(dir: &Path) -> Option<u64> {
+    fs::read_to_string(dir.join("cpu.stat")).ok()?.lines().find_map(|l| l.strip_prefix("usage_usec ").and_then(|v| v.trim().parse().ok()))
+}
+
+/// The cgroup's own PSI ({cpu,memory,io}.pressure, same format as /proc/pressure/*).
+pub fn cg_psi(dir: &Path) -> Option<crate::model::Psi> {
+    use super::system::lx::parse_psi_file;
+    let rd = |f: &str| fs::read_to_string(dir.join(f)).ok().map(|s| parse_psi_file(&s));
+    let (cpu, mem, io) = (rd("cpu.pressure"), rd("memory.pressure"), rd("io.pressure"));
+    if cpu.is_none() && mem.is_none() && io.is_none() {
+        return None;
+    }
+    let (cpu, mem, io) = (cpu.unwrap_or_default(), mem.unwrap_or_default(), io.unwrap_or_default());
+    Some(crate::model::Psi {
+        cpu_some: cpu.0.unwrap_or(0.0),
+        mem_some: mem.0.unwrap_or(0.0),
+        mem_full: mem.1.unwrap_or(0.0),
+        io_some: io.0.unwrap_or(0.0),
+        io_full: io.1.unwrap_or(0.0),
+    })
 }
 
 #[cfg(test)]
@@ -797,9 +1031,13 @@ mod tests {
         put(&root, &format!("{pc}/intel-rapl:0:0/name"), b"core\n");
         put(&root, &format!("{pc}/intel-rapl:0:0/energy_uj"), b"5\n");
         put(&root, &format!("{pc}/intel-rapl-mmio:0/energy_uj"), b"7\n");
+        // psys (whole platform, includes the package) must not be added to package-0.
+        put(&root, &format!("{pc}/intel-rapl:1/name"), b"psys\n");
+        put(&root, &format!("{pc}/intel-rapl:1/energy_uj"), b"1000\n");
         let mut r = Rapl::discover(&root);
         assert!(r.available());
-        assert_eq!(r.zones.len(), 1, "subzones and mmio duplicate must be skipped");
+        assert_eq!(r.zones.len(), 1, "subzones, psys and mmio duplicate must be skipped");
+        assert!(r.zones[0].path.to_string_lossy().contains("intel-rapl:0/"), "{:?}", r.zones);
         assert_eq!(r.sample_mw(1.0), None);
         // wrap: 328850 to the top, then 671150 more = 1_000_000 µJ in 2s = 500 mW.
         put(&root, &format!("{pc}/intel-rapl:0/energy_uj"), b"671150\n");
@@ -807,6 +1045,26 @@ mod tests {
         assert!((mw - 500.0).abs() < 1e-6, "{mw}");
         put(&root, &format!("{pc}/intel-rapl:0/energy_uj"), b"3671150\n");
         assert!((r.sample_mw(1.0).unwrap() - 3000.0).abs() < 1e-6);
+        let _ = fs::remove_dir_all(&root);
+
+        // psys alone (no package zone readable) -> used.
+        let root = fixture("rapl-psys");
+        put(&root, &format!("{pc}/intel-rapl:1/name"), b"psys\n");
+        put(&root, &format!("{pc}/intel-rapl:1/energy_uj"), b"1000\n");
+        let mut r = Rapl::discover(&root);
+        assert_eq!(r.zones.len(), 1);
+        assert_eq!(r.delta_uj(), None);
+        put(&root, &format!("{pc}/intel-rapl:1/energy_uj"), b"9001000\n");
+        assert_eq!(r.delta_uj(), Some(9_000_000));
+        let _ = fs::remove_dir_all(&root);
+
+        // Two sockets: both packages summed.
+        let root = fixture("rapl-2s");
+        for i in 0..2 {
+            put(&root, &format!("{pc}/intel-rapl:{i}/name"), format!("package-{i}\n").as_bytes());
+            put(&root, &format!("{pc}/intel-rapl:{i}/energy_uj"), b"100\n");
+        }
+        assert_eq!(Rapl::discover(&root).zones.len(), 2);
         let _ = fs::remove_dir_all(&root);
 
         // Only mmio present -> used.
@@ -833,6 +1091,99 @@ mod tests {
         let root = fixture("none");
         assert!(!Rapl::discover(&root).available());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diskstats_whole_disks_only() {
+        // Real 6.x lines: nvme disk + partitions, a loop device, dm on top of nvme0n1p3.
+        let ds = "\
+ 259       0 nvme0n1 1123590 340987 75470062 210342 2265339 1270322 152637400 1871215 0 1106676 2149853 0 0 0 0 102340 68296
+ 259       1 nvme0n1p1 312 1201 18234 52 2 0 2 0 0 80 52 0 0 0 0 0 0
+ 259       3 nvme0n1p3 1122000 339000 75400000 210000 2265000 1270000 152600000 1870000 0 1100000 2140000 0 0 0 0 0 0
+   7       0 loop0 54 0 2178 12 0 0 0 0 0 40 12 0 0 0 0 0 0
+ 253       0 dm-0 1460000 0 75000000 300000 3530000 0 152600000 4000000 0 1100000 4300000 0 0 0 0 0 0
+   8       0 sda 100 0 200 1 10 0 40 2 0 3 3 0 0 0 0 0 0
+   8       1 sda1 90 0 180 1 9 0 36 2 0 3 3 0 0 0 0 0 0
+";
+        let (r, w) = parse_diskstats(ds, None);
+        assert_eq!(r, (75_470_062 + 200) * 512);
+        assert_eq!(w, (152_637_400 + 40) * 512);
+        let blocks: HashSet<String> = ["nvme0n1", "sda", "loop0", "dm-0"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_diskstats(ds, Some(&blocks)), (r, w));
+        assert!(whole_disk("mmcblk0", None) && !whole_disk("mmcblk0p2", None));
+        assert!(whole_disk("vda", None) && !whole_disk("vda1", None));
+    }
+
+    #[test]
+    fn net_dev_skips_loopback() {
+        let nd = "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n    lo:  123456     789    0    0    0     0          0         0   123456     789    0    0    0     0       0          0\n  eth0: 98765432  65432    0    0    0     0          0         0  1234567   9876    0    0    0     0       0          0\nwlan0: 1000 10 0 0 0 0 0 0 2000 20 0 0 0 0 0 0\n";
+        assert_eq!(parse_net_dev(nd), (98_765_432 + 1000, 1_234_567 + 2000));
+    }
+
+    #[test]
+    fn sysio_rates_from_fixture() {
+        let root = fixture("sysio");
+        put(&root, "sys/block/vda/size", b"1\n");
+        put(&root, "proc/diskstats", b" 254 0 vda 10 0 1000 0 10 0 2000 0 0 0 0\n 254 1 vda1 10 0 1000 0 10 0 2000 0 0 0 0\n");
+        put(&root, "proc/net/dev", b"h|\nh|\n eth0: 100 0 0 0 0 0 0 0 50 0 0 0 0 0 0 0\n");
+        let mut s = SysIo::default();
+        assert_eq!(s.sample(&root), None);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        put(&root, "proc/diskstats", b" 254 0 vda 10 0 3000 0 10 0 2000 0 0 0 0\n");
+        put(&root, "proc/net/dev", b"h|\nh|\n eth0: 100100 0 0 0 0 0 0 0 50 0 0 0 0 0 0 0\n");
+        let r = s.sample(&root).unwrap();
+        assert!(r[0] > 0 && r[1] == 0 && r[2] > 0 && r[3] == 0, "{r:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cgroup_view_tightest_limit() {
+        // docker run --memory 256m --cpus 0.5 with --cgroupns=host: /docker/<id>.
+        let root = fixture("cgview");
+        put(&root, "cgroup.controllers", b"cpuset cpu io memory pids\n");
+        put(&root, "docker/cgroup.type", b"domain\n");
+        put(&root, "docker/memory.max", b"max\n");
+        put(&root, "docker/cpu.max", b"max 100000\n");
+        put(&root, "docker/abc/cgroup.type", b"domain\n");
+        put(&root, "docker/abc/memory.max", b"268435456\n");
+        put(&root, "docker/abc/cpu.max", b"50000 100000\n");
+        put(&root, "docker/abc/cpuset.cpus.effective", b"0-3,8\n");
+        put(&root, "docker/abc/memory.current", b"262144000\n");
+        put(&root, "docker/abc/memory.stat", b"anon 200000000\nfile 60000000\nactive_file 10000000\ninactive_file 50000000\n");
+        put(&root, "docker/abc/memory.pressure", b"some avg10=12.50 avg60=3.00 avg300=1.00 total=1\nfull avg10=2.00 avg60=0.00 avg300=0.00 total=1\n");
+        let v = cgroup_view(&root, "/docker/abc");
+        assert_eq!(v.mem_max, Some(268_435_456));
+        assert_eq!(v.mem_dir, Some(root.join("docker/abc")));
+        assert_eq!(v.cpu_quota, Some(0.5));
+        assert_eq!(v.cpus, Some(vec![0, 1, 2, 3, 8]));
+        assert_eq!(cg_mem_used(&root.join("docker/abc")), Some(212_144_000));
+        let psi = cg_psi(&root.join("docker/abc")).unwrap();
+        assert_eq!((psi.mem_some, psi.mem_full), (12.5, 2.0));
+        // Unlimited cgroup: nothing. Private cgroupns ("/"): the namespace root's own files.
+        assert_eq!(cgroup_view(&root, "/docker").mem_max, None);
+        let ns = fixture("cgview-ns");
+        put(&ns, "cgroup.type", b"domain\n");
+        put(&ns, "memory.max", b"1073741824\n");
+        put(&ns, "cpu.max", b"max 100000\n");
+        let v = cgroup_view(&ns, "/");
+        assert_eq!((v.mem_max, v.cpu_quota), (Some(1 << 30), None));
+        assert_eq!(parse_cpu_list("0-1,4,6-7\n"), vec![0, 1, 4, 6, 7]);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&ns);
+    }
+
+    #[test]
+    fn apportion_by_capacity_keeps_idle_unattributed() {
+        // Idle 8-core laptop at 6 W: fat at 0.5% must not be "drawing" ~5.5 W.
+        let v = apportion_capacity(6000.0, &[0.5, 0.03, 0.02], 8);
+        assert!(v[0] < 5.0, "{v:?}");
+        // Fully busy machine: the whole package is attributed.
+        let v = apportion_capacity(40_000.0, &[400.0, 400.0], 8);
+        assert_eq!(v, vec![20_000.0, 20_000.0]);
+        // Never more than the total, even with skewed samples above capacity.
+        let v = apportion_capacity(1000.0, &[150.0, 150.0], 2);
+        assert!((v.iter().sum::<f32>() - 1000.0).abs() < 0.01, "{v:?}");
+        assert_eq!(apportion_capacity(1000.0, &[0.0], 0), vec![0.0]);
     }
 
     #[test]

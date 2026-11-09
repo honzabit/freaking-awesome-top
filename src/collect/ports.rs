@@ -10,8 +10,12 @@
 //! [`linux`]); owners from `/proc/<pid>/fd/*` symlinks `socket:[inode]`. Without
 //! root only our own processes' fds are readable, so other users' listeners are
 //! still listed but with pid 0, process "?" and a note "owner hidden (needs root)".
-//! `/proc/net/*` is per network namespace: we see our own netns (the host's when
-//! running with host networking).
+//! `/proc/net/*` is per network namespace, so besides our own we read
+//! `/proc/<pid>/net/*` of one process per other netns we can see (`/proc/<pid>/ns/net`;
+//! every container's when root), and tag those ports with their container. Socket inodes
+//! are unique system-wide, so owners still come from one fd walk. That walk skips
+//! processes whose fds we can't read and stops once only unreadable owners remain; on
+//! Linux the scan refreshes in the background and callers get the cached list.
 use crate::model::{Port, Proc, Proto};
 use std::collections::HashMap;
 use std::io::Read;
@@ -38,6 +42,9 @@ struct RawSock {
     /// Linux only: socket owner uid when the owning pid could not be found
     /// (another user's process without root). None on macOS / when pid is known.
     hidden_uid: Option<u32>,
+    /// Linux only: the socket lives in another network namespace than fat's (a container).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    foreign_ns: bool,
 }
 
 static CACHE: Mutex<Option<(Instant, Vec<RawSock>)>> = Mutex::new(None);
@@ -69,12 +76,38 @@ fn fetch_raw() -> Vec<RawSock> {
     dedup(linux::scan(std::path::Path::new("/proc")))
 }
 
+/// A background refresh of the Linux socket scan is running.
+#[cfg(target_os = "linux")]
+static REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg_attr(not(target_os = "linux"), allow(clippy::collapsible_if))]
 fn cached_raw() -> Vec<RawSock> {
     if let Ok(guard) = CACHE.lock()
         && let Some((at, socks)) = guard.as_ref()
-            && at.elapsed() < CACHE_TTL {
-                return socks.clone();
+    {
+        if at.elapsed() < CACHE_TTL {
+            return socks.clone();
+        }
+        // Linux: the fd walk can take a while on a busy box; refresh it off the sampling
+        // thread and serve the previous list meanwhile (listeners change rarely).
+        #[cfg(target_os = "linux")]
+        {
+            use std::sync::atomic::Ordering;
+            if !REFRESHING.swap(true, Ordering::SeqCst) {
+                let spawned = std::thread::Builder::new().name("fat-ports".into()).spawn(|| {
+                    let socks = fetch_raw();
+                    if let Ok(mut guard) = CACHE.lock() {
+                        *guard = Some((Instant::now(), socks));
+                    }
+                    REFRESHING.store(false, Ordering::SeqCst);
+                });
+                if spawned.is_err() {
+                    REFRESHING.store(false, Ordering::SeqCst);
+                }
             }
+            return socks.clone();
+        }
+    }
     let socks = fetch_raw();
     if let Ok(mut guard) = CACHE.lock() {
         *guard = Some((Instant::now(), socks.clone()));
@@ -146,6 +179,7 @@ fn parse_lsof(out: &str) -> Vec<RawSock> {
             port,
             state: if proto == Proto::Tcp { f.state } else { String::new() },
             hidden_uid: None,
+            foreign_ns: false,
         });
     }
 
@@ -405,6 +439,12 @@ fn is_orphan(ppid: u32, name: &str, exe: &str, cmd: &str, home: Option<&str>) ->
     false
 }
 
+/// One pid per other network namespace (containers): (netns inode, pid). Linux only.
+#[cfg(target_os = "linux")]
+pub fn foreign_netns(limit: usize) -> Vec<(u64, u32)> {
+    linux::foreign_netns(std::path::Path::new("/proc"), limit)
+}
+
 #[cfg(any(target_os = "linux", test))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod linux {
@@ -500,14 +540,29 @@ mod linux {
         }
     }
 
-    /// Map socket inode -> owning pid by reading `/proc/<pid>/fd/*` links. Without root
-    /// only our own processes are readable; the rest are skipped silently. Pids are
-    /// visited in ascending order so a socket shared after fork (gunicorn master +
-    /// workers) is attributed to the lowest pid, usually the parent; the scan stops
-    /// as soon as every wanted inode is found.
-    pub fn socket_owners(proc_root: &Path, wanted: &HashSet<u64>) -> HashMap<u64, u32> {
+    /// Whether we may read any process's fds (/proc/<pid>/fd needs ptrace-read access:
+    /// CAP_SYS_PTRACE, which root has except in a default container). Otherwise only
+    /// processes of our own euid are readable.
+    pub fn can_read_all_fds(proc_root: &Path) -> bool {
+        const CAP_SYS_PTRACE: u32 = 19;
+        std::fs::read_to_string(proc_root.join("self/status"))
+            .ok()
+            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("CapEff:")).and_then(|v| u64::from_str_radix(v.trim(), 16).ok()))
+            .is_some_and(|caps| caps & (1 << CAP_SYS_PTRACE) != 0)
+    }
+
+    /// Map socket inode -> owning pid by reading `/proc/<pid>/fd/*` links. `wanted` maps
+    /// each inode to its socket's uid (from /proc/net/*). Pids are visited in ascending order
+    /// so a socket shared after fork (gunicorn master + workers) is attributed to the lowest
+    /// pid, usually the parent. `readable_uid(uid)`: whether we could read the fds of a
+    /// process of that uid; processes we can't read are skipped without a syscall on their
+    /// fd dir, and the walk stops as soon as every wanted inode is found *or* every one still
+    /// missing belongs to a uid whose processes we can't read (e.g. root's sshd, unprivileged).
+    pub fn socket_owners_uid(proc_root: &Path, wanted: &HashMap<u64, u32>, readable_uid: &dyn Fn(u32) -> bool) -> HashMap<u64, u32> {
+        use std::os::unix::fs::MetadataExt;
         let mut found = HashMap::new();
-        if wanted.is_empty() {
+        let mut left_readable = wanted.values().filter(|&&u| readable_uid(u)).count();
+        if wanted.is_empty() || left_readable == 0 {
             return found;
         }
         let Ok(rd) = std::fs::read_dir(proc_root) else { return found };
@@ -516,7 +571,14 @@ mod linux {
             .collect();
         pids.sort_unstable();
         for pid in pids {
-            let Ok(fds) = std::fs::read_dir(proc_root.join(pid.to_string()).join("fd")) else { continue };
+            let dir = proc_root.join(pid.to_string());
+            // A process of a uid we can't read: skip (its fd dir would be EACCES anyway).
+            if let Ok(m) = std::fs::metadata(&dir)
+                && !readable_uid(m.uid())
+            {
+                continue;
+            }
+            let Ok(fds) = std::fs::read_dir(dir.join("fd")) else { continue };
             for fd in fds.flatten() {
                 let Ok(target) = std::fs::read_link(fd.path()) else { continue };
                 let Some(ino) = target
@@ -527,15 +589,53 @@ mod linux {
                 else {
                     continue;
                 };
-                if wanted.contains(&ino) {
-                    found.entry(ino).or_insert(pid);
+                if let Some(&uid) = wanted.get(&ino)
+                    && !found.contains_key(&ino)
+                {
+                    found.insert(ino, pid);
+                    if readable_uid(uid) {
+                        left_readable -= 1;
+                    }
                 }
             }
-            if found.len() == wanted.len() {
+            if found.len() == wanted.len() || left_readable == 0 {
                 break;
             }
         }
         found
+    }
+
+    /// Map socket inode -> owning pid, reading every fd dir we can (no uid shortcut).
+    #[allow(dead_code)]
+    pub fn socket_owners(proc_root: &Path, wanted: &HashSet<u64>) -> HashMap<u64, u32> {
+        let w: HashMap<u64, u32> = wanted.iter().map(|&i| (i, 0)).collect();
+        socket_owners_uid(proc_root, &w, &|_| true)
+    }
+
+    /// One pid per network namespace other than ours whose `ns/net` link we can read
+    /// (same uid, or root): (netns inode, pid), lowest pid first, at most `limit`.
+    pub fn foreign_netns(proc_root: &Path, limit: usize) -> Vec<(u64, u32)> {
+        let ns_of = |p: &Path| -> Option<u64> {
+            let t = std::fs::read_link(p.join("ns/net")).ok()?;
+            t.to_str()?.strip_prefix("net:[")?.strip_suffix(']')?.parse().ok()
+        };
+        let Some(ours) = ns_of(&proc_root.join("self")) else { return Vec::new() };
+        let Ok(rd) = std::fs::read_dir(proc_root) else { return Vec::new() };
+        let mut pids: Vec<u32> = rd.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok()).collect();
+        pids.sort_unstable();
+        let mut seen: HashSet<u64> = HashSet::from([ours]);
+        let mut out = Vec::new();
+        for pid in pids {
+            if let Some(ns) = ns_of(&proc_root.join(pid.to_string()))
+                && seen.insert(ns)
+            {
+                out.push((ns, pid));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// (comm, ppid) from /proc/<pid>/stat. comm may contain spaces and ')'.
@@ -556,27 +656,47 @@ mod linux {
             .unwrap_or_default()
     }
 
-    /// Listening TCP + bound UDP sockets of our network namespace, with owners.
+    /// Most other network namespaces scanned per refresh (each costs four small reads).
+    const MAX_NETNS: usize = 64;
+
+    /// Listening TCP + bound UDP sockets of our network namespace and of every other one we
+    /// can see (containers), with owners.
     pub fn scan(proc_root: &Path) -> Vec<RawSock> {
-        let mut rows: Vec<(Proto, NetRow)> = Vec::new();
-        for (file, proto) in [("tcp", Proto::Tcp), ("tcp6", Proto::Tcp), ("udp", Proto::Udp), ("udp6", Proto::Udp)] {
-            let Ok(text) = std::fs::read_to_string(proc_root.join("net").join(file)) else { continue };
-            for r in parse_proc_net(&text) {
-                let keep = match proto {
-                    Proto::Tcp => r.state == TCP_LISTEN,
-                    // Connected UDP sockets are clients (QUIC, DNS lookups), not services.
-                    Proto::Udp => r.rem_port == 0,
-                };
-                if keep && r.port != 0 {
-                    rows.push((proto, r));
+        let all = can_read_all_fds(proc_root);
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        scan_with(proc_root, &|uid| all || uid == me)
+    }
+
+    /// [`scan`] with an explicit "can we read fds of a process of this uid" test.
+    pub fn scan_with(proc_root: &Path, readable_uid: &dyn Fn(u32) -> bool) -> Vec<RawSock> {
+        let mut rows: Vec<(Proto, NetRow, bool)> = Vec::new();
+        let mut seen_ino: HashSet<u64> = HashSet::new();
+        let mut read_ns = |net: &Path, foreign: bool, rows: &mut Vec<(Proto, NetRow, bool)>| {
+            for (file, proto) in [("tcp", Proto::Tcp), ("tcp6", Proto::Tcp), ("udp", Proto::Udp), ("udp6", Proto::Udp)] {
+                let Ok(text) = std::fs::read_to_string(net.join(file)) else { continue };
+                for r in parse_proc_net(&text) {
+                    let keep = match proto {
+                        Proto::Tcp => r.state == TCP_LISTEN,
+                        // Connected UDP sockets are clients (QUIC, DNS lookups), not services.
+                        Proto::Udp => r.rem_port == 0,
+                    };
+                    // Inodes are unique system-wide: a row seen twice is the same socket.
+                    if keep && r.port != 0 && (r.inode == 0 || seen_ino.insert(r.inode)) {
+                        rows.push((proto, r, foreign));
+                    }
                 }
             }
+        };
+        read_ns(&proc_root.join("net"), false, &mut rows);
+        for (_, pid) in foreign_netns(proc_root, MAX_NETNS) {
+            read_ns(&proc_root.join(pid.to_string()).join("net"), true, &mut rows);
         }
-        let wanted: HashSet<u64> = rows.iter().map(|(_, r)| r.inode).filter(|&i| i != 0).collect();
-        let owners = socket_owners(proc_root, &wanted);
+        let wanted: HashMap<u64, u32> = rows.iter().filter(|(_, r, _)| r.inode != 0).map(|(_, r, _)| (r.inode, r.uid)).collect();
+        let owners = socket_owners_uid(proc_root, &wanted, readable_uid);
         let mut stat_cache: HashMap<u32, Option<(String, u32)>> = HashMap::new();
         rows.into_iter()
-            .map(|(proto, r)| {
+            .map(|(proto, r, foreign_ns)| {
                 let pid = owners.get(&r.inode).copied().unwrap_or(0);
                 let (command, ppid) = if pid == 0 {
                     ("?".to_string(), 0)
@@ -592,6 +712,7 @@ mod linux {
                     port: r.port,
                     state: if proto == Proto::Tcp { "LISTEN".into() } else { String::new() },
                     hidden_uid: (pid == 0).then_some(r.uid),
+                    foreign_ns,
                 }
             })
             .collect()
@@ -627,6 +748,9 @@ mod linux {
                             Some(n) => note.push_str(&format!(" · uid {uid} ({n})")),
                             None => note.push_str(&format!(" · uid {uid}")),
                         }
+                    }
+                    if s.foreign_ns {
+                        note.push_str(" · in another network namespace");
                     }
                     return Port {
                         proto: s.proto,
@@ -679,7 +803,18 @@ mod linux {
                     process: name.to_string(),
                     state: s.state.clone(),
                     orphan: is_orphan_linux(ppid, &parent_name, name, &exe, &cmd, &cgroup, home),
-                    note: describe(name, &cmd, &cwd, start, now, home),
+                    note: {
+                        let mut n = describe(name, &cmd, &cwd, start, now, home);
+                        if s.foreign_ns {
+                            // Not reachable on this address from fat's own netns: say where it lives.
+                            let ctr = p.and_then(|p| p.container.clone()).or_else(|| crate::collect::linux::container_id(&cgroup));
+                            match ctr {
+                                Some(c) => n.push_str(&format!(" · in container {c} (own network namespace)")),
+                                None => n.push_str(" · in another network namespace"),
+                            }
+                        }
+                        n
+                    },
                 }
             })
             .collect()
@@ -850,7 +985,8 @@ mod linux {
         #[cfg(all(unix, target_endian = "little"))]
         fn scans_fixture_tree() {
             let root = fixture();
-            let socks = dedup(scan(&root));
+            // Fixture fds belong to us whatever uid the rows say.
+            let socks = dedup(scan_with(&root, &|_| true));
             let _ = std::fs::remove_dir_all(&root);
             let find = |proto, port| socks.iter().find(|s| s.proto == proto && s.port == port).unwrap();
             let web = find(Proto::Tcp, 18081);
@@ -869,6 +1005,46 @@ mod linux {
             assert!(!socks.iter().any(|s| s.proto == Proto::Udp && s.port != 53), "connected/unbound udp skipped");
             assert!(!socks.iter().any(|s| s.port == 46264 || s.port == 46265), "non-listen tcp skipped");
             assert!(scan(Path::new("/nonexistent/fat")).is_empty());
+        }
+
+        #[test]
+        #[cfg(all(unix, target_endian = "little"))]
+        fn owner_walk_skips_unreadable_uids() {
+            let root = fixture();
+            // Postgres's sockets, but say uid 0 owns them and we can't read uid 0: no walk.
+            let wanted: HashMap<u64, u32> = [(9001, 0), (9002, 0)].into();
+            let none = socket_owners_uid(&root, &wanted, &|u| u == 4_242_424);
+            assert!(none.is_empty());
+            // Readable owners are found; an unreadable leftover doesn't keep the walk going.
+            use std::os::unix::fs::MetadataExt;
+            let me = std::fs::metadata(&root).unwrap().uid();
+            let wanted: HashMap<u64, u32> = [(9001, me), (424_242, 0)].into();
+            let got = socket_owners_uid(&root, &wanted, &|u| u == me);
+            assert_eq!(got.get(&9001), Some(&777));
+            assert_eq!(got.len(), 1);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        #[cfg(unix)]
+        fn finds_one_pid_per_foreign_netns() {
+            let root = std::env::temp_dir().join(format!("fat-netns-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let ns = |dir: &str, ino: u64| {
+                let d = root.join(dir).join("ns");
+                std::fs::create_dir_all(&d).unwrap();
+                std::os::unix::fs::symlink(format!("net:[{ino}]"), d.join("net")).unwrap();
+            };
+            ns("self", 4026531840);
+            ns("1", 4026531840);
+            ns("300", 4026532999); // container A
+            ns("301", 4026532999);
+            ns("50", 4026533111); // container B (lower pid first)
+            std::fs::create_dir_all(root.join("77")).unwrap(); // unreadable/no ns link
+            assert_eq!(foreign_netns(&root, 8), vec![(4026533111, 50), (4026532999, 300)]);
+            assert_eq!(foreign_netns(&root, 1).len(), 1);
+            let _ = std::fs::remove_dir_all(&root);
+            assert!(foreign_netns(Path::new("/nonexistent/fat"), 8).is_empty());
         }
 
         #[test]

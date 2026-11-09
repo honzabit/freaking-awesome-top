@@ -161,10 +161,19 @@ per-process network rates) and the container CLIs (cached).
 - **PSI (pressure stall information).** The header shows `PSI cpu▂3 mem▁0 io▅12`: the share of the last 10
   seconds that tasks spent waiting for a CPU, for memory and for io. Load average can't tell you this. A busy
   machine with PSI near 0 is fine. Sustained PSI above about 10% means real contention, and `doctor` / `ask` say so.
-- **Measured power.** With RAPL (Intel, and AMD Zen), system power is the CPU package's real energy counter.
-  It is apportioned to processes by their CPU share and shown as `48.2W rapl`. Without RAPL access it falls back
-  to a CPU-time model, shown as `~8.0W est`.
-- **Temperatures.** The hottest hwmon sensor or thermal zone (`THERM 71°C`).
+- **Measured power.** With RAPL (Intel, and AMD Zen), system power is the CPU package's real energy counter
+  (the `package-N` zones; a laptop's `psys` platform zone is used only when there is no package zone, since it
+  already contains the package), shown as `48.2W rapl`. Each process gets its share of the machine's CPU capacity
+  (one of 8 cores busy = 1/8 of package power), so the idle and uncore baseline stays unattributed. Without RAPL
+  access it falls back to a CPU-time model, shown as `~8.0W est`.
+- **Temperatures.** The hottest hwmon sensor or thermal zone (`THERM 71°C`). The thermal *state* (throttling)
+  only comes from CPU sources at their real trip points (thermal-zone passive/hot/critical trips, coretemp /
+  k10temp limits): a hot NVMe or a CPU at 80°C under a build is hot, not throttled.
+- **Container limits.** When fat itself runs in a cgroup with `memory.max` / `cpu.max` / a cpuset (a container
+  started with `--memory`, `--cpus`, `--cpuset-cpus`), memory total and used, memory pressure, PSI, the core
+  count and CPU% are the container's (CPU% is of its quota), not the host's `/proc/meminfo` and cores.
+- **System disk and network totals** come from `/proc/diskstats` (whole disks) and `/proc/net/dev` (all but
+  `lo`), which are world-readable, so they are right without root even though other users' per-process io isn't.
 - **Containers as first-class processes.** Each process's cgroup v2 path (`/system.slice/docker-<id>.scope`,
   `…/libpod-<id>.scope`, kubepods, …) gives its container id. The procs table gets a **CONTAINER** column
   (the container's name when the runtime reports it, otherwise the short id), and `/db-1` filters to that
@@ -172,23 +181,37 @@ per-process network rates) and the container CLIs (cached).
   processes.
 - **cgroup-based budgets.** `fat run` measures the whole tree from procfs, including children that already exited.
   When it can create a cgroup v2 child (as root, or inside a delegated subtree such as a systemd user scope), the
-  kernel enforces the budget itself through `cpu.max` and `memory.max`, so a fork bomb or a sudden allocation can't
-  outrun the poll. As root it creates `/sys/fs/cgroup/fat.slice/run-<pid>-<n>`; as a normal user it starts a
-  transient `systemd-run --user --scope` itself (this needs a user manager: on a headless box run
-  `loginctl enable-linger $USER` once). Otherwise it polls every 500 ms, as on macOS. The first line of output
-  says which mechanism is enforcing. `FAT_BUDGET_MODE=auto|cgroup|poll` forces a choice. With a kernel memory
-  limit a breach is an OOM kill inside the job (reported as a mem violation), not a pause.
+  kernel backs the budget so a sudden allocation or a fork bomb can't outrun the poll, while the policy keeps
+  its meaning:
+  - `--cpu`: `cpu.max` holds the job at its quota. A job throttled in most periods wants more than its budget,
+    which is a cpu violation, so `pause` and `kill` fire as on macOS (`warn` sets no limit and only reports).
+  - `--mem` with `pause` (the default): `memory.high` just above the budget slows the job down (no kill) and
+    `memory.max` well above it is only a backstop; the poll pauses the job at the breach, and it can be resumed.
+    With `kill`, `memory.max` sits at the budget and an OOM kills the whole job (`memory.oom.group`).
+  - `--procs`: `pids.max` as a backstop (16 × procs + 256 tasks; it counts threads), with the exact process
+    count polled.
 
-- **Ports and orphans without lsof.** Ports come from `/proc/net/{tcp,tcp6,udp,udp6}`, and owners from
-  `/proc/<pid>/fd`. A dev server re-parented to pid 1 or to a `systemd --user` subreaper is flagged as an orphan.
+  As root it creates `/sys/fs/cgroup/fat.slice/run-<pid>-<random>` (never inside a container's cgroup-namespace
+  root that holds processes); as a normal user it starts a transient `systemd-run --user --scope` itself (this
+  needs a user manager: on a headless box run `loginctl enable-linger $USER` once; if systemd-run fails, the
+  command is started directly and polled). When fat itself runs inside a limited cgroup (another `fat run`, a
+  container with `--memory`/`--cpus`), it makes no new cgroup, which would escape those limits: the job stays
+  under them and this budget is polled. Processes that leave the job's cgroup (`systemd-run --scope`) are
+  noticed and polled too. Otherwise it polls every 500 ms, as on macOS. The first line of output says which
+  mechanism is enforcing. `FAT_BUDGET_MODE=auto|cgroup|poll` forces a choice.
+
+- **Ports and orphans without lsof.** Ports come from `/proc/net/{tcp,tcp6,udp,udp6}` of fat's own network
+  namespace and of every other one it can see (`/proc/<pid>/net/*`; all containers' as root, tagged "in
+  container <id>"), and owners from `/proc/<pid>/fd`. As root, per-process traffic is also read from each
+  container's namespace (`nsenter -n ss`). A dev server re-parented to pid 1 or to a `systemd --user` subreaper is flagged as an orphan.
 
 ### Data sources
 
 | Data | macOS | Linux |
 | --- | --- | --- |
 | Process list, cpu, memory, threads, nice | `proc_pid_rusage`, `proc_pidinfo`, `sysinfo` | `/proc/<pid>/stat`, `status` |
-| Per-process disk I/O | `proc_pid_rusage` | `/proc/<pid>/io` (own processes, or all as root) |
-| Per-process network | `nettop` | `ss -tinpeH` tcp_info byte counters (own sockets, or all as root) |
+| Per-process disk I/O | `proc_pid_rusage` | `/proc/<pid>/io` (own processes, or all as root); system totals `/proc/diskstats` |
+| Per-process network | `nettop` | `ss -tinpeH` tcp_info byte counters (own sockets, or all as root, every netns); system totals `/proc/net/dev` |
 | Power | per-task energy (`ri_energy_nj`) → `rusage` | RAPL `/sys/class/powercap/intel-rapl:*/energy_uj` → `rapl`, else CPU-time model → `estimate` |
 | Memory pressure | `kern.memorystatus_vm_pressure_level` | `/proc/pressure/memory`, `/proc/meminfo` |
 | CPU / io pressure | none | `/proc/pressure/{cpu,io}` (PSI, kernel 4.20+, `psi=1`) |
@@ -208,7 +231,8 @@ fat never needs root on Linux. As a normal user:
 
 - **All processes**, with cpu, memory, threads, state, cgroup and container, because `stat`, `status` and `cgroup` are world-readable.
   (With `hidepid=2` on `/proc` you only see your own.)
-- **Disk rates, cwd and exe for your own processes only.** For other users these read 0 / empty.
+- **Disk rates, cwd and exe for your own processes only.** For other users these read 0 / empty (the system
+  disk and network totals are still complete).
 - **Network rates for your own sockets only**, because `ss` hides other users' pids.
 - **Listeners for every port, but owners only for your own.** Others show as pid 0, "owner hidden (needs root)".
 - **No RAPL.** `energy_uj` has been root-only since CVE-2020-8694, so power is `~est`. To allow it for a group, use
