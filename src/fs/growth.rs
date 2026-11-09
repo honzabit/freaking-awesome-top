@@ -951,7 +951,8 @@ impl Tracker {
 /// Sum of deltas of growers not nested in another listed grower.
 fn top_level_sum(g: &[crate::fs::Grower]) -> i64 {
     g.iter()
-        .filter(|x| !g.iter().any(|y| y.path != x.path && under_prefix(&x.path, &y.path)))
+        // An "other under Y" row carries only Y's remainder: rows below it count too.
+        .filter(|x| !g.iter().any(|y| !y.other && y.path != x.path && under_prefix(&x.path, &y.path)))
         .map(|x| x.delta)
         .sum()
 }

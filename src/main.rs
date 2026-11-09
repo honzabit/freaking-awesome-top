@@ -12,6 +12,7 @@ mod fs;
 mod history;
 mod mcp;
 mod model;
+mod sys;
 mod tui;
 
 use anyhow::Result;
@@ -52,7 +53,15 @@ enum Cmd {
         json: bool,
     },
     /// Ask in plain language ("why is this machine slow?").
-    Ask { question: Vec<String> },
+    ///
+    /// Offline (rule-based) unless ANTHROPIC_API_KEY is set; then a redacted digest is sent to
+    /// the Claude API. --dry-run prints exactly that request body and sends nothing.
+    Ask {
+        /// Print the request body that would be sent to the API, and send nothing.
+        #[arg(long)]
+        dry_run: bool,
+        question: Vec<String>,
+    },
     /// Run the always-on flight recorder (foreground).
     Record,
     /// Query the recorder: timeline, spikes, or a past snapshot.
@@ -92,13 +101,13 @@ enum Cmd {
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Pause a process (SIGSTOP). Undoable.
+    /// Pause a process (SIGSTOP). Undoable: `fat undo` or `fat resume` continues it.
     Pause { pid: u32 },
     /// Resume a paused process (SIGCONT).
     Resume { pid: u32 },
-    /// Change priority. Undoable.
+    /// Change priority. Undoable (lowering nice again may need root).
     Renice { pid: u32, nice: i32 },
-    /// Terminate (TERM). With --tree, the whole subtree. --force sends KILL.
+    /// Terminate (TERM). NOT undoable: pause first to try it out. --tree: whole subtree; --force: KILL.
     Kill {
         pid: u32,
         #[arg(long)]
@@ -106,7 +115,7 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Undo the last undoable action (or a specific id).
+    /// Undo the last pause or renice (or a specific id). A kill cannot be undone.
     Undo { id: Option<u64> },
     /// Show the action journal.
     Log {
@@ -126,6 +135,36 @@ enum Cmd {
     Fs(FsArgs),
     /// Serve the MCP protocol on stdio (for agents).
     Mcp,
+}
+
+/// Top-level help groups (clap has no per-subcommand headings, so the list is rendered here
+/// from each subcommand's own about text; `help_groups_cover_every_subcommand` keeps it whole).
+const HELP_GROUPS: &[(&str, &[&str])] = &[
+    ("Everyday", &["snapshot", "ports", "fs", "why", "doctor", "ask"]),
+    ("Actions (pause/resume/renice can be undone; kill cannot)", &["pause", "resume", "renice", "kill", "undo", "log"]),
+    ("Flight recorder", &["record", "history"]),
+    ("Advanced", &["run", "fleet", "mcp"]),
+];
+
+fn cli_command() -> clap::Command {
+    use clap::CommandFactory;
+    let cmd = Cli::command();
+    let mut groups = String::from("With no command, fat opens the TUI (processes by CPU; h for keys).\n");
+    for (title, names) in HELP_GROUPS {
+        groups.push_str(&format!("\n{title}:\n"));
+        for n in *names {
+            let about = cmd.find_subcommand(n).and_then(|c| c.get_about()).map(|a| a.to_string()).unwrap_or_default();
+            groups.push_str(&format!("  {n:<10}{about}\n"));
+        }
+    }
+    groups.push_str("  help      Print help for a command (fat help <command>)\n");
+    cmd.help_template(format!("{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{groups}\nOptions:\n{{options}}{{after-help}}"))
+}
+
+fn parse_cli() -> Cli {
+    use clap::FromArgMatches;
+    let m = cli_command().get_matches();
+    Cli::from_arg_matches(&m).unwrap_or_else(|e| e.exit())
 }
 
 /// Two samples 600ms apart (rates need an interval). Containers, when wanted and enabled,
@@ -373,13 +412,12 @@ fn fmt_growth(g: &fs::Growth, window_ms: i64, now: model::Ts) -> String {
             }
             let _ = writeln!(
                 out,
-                "{:>9} {:>8} {:>9}  {:<24} {}{}{who}",
+                "{:>9} {:>8} {:>9}  {:<24} {}{who}",
                 fmt_delta(x.delta),
                 hb(x.size),
                 if rate > 0 { format!("{}/s", hb(rate)) } else { "-".into() },
                 evidence_tags(&x.evidence),
-                x.path,
-                if x.is_dir { "/" } else { "" },
+                tui::widgets::grower_label(x),
             );
         }
     }
@@ -388,15 +426,20 @@ fn fmt_growth(g: &fs::Growth, window_ms: i64, now: model::Ts) -> String {
         let n = quiet;
         let _ = writeln!(out, "  … {n} more paths touched with no net size change (--json lists them)");
     }
-    if !g.deleted_open.is_empty() {
+    let (groups, small, small_bytes) = tui::widgets::group_deleted(&g.deleted_open, tui::widgets::DELETED_MIN_BYTES);
+    if !groups.is_empty() || small > 0 {
         let _ = writeln!(out, "Deleted but still open (space returns when the holder closes them or restarts):");
         const SHOW: usize = 8;
-        for (pid, name, path, b) in g.deleted_open.iter().take(SHOW) {
-            let _ = writeln!(out, "{:>9}  {path}  held by {name} ({pid})", hb(*b));
+        for d in groups.iter().take(SHOW) {
+            let what = if d.files == 1 { d.biggest.clone() } else { format!("{} files, biggest {}", d.files, d.biggest) };
+            let _ = writeln!(out, "{:>9}  {} ({}) holds {what}", hb(d.bytes), d.name, d.pid);
         }
-        if g.deleted_open.len() > SHOW {
-            let rest = &g.deleted_open[SHOW..];
-            let _ = writeln!(out, "{:>9}  … {} more (--json lists them)", hb(rest.iter().map(|d| d.3).sum()), rest.len());
+        if groups.len() > SHOW {
+            let rest = &groups[SHOW..];
+            let _ = writeln!(out, "{:>9}  … {} more processes (--json lists them)", hb(rest.iter().map(|d| d.bytes).sum()), rest.len());
+        }
+        if small > 0 {
+            let _ = writeln!(out, "{:>9}  … {small} small files under 1M not shown (--json lists them)", hb(small_bytes));
         }
     }
     if !g.writers.is_empty() {
@@ -576,7 +619,7 @@ fn main() -> Result<()> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    let cli = Cli::parse();
+    let cli = parse_cli();
     let cfg = config::Config::load();
     match cli.cmd {
         None => tui::run(cfg)?,
@@ -619,7 +662,8 @@ fn main() -> Result<()> {
             }
         }
         Some(Cmd::Ports { json }) => {
-            let s = sample();
+            // Ports need names, command lines and ppids, not cpu deltas: one sample, no 600 ms wait.
+            let s = collect::Collector::new().sample();
             if json {
                 print_json(&s.ports)?;
             } else {
@@ -659,8 +703,9 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Doctor { json }) => {
             let mut s = sample();
-            // Container names for container findings, fetched only when something runs in one.
-            if cfg.containers && s.procs.iter().any(|p| p.container.is_some()) {
+            // Container names for container findings and VM-host advice, fetched only when
+            // something runs in a container or hosts them (OrbStack, Docker Desktop, dockerd).
+            if cfg.containers && blame::hosts_containers(&s) {
                 s.containers = fleet::containers();
             }
             let h = history::History::open(cfg.history_path.as_deref()).ok();
@@ -678,12 +723,18 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Some(Cmd::Ask { question }) => {
+        Some(Cmd::Ask { question, dry_run }) => {
             let q = question.join(" ");
             let s = sample_with(true);
             let h = history::History::open(cfg.history_path.as_deref()).ok();
             let f = blame::diagnose(&s, h.as_ref());
-            println!("{}", ask::ask(&q, &s, &f, &cfg.ask));
+            if dry_run {
+                let (body, note) = ask::dry_run(&q, &s, &f, &cfg.ask);
+                eprintln!("{note}");
+                println!("{body}");
+            } else {
+                println!("{}", ask::ask(&q, &s, &f, &cfg.ask));
+            }
         }
         Some(Cmd::Record) => history::record_forever(&cfg)?,
         Some(Cmd::History { since, at, spikes, json }) => {
@@ -831,6 +882,31 @@ mod tests {
     }
 
     #[test]
+    fn help_groups_cover_every_subcommand() {
+        let cmd = cli_command();
+        let mut listed: Vec<&str> = HELP_GROUPS.iter().flat_map(|(_, n)| n.iter().copied()).collect();
+        let mut all: Vec<&str> = cmd.get_subcommands().map(|c| c.get_name()).collect();
+        listed.sort_unstable();
+        all.sort_unstable();
+        assert_eq!(listed, all, "every subcommand in exactly one help group");
+        let help = cli_command().render_help().to_string();
+        for (title, names) in HELP_GROUPS {
+            assert!(help.contains(&format!("{title}:")), "{help}");
+            for n in *names {
+                assert!(help.contains(&format!("  {n} ")), "{n} missing\n{help}");
+            }
+        }
+        assert!(help.find("Everyday:").unwrap() < help.find("Advanced:").unwrap());
+        // Every existing command still parses (no renames).
+        for args in [&["fat", "snapshot"][..], &["fat", "log"], &["fat", "undo"], &["fat", "kill", "5", "--tree"], &["fat", "ask", "--dry-run", "why", "hot"], &["fat", "mcp"], &["fat", "fleet"], &["fat", "record"], &["fat", "history", "--spikes"], &["fat", "run", "--", "true"]] {
+            let m = cli_command().try_get_matches_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            <Cli as clap::FromArgMatches>::from_arg_matches(&m).unwrap();
+        }
+        let m = cli_command().try_get_matches_from(["fat", "ask", "--dry-run", "why", "hot"]).unwrap();
+        assert!(matches!(<Cli as clap::FromArgMatches>::from_arg_matches(&m).unwrap().cmd, Some(Cmd::Ask { dry_run: true, ref question }) if question == &["why", "hot"]));
+    }
+
+    #[test]
     fn fs_cli_parsing() {
         let a = parse(&[]).unwrap();
         assert_eq!((a.path, a.depth, a.growth, a.volumes, a.largest, a.json), (None, 1, false, false, None, false));
@@ -900,7 +976,7 @@ mod tests {
         let out = fmt_growth(&g, 600_000, 5);
         assert!(out.contains("last 10m") && out.contains("volume /: +3.0G"), "{out}");
         assert!(out.contains("    +2.0G     5.0G    1.0M/s  fsevents,open-files      /w/logs/  ← node (42) +1"), "{out}");
-        assert!(out.contains("held by java (9)") && out.contains("fat why 42") && out.contains("note: fanotify"), "{out}");
+        assert!(out.contains("java (9) holds /tmp/old.log") && out.contains("fat why 42") && out.contains("note: fanotify"), "{out}");
         let vols = vec![fs::Volume { mount: "/".into(), fstype: "apfs".into(), total: 100 << 30, used: 95 << 30, avail: 5 << 30, primary: true, fill_bps: Some(1e6), eta_full_s: Some(5000), ..Default::default() }];
         let out = fmt_volumes(&vols);
         assert!(out.contains("95.0G/100.0G  95%") && out.contains("full in 1h") && out.contains("apfs primary"), "{out}");

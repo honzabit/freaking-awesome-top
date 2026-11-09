@@ -1,8 +1,8 @@
 //! Evidence::OpenFiles: regular files that disk-writing processes hold open for writing,
 //! sized repeatedly so their growth can be measured and attributed to the writer.
 //!
-//! Linux: /proc/<pid>/fd + /proc/<pid>/fdinfo flags. macOS: libproc
-//! (proc_pidinfo(PROC_PIDLISTFDS) + proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)), which returns
+//! Linux: /proc/<pid>/fd + /proc/<pid>/fdinfo flags. macOS: libproc (`sys::darwin::libproc`:
+//! proc_pidinfo(PROC_PIDLISTFDS) + proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)), which returns
 //! open mode, path and size straight from the kernel: no lsof subprocess, no stat of the file,
 //! so it cannot trip TCC prompts either.
 use super::rollup::Obs;
@@ -189,76 +189,10 @@ pub fn writable_files(pid: u32) -> Vec<(String, u64)> {
     out
 }
 
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct ProcFileInfo {
-    fi_openflags: u32,
-    fi_status: u32,
-    fi_offset: i64,
-    fi_type: i32,
-    fi_guardflags: u32,
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct VnodeFdInfoWithPath {
-    pfi: ProcFileInfo,
-    pvip: libc::vnode_info_path,
-}
-
-#[cfg(target_os = "macos")]
-const _: () = assert!(std::mem::size_of::<VnodeFdInfoWithPath>() == 1200);
-
+/// macOS: libproc fds + PROC_PIDFDVNODEPATHINFO (open mode, path and size from the kernel).
 #[cfg(target_os = "macos")]
 pub fn writable_files(pid: u32) -> Vec<(String, u64)> {
-    const PROC_PIDFDVNODEPATHINFO: i32 = 2;
-    const FWRITE: u32 = 0x2;
-    const VREG: i32 = 1;
-    let mut out = vec![];
-    let pid = pid as i32;
-    // SAFETY: libproc calls with correctly sized, zero-initialized buffers.
-    unsafe {
-        let need = libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
-        if need <= 0 {
-            return out;
-        }
-        let sz = std::mem::size_of::<libc::proc_fdinfo>();
-        let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(need as usize / sz + 32);
-        let got = libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDLISTFDS,
-            0,
-            fds.as_mut_ptr() as *mut _,
-            (fds.capacity() * sz) as i32,
-        );
-        if got <= 0 {
-            return out;
-        }
-        fds.set_len(got as usize / sz);
-        for fd in fds.iter().filter(|f| f.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32) {
-            let mut vi: VnodeFdInfoWithPath = std::mem::zeroed();
-            let vsz = std::mem::size_of::<VnodeFdInfoWithPath>() as i32;
-            let r = libc::proc_pidfdinfo(
-                pid,
-                fd.proc_fd,
-                PROC_PIDFDVNODEPATHINFO,
-                &mut vi as *mut _ as *mut _,
-                vsz,
-            );
-            if r != vsz || vi.pfi.fi_openflags & FWRITE == 0 || vi.pvip.vip_vi.vi_type != VREG {
-                continue;
-            }
-            let raw = std::slice::from_raw_parts(vi.pvip.vip_path.as_ptr() as *const u8, 1024);
-            let len = raw.iter().position(|&b| b == 0).unwrap_or(1024);
-            let Ok(p) = std::str::from_utf8(&raw[..len]) else {
-                continue;
-            };
-            if p.starts_with('/') && !p.starts_with("/dev/") {
-                out.push((p.to_string(), vi.pvip.vip_vi.vi_stat.vst_blocks as u64 * 512));
-            }
-        }
-    }
-    out
+    crate::sys::darwin::libproc::writable_files(pid as i32)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

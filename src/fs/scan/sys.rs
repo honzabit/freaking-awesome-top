@@ -434,39 +434,8 @@ pub fn firmlink_aliases() -> HashSet<Vec<u8>> {
 pub const PROTECTED_HINT: &str =
     "protected by macOS privacy (TCC): open it to scan (macOS may ask for permission), or grant Full Disk Access";
 
-/// Home-relative locations macOS guards with TCC. Reading them from a terminal without Full
-/// Disk Access either pops a permission dialog or fails with EPERM.
-const TCC_HOME: &[&str] = &[
-    "Desktop",
-    "Documents",
-    "Downloads",
-    ".Trash",
-    "Library/Mail",
-    "Library/Messages",
-    "Library/Safari",
-    "Library/Cookies",
-    "Library/Calendars",
-    "Library/Reminders",
-    "Library/HomeKit",
-    "Library/IdentityServices",
-    "Library/Suggestions",
-    "Library/PersonalizationPortrait",
-    "Library/Biome",
-    "Library/Accounts",
-    "Library/Sharing",
-    "Library/Metadata/CoreSpotlight",
-    "Library/Metadata/com.apple.IntelligentSuggestions",
-    "Library/Mobile Documents",
-    "Library/CloudStorage",
-    "Library/Application Support/AddressBook",
-    "Library/Application Support/CallHistoryDB",
-    "Library/Application Support/CallHistoryTransactions",
-    "Library/Application Support/com.apple.TCC",
-    "Library/Application Support/FaceTime",
-    "Library/Application Support/Knowledge",
-    "Library/Application Support/MobileSync",
-    "Library/Application Support/com.apple.sharedfilelist",
-];
+// The TCC-protected locations themselves live in `crate::fs::tcc` (shared with the growth
+// tracker).
 
 #[derive(Clone, Default)]
 pub struct Policy {
@@ -503,6 +472,9 @@ impl Policy {
         if !self.protect || self.fda {
             return None;
         }
+        if crate::fs::tcc::is_protected_abs(path) {
+            return Some(PROTECTED_HINT);
+        }
         std::iter::once(&self.home).chain(self.other_homes.iter()).filter(|h| !h.is_empty()).find_map(|h| {
             let mut pre = h.clone();
             pre.push(b'/');
@@ -511,21 +483,7 @@ impl Policy {
     }
 
     fn protected_rel(rel: &[u8]) -> Option<&'static str> {
-        if TCC_HOME.iter().any(|p| p.as_bytes() == rel) {
-            return Some(PROTECTED_HINT);
-        }
-        for parent in [&b"Library/Containers/"[..], b"Library/Group Containers/"] {
-            if let Some(rest) = rel.strip_prefix(parent)
-                && !rest.is_empty()
-                && !rest.contains(&b'/')
-            {
-                return Some(PROTECTED_HINT);
-            }
-        }
-        if rel.ends_with(b".photoslibrary") {
-            return Some(PROTECTED_HINT);
-        }
-        None
+        crate::fs::tcc::is_protected_rel(rel).then_some(PROTECTED_HINT)
     }
 
     fn auto_descend(&self, path: &[u8], m: &MountInfo) -> bool {

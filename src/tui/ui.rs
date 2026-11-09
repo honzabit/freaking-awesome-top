@@ -45,7 +45,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Tab::Fleet => draw_fleet(f, app, main),
         Tab::Timeline => draw_timeline(f, app, main),
         Tab::Doctor => draw_doctor(f, app, main),
-        Tab::Log => draw_log(f, app, main),
     }
 
     if app.why.is_some() {
@@ -237,11 +236,11 @@ fn thermal_spans(thermal: &str, temp_c: Option<f32>) -> Vec<Span<'static>> {
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let titles: Vec<Line> = Tab::ALL
+    let tabs = app.tabs();
+    let titles: Vec<Line> = tabs
         .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            let mut spans = vec![Span::styled(format!("{}", i + 1), Style::default().fg(Color::Yellow)), Span::raw(t.title())];
+        .map(|t| {
+            let mut spans = vec![Span::styled(format!("{}", t.index() + 1), Style::default().fg(Color::Yellow)), Span::raw(t.title())];
             if *t == Tab::Doctor {
                 let crit = app.findings.iter().filter(|x| x.severity == "crit").count();
                 let warn = app.findings.iter().filter(|x| x.severity == "warn").count();
@@ -276,7 +275,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     let tabs = Tabs::new(titles)
-        .select(app.tab.index())
+        .select(tabs.iter().position(|t| *t == app.tab).unwrap_or(0))
         .style(dim())
         .highlight_style(Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
         .divider("│")
@@ -915,11 +914,14 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
     // No volume samples cover the window (no recorder history yet): unknown, not "0".
     let vol_text = if g.volumes.is_empty() { "volumes ?".to_string() } else { format!("volumes {}", fmt_delta(total)) };
     let shown_deleted = fs.grows.iter().filter(|r| matches!(r, GrowthRow::Deleted(_))).count();
-    let deleted_text = if shown_deleted < g.deleted_open.len() {
-        format!("{} deleted-open ({shown_deleted} shown)", g.deleted_open.len())
-    } else {
-        format!("{} deleted-open", g.deleted_open.len())
-    };
+    let (_, small, small_bytes) = group_deleted(&g.deleted_open, DELETED_MIN_BYTES);
+    let mut deleted_text = format!("{shown_deleted} holding deleted files");
+    if fs.deleted.len() > shown_deleted {
+        deleted_text.push_str(&format!(" (+{} more)", fs.deleted.len() - shown_deleted));
+    }
+    if small > 0 {
+        deleted_text.push_str(&format!(" · {small} small (<1M, {}) hidden", fmt_bytes(small_bytes)));
+    }
     let title = Line::from(vec![
         Span::styled(" What is eating space ", Style::default().bold()),
         Span::styled(format!("last {win} · {vol_text} "), if g.volumes.is_empty() { dim() } else { delta_style(total) }),
@@ -945,7 +947,11 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
             GrowthRow::Grower(j) => {
                 let x = &g.growers[j];
                 let rate: u64 = x.writers.iter().map(|w| w.2).sum();
-                let mut spans = vec![Span::styled(if x.is_dir { format!("{}/", x.path) } else { x.path.clone() }, Style::default().bold())];
+                let mut spans = if x.other {
+                    vec![Span::styled("other under ", dim()), Span::styled(format!("{}/", x.path.trim_end_matches('/')), Style::default().bold())]
+                } else {
+                    vec![Span::styled(grower_label(x), Style::default().bold())]
+                };
                 if let Some(w) = x.writers.iter().max_by_key(|w| w.2) {
                     spans.push(Span::styled(format!("  ← {} ({})", w.1, w.0), Style::default().fg(Color::Yellow)));
                     if x.writers.len() > 1 {
@@ -958,12 +964,14 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
                 ("grow", Style::default(), fmt_delta(x.delta), delta_style(x.delta), fmt_bytes(x.size), rate, evidence_tags(&x.evidence), Line::from(spans))
             }
             GrowthRow::Deleted(j) => {
-                let (pid, name, path, bytes) = &g.deleted_open[j];
+                let d = &fs.deleted[j];
+                let files = if d.files == 1 { format!("{} (deleted)", d.biggest) } else { format!("{} deleted files, biggest {}", d.files, d.biggest) };
                 let line = Line::from(vec![
-                    Span::styled(format!("{path} (deleted)"), Style::default()),
-                    Span::styled(format!("  held by {name} ({pid}) · restart it to free the space"), Style::default().fg(Color::Yellow)),
+                    Span::styled(format!("{} ({}) holds ", d.name, d.pid), Style::default().fg(Color::Yellow)),
+                    Span::raw(files),
+                    Span::styled(" · restart it to free the space · ⏎ why", dim()),
                 ]);
-                ("deleted", Style::default().fg(Color::Magenta), fmt_bytes(*bytes), Style::default().fg(Color::Magenta), String::new(), 0, "open-files".into(), line)
+                ("deleted", Style::default().fg(Color::Magenta), fmt_bytes(d.bytes), Style::default().fg(Color::Magenta), String::new(), 0, "open-files".into(), line)
             }
             GrowthRow::Writer(j) => {
                 let (pid, name, bytes) = &g.writers[j];
@@ -1288,22 +1296,34 @@ fn draw_doctor(f: &mut Frame, app: &App, area: Rect) {
 
 // ------------------------------------------------------------------- log
 
-fn draw_log(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::TOP).border_style(dim()).title(Line::from(vec![
-        Span::styled(" Action log ", Style::default().bold()),
-        Span::styled("most recent first · u undoes the last undoable action ", dim()),
-    ]));
+/// The action journal, as an overlay over the current view (`a`).
+fn draw_log(f: &mut Frame, app: &App, full: Rect) {
+    // Only as tall as the journal needs, so the view behind it stays recognisable.
+    let want = (app.log.len() as u16).saturating_add(4).max(8);
+    let area = centered(full.width.saturating_sub(4).min(120), want.min(full.height.saturating_sub(4)).max(6), full);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Line::from(vec![
+            Span::styled(" Action log ", Style::default().bold()),
+            Span::styled("most recent first ", dim()),
+        ]))
+        .title_bottom(Line::styled(
+            " ⏎ undo selected · u undo last · pause/resume/renice are undoable; TERM/KILL are not · Esc close ",
+            dim(),
+        ));
     if app.log.is_empty() {
         let t = Text::from(vec![
             Line::styled("No actions yet.", Style::default().bold()),
-            Line::styled("Pause (space), renice (r) or terminate (k) a process — every action lands here,", dim()),
-            Line::styled("and pause/renice can be undone with u.", dim()),
+            Line::styled("Pause (space), renice (r) or terminate (k) a process: every action lands here.", dim()),
+            Line::styled("A pause or renice can be undone with u; a terminate cannot (pause first to try it out).", dim()),
         ]);
         f.render_widget(Paragraph::new(t).block(block), area);
         return;
     }
     let header = Row::new(["TIME", "#", "ACTION", "PID", "NAME", "RESULT"].map(|h| Cell::from(Span::styled(h, Style::default().bold()))));
-    let body_h = area.height.saturating_sub(2) as usize;
+    let body_h = area.height.saturating_sub(3) as usize;
     let mut offset = 0;
     scroll_into_view(app.log_sel, &mut offset, body_h, app.log.len());
     let rows = app.log.iter().enumerate().skip(offset).take(body_h).map(|(i, r)| {
@@ -1458,6 +1478,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
     match &app.modal {
         Modal::None | Modal::Filter => {}
         Modal::Help => draw_help(f, area),
+        Modal::Log => draw_log(f, app, area),
         Modal::Confirm { prompt, .. } => {
             let r = centered(64.min(area.width.saturating_sub(2)), 6, area);
             let t = Text::from(vec![
@@ -1500,16 +1521,17 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
 }
 
 const HELP: &[(&str, &str)] = &[
-    ("1-7 / Tab", "switch view: Procs Ports Fs Fleet Timeline Doctor Log"),
+    ("1-6 / Tab", "switch view: Procs Ports Fs Timeline Doctor (Fleet when containers/hosts exist)"),
     ("↑↓ PgUp PgDn g G", "move selection"),
     ("c m p n d i N", "sort by cpu mem power net disk pid name (again = reverse)"),
     ("t", "toggle process tree"),
     ("/", "filter by name, command, container or cgroup (Esc clears)"),
     ("Enter / w", "why: blame chain for the selection"),
-    ("space / z", "pause / resume (SIGSTOP/SIGCONT, undoable)"),
-    ("r", "renice (default 10, undoable)"),
-    ("k / K", "terminate / terminate whole tree (confirm)"),
-    ("u", "undo last undoable action"),
+    ("space / z", "pause / resume (SIGSTOP/SIGCONT; undo resumes)"),
+    ("r", "renice (default 10; undo restores it, lowering needs root)"),
+    ("k / K", "terminate / whole tree (confirm; NOT undoable: pause first)"),
+    ("u", "undo the last pause or renice"),
+    ("a", "action log: everything fat did, ⏎ undoes the selected entry"),
     ("← → [ ] { }", "timeline: move through time (shift / braces = ×10)"),
     ("s  +/-", "timeline: jump to next spike · zoom window"),
     ("Fs: ⏎ → l  ← ⌫", "storage: open directory · go up (⏎ on a 🔒 dir reads it once)"),
@@ -1558,15 +1580,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let hints: &[(&str, &str)] = match app.tab {
-        Tab::Procs => &[("⏎", "why"), ("␣", "pause"), ("r", "renice"), ("k", "term"), ("K", "tree"), ("u", "undo"), ("/", "filter"), ("t", "tree"), ("cmpnd", "sort"), ("?", "ask"), ("h", "help"), ("q", "quit")],
-        Tab::Ports => &[("⏎", "why"), ("k", "kill tree"), ("␣", "pause"), ("u", "undo"), ("?", "ask"), ("h", "help"), ("q", "quit")],
+        Tab::Procs => &[("⏎", "why"), ("␣", "pause"), ("r", "renice"), ("k", "term"), ("K", "tree"), ("u", "undo"), ("a", "log"), ("/", "filter"), ("t", "tree"), ("cmpnd", "sort"), ("?", "ask"), ("h", "help"), ("q", "quit")],
+        Tab::Ports => &[("⏎", "why"), ("k", "kill tree"), ("␣", "pause"), ("u", "undo"), ("a", "log"), ("?", "ask"), ("h", "help"), ("q", "quit")],
         Tab::Fs if app.fs.mode == FsMode::Growth => &[("⏎", "open / why"), ("w", "window"), ("g", "dirs"), ("/", "filter"), ("Esc", "back"), ("?", "ask"), ("h", "help"), ("q", "quit")],
         Tab::Fs => &[("⏎", "open"), ("←", "up"), ("s", "sort"), ("g", "growth"), ("w", "window"), ("b", "biggest"), ("r", "rescan"), ("/", "filter"), ("?", "ask"), ("h", "help"), ("q", "quit")],
         Tab::Fleet => &[("↑↓", "move"), ("?", "ask"), ("h", "help"), ("q", "quit")],
         Tab::Timeline => &[("←→", "scrub"), ("s", "spike"), ("+/-", "zoom"), ("L", "live"), ("⏎", "why"), ("?", "ask"), ("h", "help"), ("q", "quit")],
-        Tab::Doctor => &[("⏎", "run action"), ("w", "why"), ("?", "ask"), ("h", "help"), ("q", "quit")],
-        Tab::Log => &[("u", "undo last"), ("↑↓", "move"), ("?", "ask"), ("h", "help"), ("q", "quit")],
+        Tab::Doctor => &[("⏎", "run action"), ("w", "why"), ("a", "log"), ("?", "ask"), ("h", "help"), ("q", "quit")],
     };
+    let hints: &[(&str, &str)] = if app.modal == Modal::Log { &[("↑↓", "move"), ("⏎", "undo selected"), ("u", "undo last"), ("Esc", "close")] } else { hints };
     let mut spans = Vec::with_capacity(hints.len() * 3);
     if app.rewound() && app.tab != Tab::Timeline {
         spans.push(Span::styled(" ⏪ L live ", Style::default().fg(Color::White).bg(Color::Magenta).bold()));
@@ -1671,11 +1693,20 @@ mod tests {
     #[test]
     fn fleet_tab_empty_state_and_rows() {
         let mut a = full_app();
-        a.switch_tab(Tab::Fleet);
         a.set_fleet(Some(vec![]), Some(vec![]));
+        // Nothing beyond this machine: no Fleet tab at all.
+        assert!(!a.fleet_visible());
+        a.switch_tab(Tab::Fleet);
+        assert_eq!(a.tab, Tab::Procs);
         let out = render(&mut a, 80, 24);
-        assert!(out.contains("No containers or remote hosts"), "{out}");
-        assert!(out.contains("[[hosts]]"));
+        assert!(!out.contains("6Fleet") && out.contains("5Doctor"), "{out}");
+        // A configured host makes it appear (with its empty-state hint until data arrives).
+        a.configured_hosts = 1;
+        a.switch_tab(Tab::Fleet);
+        assert_eq!(a.tab, Tab::Fleet);
+        let out = render(&mut a, 80, 24);
+        assert!(out.contains("6Fleet"), "{out}");
+        a.configured_hosts = 0;
         a.set_fleet(
             Some(vec![Container { id: "abc".into(), name: "pg".into(), image: "postgres:16".into(), runtime: "docker".into(), status: "Up 3 hours".into(), cpu: 1.5, mem: 200 << 20, ports: "5432".into() }]),
             Some(vec![HostRow { name: "devbox".into(), ok: true, cpu: 12.0, mem_used: 1 << 30, mem_total: 8 << 30, procs: 99, ports: 3, error: String::new() }, HostRow { name: "dead".into(), ok: false, error: "ssh: timeout".into(), ..Default::default() }]),
@@ -1723,19 +1754,24 @@ mod tests {
             if h >= 24 {
                 assert!(out.contains("CRIT") && out.contains("pegging") && out.contains("pause 200"), "{out}");
             }
-            a.switch_tab(Tab::Log);
+            a.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+            assert_eq!(a.modal, Modal::Log);
             let out = render(&mut a, w, h);
             if h >= 24 {
-                assert!(out.contains("pause") && out.contains("undoable"), "{out}");
+                assert!(out.contains("Action log") && out.contains("pause") && out.contains("undoable"), "{out}");
+                assert!(out.contains("Doctor"), "the log is an overlay: the Doctor view stays behind it\n{out}");
             }
+            a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert_eq!(a.modal, Modal::None);
         }
         let mut a = App::new(1000);
         a.switch_tab(Tab::Doctor);
         assert!(render(&mut a, 80, 24).contains("diagnosing"));
         a.set_findings(vec![]);
         assert!(render(&mut a, 80, 24).contains("All good"));
-        a.switch_tab(Tab::Log);
-        assert!(render(&mut a, 80, 24).contains("No actions yet"));
+        a.modal = Modal::Log;
+        let out = render(&mut a, 80, 24);
+        assert!(out.contains("No actions yet") && out.contains("cannot"), "{out}");
     }
 
     #[test]
@@ -1902,8 +1938,8 @@ mod tests {
     #[test]
     fn linux_fleet_counts_container_procs() {
         let mut a = linux_app();
-        a.switch_tab(Tab::Fleet);
         a.set_fleet(Some(a.live.as_ref().unwrap().containers.clone()), Some(vec![]));
+        a.switch_tab(Tab::Fleet);
         let out = render(&mut a, 80, 24);
         assert!(out.contains("db-1") && out.contains("2 procs"), "{out}");
     }
@@ -1970,9 +2006,12 @@ mod tests {
             }),
         );
         a.set_fs_growth(Growth {
-            growers: vec![Grower { path: "/Users/me/Library/Caches/pip".into(), is_dir: true, delta: 1 << 30, size: 3 << 30, writers: vec![(200, "node".into(), 4 << 20)], evidence: vec![Evidence::Fsevents], ..Default::default() }],
+            growers: vec![
+                Grower { path: "/Users/me/Library/Caches/pip".into(), is_dir: true, delta: 1 << 30, size: 3 << 30, writers: vec![(200, "node".into(), 4 << 20)], evidence: vec![Evidence::Fsevents], ..Default::default() },
+                Grower { path: "/Users/me/Library/Caches".into(), is_dir: true, delta: 300 << 20, other: true, evidence: vec![Evidence::Fsevents], ..Default::default() },
+            ],
             writers: vec![(200, "node".into(), 1 << 30)],
-            deleted_open: vec![(400, "Chrome".into(), "/tmp/blob".into(), 2 << 30)],
+            deleted_open: vec![(400, "Chrome".into(), "/tmp/blob".into(), 2 << 30), (400, "Chrome".into(), "/tmp/blob2".into(), 1 << 30), (400, "Chrome".into(), "/tmp/tiny".into(), 4096)],
             notes: vec!["open-file attribution covers your own processes".into()],
             ..Default::default()
         });
@@ -1989,7 +2028,7 @@ mod tests {
                 assert!(out.contains("/System/Volumes/Data") && out.contains("full in 3h"), "volume strip {w}x{h}\n{out}");
                 assert!(!out.contains("Preboot"), "helper volumes hidden\n{out}");
                 assert!(out.contains("scanning 43%") && out.contains("1.2M files"), "{w}x{h}\n{out}");
-                assert!(out.contains("Users/") && out.contains("400.0G") && out.contains("+1.0G"), "{w}x{h}\n{out}");
+                assert!(out.contains("Users/") && out.contains("400.0G") && out.contains("+1.3G"), "a remainder row adds to its children: {w}x{h}\n{out}");
                 assert!(out.contains("🔒") || out.contains("private/"), "{out}");
             }
             if w >= 100 {
@@ -2000,6 +2039,11 @@ mod tests {
             let out = render(&mut a, w, h);
             if h >= 24 {
                 assert!(out.contains("What is eating space") && out.contains("Library/Caches/pip") && out.contains("Chrome"), "{w}x{h}\n{out}");
+                assert!(out.contains("other under /Users/me/Library/Caches/"), "remainder row is labelled\n{out}");
+                assert_eq!(out.matches("Chrome (400) holds").count(), 1, "one row per holder\n{out}");
+                if w >= 120 {
+                    assert!(out.contains("2 deleted files, biggest /tmp/blob") && out.contains("1 small (<1M"), "{out}");
+                }
             }
             a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
             a.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));

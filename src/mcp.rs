@@ -40,8 +40,12 @@ recorder (timeline, spikes, or a past snapshot via at_minutes_ago; needs `fat re
 (on Linux, `snapshot {container}` lists the host processes inside one container, joined via cgroups), \
 and `ask {question}` for a plain-language answer. For disk space: `fs_volumes` (capacity, fill rate, ETA to full), \
 `fs_list {path}` (du-style sizes, cached background scan), `fs_largest {path}`, and `fs_growth {since}` ('what is eating my space \
-in the last 10 minutes': growing paths, their writers, deleted-but-open files). The fs tools only read; fat never deletes files. Actions are reversible where possible and journaled: prefer `pause` \
-(SIGSTOP, undo with `resume` or `undo`) or `renice` over `kill`; every action returns an id usable with `undo`. \
+in the last 10 minutes': growing paths, their writers, deleted-but-open files). The fs tools only read; fat never deletes files. \
+Side-effect tools (`pause`, `resume`, `renice`, `kill`, `undo`) are off unless the user enabled them in fat's config \
+(`[mcp] allow_actions`); a disabled one returns an error saying how. Do not work around a disabled tool with a shell `kill`: \
+tell the user. All actions are journaled. `pause` (SIGSTOP; undo with `resume` or `undo`) and `renice` are undoable; `kill` \
+is NOT undoable, so prefer pausing a suspect first. `kill` takes two calls: the first returns a preview (what would be \
+signalled, protection checks, the tree) and a short-lived `confirm_token`; call `kill` again with that token to act. \
 Pass the `start_time` (and `name`) you saw in snapshot/process with every action, so a pid that was reused by another \
 process in the meantime is refused instead of signalled. Processes with `usage_unknown: true` belong to other users and \
 can't be measured without root: their zero cpu/mem means unknown, not idle. \
@@ -63,6 +67,82 @@ pub struct State {
     samples: u32,
     /// Storage engines, created by the first fs_* call (never at startup).
     fs: FsEngines,
+    /// Side-effect tools the user enabled in `[mcp] allow_actions` (default: none).
+    allowed: Vec<String>,
+    /// Outstanding kill confirmations (single use, short-lived).
+    kill_tokens: Vec<KillToken>,
+}
+
+/// Every tool with a side effect. Each is refused unless named in `[mcp] allow_actions`.
+pub const ACTION_TOOLS: &[&str] = &["pause", "resume", "renice", "kill", "undo"];
+/// How long a kill preview's token stays valid.
+const KILL_TOKEN_TTL: Duration = Duration::from_secs(60);
+
+/// A kill the agent previewed: valid once, for this exact process and signal.
+#[derive(Debug, Clone)]
+struct KillToken {
+    token: String,
+    pid: u32,
+    /// Start time seen at preview; a different process on the same pid is refused.
+    start_time: Option<u64>,
+    kind: ActionKind,
+    issued: Instant,
+}
+
+/// `[mcp]` in fat's config file (parsed here: the rest of the file belongs to `Config`).
+#[derive(Debug, Default, serde::Deserialize)]
+struct McpFile {
+    #[serde(default)]
+    mcp: McpCfg,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct McpCfg {
+    /// `"all"`, `"none"`, or a list of tool names, e.g. `["pause", "renice"]`.
+    #[serde(default)]
+    allow_actions: Option<toml::Value>,
+}
+
+/// Which side-effect tools a config text enables. Unknown names are ignored (and logged).
+pub fn allowed_actions(config_text: &str) -> Vec<String> {
+    let v = match toml::from_str::<McpFile>(config_text) {
+        Ok(f) => f.mcp.allow_actions,
+        Err(e) => {
+            log(&format!("ignoring [mcp] config: {e}"));
+            None
+        }
+    };
+    let names: Vec<String> = match v {
+        Some(toml::Value::String(s)) if s.eq_ignore_ascii_case("all") => ACTION_TOOLS.iter().map(|s| s.to_string()).collect(),
+        Some(toml::Value::String(s)) if s.eq_ignore_ascii_case("none") || s.is_empty() => vec![],
+        Some(toml::Value::String(s)) => vec![s],
+        Some(toml::Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+        _ => vec![],
+    };
+    let mut out = Vec::new();
+    for n in names {
+        let n = n.trim().to_ascii_lowercase();
+        if n == "all" {
+            return ACTION_TOOLS.iter().map(|s| s.to_string()).collect();
+        }
+        if ACTION_TOOLS.contains(&n.as_str()) {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        } else {
+            log(&format!("[mcp] allow_actions: unknown action {n:?} ignored"));
+        }
+    }
+    out
+}
+
+fn disabled_message(name: &str) -> String {
+    format!(
+        "`{name}` is disabled: fat's MCP server performs no side effects unless the user enables them. \
+To enable it, the user adds to {}:\n\n[mcp]\nallow_actions = [\"{name}\"]   # or \"all\"\n\nand restarts the MCP server. \
+Ask the user instead of signalling the process another way.",
+        Config::path().display()
+    )
 }
 
 #[derive(Default)]
@@ -79,7 +159,17 @@ impl State {
     /// State with no backends attached (used by tests and as a fallback).
     #[allow(dead_code)]
     pub fn empty() -> State {
-        State { collector: None, history: None, actions: None, config: Config::default(), last: None, samples: 0, fs: FsEngines::default() }
+        State {
+            collector: None,
+            history: None,
+            actions: None,
+            config: Config::default(),
+            last: None,
+            samples: 0,
+            fs: FsEngines::default(),
+            allowed: Vec::new(),
+            kill_tokens: Vec::new(),
+        }
     }
 
     /// Full state: collector (with an initial sample), history DB, action journal.
@@ -96,7 +186,9 @@ impl State {
             log("collector unavailable; snapshot-based tools will fail");
         }
         let samples = u32::from(last.is_some());
-        State { collector, history, actions, config, last, samples, fs: FsEngines::default() }
+        let allowed = std::fs::read_to_string(Config::path()).map(|t| allowed_actions(&t)).unwrap_or_default();
+        log(&if allowed.is_empty() { "side-effect tools disabled ([mcp] allow_actions not set)".to_string() } else { format!("side-effect tools enabled: {}", allowed.join(", ")) });
+        State { collector, history, actions, config, last, samples, fs: FsEngines::default(), allowed, kill_tokens: Vec::new() }
     }
 
     fn scanner(&mut self) -> Result<&crate::fs::scan::Scanner> {
@@ -155,7 +247,13 @@ impl State {
                 let since = self.last.as_ref().map(|(t, _)| t.elapsed()).unwrap_or_default();
                 std::thread::sleep(WARMUP.saturating_sub(since));
             }
-            self.last = Some((Instant::now(), c.sample()));
+            let mut snap = c.sample();
+            // doctor/why name a VM's containers ("docker stop <its biggest>"); the list is
+            // cached for 5s, so only the first call pays for `docker ps`.
+            if snap.containers.is_empty() && self.config.containers && crate::blame::hosts_containers(&snap) {
+                snap.containers = crate::fleet::containers();
+            }
+            self.last = Some((Instant::now(), snap));
             self.samples += 1;
         }
         Ok(&self.last.as_ref().expect("set above").1)
@@ -252,7 +350,7 @@ pub fn handle_message(state: &mut State, msg: &Value) -> Option<Value> {
     let result: std::result::Result<Value, (i64, String)> = match method {
         "initialize" => Ok(initialize_result(&params)),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tools() })),
+        "tools/list" => Ok(json!({ "tools": tools_listed(&state.allowed) })),
         "tools/call" => tools_call(state, &params),
         other => Err((METHOD_NOT_FOUND, format!("method not found: {other}"))),
     };
@@ -288,6 +386,9 @@ fn tools_call(state: &mut State, params: &Value) -> std::result::Result<Value, (
         Some(_) => return Err((INVALID_PARAMS, "params.arguments must be an object".into())),
     };
     let handler = handler_for(name).ok_or((INVALID_PARAMS, format!("unknown tool: {name}")))?;
+    if ACTION_TOOLS.contains(&name) && !state.allowed.iter().any(|a| a == name) {
+        return Ok(tool_result(json!({ "error": disabled_message(name), "disabled": true }), true));
+    }
     Ok(run_tool(state, name, handler, &args))
 }
 
@@ -388,6 +489,21 @@ fn tool(name: &str, title: &str, description: &str, input: Value, destructive: b
 }
 
 /// The full tool list advertised by `tools/list`.
+/// The catalog as `tools/list` serves it: every tool, with disabled side-effect tools marked
+/// as such in their description (they stay listed so an agent can tell the user how to enable
+/// one, rather than concluding fat cannot do it and reaching for a shell `kill`).
+pub fn tools_listed(allowed: &[String]) -> Vec<Value> {
+    let mut v = tools();
+    for t in &mut v {
+        let name = t["name"].as_str().unwrap_or_default().to_string();
+        if ACTION_TOOLS.contains(&name.as_str()) && !allowed.contains(&name) {
+            let d = t["description"].as_str().unwrap_or_default().to_string();
+            t["description"] = json!(format!("DISABLED in this fat (enable with `[mcp] allow_actions = [\"{name}\"]` in fat's config.toml; calling it returns how). {d}"));
+        }
+    }
+    v
+}
+
 pub fn tools() -> Vec<Value> {
     vec![
         tool(
@@ -460,7 +576,7 @@ pub fn tools() -> Vec<Value> {
         tool(
             "pause",
             "Pause process",
-            "Freeze a process with SIGSTOP. Reversible (resume or undo) — prefer this over kill to test whether a process is the culprit. Refused for system/session daemons (launchd, WindowServer, cfprefsd on macOS; init, systemd, dbus, the display server on Linux, ...) that other apps block on. Pass `start_time` from snapshot so a reused pid is never hit. Returns an action record with an id for `undo`.",
+            "Freeze a process with SIGSTOP. Undoable (resume or undo) — prefer this over kill to test whether a process is the culprit. Refused for system/session daemons (launchd, WindowServer, cfprefsd on macOS; init, systemd, dbus, the display server on Linux, ...) that other apps block on. Pass `start_time` from snapshot so a reused pid is never hit. Returns an action record with an id for `undo`.",
             schema(target_schema(json!({})), &["pid"]),
             true,
         ),
@@ -486,11 +602,12 @@ pub fn tools() -> Vec<Value> {
         tool(
             "kill",
             "Terminate process",
-            "Terminate a process with SIGTERM (graceful; a paused process is continued so it can act on it). `tree: true` terminates the process and all its descendants; `force: true` sends SIGKILL instead. Not undoable — consider `pause` first. Pass `start_time` from snapshot so a reused pid is never hit. Journaled.",
+            "Terminate a process with SIGTERM (graceful; a paused process is continued so it can act on it). `tree: true` terminates the process and all its descendants; `force: true` sends SIGKILL instead. NOT undoable — consider `pause` first. Two steps: a call without `confirm_token` signals nothing and returns a preview (target, signal, protection checks, the tree that would be hit) plus a `confirm_token` valid for 60 s; repeat the call with the same pid/tree/force and that token to execute. The token is single-use and bound to that process's start time, so a reused pid is refused. Journaled.",
             schema(
                 target_schema(json!({
                     "tree": { "type": "boolean", "default": false, "description": "Also terminate all descendants." },
-                    "force": { "type": "boolean", "default": false, "description": "Send SIGKILL instead of SIGTERM." }
+                    "force": { "type": "boolean", "default": false, "description": "Send SIGKILL instead of SIGTERM." },
+                    "confirm_token": { "type": "string", "description": "Token from this call's preview; omit to get the preview." }
                 })),
                 &["pid"],
             ),
@@ -499,7 +616,7 @@ pub fn tools() -> Vec<Value> {
         tool(
             "undo",
             "Undo action",
-            "Undo a previous pause or renice by its action id; without `id`, undoes the most recent undoable action.",
+            "Undo a previous pause or renice by its action id (resume / restore the nice value); without `id`, undoes the most recent undoable action. A kill can't be undone.",
             schema(json!({ "id": { "type": "integer", "minimum": 0, "description": "Action id returned by a previous action." } }), &[]),
             true,
         ),
@@ -682,7 +799,9 @@ fn top_procs_in<'a>(
 fn action_value(r: &ActionRecord) -> Result<Value> {
     let mut v = to_value(r)?;
     if r.undoable && r.ok {
-        v["hint"] = json!(format!("reversible: call undo with id {}", r.id));
+        v["hint"] = json!(format!("undoable: call undo with id {}", r.id));
+    } else if r.ok && matches!(r.kind, ActionKind::Term | ActionKind::Kill | ActionKind::KillTree) {
+        v["hint"] = json!("not undoable: the signal has been delivered");
     }
     Ok(v)
 }
@@ -902,7 +1021,88 @@ fn tool_kill(state: &mut State, args: &Value) -> Result<Value> {
     } else {
         ActionKind::Term
     };
-    apply(state, kind, pid, None, args)
+    state.kill_tokens.retain(|t| t.issued.elapsed() < KILL_TOKEN_TTL);
+    match arg_str(args, "confirm_token")?.map(str::trim).filter(|t| !t.is_empty()) {
+        None => kill_preview(state, kind, pid, args),
+        Some(tok) => {
+            // Single use: the token is consumed whatever happens next.
+            let i = state.kill_tokens.iter().position(|t| t.token == tok).context("unknown or expired confirm_token: call kill without it for a fresh preview")?;
+            let t = state.kill_tokens.remove(i);
+            if t.pid != pid || t.kind != kind {
+                bail!("confirm_token was issued for {:?} of pid {}, not {kind:?} of pid {pid}: call kill without it for a fresh preview", t.kind, t.pid);
+            }
+            // The process must still be the one previewed (start time), plus any identity the caller passes.
+            let mut expect = arg_expect(args)?.unwrap_or_default();
+            if t.start_time.is_some() {
+                expect.start_time = t.start_time;
+            }
+            let expect = (expect.start_time.is_some() || expect.name.is_some()).then_some(expect);
+            state.snapshot()?;
+            let snap = state.last.as_ref().expect("snapshot cached").1.clone();
+            if snap.proc(pid).is_none() {
+                bail!("no process with pid {pid}");
+            }
+            let r = state.actions()?.apply_expect(kind, pid, None, &snap, expect.as_ref());
+            state.last = None;
+            action_result(r)
+        }
+    }
+}
+
+/// First kill call: what would happen, and a token to make it happen. Signals nothing.
+fn kill_preview(state: &mut State, kind: ActionKind, pid: u32, args: &Value) -> Result<Value> {
+    let expect = arg_expect(args)?;
+    state.snapshot()?;
+    let snap = state.last.as_ref().expect("snapshot cached").1.clone();
+    let Some(p) = snap.proc(pid) else { bail!("no process with pid {pid}") };
+    let pv = crate::actions::preview(kind, pid, &snap, expect.as_ref());
+    let signal = if kind == ActionKind::Kill { "SIGKILL" } else { "SIGTERM" };
+    let mut v = json!({
+        "preview": true,
+        "would_signal": { "pid": pid, "name": p.name, "cmd": p.cmd, "user": p.user, "start_time": pv.start_time.unwrap_or(p.start_time), "signal": signal, "tree": kind == ActionKind::KillTree },
+        "ancestors": snap.ancestors(pid).iter().map(|a| json!({ "pid": a.pid, "name": a.name })).collect::<Vec<_>>(),
+        "undoable": false,
+    });
+    if kind == ActionKind::KillTree {
+        v["descendants"] = json!(pv.tree.iter().map(|(cpid, name, skip)| {
+            let mut d = json!({ "pid": cpid, "name": name });
+            if let Some(why) = skip {
+                d["skipped"] = json!(why);
+            }
+            d
+        }).collect::<Vec<_>>());
+    }
+    if let Some(r) = pv.refusal {
+        v["refused"] = json!(r);
+        v["note"] = json!("fat would refuse this; no token issued");
+        return Ok(v);
+    }
+    if let Some(w) = pv.warning {
+        v["warning"] = json!(w);
+    }
+    let token = new_token(pid);
+    state.kill_tokens.push(KillToken { token: token.clone(), pid, start_time: pv.start_time.or((p.start_time != 0).then_some(p.start_time)), kind, issued: Instant::now() });
+    v["confirm_token"] = json!(token);
+    v["expires_in_s"] = json!(KILL_TOKEN_TTL.as_secs());
+    v["next"] = json!(format!("This cannot be undone. To proceed, call kill again with pid {pid}{} and confirm_token. Consider `pause` first.", match kind {
+        ActionKind::KillTree => ", tree: true",
+        ActionKind::Kill => ", force: true",
+        _ => "",
+    }));
+    Ok(v)
+}
+
+/// 128 random bits from the OS (hex), falling back to time and pid mixing if /dev/urandom is
+/// unreadable. Unguessable enough for a 60-second, single-use, same-process confirmation.
+fn new_token(pid: u32) -> String {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_err() {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let x = t ^ ((pid as u128) << 64) ^ (std::process::id() as u128);
+        b = x.to_le_bytes();
+    }
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn tool_undo(state: &mut State, args: &Value) -> Result<Value> {
@@ -1122,6 +1322,10 @@ pub fn growth_json(g: &crate::fs::Growth, window_ms: i64) -> Value {
             if x.is_dir {
                 v["dir"] = json!(true);
             }
+            if x.other {
+                // Only what the growers listed below this path leave unexplained.
+                v["other_under"] = json!(true);
+            }
             if x.files_touched > 0 {
                 v["files_touched"] = json!(x.files_touched);
             }
@@ -1131,6 +1335,13 @@ pub fn growth_json(g: &crate::fs::Growth, window_ms: i64) -> Value {
             v
         })
         .collect();
+    // Deleted-but-open files by the process holding them; files under 1 MB only counted.
+    let (groups, small, small_bytes) = crate::tui::widgets::group_deleted(&g.deleted_open, crate::tui::widgets::DELETED_MIN_BYTES);
+    let deleted = json!({
+        "by_process": groups.iter().take(10).map(|d| json!({ "pid": d.pid, "name": d.name, "files": d.files, "bytes": d.bytes, "biggest": d.biggest })).collect::<Vec<_>>(),
+        "small_files": small,
+        "small_bytes": small_bytes,
+    });
     json!({
         "from_ts": g.from,
         "to_ts": g.to,
@@ -1138,7 +1349,7 @@ pub fn growth_json(g: &crate::fs::Growth, window_ms: i64) -> Value {
         "volumes": g.volumes.iter().map(|(m, d)| json!({ "mount": m, "delta": d })).collect::<Vec<_>>(),
         "growers": growers,
         "writers": g.writers.iter().take(10).map(|(p, n, b)| json!({ "pid": p, "name": n, "bytes": b })).collect::<Vec<_>>(),
-        "deleted_open": g.deleted_open.iter().take(10).map(|(p, n, path, b)| json!({ "pid": p, "name": n, "path": path, "bytes": b })).collect::<Vec<_>>(),
+        "deleted_open": deleted,
         "notes": g.notes,
     })
 }
@@ -1175,6 +1386,122 @@ mod tests {
 
     fn call(state: &mut State, line: &str) -> Value {
         serde_json::from_str(&handle_line(state, line).expect("response")).unwrap()
+    }
+
+    fn tool_call(state: &mut State, name: &str, args: Value) -> Value {
+        let line = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}).to_string();
+        call(state, &line)["result"].clone()
+    }
+
+    #[test]
+    fn allow_actions_config_parsing() {
+        assert!(allowed_actions("").is_empty(), "default: no side effects");
+        assert!(allowed_actions("interval_ms = 5\n").is_empty());
+        assert_eq!(allowed_actions("[mcp]\nallow_actions = [\"pause\", \"renice\", \"bogus\"]\n"), vec!["pause", "renice"]);
+        assert_eq!(allowed_actions("[mcp]\nallow_actions = \"all\"\n"), ACTION_TOOLS.to_vec());
+        assert!(allowed_actions("[mcp]\nallow_actions = \"none\"\n").is_empty());
+        assert_eq!(allowed_actions("[mcp]\nallow_actions = \"kill\"\n"), vec!["kill"]);
+        assert!(allowed_actions("[mcp]\nallow_actions = 3\n").is_empty());
+    }
+
+    #[test]
+    fn side_effect_tools_are_disabled_by_default() {
+        let mut s = State::empty();
+        let list = call(&mut s, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        let tools = list["result"]["tools"].as_array().unwrap();
+        for t in tools {
+            let name = t["name"].as_str().unwrap();
+            let d = t["description"].as_str().unwrap();
+            assert_eq!(d.starts_with("DISABLED"), ACTION_TOOLS.contains(&name), "{name}: {d}");
+        }
+        for name in ACTION_TOOLS {
+            // pid 1 would be refused anyway; the gate answers before any handler runs.
+            let r = tool_call(&mut s, name, json!({"pid": 1, "nice": 5}));
+            assert_eq!(r["isError"], true, "{name}");
+            let msg = r["structuredContent"]["error"].as_str().unwrap();
+            assert!(msg.contains("disabled") && msg.contains("allow_actions") && msg.contains(name), "{msg}");
+        }
+        // Read-only tools are unaffected.
+        assert_ne!(tool_call(&mut s, "containers", json!({}))["isError"], true);
+        s.allowed = vec!["pause".into()];
+        let list = call(&mut s, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        let pause = list["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "pause").unwrap().clone();
+        assert!(!pause["description"].as_str().unwrap().starts_with("DISABLED"));
+        assert_eq!(tool_call(&mut s, "kill", json!({"pid": 1}))["structuredContent"]["disabled"], true);
+    }
+
+    #[test]
+    fn kill_needs_a_preview_token_bound_to_the_process() {
+        // Our own victim: a child we spawn and reap.
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let journal = std::env::temp_dir().join(format!("fat-mcp-kill-{}-{}.jsonl", std::process::id(), now_ms()));
+        let mut s = State::empty();
+        s.collector = Some(Collector::new());
+        s.actions = Some(Actions::open_at(&journal));
+        s.allowed = vec!["kill".into()];
+        let alive = |pid: u32| unsafe { libc::kill(pid as i32, 0) == 0 };
+
+        // 1. Preview: nothing is signalled, a token comes back.
+        let r = tool_call(&mut s, "kill", json!({"pid": pid}));
+        assert_ne!(r["isError"], true, "{r}");
+        let p = &r["structuredContent"];
+        assert_eq!(p["preview"], true);
+        assert_eq!(p["would_signal"]["pid"], pid);
+        assert_eq!(p["would_signal"]["signal"], "SIGTERM");
+        assert_eq!(p["undoable"], false);
+        let token = p["confirm_token"].as_str().unwrap().to_string();
+        assert_eq!(token.len(), 32);
+        assert!(alive(pid), "a preview never signals");
+        assert!(child.try_wait().unwrap().is_none());
+
+        // 2. A token for another signal or pid is refused, and is used up by trying.
+        let r = tool_call(&mut s, "kill", json!({"pid": pid, "force": true, "confirm_token": token}));
+        assert_eq!(r["isError"], true);
+        assert!(r["structuredContent"]["error"].as_str().unwrap().contains("issued for"), "{r}");
+        let r = tool_call(&mut s, "kill", json!({"pid": pid, "confirm_token": token}));
+        assert!(r["structuredContent"]["error"].as_str().unwrap().contains("unknown or expired"), "single use: {r}");
+        assert!(alive(pid));
+
+        // 3. A token whose process identity no longer matches (pid reuse) is refused.
+        let r = tool_call(&mut s, "kill", json!({"pid": pid}));
+        let token = r["structuredContent"]["confirm_token"].as_str().unwrap().to_string();
+        s.kill_tokens.iter_mut().for_each(|t| t.start_time = t.start_time.map(|st| st - 1000));
+        let r = tool_call(&mut s, "kill", json!({"pid": pid, "confirm_token": token}));
+        assert_eq!(r["isError"], true);
+        assert!(r["structuredContent"]["error"].as_str().unwrap().contains("no longer the process"), "{r}");
+        assert!(alive(pid));
+
+        // 4. Preview + token executes, once.
+        let r = tool_call(&mut s, "kill", json!({"pid": pid}));
+        let token = r["structuredContent"]["confirm_token"].as_str().unwrap().to_string();
+        let r = tool_call(&mut s, "kill", json!({"pid": pid, "confirm_token": token}));
+        assert_ne!(r["isError"], true, "{r}");
+        assert!(r["structuredContent"]["hint"].as_str().unwrap().contains("not undoable"));
+        let st = child.wait().unwrap();
+        assert!(!st.success(), "terminated by the signal");
+        let r = tool_call(&mut s, "kill", json!({"pid": pid, "confirm_token": token}));
+        assert_eq!(r["isError"], true);
+
+        // 5. Expired tokens are dropped.
+        s.kill_tokens.push(KillToken { token: "old".into(), pid: 42, start_time: None, kind: ActionKind::Term, issued: Instant::now() - KILL_TOKEN_TTL - Duration::from_secs(1) });
+        let r = tool_call(&mut s, "kill", json!({"pid": 42, "confirm_token": "old"}));
+        assert!(r["structuredContent"]["error"].as_str().unwrap().contains("expired"));
+        let _ = std::fs::remove_file(&journal);
+    }
+
+    #[test]
+    fn kill_preview_refuses_protected_targets_without_a_token() {
+        let mut s = State::empty();
+        s.collector = Some(Collector::new());
+        s.allowed = vec!["kill".into()];
+        // fat itself: refused at preview, no token.
+        let r = tool_call(&mut s, "kill", json!({"pid": std::process::id(), "tree": true}));
+        let p = &r["structuredContent"];
+        assert!(p["refused"].as_str().unwrap().contains("fat itself"), "{r}");
+        assert!(p.get("confirm_token").is_none());
+        assert!(p["descendants"].is_array());
+        assert!(s.kill_tokens.is_empty());
     }
 
     #[test]
@@ -1470,6 +1797,7 @@ mod tests {
         assert_eq!(j["window_s"], 600);
         assert_eq!(j["growers"][0]["evidence"][0], "open_files");
         assert_eq!(j["growers"][0]["writers"][0]["pid"], 9);
-        assert_eq!(j["deleted_open"][0]["bytes"], 1u64 << 30);
+        assert_eq!(j["deleted_open"]["by_process"][0]["bytes"], 1u64 << 30);
+        assert_eq!(j["deleted_open"]["by_process"][0]["files"], 1);
     }
 }

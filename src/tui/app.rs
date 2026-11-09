@@ -5,7 +5,7 @@
 use crate::fs::{DirEntry, Evidence, Grower, Growth, Listing, Volume};
 use crate::history::Point;
 use crate::model::{ActionKind, ActionRecord, Container, Explanation, Finding, Proc, Snapshot, Ts};
-use crate::tui::widgets::contains_ci;
+use crate::tui::widgets::{DELETED_MIN_BYTES, DeletedGroup, contains_ci, group_deleted};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -28,25 +28,26 @@ pub enum Tab {
     Procs,
     Ports,
     Fs,
-    Fleet,
     Timeline,
     Doctor,
-    Log,
+    /// Only shown when there is something beyond this machine (see [`App::fleet_visible`]).
+    Fleet,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 7] = [Tab::Procs, Tab::Ports, Tab::Fs, Tab::Fleet, Tab::Timeline, Tab::Doctor, Tab::Log];
+    /// Number keys 1-6 in this order. Fleet is last so hiding it never renumbers the others.
+    pub const ALL: [Tab; 6] = [Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
     pub fn title(self) -> &'static str {
         match self {
             Tab::Procs => "Procs",
             Tab::Ports => "Ports",
             Tab::Fs => "Fs",
-            Tab::Fleet => "Fleet",
             Tab::Timeline => "Timeline",
             Tab::Doctor => "Doctor",
-            Tab::Log => "Log",
+            Tab::Fleet => "Fleet",
         }
     }
+    /// Position in [`Tab::ALL`] (the number key is this + 1).
     pub fn index(self) -> usize {
         Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
@@ -87,7 +88,10 @@ pub enum Command {
     /// `start` is the target's start time when it was chosen (0 = unknown); the action is
     /// refused if the pid has since been reused by another process.
     Act { kind: ActionKind, pid: u32, nice: Option<i32>, start: u64 },
+    /// Undo the most recent undoable action.
     Undo,
+    /// Undo one journal entry by id (from the action log).
+    UndoId(u64),
     Explain(u32),
     /// `id` ties the eventual answer to this question (a cancelled ask's late answer is dropped).
     Ask { id: u64, question: String },
@@ -115,6 +119,8 @@ pub enum Modal {
     Renice { pid: u32, name: String, input: String, start: u64 },
     AskInput(String),
     Help,
+    /// The action journal (`a`): most recent first, `u`/⏎ undo.
+    Log,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -241,16 +247,17 @@ pub fn parent_dir(p: &str) -> Option<String> {
     }
 }
 
-/// Δ, writers and evidence for `path` from the growers at or below it. Growers nested under
-/// another matching grower are skipped so a rolled-up parent and its child are not counted twice.
+/// Δ, writers and evidence for `path` from the growers at or below it. Growers are disjoint
+/// ("other under X" rows carry only X's remainder), so they add up; a full row nested under
+/// another full row (older reports) is skipped so it is not counted twice.
 pub fn child_growth(path: &str, growers: &[Grower]) -> ChildGrowth {
     let mut under: Vec<&Grower> = growers.iter().filter(|g| path_within(&g.path, path)).collect();
-    under.sort_by(|a, b| a.path.len().cmp(&b.path.len()).then_with(|| a.path.cmp(&b.path)));
-    under.dedup_by(|a, b| a.path == b.path);
+    under.sort_by(|a, b| a.path.len().cmp(&b.path.len()).then_with(|| a.path.cmp(&b.path)).then_with(|| b.other.cmp(&a.other)));
+    under.dedup_by(|a, b| a.path == b.path && a.other == b.other);
     let mut out = ChildGrowth::default();
     let mut kept: Vec<&Grower> = Vec::new();
     for g in under {
-        if kept.iter().any(|k| path_within(&g.path, &k.path)) {
+        if kept.iter().any(|k| !k.other && path_within(&g.path, &k.path)) {
             continue;
         }
         kept.push(g);
@@ -276,12 +283,13 @@ pub fn child_growth(path: &str, growers: &[Grower]) -> ChildGrowth {
     out
 }
 
-/// Row order for the growth view: growers, then deleted-but-open files, then top writers.
-/// Deleted-but-open files shown in the growth view: at most this many, at least this big.
+/// Deleted-but-open holders shown in the growth view: at most this many.
 pub const DELETED_ROWS: usize = 8;
-pub const DELETED_MIN_BYTES: u64 = 1 << 20;
 
-pub fn growth_rows(g: &Growth, filter_lower: &str) -> Vec<GrowthRow> {
+/// Row order for the growth view: growers, then deleted-but-open files grouped by the process
+/// holding them (`Deleted(i)` indexes the returned groups; files under 1 MB are only counted),
+/// then top writers.
+pub fn growth_rows(g: &Growth, filter_lower: &str) -> (Vec<GrowthRow>, Vec<DeletedGroup>) {
     let mut v: Vec<GrowthRow> = Vec::new();
     // Paths merely touched (no net change, no writer) are noise here.
     v.extend(
@@ -292,20 +300,14 @@ pub fn growth_rows(g: &Growth, filter_lower: &str) -> Vec<GrowthRow> {
             .filter(|(_, x)| contains_ci(&x.path, filter_lower) || x.writers.iter().any(|w| contains_ci(&w.1, filter_lower)))
             .map(|(i, _)| GrowthRow::Grower(i)),
     );
-    // Deleted-but-open files: only the ones worth restarting a process for, biggest first
-    // (browsers alone hold hundreds of small temp files).
-    let mut del: Vec<usize> = g
-        .deleted_open
-        .iter()
-        .enumerate()
-        .filter(|(_, x)| x.3 >= DELETED_MIN_BYTES)
-        .filter(|(_, x)| contains_ci(&x.1, filter_lower) || contains_ci(&x.2, filter_lower))
-        .map(|(i, _)| i)
-        .collect();
-    del.sort_by_key(|&i| std::cmp::Reverse(g.deleted_open[i].3));
-    v.extend(del.into_iter().take(DELETED_ROWS).map(GrowthRow::Deleted));
+    // Only files worth restarting a process for (browsers alone hold hundreds of small temp
+    // files), one row per holder, biggest first.
+    let matching: Vec<(u32, String, String, u64)> =
+        g.deleted_open.iter().filter(|x| contains_ci(&x.1, filter_lower) || contains_ci(&x.2, filter_lower)).cloned().collect();
+    let (groups, _, _) = group_deleted(&matching, DELETED_MIN_BYTES);
+    v.extend((0..groups.len().min(DELETED_ROWS)).map(GrowthRow::Deleted));
     v.extend(g.writers.iter().enumerate().filter(|(_, x)| contains_ci(&x.1, filter_lower)).map(|(i, _)| GrowthRow::Writer(i)));
-    v
+    (v, groups)
 }
 
 /// Sorted, filtered order of a listing's children. Each sort has its natural direction:
@@ -391,6 +393,8 @@ pub struct FsView {
     /// Row order for the current mode (indices into children / largest; growth uses `grows`).
     pub rows: Vec<usize>,
     pub grows: Vec<GrowthRow>,
+    /// Deleted-but-open files by holder, for `GrowthRow::Deleted`.
+    pub deleted: Vec<DeletedGroup>,
     /// Per child of `listing`, aligned with `listing.children`.
     pub child_growth: Vec<ChildGrowth>,
     rows_dirty: bool,
@@ -428,6 +432,7 @@ impl Default for FsView {
             filter_lower: String::new(),
             rows: Vec::new(),
             grows: Vec::new(),
+            deleted: Vec::new(),
             child_growth: Vec::new(),
             rows_dirty: true,
             sel: 0,
@@ -496,7 +501,7 @@ impl FsView {
                 self.grows.clear();
             }
             FsMode::Growth => {
-                self.grows = self.growth.as_ref().map(|g| growth_rows(g, f)).unwrap_or_default();
+                (self.grows, self.deleted) = self.growth.as_ref().map(|g| growth_rows(g, f)).unwrap_or_default();
                 self.rows.clear();
             }
         }
@@ -518,7 +523,7 @@ impl FsView {
                 let g = self.growth.as_ref()?;
                 Some(match self.grows.get(i)? {
                     GrowthRow::Grower(j) => format!("g:{}", g.growers.get(*j)?.path),
-                    GrowthRow::Deleted(j) => format!("d:{}", g.deleted_open.get(*j)?.2),
+                    GrowthRow::Deleted(j) => format!("d:{}", self.deleted.get(*j)?.pid),
                     GrowthRow::Writer(j) => format!("w:{}", g.writers.get(*j)?.0),
                 })
             }
@@ -797,6 +802,20 @@ impl App {
             self.hosts = h;
         }
         self.fleet_loaded = true;
+        if self.tab == Tab::Fleet && !self.fleet_visible() {
+            self.tab = Tab::Procs;
+        }
+    }
+
+    /// The Fleet tab exists only when there is something beyond this machine: configured
+    /// hosts, or local containers running.
+    pub fn fleet_visible(&self) -> bool {
+        self.configured_hosts > 0 || !self.hosts.is_empty() || !self.containers.is_empty()
+    }
+
+    /// The tabs on screen, in order.
+    pub fn tabs(&self) -> Vec<Tab> {
+        Tab::ALL.into_iter().filter(|t| *t != Tab::Fleet || self.fleet_visible()).collect()
     }
 
     pub fn set_log(&mut self, log: Vec<ActionRecord>) {
@@ -1168,6 +1187,7 @@ impl App {
         match modal {
             Modal::None => Vec::new(),
             Modal::Help => Vec::new(), // any key closes
+            Modal::Log => self.on_log_key(k),
             Modal::Filter => {
                 match k.code {
                     KeyCode::Esc => self.set_active_filter(String::new()),
@@ -1309,9 +1329,12 @@ impl App {
         if self.tab != t {
             self.why = None;
         }
+        if t == Tab::Fleet && !self.fleet_visible() {
+            self.set_status("no Fleet yet: start a container or add [[hosts]] to the config", false);
+            return Vec::new();
+        }
         self.tab = t;
         match t {
-            Tab::Log => vec![Command::RefreshLog],
             Tab::Timeline => vec![self.timeline_refresh()],
             Tab::Fs => {
                 // Opening the tab is what starts the storage engines (never before).
@@ -1332,9 +1355,18 @@ impl App {
                 self.quit = true;
                 return vec![Command::Quit];
             }
-            KeyCode::Char(c @ '1'..='7') => return self.switch_tab(Tab::ALL[(c as u8 - b'1') as usize]),
-            KeyCode::Tab => return self.switch_tab(Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()]),
-            KeyCode::BackTab => return self.switch_tab(Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]),
+            KeyCode::Char(c @ '1'..='6') => return self.switch_tab(Tab::ALL[(c as u8 - b'1') as usize]),
+            KeyCode::Tab | KeyCode::BackTab => {
+                let tabs = self.tabs();
+                let n = tabs.len();
+                let cur = tabs.iter().position(|t| *t == self.tab).unwrap_or(0);
+                let next = if k.code == KeyCode::Tab { (cur + 1) % n } else { (cur + n - 1) % n };
+                return self.switch_tab(tabs[next]);
+            }
+            KeyCode::Char('a') => {
+                self.modal = Modal::Log;
+                return vec![Command::RefreshLog];
+            }
             KeyCode::Char('h') | KeyCode::F(1) => {
                 self.modal = Modal::Help;
                 return Vec::new();
@@ -1383,10 +1415,39 @@ impl App {
                 Vec::new()
             }
             Tab::Doctor => self.on_doctor_key(k),
-            Tab::Log => {
-                list_nav(&mut self.log_sel, self.log.len(), k.code);
+        }
+    }
+
+    /// Keys while the action log is open. It stays open until Esc / q / a.
+    fn on_log_key(&mut self, k: KeyEvent) -> Vec<Command> {
+        self.modal = Modal::Log;
+        if list_nav(&mut self.log_sel, self.log.len(), k.code) {
+            return Vec::new();
+        }
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('a') => {
+                self.modal = Modal::None;
                 Vec::new()
             }
+            KeyCode::Char('u') => vec![Command::Undo],
+            KeyCode::Enter => match self.log.get(self.log_sel) {
+                Some(r) if r.ok && r.undoable && !r.undone && r.id != 0 => vec![Command::UndoId(r.id)],
+                Some(r) if r.undone => {
+                    self.set_status(format!("#{} was already undone", r.id), false);
+                    Vec::new()
+                }
+                Some(r) => {
+                    let why = match r.kind {
+                        ActionKind::Term | ActionKind::Kill | ActionKind::KillTree => "a signal to end a process cannot be taken back",
+                        _ if !r.ok => "it did not succeed",
+                        _ => "fat could not record how to reverse it",
+                    };
+                    self.set_status(format!("#{} is not undoable: {why}", r.id), false);
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
         }
     }
 
@@ -1452,14 +1513,14 @@ impl App {
             }
             KeyCode::Char('k') if !k_is_tree => {
                 self.modal = Modal::Confirm {
-                    prompt: format!("Send TERM to {pid} ({name})?"),
+                    prompt: format!("Send TERM to {pid} ({name})? This cannot be undone (space pauses it instead, which can)."),
                     cmd: Command::Act { kind: ActionKind::Term, pid, nice: None, start },
                 };
                 Vec::new()
             }
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.modal = Modal::Confirm {
-                    prompt: format!("Terminate {pid} ({name}) AND all its descendants?"),
+                    prompt: format!("Terminate {pid} ({name}) AND all its descendants? This cannot be undone."),
                     cmd: Command::Act { kind: ActionKind::KillTree, pid, nice: None, start },
                 };
                 Vec::new()
@@ -1592,7 +1653,7 @@ impl App {
                         }
                     }
                     // Only ⏎ explains (→ is navigation).
-                    GrowthRow::Deleted(i) if enter => g.deleted_open.get(i).map(|d| vec![Command::Explain(d.0)]).unwrap_or_default(),
+                    GrowthRow::Deleted(i) if enter => self.fs.deleted.get(i).map(|d| vec![Command::Explain(d.pid)]).unwrap_or_default(),
                     GrowthRow::Writer(i) if enter => g.writers.get(i).map(|w| vec![Command::Explain(w.0)]).unwrap_or_default(),
                     _ => Vec::new(),
                 }
@@ -2162,21 +2223,60 @@ pub(crate) mod tests {
     #[test]
     fn tab_switching() {
         let mut a = app();
-        assert_eq!(a.on_key(key('7')), vec![Command::RefreshLog]);
-        assert_eq!(a.tab, Tab::Log);
+        assert_eq!(a.tab, Tab::Procs, "the first screen is the process list");
+        assert_eq!((a.sort, a.sort_desc), (SortKey::Cpu, true), "sorted by cpu, hottest first");
+        // No Fleet without containers or hosts: five tabs, BackTab wraps to Doctor.
+        assert_eq!(a.tabs(), vec![Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor]);
+        a.on_key(code(KeyCode::BackTab));
+        assert_eq!(a.tab, Tab::Doctor);
         a.on_key(code(KeyCode::Tab));
         assert_eq!(a.tab, Tab::Procs);
-        a.on_key(code(KeyCode::BackTab));
-        assert_eq!(a.tab, Tab::Log);
+        assert!(a.on_key(key('6')).is_empty());
+        assert_eq!(a.tab, Tab::Procs, "6 does nothing while Fleet is hidden");
         a.on_key(key('2'));
         assert_eq!(a.tab, Tab::Ports);
         a.on_key(code(KeyCode::Tab));
         assert_eq!(a.tab, Tab::Fs, "Fs sits right after Ports");
+        let cmds = a.on_key(key('4'));
+        assert!(matches!(cmds[0], Command::RefreshTimeline { .. }));
+        assert_eq!(a.tab, Tab::Timeline);
+        a.on_key(key('5'));
+        assert_eq!(a.tab, Tab::Doctor);
+        // A running container makes Fleet appear as 6, after Doctor.
+        a.set_fleet(Some(vec![Container { id: "abc".into(), name: "pg".into(), ..Default::default() }]), None);
         a.on_key(code(KeyCode::Tab));
         assert_eq!(a.tab, Tab::Fleet);
-        let cmds = a.on_key(key('5'));
-        assert!(matches!(cmds[0], Command::RefreshTimeline { .. }));
-        assert_eq!(Tab::ALL.map(|t| t.title()), ["Procs", "Ports", "Fs", "Fleet", "Timeline", "Doctor", "Log"]);
+        a.on_key(key('6'));
+        assert_eq!(a.tab, Tab::Fleet);
+        // ... and disappear when it stops (the view falls back to Procs).
+        a.set_fleet(Some(vec![]), None);
+        assert_eq!(a.tab, Tab::Procs);
+        assert_eq!(Tab::ALL.map(|t| t.title()), ["Procs", "Ports", "Fs", "Timeline", "Doctor", "Fleet"]);
+        // The action log is an overlay on any view, not a tab.
+        a.on_key(key('3'));
+        assert_eq!(a.on_key(key('a')), vec![Command::RefreshLog]);
+        assert_eq!((a.tab, a.modal.clone()), (Tab::Fs, Modal::Log));
+        assert_eq!(a.on_key(key('u')), vec![Command::Undo]);
+        assert_eq!(a.modal, Modal::Log, "undo keeps the log open");
+        a.on_key(code(KeyCode::Esc));
+        assert_eq!(a.modal, Modal::None);
+    }
+
+    #[test]
+    fn log_overlay_undoes_the_selected_entry_only_if_undoable() {
+        let mut a = app();
+        let rec = |id: u64, kind: ActionKind, undoable: bool, undone: bool| ActionRecord { id, ts: 0, kind, pid: 200, name: "node".into(), prev_nice: None, new_nice: None, pids: vec![], ok: true, undoable, undone, message: String::new() };
+        a.set_log(vec![rec(3, ActionKind::Term, false, false), rec(2, ActionKind::Pause, true, false), rec(1, ActionKind::Pause, true, true)]);
+        a.on_key(key('a'));
+        assert!(a.on_key(code(KeyCode::Enter)).is_empty(), "TERM is not undoable");
+        assert!(a.status.as_ref().unwrap().text.contains("cannot be taken back"));
+        a.on_key(code(KeyCode::Down));
+        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::UndoId(2)]);
+        a.on_key(code(KeyCode::Down));
+        assert!(a.on_key(code(KeyCode::Enter)).is_empty());
+        assert!(a.status.as_ref().unwrap().text.contains("already undone"));
+        assert!(a.on_key(key('q')).is_empty() && !a.quit, "q closes the overlay, it does not quit");
+        assert_eq!(a.modal, Modal::None);
     }
 
     #[test]
@@ -2370,7 +2470,7 @@ pub(crate) mod tests {
     #[test]
     fn doctor_enter_confirms_suggested_action() {
         let mut a = app();
-        a.on_key(key('6'));
+        a.on_key(key('5'));
         a.set_findings_with_starts(
             vec![
                 Finding { severity: "info".into(), title: "x".into(), detail: "".into(), pids: vec![], action: None },

@@ -16,6 +16,7 @@
 
 pub mod growth;
 pub mod scan;
+pub mod tcc;
 pub mod volumes;
 
 use crate::model::Ts;
@@ -144,6 +145,10 @@ pub struct Grower {
     /// Processes seen writing here: (pid, name, write bytes/sec at last sample).
     pub writers: Vec<(u32, String, u64)>,
     pub evidence: Vec<Evidence>,
+    /// "other under `path`": `delta` is only what the growers listed below `path` leave
+    /// unexplained (a parent never repeats its listed children's bytes).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub other: bool,
 }
 
 /// Answer to "what is eating my space in the last N minutes?".
@@ -153,8 +158,9 @@ pub struct Growth {
     pub to: Ts,
     /// Per-volume used delta in the window.
     pub volumes: Vec<(String, i64)>,
-    /// Paths with the largest |delta|, rolled up so a parent is listed only when no single
-    /// child explains most (>=80%) of it. Sorted by delta desc.
+    /// Paths with the largest |delta|, as specific as the evidence allows and disjoint: a
+    /// parent appears only as "other under X" (`Grower::other`) carrying what its listed
+    /// children leave unexplained. Sorted by delta desc.
     pub growers: Vec<Grower>,
     /// Top writing processes in the window: (pid, name, bytes written in window).
     pub writers: Vec<(u32, String, u64)>,

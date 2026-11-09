@@ -137,6 +137,41 @@ fn restore_signals(old: [(libc::c_int, libc::sighandler_t); 3]) {
     }
 }
 
+/// Whether our terminal hung up (its window closed, ssh dropped): poll reports POLLHUP on
+/// stdin. Only meaningful while stdin is a tty.
+fn tty_hung_up() -> bool {
+    let mut p = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    // SAFETY: one pollfd we own, zero timeout; isatty only inspects fd 0.
+    unsafe { libc::isatty(0) == 1 && libc::poll(&mut p, 1, 0) == 1 && p.revents & libc::POLLHUP != 0 }
+}
+
+/// Guarantee that a quit signal or a hung-up terminal ends the process. When the tty goes
+/// away, crossterm's `event::poll` can spin inside its read loop at 100% CPU without ever
+/// returning, so the event loop never sees QUIT_SIGNAL (a closed terminal window used to
+/// leave fat running forever). Normally the loop exits within 50ms; if it has not after a
+/// grace period, restore what can be restored and exit from here.
+fn spawn_quit_watchdog() {
+    const GRACE: Duration = Duration::from_millis(1500);
+    thread::spawn(|| {
+        let mut since: Option<Instant> = None;
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            if QUIT_SIGNAL.load(Ordering::SeqCst) == 0 && tty_hung_up() {
+                QUIT_SIGNAL.store(libc::SIGHUP, Ordering::SeqCst);
+            }
+            let sig = QUIT_SIGNAL.load(Ordering::SeqCst);
+            if sig == 0 {
+                since = None;
+                continue;
+            }
+            if since.get_or_insert_with(Instant::now).elapsed() >= GRACE {
+                restore_terminal();
+                std::process::exit(128 + sig);
+            }
+        }
+    });
+}
+
 /// Run `f`, converting a panic into `Err(message)`.
 pub fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     GUARD_DEPTH.with(|d| d.set(d.get() + 1));
@@ -214,7 +249,7 @@ fn spawn_sampler(cfg: Config, tx: Sender<Msg>, fs: Arc<FsShared>) {
         let (mut last_rec, mut last_diag) = (0i64, 0i64);
         let mut first = true;
         loop {
-            let snap = match guarded(|| col.sample()) {
+            let mut snap = match guarded(|| col.sample()) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = tx.send(Msg::CollectorError(e));
@@ -252,6 +287,15 @@ fn spawn_sampler(cfg: Config, tx: Sender<Msg>, fs: Arc<FsShared>) {
             if diagnose_ok && now - last_diag >= 5000 {
                 last_diag = now;
                 let facts = fs.facts();
+                // Name a VM's containers in the advice: reuse the list the fleet thread keeps
+                // fresh (never blocks on docker here).
+                if snap.containers.is_empty()
+                    && cfg.containers
+                    && crate::blame::hosts_containers(&snap)
+                    && let Some(cs) = crate::fleet::cached_containers()
+                {
+                    snap.containers = cs;
+                }
                 match guarded(|| crate::blame::diagnose_with_fs(&snap, hist.as_ref(), &facts)) {
                     Ok(f) => {
                         let starts = finding_starts(&f, &snap);
@@ -718,6 +762,17 @@ impl Ctx {
                 }
                 self.exec(app, Command::RefreshLog);
             }
+            Command::UndoId(id) => {
+                let Some(a) = self.actions() else {
+                    app.set_status("actions unavailable", true);
+                    return;
+                };
+                match guarded(|| a.undo(id)) {
+                    Ok(r) => app.undo_done(Some(&r)),
+                    Err(e) => app.set_status(format!("undo failed: {e}"), true),
+                }
+                self.exec(app, Command::RefreshLog);
+            }
             Command::RefreshLog => {
                 if let Some(a) = self.actions()
                     && let Ok(log) = guarded(|| a.log()) {
@@ -848,11 +903,12 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
     app.configured_hosts = cfg.hosts.len();
     let hist_tx = spawn_history(hist, tx.clone());
     let mut ctx = Ctx { cfg, hist: Some(hist_tx), actions: None, actions_failed: false, tx, fs_shared, fs: None };
-    // Load the journal up front so the Log tab is ready.
-    ctx.exec(&mut app, Command::RefreshLog);
+    // Nothing else runs before the first frame: the journal is read when the action log (`a`)
+    // opens or an action runs, samples arrive from the sampler thread.
 
     QUIT_SIGNAL.store(0, Ordering::SeqCst);
     let old_signals = install_quit_signals();
+    spawn_quit_watchdog();
     let res = setup_terminal().and_then(|mut term| event_loop(&mut term, &mut app, &mut ctx, rx));
     restore_terminal();
     restore_signals(old_signals);

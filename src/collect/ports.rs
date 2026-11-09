@@ -1,10 +1,13 @@
-//! Listening sockets -> owning pid, orphan heuristic. OWNER: ports-net agent.
+//! Listening sockets -> owning pid, orphan heuristic. OWNER: ports-net agent (macOS source:
+//! native-macos agent).
 //!
-//! Data source: `lsof -nP -iTCP -sTCP:LISTEN -iUDP -FpcRnPT`. The `-F` field
-//! output is line-oriented and designed for machine parsing: every line starts
-//! with a one-letter field tag (`p` pid, `c` command, `R` ppid, `f` fd,
-//! `P` protocol, `n` name/address, `T` TCP/TPI info such as `ST=LISTEN`).
-//! Without root, lsof only reports the current user's sockets, which is fine.
+//! macOS: no subprocess. libproc (`proc_listpids` + `PROC_PIDLISTFDS` + `PROC_PIDFDSOCKETINFO`,
+//! see `sys::darwin::libproc`) lists every socket fd of every process we may inspect, with its
+//! protocol, TCP state and local address; TCP sockets in LISTEN and bound UDP sockets without a
+//! peer are kept. Without root that is the current user's processes, exactly what `lsof` showed.
+//! Only if the native call fails does it fall back to
+//! `lsof -nP -iTCP -sTCP:LISTEN -iUDP -FpcRnPT` (its `-F` field output is line-oriented: `p` pid,
+//! `c` command, `R` ppid, `f` fd, `P` protocol, `n` name/address, `T` TCP info like `ST=LISTEN`).
 //!
 //! Linux: no subprocess. Sockets come from `/proc/net/{tcp,tcp6,udp,udp6}` (see
 //! [`linux`]); owners from `/proc/<pid>/fd/*` symlinks `socket:[inode]`. Without
@@ -18,15 +21,14 @@
 //! Linux the scan refreshes in the background and callers get the cached list.
 use crate::model::{Port, Proc, Proto};
 use std::collections::HashMap;
-use std::io::Read;
-use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Hard deadline for the lsof call; the whole `ports()` must stay < 400ms.
+/// Hard deadline for the lsof fallback; the whole `ports()` must stay < 400ms.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 const LSOF_TIMEOUT: Duration = Duration::from_millis(350);
-/// Raw socket list is reused for this long between calls.
-/// Listening sockets change rarely and `lsof` costs ~40ms CPU per run, so refresh every 5s.
+/// Raw socket list is reused for this long between calls. Listening sockets change rarely; the
+/// native macOS scan costs a few ms of CPU (the old `lsof` run ~40ms), the Linux fd walk more.
 const CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// One socket as reported by lsof, before annotation.
@@ -66,7 +68,40 @@ pub fn ports(procs: &[Proc]) -> Vec<Port> {
 }
 
 /// Fetch the raw socket list from the platform source (uncached).
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn fetch_raw() -> Vec<RawSock> {
+    if !crate::sys::force_fallback()
+        && let Some(l) = crate::sys::darwin::libproc::listeners()
+    {
+        crate::sys::note_source("ports", "libproc");
+        return dedup(l.iter().map(from_listener).collect());
+    }
+    crate::sys::note_source("ports", "lsof");
+    run_lsof().map(|out| dedup(parse_lsof(&out))).unwrap_or_default()
+}
+
+/// libproc listener -> the same RawSock the lsof parser produces ("*" wildcard, "[v6]").
+#[cfg(target_os = "macos")]
+fn from_listener(l: &crate::sys::darwin::libproc::Listener) -> RawSock {
+    let addr = match l.addr {
+        a if a.is_unspecified() => "*".to_string(),
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    RawSock {
+        pid: l.pid,
+        ppid: l.ppid,
+        command: l.comm.clone(),
+        proto: if l.tcp { Proto::Tcp } else { Proto::Udp },
+        addr,
+        port: l.port,
+        state: if l.tcp { "LISTEN".into() } else { String::new() },
+        hidden_uid: None,
+        foreign_ns: false,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn fetch_raw() -> Vec<RawSock> {
     run_lsof().map(|out| dedup(parse_lsof(&out))).unwrap_or_default()
 }
@@ -115,38 +150,11 @@ fn cached_raw() -> Vec<RawSock> {
     socks
 }
 
-/// Run lsof with a deadline. Returns None if lsof is missing, fails, or times out.
+/// Run lsof with a deadline (fallback). None if lsof is missing or times out.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 fn run_lsof() -> Option<String> {
-    let mut child = Command::new("lsof")
-        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-iUDP", "-FpcRnPT"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    // Read stdout on a helper thread so a full pipe can't deadlock the deadline loop.
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stdout.read_to_string(&mut s);
-        s
-    });
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if start.elapsed() < LSOF_TIMEOUT => std::thread::sleep(Duration::from_millis(5)),
-            _ => {
-                // Timed out (or wait failed): kill our own child and reap it.
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
     // lsof exits 1 when some selectors match nothing; its output is still valid.
-    reader.join().ok()
+    crate::sys::run_fallback("lsof", &["-nP", "-iTCP", "-sTCP:LISTEN", "-iUDP", "-FpcRnPT"], LSOF_TIMEOUT)
 }
 
 /// Parse lsof `-F` output into sockets. Unknown fields are ignored; sockets with
@@ -444,6 +452,11 @@ fn is_orphan(ppid: u32, name: &str, exe: &str, cmd: &str, home: Option<&str>) ->
 pub fn foreign_netns(limit: usize) -> Vec<(u64, u32)> {
     linux::foreign_netns(std::path::Path::new("/proc"), limit)
 }
+
+/// The /proc/*/fd owner walk, shared with the network sampler.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+pub(super) use linux::{can_read_all_fds, socket_owners_uid};
 
 #[cfg(any(target_os = "linux", test))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1235,6 +1248,52 @@ TST=LISTEN
         let t = Instant::now();
         let _ = super::ports(&[]);
         assert!(t.elapsed() < Duration::from_millis(20), "cached");
+    }
+
+    /// Our own listeners come back through the native macOS path in lsof's address format.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_finds_own_listener() {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tport = tcp.local_addr().unwrap().port();
+        let any = std::net::TcpListener::bind("[::]:0").ok();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let uport = udp.local_addr().unwrap().port();
+        let me = std::process::id();
+        let raw = dedup(crate::sys::darwin::libproc::listeners().unwrap().iter().map(from_listener).collect());
+        let mine: Vec<&RawSock> = raw.iter().filter(|s| s.pid == me).collect();
+        assert!(mine.iter().any(|s| s.proto == Proto::Tcp && s.port == tport && s.addr == "127.0.0.1" && s.state == "LISTEN"), "{mine:?}");
+        assert!(mine.iter().any(|s| s.proto == Proto::Udp && s.port == uport && s.addr == "127.0.0.1" && s.state.is_empty()), "{mine:?}");
+        if let Some(a) = &any {
+            let p = a.local_addr().unwrap().port();
+            assert!(mine.iter().any(|s| s.port == p && s.addr == "*"), "{mine:?}");
+        }
+        drop((tcp, any, udp));
+    }
+
+    /// Parity with lsof at the same moment (current user's sockets):
+    /// `cargo test ports_match_lsof -- --ignored --nocapture`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn ports_match_lsof() {
+        let key = |s: &RawSock| (s.proto == Proto::Udp, s.port, s.pid, s.addr.clone());
+        let t = Instant::now();
+        let native: Vec<_> = dedup(crate::sys::darwin::libproc::listeners().unwrap().iter().map(from_listener).collect());
+        let dn = t.elapsed();
+        let t = Instant::now();
+        let lsof = dedup(parse_lsof(&run_lsof().unwrap()));
+        let dl = t.elapsed();
+        let a: std::collections::BTreeSet<_> = native.iter().map(key).collect();
+        let b: std::collections::BTreeSet<_> = lsof.iter().map(key).collect();
+        println!("native {} sockets in {dn:?}, lsof {} in {dl:?}", a.len(), b.len());
+        for x in a.difference(&b) {
+            println!("only native: {x:?}");
+        }
+        for x in b.difference(&a) {
+            println!("only lsof:   {x:?}");
+        }
+        assert_eq!(a, b);
     }
 
     #[test]

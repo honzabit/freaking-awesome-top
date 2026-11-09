@@ -1,4 +1,5 @@
-//! Safe, reversible actions with a persisted journal. OWNER: actions agent.
+//! Safe actions with a persisted journal: pause/resume and renice are undoable, TERM/KILL
+//! are not (pause first to test a culprit). OWNER: actions agent.
 //!
 //! Every action (including refused ones) is appended to a JSONL journal so the
 //! TUI, CLI and MCP all share one audit trail. The journal is strictly
@@ -276,7 +277,8 @@ impl Actions {
             return failed(undo_kind, o.pid, &o.name, format!("#{id} did not succeed; nothing to undo"));
         }
         if !o.undoable {
-            return failed(undo_kind, o.pid, &o.name, format!("#{id} ({:?}) is not undoable", o.kind));
+            let why = if matches!(o.kind, ActionKind::Term | ActionKind::Kill | ActionKind::KillTree) { ": a signal that ends a process can't be taken back" } else { "" };
+            return failed(undo_kind, o.pid, &o.name, format!("#{id} ({:?}) is not undoable{why}", o.kind));
         }
         if o.undone {
             return failed(undo_kind, o.pid, &o.name, format!("#{id} was already undone"));
@@ -441,6 +443,45 @@ fn blank(kind: ActionKind, pid: u32, name: &str) -> ActionRecord {
 
 fn failed(kind: ActionKind, pid: u32, name: &str, message: String) -> ActionRecord {
     ActionRecord { message, ..blank(kind, pid, name) }
+}
+
+// ---- preview (read-only) ----
+
+/// What an action would do, without doing it: the same checks [`Actions::apply_expect`] runs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Preview {
+    /// Why it would be refused (None = it would run).
+    pub refusal: Option<String>,
+    /// A warning it would run with.
+    pub warning: Option<String>,
+    /// Live start time of the target (epoch secs), to bind a confirmation to this process.
+    pub start_time: Option<u64>,
+    /// For KillTree: each descendant (pid, name, Some(reason) if it would be skipped),
+    /// deepest first, as they would be signalled.
+    pub tree: Vec<(u32, String, Option<String>)>,
+}
+
+/// Dry run of `kind` on `pid`: never signals anything.
+pub fn preview(kind: ActionKind, pid: u32, snap: &Snapshot, expect: Option<&Expect>) -> Preview {
+    let live = live_proc(pid);
+    let mut p = Preview { start_time: live.as_ref().map(|l| l.start_time), ..Default::default() };
+    match check_target(kind, pid, live.as_ref(), snap, expect) {
+        Err(r) => p.refusal = Some(r),
+        Ok(w) => p.warning = w,
+    }
+    if kind == ActionKind::KillTree {
+        let ours = self_and_ancestors();
+        let mut desc: Vec<(usize, &crate::model::Proc)> = snap.descendants(pid).into_iter().map(|c| (depth_below(snap, c.pid, pid), c)).collect();
+        desc.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, c) in desc {
+            let skip = protection(c.pid, &c.name, &ours)
+                .err()
+                .or_else(|| critical_refusal(ActionKind::KillTree, &c.name))
+                .or_else(|| kernel_thread_refusal(c.pid, &c.name).err());
+            p.tree.push((c.pid, c.name.clone(), skip));
+        }
+    }
+    p
 }
 
 // ---- safety checks ----

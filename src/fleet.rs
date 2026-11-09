@@ -49,6 +49,12 @@ pub fn containers() -> Vec<Container> {
     }
 }
 
+/// The last container list fetched by anyone (possibly stale), without ever running docker.
+/// For hot loops (the TUI's diagnose) that must not block on a slow daemon.
+pub fn cached_containers() -> Option<Vec<Container>> {
+    CACHE.lock().ok().and_then(|g| g.as_ref().map(|(_, l)| l.clone()))
+}
+
 fn store(list: Vec<Container>) {
     if let Ok(mut g) = CACHE.lock() {
         *g = Some((Instant::now(), list));
@@ -189,6 +195,7 @@ impl CmdOut {
 pub(crate) fn run_with_timeout(prog: &str, args: &[&str], timeout: Duration) -> anyhow::Result<CmdOut> {
     let mut child = Command::new(prog)
         .args(args)
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

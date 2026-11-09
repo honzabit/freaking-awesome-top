@@ -8,12 +8,14 @@
 //! * APFS volumes of one container share free space: `total`/`avail` are container-wide and
 //!   `used` is per volume. Use [`totals`] to sum without double counting.
 //! * I/O: Linux `/proc/diskstats` (by mount major:minor, else source device, else its parent
-//!   disk). macOS: IOKit `IOBlockStorageDriver` "Statistics" via `ioreg`, polled every 5 s in a
-//!   background thread, mapped from the physical disk to every BSD node below it, so every
+//!   disk). macOS: IOKit `IOBlockStorageDriver` "Statistics" read natively (`sys::darwin::iokit`;
+//!   `ioreg` only as a fallback), polled every 5 s in a background thread, mapped from the physical disk to every BSD node below it, so every
 //!   volume of one physical disk reports the same (disk-level) rate; see `note`.
 //! * `fill_bps`: least-squares slope of `used` over the last [`FILL_WINDOW_MS`].
 //! * Purgeable (macOS): CoreFoundation `kCFURLVolumeAvailableCapacityForImportantUsageKey`
 //!   minus `avail`, once per container per 60 s.
+//!
+//! * Deleted-but-open (macOS): libproc vnode fds with link count 0 (`lsof +L1` as a fallback).
 //!
 //! Everything here is read-only.
 use super::Volume;
@@ -33,7 +35,7 @@ const FILL_MIN_SPAN_MS: i64 = 60_000;
 const PURGEABLE_EVERY: Duration = Duration::from_secs(60);
 /// (pid, process name, path, bytes).
 type DeletedFile = (u32, String, String, u64);
-/// `deleted_open()` result cache: lsof costs ~0.25 s CPU on macOS.
+/// `deleted_open()` result cache (the native macOS scan is ~10 ms; the lsof fallback ~0.25 s CPU).
 const DELETED_TTL: Duration = Duration::from_secs(15);
 
 /// Stateful so it can compute I/O and fill rates between calls.
@@ -787,6 +789,13 @@ pub fn deleted_open_uncached() -> Vec<(u32, String, String, u64)> {
 pub fn deleted_open_uncached() -> Vec<(u32, String, String, u64)> {
     // SAFETY: geteuid has no preconditions.
     let euid = unsafe { libc::geteuid() };
+    if !crate::sys::force_fallback()
+        && let Some(v) = crate::sys::darwin::libproc::deleted_open((euid != 0).then_some(euid))
+    {
+        crate::sys::note_source("deleted_open", "libproc");
+        return finish_deleted(v);
+    }
+    crate::sys::note_source("deleted_open", "lsof");
     let uid = euid.to_string();
     let mut args: Vec<&str> = vec!["+c", "0", "-nP", "-w", "+L1"];
     if euid != 0 {
@@ -839,42 +848,13 @@ pub fn parse_lsof_deleted(text: &str) -> Vec<(u32, String, String, u64)> {
     out
 }
 
-/// Run a command we spawn ourselves, killing it after `timeout`. stdout on success.
+/// Fallback shell-out (macOS `lsof` / `ioreg`), only when the native API failed.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn run_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
-    use std::io::Read;
-    use std::process::Stdio;
-    let mut child = std::process::Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    // Read in a thread so a large output can't fill the pipe and deadlock the wait.
-    let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stdout.read_to_string(&mut s);
-        s
-    });
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-        }
-    }
-    // lsof exits 1 when nothing matched; output is still valid.
-    reader.join().ok()
+    crate::sys::run_fallback(cmd, args, timeout)
 }
 
-// ---- ioreg parsing (pure; used on macOS) ----------------------------------------------------------
+// ---- ioreg parsing (pure; the macOS fallback) ----------------------------------------------------------
 
 /// `ioreg -c IOBlockStorageDriver -r -d 1 -w0` -> [(registry id, bytes read, bytes written)].
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -1094,7 +1074,7 @@ mod mac {
         }
     }
 
-    // ---- ioreg background poller ---------------------------------------------------------
+    // ---- disk I/O background poller ---------------------------------------------------------
 
     /// BSD name -> (read bps, write bps, physical disk name).
     pub type Rates = HashMap<String, (u64, u64, String)>;
@@ -1124,6 +1104,31 @@ mod mac {
         }
     }
 
+    /// (driver id, bytes read, bytes written): IOKit, else `ioreg`.
+    fn driver_stats() -> Vec<(String, u64, u64)> {
+        if !crate::sys::force_fallback()
+            && let Some(v) = crate::sys::darwin::iokit::block_storage_stats()
+        {
+            crate::sys::note_source("disk_io", "iokit");
+            return v;
+        }
+        crate::sys::note_source("disk_io", "ioreg");
+        super::run_timeout("ioreg", &["-c", "IOBlockStorageDriver", "-r", "-d", "1", "-w0"], Duration::from_secs(3))
+            .map(|s| super::parse_ioreg_stats(&s))
+            .unwrap_or_default()
+    }
+
+    /// BSD name -> (driver id, whole disk): IOKit, else `ioreg`.
+    fn bsd_map() -> Option<HashMap<String, (String, String)>> {
+        if !crate::sys::force_fallback()
+            && let Some(m) = crate::sys::darwin::iokit::block_storage_bsd_map()
+        {
+            return Some(m);
+        }
+        super::run_timeout("ioreg", &["-c", "IOBlockStorageDriver", "-r", "-l", "-w0"], Duration::from_secs(3))
+            .map(|s| super::parse_ioreg_bsd_map(&s))
+    }
+
     fn poll(weak: Weak<Shared>) {
         let mut map: HashMap<String, (String, String)> = HashMap::new();
         let mut last_map: Option<Instant> = None;
@@ -1138,14 +1143,12 @@ mod mac {
             let every = if warm { IO_EVERY } else { Duration::from_millis(900) };
             if !idle && last_io.is_none_or(|t| t.elapsed() >= every) {
                 last_io = Some(Instant::now());
-                let stats = super::run_timeout("ioreg", &["-c", "IOBlockStorageDriver", "-r", "-d", "1", "-w0"], Duration::from_secs(3))
-                    .map(|s| super::parse_ioreg_stats(&s))
-                    .unwrap_or_default();
+                let stats = driver_stats();
                 let unknown = stats.iter().any(|(id, _, _)| !map.values().any(|(i, _)| i == id));
                 if last_map.is_none_or(|t| t.elapsed() >= MAP_EVERY) || (unknown && last_map.is_none_or(|t| t.elapsed() >= IO_EVERY)) {
                     last_map = Some(Instant::now());
-                    if let Some(s) = super::run_timeout("ioreg", &["-c", "IOBlockStorageDriver", "-r", "-l", "-w0"], Duration::from_secs(3)) {
-                        map = super::parse_ioreg_bsd_map(&s);
+                    if let Some(m) = bsd_map() {
+                        map = m;
                     }
                 }
                 let now = Instant::now();
@@ -1456,6 +1459,58 @@ garbage line without separator
             .join(format!("{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Native IOKit disk map / counters and libproc deleted files against `ioreg` / `lsof` at the
+    /// same moment: `cargo test native_matches_shellouts -- --ignored --nocapture`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn native_matches_shellouts() {
+        use crate::sys::darwin::{iokit, libproc};
+        let t = Instant::now();
+        let m = iokit::block_storage_bsd_map().unwrap();
+        let st = iokit::block_storage_stats().unwrap();
+        let dn = t.elapsed();
+        let t = Instant::now();
+        let m2 = parse_ioreg_bsd_map(&run_timeout("ioreg", &["-c", "IOBlockStorageDriver", "-r", "-l", "-w0"], Duration::from_secs(5)).unwrap());
+        let st2 = parse_ioreg_stats(&run_timeout("ioreg", &["-c", "IOBlockStorageDriver", "-r", "-d", "1", "-w0"], Duration::from_secs(5)).unwrap());
+        let ds = t.elapsed();
+        println!("disk map+stats: iokit {dn:?}, ioreg {ds:?}; {} bsd nodes, {} drivers", m.len(), st.len());
+        assert_eq!(m, m2);
+        let (mut st, mut st2) = (st, st2);
+        st.sort();
+        st2.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(st.iter().map(|x| &x.0).collect::<Vec<_>>(), st2.iter().map(|x| &x.0).collect::<Vec<_>>());
+        for (a, b) in st.iter().zip(&st2) {
+            // Counters only grow; ioreg ran after us.
+            assert!(a.1 <= b.1 && a.2 <= b.2 && b.2 - a.2 < 1 << 30, "{a:?} {b:?}");
+        }
+        // SAFETY: no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        let t = Instant::now();
+        let d = finish_deleted(libproc::deleted_open(Some(euid)).unwrap());
+        let dn = t.elapsed();
+        let t = Instant::now();
+        let uid = euid.to_string();
+        let out = run_timeout("lsof", &["+c", "0", "-nP", "-w", "+L1", "-a", "-u", &uid, "-F", "pcftsiDn"], Duration::from_secs(10)).unwrap();
+        let d2 = finish_deleted(parse_lsof_deleted(&out));
+        let ds = t.elapsed();
+        println!("deleted-open: libproc {} files in {dn:?}, lsof {} in {ds:?}", d.len(), d2.len());
+        let k = |v: &[DeletedFile]| v.iter().map(|e| (e.0, e.2.clone(), e.3)).collect::<std::collections::BTreeSet<_>>();
+        let (kd, kd2) = (k(&d), k(&d2));
+        for x in kd.difference(&kd2) {
+            println!("only libproc: {x:?}");
+        }
+        for x in kd2.difference(&kd) {
+            println!("only lsof:    {x:?}");
+        }
+        // Expected gap: mapped files whose stat the kernel withholds (vnode info all zero, e.g.
+        // LaunchServices' stale csstores in a TCC-protected folder) are not reported natively, since
+        // their link count is unknown; lsof lists them. Files coming and going between the two
+        // scans also show up here.
+        let diff = kd.symmetric_difference(&kd2).count();
+        assert!(diff <= 3.max(kd2.len() / 50), "{diff} of {} differ", kd2.len());
     }
 
     #[test]

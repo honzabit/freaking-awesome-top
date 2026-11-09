@@ -8,6 +8,9 @@ use crate::history::History;
 use crate::model::{Explanation, Finding, Proc, Snapshot, Ts};
 use std::collections::HashMap;
 
+mod hubs;
+use hubs::{Advice, Block, Ctx, Hub, Want};
+
 const KB: u64 = 1024;
 const MB: u64 = 1024 * KB;
 const GB: u64 = 1024 * MB;
@@ -77,8 +80,12 @@ pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation
                 .into(),
         );
     }
+    let cx = Ctx::new(snap, os);
+    let hub = cx.hub(p);
     let causes = cause_steps(snap, os, p, &tree, hist, now);
     chain.extend(causes.steps);
+    let (hub_steps, hub_suggestions) = hub.as_ref().map(|h| cx.hub_explain(p, h)).unwrap_or_default();
+    chain.extend(hub_steps);
     if let Some((start, dur)) = streak {
         let mut s = format!("hot for the last {}, started {}", human_dur_ms(dur), clock(start));
         if let Some(sp) = hist.and_then(|h| coinciding_spike(h, start)) {
@@ -175,9 +182,18 @@ pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation
             "see what it waits on: cat /proc/{pid}/wchan (sudo cat /proc/{pid}/stack for the full kernel stack); check `dmesg` for IO errors or hung-task warnings"
         ));
     }
+    // Every pause/kill suggestion below is gated by `cx.advise`: hubs (VM hosts, runtimes,
+    // container pid 1, init, browser/app main processes, sessions), OS parts, GUI apps and
+    // system services never get one.
+    let block = cx.block(p);
     if is_stopped(p) {
         suggestions.push(format!("it is paused; resume it: fat resume {pid}"));
-        suggestions.push(format!("or stop it for good: fat kill {pid}{}", tree_flag(&descendants)));
+        match cx.advise(p, Want::End) {
+            Advice { action: Some(a), .. } => suggestions.push(format!("or stop it for good: fat {a}")),
+            Advice { note: Some(n), .. } => suggestions.push(n),
+            _ => {}
+        }
+        suggestions.extend(hub_suggestions);
     } else if kthread {
         suggestions.push(format!(
             "{} is a kernel thread: it can't be paused or killed, and renicing it doesn't help. Address the cause above instead.",
@@ -198,19 +214,40 @@ pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation
             Os::Mac => format!("{} is part of macOS; don't kill it. Address the cause above instead.", p.name),
         };
         suggestions.push(msg);
-        if p.pid != 0 && p.pid != 1 && p.name != "kernel_task" {
+        suggestions.extend(hub_suggestions);
+        if p.pid != 0 && p.pid != 1 && p.name != "kernel_task" && hub.is_none() {
             suggestions.push(format!("if it's hurting right now, lower its priority: fat renice {pid} 10"));
+        }
+    } else if let Some(Block::Hub(h)) = &block {
+        if os == Os::Linux && matches!(h, Hub::ContainerInit { .. }) {
+            suggestions.extend(placement_suggestions(snap, &cg, p));
+        }
+        suggestions.extend(hub_suggestions);
+        if suggestions.is_empty() {
+            suggestions.push(cx.block_note(p, &Block::Hub(h.clone())));
+        }
+    } else if let Some(b) = &block {
+        // OS part (via CoreServices), GUI app, container process or system service.
+        if os == Os::Linux {
+            suggestions.extend(placement_suggestions(snap, &cg, p));
+        }
+        suggestions.push(cx.block_note(p, b));
+        if let Some(a) = cx.advise(p, Want::Renice).action {
+            suggestions.push(format!("lower its priority (reversible): fat {a}"));
         }
     } else {
         if os == Os::Linux {
             suggestions.extend(placement_suggestions(snap, &cg, p));
         }
+        let end = cx.advise(p, Want::End);
         suggestions.push(format!("pause it (reversible): fat pause {pid}"));
         suggestions.push(format!("lower its priority (reversible): fat renice {pid} 10"));
-        if descendants.is_empty() {
-            suggestions.push(format!("stop it: fat kill {pid}"));
-        } else {
-            suggestions.push(format!("stop the tree ({} procs): fat kill {pid} --tree", descendants.len() + 1));
+        match end.action {
+            Some(a) if a.contains("--tree") => {
+                suggestions.push(format!("stop the tree ({} procs): fat {a}", descendants.len() + 1))
+            }
+            Some(a) => suggestions.push(format!("stop it: fat {a}")),
+            None => suggestions.extend(end.note),
         }
     }
 
@@ -222,29 +259,40 @@ pub fn diagnose(snap: &Snapshot, hist: Option<&History>) -> Vec<Finding> {
     let now = now_of(snap);
     let os = platform(snap);
     let mut out = Vec::new();
+    // Every Finding::action below comes from `cx.advise` (or is None): never a pause/kill of a
+    // hub, an OS part, a GUI app or a system service. The TUI's Doctor tab runs it as-is.
+    let cx = Ctx::new(snap, os);
 
-    rule_memory(snap, os, &mut out);
-    rule_swap(snap, &mut out);
-    rule_thermal(snap, os, &mut out);
-    rule_cpu(snap, os, hist, now, &mut out);
-    rule_power(snap, os, &mut out);
-    rule_orphans(snap, &mut out);
-    rule_stopped(snap, hist, now, &mut out);
-    rule_zombies(snap, &mut out);
-    rule_swarms(snap, os, &mut out);
-    rule_disk(snap, os, &mut out);
+    rule_memory(&cx, &mut out);
+    rule_swap(&cx, &mut out);
+    rule_thermal(&cx, &mut out);
+    rule_cpu(&cx, hist, now, &mut out);
+    rule_power(&cx, &mut out);
+    rule_orphans(&cx, &mut out);
+    rule_stopped(&cx, hist, now, &mut out);
+    rule_zombies(&cx, &mut out);
+    rule_swarms(&cx, &mut out);
+    rule_disk(&cx, &mut out);
     rule_net(snap, os, &mut out);
-    rule_load(snap, os, &mut out);
+    rule_load(&cx, &mut out);
     rule_unattributed(snap, os, &mut out);
     if os != Os::Mac {
-        rule_psi(snap, os, &mut out);
-        rule_temp(snap, os, &mut out);
+        rule_psi(&cx, &mut out);
+        rule_temp(&cx, &mut out);
         rule_dstate(snap, os, hist, now, &mut out);
     }
     rule_containers(snap, &mut out);
 
     out.sort_by_key(|f| std::cmp::Reverse(severity_rank(&f.severity)));
     out
+}
+
+/// True when some process hosts containers (a VM host like OrbStack Helper or Docker Desktop's
+/// VM, or a container runtime): callers should fetch the container list before diagnosing, so
+/// hub advice can name the containers instead of the host process.
+pub fn hosts_containers(snap: &Snapshot) -> bool {
+    let cx = Ctx::new(snap, platform(snap));
+    snap.procs.iter().any(|p| p.container.is_some() || matches!(cx.hub(p), Some(Hub::Vm { .. }) | Some(Hub::Runtime)))
 }
 
 // ======================================================================
@@ -263,7 +311,18 @@ pub struct FsFacts {
 /// [`diagnose`] plus the storage rules, ranked together.
 pub fn diagnose_with_fs(snap: &Snapshot, hist: Option<&History>, fs: &FsFacts) -> Vec<Finding> {
     let mut out = diagnose(snap, hist);
-    out.extend(diagnose_fs(fs));
+    let mut disk = diagnose_fs(fs);
+    // "Restart X to release deleted files" is wrong advice for a hub (OrbStack's VM, a browser,
+    // launchd): say what restarting it really means instead.
+    let cx = Ctx::new(snap, platform(snap));
+    for f in disk.iter_mut().filter(|f| f.title.contains("of deleted files")) {
+        if let Some(p) = f.pids.first().and_then(|pid| snap.proc(*pid))
+            && let Some(b) = cx.block(p)
+        {
+            f.detail.push_str(&format!(" Careful: {}.", cx.block_note(p, &b)));
+        }
+    }
+    out.extend(disk);
     out.sort_by_key(|f| std::cmp::Reverse(severity_rank(&f.severity)));
     out
 }
@@ -1130,25 +1189,22 @@ fn cause_steps(snap: &Snapshot, os: Os, p: &Proc, tree: &TreeCost, hist: Option<
         return c;
     }
 
-    if lname.contains("chrome helper") || lname.contains("webcontent") {
-        c.steps.push("root cause: one browser tab/extension is doing heavy work".into());
-        c.suggestions.push("find and close the tab: Chrome Window > Task Manager, or Safari Develop menu; reloading a runaway tab also works".into());
+    let cx = hubs::Ctx::new(snap, os);
+    if let Some(app) = cx.app(p).filter(|a| a.browser && !a.main) {
+        c.steps.push(format!("root cause: one {} tab/extension is doing heavy work", app.name));
+        c.suggestions.push(if app.name == "Safari" || app.name == "WebKit" {
+            "find and close the tab: Activity Monitor names each Safari WebContent process; reloading a runaway tab also works".into()
+        } else if app.name == "Firefox" {
+            "find and close the tab: open about:processes in Firefox; reloading a runaway tab also works".into()
+        } else {
+            format!("find and close the tab: Shift+Esc (Window > Task Manager) in {}; reloading a runaway tab also works", app.name)
+        });
         return c;
     }
 
-    if lname.contains("virtualization") || lname.starts_with("qemu") || lname.contains("docker") || lname.contains("orbstack") {
-        let busy: Vec<String> = snap
-            .containers
-            .iter()
-            .filter(|ct| ct.cpu > 1.0 || ct.mem > 256 * MB)
-            .map(|ct| format!("{} ({}) {:.0}% CPU {}", ct.name, ct.image, ct.cpu, human_bytes(ct.mem)))
-            .collect();
-        if busy.is_empty() {
-            c.steps.push("root cause: workload inside the VM (containers or VM guest processes)".into());
-        } else {
-            c.steps.push(format!("root cause: containers inside the VM: {}", busy.join(", ")));
-        }
-        c.suggestions.push("inspect containers: fat fleet (or docker stats); stop idle ones with docker stop".into());
+    // VM / container hosts: `hubs::Ctx::hub_explain` names the containers and product-specific
+    // fixes; nothing generic (pause/kill, "pure CPU spin") applies to them.
+    if hubs::Ctx::new(snap, os).vm_product(p).is_some() {
         return c;
     }
 
@@ -1350,10 +1406,6 @@ fn status_word(s: &str) -> String {
     w.to_string()
 }
 
-fn tree_flag(desc: &[&Proc]) -> &'static str {
-    if desc.is_empty() { "" } else { " --tree" }
-}
-
 // ======================================================================
 // Diagnose rules
 // ======================================================================
@@ -1384,18 +1436,47 @@ fn list_procs(ps: &[&Proc], f: impl Fn(&Proc) -> String) -> String {
     ps.iter().map(|p| format!("{} (pid {}) {}", p.name, p.pid, f(p))).collect::<Vec<_>>().join(", ")
 }
 
-/// Safe default action for a process: pause unless it's part of macOS.
-fn safe_action(os: Os, p: &Proc, snap: &Snapshot) -> Option<String> {
-    if is_system_critical_on(os, p) {
-        None
-    } else if snap.descendants(p.pid).is_empty() {
-        Some(format!("pause {}", p.pid))
-    } else {
-        Some(format!("pause {} (or kill {} --tree)", p.pid, p.pid))
+/// Pause-style action for a hot process, through the hub/safety gate. The gate's advice (what
+/// to do instead) is appended to `detail` when there is no safe command.
+fn gated(cx: &Ctx, p: &Proc, want: Want, detail: &mut String) -> Option<String> {
+    let a = cx.advise(p, want);
+    if let Some(n) = a.note.filter(|_| a.action.is_none()) {
+        detail.push_str(&format!(" Advice: {n}."));
     }
+    a.action
 }
 
-fn rule_memory(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
+/// "swap 6.7G of 8.0G in use" (empty when there is no swap).
+fn swap_text(snap: &Snapshot) -> String {
+    let s = &snap.system;
+    if s.swap_total == 0 { String::new() } else { format!("swap {} of {} in use", human_bytes(s.swap_used), human_bytes(s.swap_total)) }
+}
+
+/// Memory workloads for the memory/swap/PSI findings: top `n` as text, their lead pids, the
+/// first safe action among the top three, and advice for the top ones without one.
+fn memory_workloads(cx: &Ctx, n: usize) -> (String, Vec<u32>, Option<String>, Vec<String>) {
+    let all = cx.consumers();
+    let top: Vec<&hubs::Consumer> = all.iter().filter(|c| c.mem > 0).take(n).collect();
+    if top.is_empty() {
+        return ("none measurable in this sample".into(), Vec::new(), None, Vec::new());
+    }
+    let text = top.iter().map(|c| cx.consumer_text(c)).collect::<Vec<_>>().join("; ");
+    let pids = top.iter().map(|c| c.lead.pid).collect();
+    let mut action = None;
+    let mut notes: Vec<String> = Vec::new();
+    for c in top.iter().take(3) {
+        let a = cx.consumer_advice(c);
+        match (a.action, a.note) {
+            (Some(x), _) if action.is_none() => action = Some(x),
+            (None, Some(note)) if notes.len() < 2 && !notes.contains(&note) => notes.push(note),
+            _ => {}
+        }
+    }
+    (text, pids, action, notes)
+}
+
+fn rule_memory(cx: &Ctx, out: &mut Vec<Finding>) {
+    let snap = cx.snap;
     let sys = &snap.system;
     let ratio = if sys.mem_total > 0 { sys.mem_used as f64 / sys.mem_total as f64 } else { 0.0 };
     let sev = match sys.mem_pressure.as_str() {
@@ -1406,24 +1487,23 @@ fn rule_memory(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
         _ => None,
     };
     let Some(sev) = sev else { return };
-    let top: Vec<&Proc> = top_by(snap, |p| p.mem as f32, 5).into_iter().filter(|p| p.mem > 0).collect();
-    let first = top.iter().find(|p| !is_system_critical_on(os, p)).copied();
-    out.push(finding(
-        sev,
-        format!("Memory pressure is {}", if sev == "crit" { "critical" } else { "elevated" }),
-        format!(
-            "{} of {} RAM used ({:.0}%). Top consumers: {}",
-            human_bytes(sys.mem_used),
-            human_bytes(sys.mem_total),
-            ratio * 100.0,
-            list_procs(&top, |p| human_bytes(p.mem))
-        ),
-        top.iter().map(|p| p.pid).collect(),
-        first.map(|p| format!("kill {}{}", p.pid, tree_flag(&snap.descendants(p.pid)))),
-    ));
+    let (text, pids, action, notes) = memory_workloads(cx, 5);
+    let swap = swap_text(snap);
+    let mut detail = format!(
+        "{} of {} RAM used ({:.0}%){}. Biggest workloads: {text}.",
+        human_bytes(sys.mem_used),
+        human_bytes(sys.mem_total),
+        ratio * 100.0,
+        if swap.is_empty() { String::new() } else { format!(", {swap}") }
+    );
+    if !notes.is_empty() {
+        detail.push_str(&format!(" What to do: {}.", notes.join("; ")));
+    }
+    out.push(finding(sev, format!("Memory pressure is {}", if sev == "crit" { "critical" } else { "elevated" }), detail, pids, action));
 }
 
-fn rule_swap(snap: &Snapshot, out: &mut Vec<Finding>) {
+fn rule_swap(cx: &Ctx, out: &mut Vec<Finding>) {
+    let snap = cx.snap;
     let s = &snap.system;
     if s.swap_total == 0 || s.swap_used < 2 * GB {
         return;
@@ -1432,22 +1512,22 @@ fn rule_swap(snap: &Snapshot, out: &mut Vec<Finding>) {
     if ratio < 0.5 && s.swap_used < 8 * GB {
         return;
     }
-    let top = top_by(snap, |p| p.mem as f32, 3);
+    let (text, pids, _, _) = memory_workloads(cx, 3);
     out.push(finding(
         "warn",
         "Heavy swap use".into(),
         format!(
-            "{} of {} swap in use; the machine is paging to disk, which feels sluggish. Biggest residents: {}",
+            "{} of {} swap in use; the machine is paging to disk, which feels sluggish. Biggest workloads: {text}.",
             human_bytes(s.swap_used),
             human_bytes(s.swap_total),
-            list_procs(&top, |p| human_bytes(p.mem))
         ),
-        top.iter().map(|p| p.pid).collect(),
+        pids,
         None,
     ));
 }
 
-fn rule_thermal(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
+fn rule_thermal(cx: &Ctx, out: &mut Vec<Finding>) {
+    let (snap, os) = (cx.snap, cx.os);
     let sev = match snap.system.thermal.as_str() {
         "critical" => "crit",
         "serious" => "warn",
@@ -1474,11 +1554,12 @@ fn rule_thermal(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
         "Thermal throttling".into(),
         detail,
         hot.iter().map(|p| p.pid).collect(),
-        hot.iter().find(|p| !is_system_critical_on(os, p)).map(|p| format!("renice {} 10", p.pid)),
+        hot.iter().find_map(|p| cx.advise(p, Want::Renice).action),
     ));
 }
 
-fn rule_cpu(snap: &Snapshot, os: Os, hist: Option<&History>, now: Ts, out: &mut Vec<Finding>) {
+fn rule_cpu(cx: &Ctx, hist: Option<&History>, now: Ts, out: &mut Vec<Finding>) {
+    let (snap, os) = (cx.snap, cx.os);
     for p in &snap.procs {
         if is_stopped(p) {
             continue;
@@ -1515,22 +1596,20 @@ fn rule_cpu(snap: &Snapshot, os: Os, hist: Option<&History>, now: Ts, out: &mut 
             detail.push(' ');
             detail.push_str(k);
         }
-        detail.push_str(&format!(" Details: fat why {}", p.pid));
-        out.push(finding("warn", title, detail, vec![p.pid], safe_action(os, p, snap)));
+        detail.push_str(&format!(" Details: fat why {}.", p.pid));
+        let action = gated(cx, p, Want::Calm, &mut detail);
+        out.push(finding("warn", title, detail, vec![p.pid], action));
     }
 }
 
-fn rule_power(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
+fn rule_power(cx: &Ctx, out: &mut Vec<Finding>) {
+    let snap = cx.snap;
     let sys = &snap.system;
     let heavy: Vec<&Proc> = snap.procs.iter().filter(|p| p.power_mw > 5000.0).collect();
     for p in &heavy {
-        out.push(finding(
-            "warn",
-            format!("{} is drawing {}", p.name, human_watts(p.power_mw)),
-            format!("{} (pid {}) is the kind of load that drains a battery in a couple of hours.", p.name, p.pid),
-            vec![p.pid],
-            safe_action(os, p, snap),
-        ));
+        let mut detail = format!("{} (pid {}) is the kind of load that drains a battery in a couple of hours.", p.name, p.pid);
+        let action = gated(cx, p, Want::Calm, &mut detail);
+        out.push(finding("warn", format!("{} is drawing {}", p.name, human_watts(p.power_mw)), detail, vec![p.pid], action));
     }
     if sys.on_battery == Some(true)
         && let Some(b) = sys.battery_pct
@@ -1545,12 +1624,13 @@ fn rule_power(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
                         list_procs(&top, |p| human_watts(p.power_mw))
                     ),
                     top.iter().map(|p| p.pid).collect(),
-                    top.iter().find(|p| !is_system_critical_on(os, p)).map(|p| format!("pause {}", p.pid)),
+                    top.iter().find_map(|p| cx.advise(p, Want::Pause).action),
                 ));
             }
 }
 
-fn rule_orphans(snap: &Snapshot, out: &mut Vec<Finding>) {
+fn rule_orphans(cx: &Ctx, out: &mut Vec<Finding>) {
+    let snap = cx.snap;
     let mut seen: Vec<u32> = Vec::new();
     for pt in snap.ports.iter().filter(|p| p.orphan) {
         if seen.contains(&pt.pid) {
@@ -1568,34 +1648,33 @@ fn rule_orphans(snap: &Snapshot, out: &mut Vec<Finding>) {
         if !pt.note.is_empty() {
             detail.push_str(&format!(" {}", pt.note));
         }
-        out.push(finding(
-            "warn",
-            format!("Orphaned dev server on :{}", pt.port),
-            detail,
-            vec![pt.pid],
-            Some(format!("kill {} --tree", pt.pid)),
-        ));
+        let action = match snap.proc(pt.pid) {
+            Some(p) => gated(cx, p, Want::EndTree, &mut detail),
+            None => None, // gone (or not visible): nothing safe to suggest
+        };
+        out.push(finding("warn", format!("Orphaned dev server on :{}", pt.port), detail, vec![pt.pid], action));
     }
 }
 
-fn rule_stopped(snap: &Snapshot, hist: Option<&History>, now: Ts, out: &mut Vec<Finding>) {
+fn rule_stopped(cx: &Ctx, hist: Option<&History>, now: Ts, out: &mut Vec<Finding>) {
+    let snap = cx.snap;
     for p in snap.procs.iter().filter(|p| is_stopped(p)) {
         let idle_ms = stopped_for(p, hist, now);
         if idle_ms < 10 * MIN_MS {
             continue;
         }
-        out.push(finding(
-            "info",
-            format!("{} has been paused for {}+", p.name, human_dur_ms(idle_ms)),
-            format!(
-                "{} (pid {}) is stopped (T) holding {} RAM. Forgotten? Resume it or end it.",
-                p.name,
-                p.pid,
-                human_bytes(p.mem)
-            ),
-            vec![p.pid],
-            Some(format!("resume {} (or kill {}{})", p.pid, p.pid, tree_flag(&snap.descendants(p.pid)))),
-        ));
+        // Resuming is always safe; ending it only when the gate allows.
+        let end = cx.advise(p, Want::End);
+        let mut detail = format!("{} (pid {}) is stopped (T) holding {} RAM. Forgotten? ", p.name, p.pid, human_bytes(p.mem));
+        detail.push_str(if end.action.is_some() { "Resume it or end it." } else { "Resume it." });
+        if let (None, Some(n)) = (&end.action, &end.note) {
+            detail.push_str(&format!(" Advice: {n}."));
+        }
+        let action = Some(match end.action {
+            Some(e) => format!("resume {} (or {e})", p.pid),
+            None => format!("resume {}", p.pid),
+        });
+        out.push(finding("info", format!("{} has been paused for {}+", p.name, human_dur_ms(idle_ms)), detail, vec![p.pid], action));
     }
 }
 
@@ -1622,7 +1701,8 @@ fn stopped_for(p: &Proc, hist: Option<&History>, now: Ts) -> i64 {
     (now - start).max(0)
 }
 
-fn rule_zombies(snap: &Snapshot, out: &mut Vec<Finding>) {
+fn rule_zombies(cx: &Ctx, out: &mut Vec<Finding>) {
+    let snap = cx.snap;
     let z: Vec<&Proc> = snap.procs.iter().filter(|p| is_zombie(p)).collect();
     if z.is_empty() {
         return;
@@ -1636,14 +1716,10 @@ fn rule_zombies(snap: &Snapshot, out: &mut Vec<Finding>) {
     let sev = if z.len() >= 20 { "warn" } else { "info" };
     // Linux: a container's pid 1 (e.g. `sleep infinity` as the entrypoint) never reaps the
     // orphans re-parented to it. Killing it would stop the whole container, so say that instead.
-    let container_init = (platform(snap) == Os::Linux)
-        .then(|| snap.proc(parent))
-        .flatten()
-        .and_then(|pp| {
-            let c = pp.container.as_deref()?;
-            let grand_same = snap.proc(pp.ppid).is_some_and(|g| g.container.as_deref() == Some(c));
-            (!grand_same).then(|| c.to_string())
-        });
+    let container_init = snap.proc(parent).and_then(|pp| match cx.hub(pp) {
+        Some(Hub::ContainerInit { id }) => Some(id),
+        _ => None,
+    });
     // Inside a container (own pid namespace) the entrypoint is pid 1 and has no container id.
     let reaper_pid1 = platform(snap) == Os::Linux
         && parent == 1
@@ -1661,17 +1737,36 @@ fn rule_zombies(snap: &Snapshot, out: &mut Vec<Finding>) {
             "Exited processes not reaped by their parent; most ({n}) belong to {pname} (pid {parent}). They hold no memory but leak pid slots; restarting the parent clears them."
         ),
     };
-    let protected = platform(snap) == Os::Linux && snap.proc(parent).is_some_and(|pp| is_system_critical_on(Os::Linux, pp));
+    let mut detail = detail;
+    // Killing the parent reaps them, but only when the parent is an ordinary user process: not
+    // a shell or terminal, a container's init, an app, or a system daemon.
+    let action = match snap.proc(parent) {
+        Some(pp) if parent > 1 && container_init.is_none() => {
+            let a = cx.advise(pp, Want::End);
+            match a.action {
+                Some(x) if !x.contains("--tree") => Some(x),
+                Some(_) => None, // never take down the parent's live children to reap dead ones
+                None => {
+                    if let Some(n) = a.note {
+                        detail.push_str(&format!(" Advice: {n}."));
+                    }
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     out.push(finding(
         sev,
         format!("{} zombie process{}", z.len(), if z.len() == 1 { "" } else { "es" }),
         detail,
         z.iter().map(|p| p.pid).collect(),
-        (parent > 1 && container_init.is_none() && !protected).then(|| format!("kill {parent}")),
+        action,
     ));
 }
 
-fn rule_swarms(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
+fn rule_swarms(cx: &Ctx, out: &mut Vec<Finding>) {
+    let (snap, os) = (cx.snap, cx.os);
     let mut groups: HashMap<&str, Vec<&Proc>> = HashMap::new();
     for p in &snap.procs {
         groups.entry(p.name.as_str()).or_default().push(p);
@@ -1696,11 +1791,6 @@ fn rule_swarms(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
             *parents.entry(p.ppid).or_default() += 1;
         }
         let (pp, cnt) = parents.iter().max_by_key(|(_, c)| **c).map(|(a, b)| (*a, *b)).unwrap_or((0, 0));
-        let action = if pp > 1 && cnt * 2 >= ps.len() && !benign {
-            Some(format!("kill {pp} --tree"))
-        } else {
-            None
-        };
         let mut detail = format!("{} processes named {name} using {:.0}% CPU and {} RAM together.", ps.len(), cpu, human_bytes(mem));
         if pp > 1 && cnt * 2 >= ps.len() {
             let pname = snap.proc(pp).map(|p| p.name.as_str()).unwrap_or("?");
@@ -1712,6 +1802,10 @@ fn rule_swarms(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
                 " Most were re-parented to init/systemd: likely leaked workers."
             });
         }
+        let action = match snap.proc(pp) {
+            Some(parent) if pp > 1 && cnt * 2 >= ps.len() && !benign => gated(cx, parent, Want::EndTree, &mut detail),
+            _ => None,
+        };
         out.push(finding(
             if benign { "info" } else { "warn" },
             format!("{} copies of {name}", ps.len()),
@@ -1722,22 +1816,19 @@ fn rule_swarms(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
     }
 }
 
-fn rule_disk(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
+fn rule_disk(cx: &Ctx, out: &mut Vec<Finding>) {
+    let snap = cx.snap;
     const STORM: u64 = 100 * MB;
     let writers: Vec<&Proc> = snap.procs.iter().filter(|p| p.disk_write_bps >= STORM).collect();
     for p in &writers {
-        out.push(finding(
-            "warn",
-            format!("{} is writing {}", p.name, human_rate(p.disk_write_bps)),
-            format!(
-                "Disk write storm from {} (pid {}){}. Sustained writes wear the SSD and stall other apps.",
-                p.name,
-                p.pid,
-                if p.cwd.is_empty() { String::new() } else { format!(" in {}", p.cwd) }
-            ),
-            vec![p.pid],
-            safe_action(os, p, snap),
-        ));
+        let mut detail = format!(
+            "Disk write storm from {} (pid {}){}. Sustained writes wear the SSD and stall other apps.",
+            p.name,
+            p.pid,
+            if p.cwd.is_empty() { String::new() } else { format!(" in {}", p.cwd) }
+        );
+        let action = gated(cx, p, Want::Calm, &mut detail);
+        out.push(finding("warn", format!("{} is writing {}", p.name, human_rate(p.disk_write_bps)), detail, vec![p.pid], action));
     }
     if writers.is_empty() && snap.system.disk_write_bps >= STORM {
         let top = top_by(snap, |p| p.disk_write_bps as f32, 3);
@@ -1770,7 +1861,8 @@ fn rule_net(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
     }
 }
 
-fn rule_load(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
+fn rule_load(cx: &Ctx, out: &mut Vec<Finding>) {
+    let snap = cx.snap;
     let cores = snap.system.cores;
     if cores == 0 {
         return;
@@ -1799,7 +1891,7 @@ fn rule_load(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
             list_procs(&top, |p| format!("{:.0}%", p.cpu))
         ),
         top.iter().map(|p| p.pid).collect(),
-        top.iter().find(|p| !is_system_critical_on(os, p)).map(|p| format!("renice {} 10", p.pid)),
+        top.iter().find_map(|p| cx.advise(p, Want::Renice).action),
     ));
 }
 
@@ -2315,7 +2407,8 @@ fn linux_causes(snap: &Snapshot, p: &Proc, lname: &str, hist: Option<&History>, 
 /// Example /proc/pressure/memory on a thrashing box:
 ///   some avg10=34.50 avg60=20.12 avg300=8.03 total=123456789
 ///   full avg10=12.07 avg60=6.40 avg300=2.10 total=45678901
-fn rule_psi(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
+fn rule_psi(cx: &Ctx, out: &mut Vec<Finding>) {
+    let snap = cx.snap;
     let Some(ps) = snap.system.psi else { return };
     let sys = &snap.system;
 
@@ -2332,14 +2425,11 @@ fn rule_psi(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
                 list_procs(&top, |q| format!("{:.0}%", q.cpu))
             ),
             top.iter().map(|q| q.pid).collect(),
-            top.iter().find(|q| !is_system_critical_on(os, q)).map(|q| format!("renice {} 10", q.pid)),
+            top.iter().find_map(|q| cx.advise(q, Want::Renice).action),
         ));
     }
 
     if ps.mem_full >= 5.0 || ps.mem_some >= 20.0 {
-        let top: Vec<&Proc> =
-            busiest(snap, |q| q.mem as f32, 6, u32::MAX).into_iter().filter(|q| !is_kernel_thread(q)).take(5).collect();
-        let first = top.iter().find(|q| !is_system_critical_on(os, q)).copied();
         let title = if ps.mem_full >= 5.0 {
             "Memory stalls: the system is thrashing"
         } else {
@@ -2361,14 +2451,12 @@ fn rule_psi(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
         if kswapd >= 5.0 {
             detail.push_str(&format!(" kswapd is burning {kswapd:.0}% CPU reclaiming."));
         }
-        detail.push_str(&format!(" Biggest consumers: {}", list_procs(&top, |q| human_bytes(q.mem))));
-        out.push(finding(
-            if ps.mem_full >= 20.0 { "crit" } else { "warn" },
-            title.into(),
-            detail,
-            top.iter().map(|q| q.pid).collect(),
-            first.map(|q| format!("kill {}{}", q.pid, tree_flag(&snap.descendants(q.pid)))),
-        ));
+        let (text, pids, action, notes) = memory_workloads(cx, 5);
+        detail.push_str(&format!(" Biggest consumers: {text}."));
+        if !notes.is_empty() {
+            detail.push_str(&format!(" What to do: {}.", notes.join("; ")));
+        }
+        out.push(finding(if ps.mem_full >= 20.0 { "crit" } else { "warn" }, title.into(), detail, pids, action));
     }
 
     if ps.io_full >= 10.0 {
@@ -2393,14 +2481,15 @@ fn rule_psi(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
             format!("IO stalls: all tasks blocked on IO {:.0}% of the time", ps.io_full),
             detail,
             pids,
-            top.first().filter(|q| io(q) >= MB as f32).and_then(|q| safe_action(os, q, snap)),
+            top.first().filter(|q| io(q) >= MB as f32).and_then(|q| cx.advise(q, Want::Calm).action),
         ));
     }
 }
 
 /// Hottest sensor temperature (hwmon/thermal zones). Skipped when the thermal-state rule
 /// already reports throttling, and on macOS where Apple silicon routinely runs ~100°C.
-fn rule_temp(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
+fn rule_temp(cx: &Ctx, out: &mut Vec<Finding>) {
+    let snap = cx.snap;
     let Some(t) = snap.system.temp_c else { return };
     if matches!(snap.system.thermal.as_str(), "fair" | "serious" | "critical") {
         return;
@@ -2427,7 +2516,7 @@ fn rule_temp(snap: &Snapshot, os: Os, out: &mut Vec<Finding>) {
         format!("Running hot: {t:.0}°C"),
         detail,
         hot.iter().map(|q| q.pid).collect(),
-        hot.iter().find(|q| !is_system_critical_on(os, q)).map(|q| format!("renice {} 10", q.pid)),
+        hot.iter().find_map(|q| cx.advise(q, Want::Renice).action),
     ));
 }
 
@@ -2990,7 +3079,20 @@ mod tests {
         let z = f.iter().find(|x| x.title.contains("zombie")).unwrap();
         assert_eq!(z.pids.len(), 3);
         assert!(z.detail.contains("-zsh (pid 102)"));
-        assert_eq!(z.action.as_deref(), Some("kill 102"));
+        // The parent is the user's interactive shell (a hub): killing it to reap zombies would
+        // close their terminal session.
+        assert_eq!(z.action, None);
+        assert!(z.detail.contains("is your shell"), "{}", z.detail);
+        // An ordinary (non-session) parent still gets the reaping kill.
+        let mut ps = base_procs();
+        ps.push(pr(960, 102, "flaky-daemon", 0.0, 10 * MB));
+        for i in 0..3 {
+            let mut z = pr(961 + i, 960, "defunct", 0.0, 0);
+            z.status = "Z".into();
+            ps.push(z);
+        }
+        let z = diagnose(&snap(ps), None).into_iter().find(|x| x.title.contains("zombie")).unwrap();
+        assert_eq!(z.action.as_deref(), Some("kill 960"));
     }
 
     #[test]
@@ -3218,7 +3320,9 @@ mod tests {
         assert!(e.evidence.iter().any(|x| x.contains("PSI")));
         let sg = e.suggestions.join("\n");
         assert!(sg.contains("sudo systemctl restart nginx.service"), "{sg}");
-        assert!(sg.contains("fat pause 800"));
+        // A system service (www-data, under systemd): no pause/kill, service-manager advice.
+        assert!(!sg.contains("fat pause 800") && !sg.contains("fat kill 800"), "{sg}");
+        assert!(sg.contains("runs as www-data, a system service"), "{sg}");
     }
 
     #[test]

@@ -1,8 +1,11 @@
 //! Natural-language questions about the machine. OWNER: fleet agent.
 //!
 //! With `ANTHROPIC_API_KEY` set (and `[ask] enabled = true`), the question plus a compact JSON
-//! digest of the snapshot goes to the Claude Messages API. Without a key, a rule-based answerer
-//! assembles a reply from findings and top consumers.
+//! digest of the snapshot goes to the Claude Messages API. Every string in that request is
+//! redacted first ([`redact`]: API keys and tokens, password/token/secret arguments, URLs with
+//! credentials, long hex/base64 blobs; the home directory becomes `~`, the user name "me").
+//! `fat ask --dry-run` prints the exact body without sending it. Without a key, a rule-based
+//! answerer assembles a reply from findings and top consumers.
 use crate::model::{Finding, Proc, Snapshot};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -18,7 +21,7 @@ by CPU, memory and estimated power, listening ports, and rule-based findings) fo
 question. Answer concisely and concretely from that data: name the processes responsible, with their \
 pid and numbers. When an action would help, recommend fat commands such as `fat pause PID` \
 (reversible SIGSTOP), `fat resume PID`, `fat renice PID 10`, `fat why PID`, `fat ports`, or \
-`fat kill PID`, preferring reversible actions first. Only mention pids that appear in the data; never \
+`fat kill PID` (not undoable), preferring the undoable ones first. Only mention pids that appear in the data; never \
 invent pids, processes or numbers. If the data cannot answer the question, say what is missing. \
 Tailor advice to the operating system in system.os: macOS-only remedies (Spotlight, launchctl, Activity Monitor) \
 do not apply on Linux, and Linux ones (systemctl, journalctl, cgroup limits, docker update) do not apply on macOS. \
@@ -45,6 +48,10 @@ pub fn ask(question: &str, snap: &Snapshot, findings: &[Finding], cfg: &crate::c
 
 pub(crate) fn request_body(question: &str, context: &str, model: &str) -> Value {
     let model = if model.trim().is_empty() { "claude-opus-5-5" } else { model };
+    let (home, user) = identity();
+    let mut q = Value::String(question.trim().to_string());
+    redact_value(&mut q, home.as_deref(), user.as_deref());
+    let question = q.as_str().unwrap_or_default().to_string();
     json!({
         "model": model,
         "max_tokens": 16000,
@@ -53,15 +60,37 @@ pub(crate) fn request_body(question: &str, context: &str, model: &str) -> Value 
         "system": SYSTEM_PROMPT,
         "messages": [{
             "role": "user",
-            "content": format!("<snapshot>\n{context}\n</snapshot>\n\nQuestion: {}", question.trim()),
+            "content": format!("<snapshot>\n{context}\n</snapshot>\n\nQuestion: {question}"),
         }],
     })
 }
 
-fn call_claude(question: &str, snap: &Snapshot, findings: &[Finding], model: &str, key: &str) -> Result<String, String> {
-    let body = request_body(question, &build_context(snap, findings), model);
+/// The exact bytes `ask` would POST for this question (redacted; see [`redact`]).
+pub fn request_json(question: &str, snap: &Snapshot, findings: &[Finding], model: &str) -> String {
+    request_body(question, &build_context(snap, findings), model).to_string()
+}
+
+/// Where the request goes.
+pub fn endpoint() -> String {
     let base = std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".into());
-    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+    format!("{}/v1/messages", base.trim_end_matches('/'))
+}
+
+/// `fat ask --dry-run`: the request body that would be sent, and nothing is sent.
+pub fn dry_run(question: &str, snap: &Snapshot, findings: &[Finding], cfg: &crate::config::AskCfg) -> (String, String) {
+    let key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.trim().is_empty());
+    let note = match (key.is_some(), cfg.enabled) {
+        (true, true) => format!("dry run: this body would be POSTed to {} (headers x-api-key, anthropic-version {API_VERSION}); nothing was sent", endpoint()),
+        (_, false) => "dry run: [ask] enabled = false, so `fat ask` answers offline and sends nothing; this is what it would send if enabled".to_string(),
+        (false, true) => "dry run: ANTHROPIC_API_KEY is not set, so `fat ask` answers offline and sends nothing; this is what it would send with a key".to_string(),
+    };
+    (request_json(question, snap, findings, &cfg.model), note)
+}
+
+fn call_claude(question: &str, snap: &Snapshot, findings: &[Finding], model: &str, key: &str) -> Result<String, String> {
+    // Sent as these exact bytes, so `fat ask --dry-run` shows precisely what leaves the machine.
+    let body = request_json(question, snap, findings, model);
+    let url = endpoint();
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(90)).build();
     let resp = agent
         .post(&url)
@@ -69,7 +98,7 @@ fn call_claude(question: &str, snap: &Snapshot, findings: &[Finding], model: &st
         .set("anthropic-version", API_VERSION)
         .set("anthropic-beta", API_BETA)
         .set("content-type", "application/json")
-        .send_json(body);
+        .send_string(&body);
     match resp {
         Ok(r) => {
             let v: Value = r.into_json().map_err(|e| format!("Claude API returned unreadable JSON: {e}"))?;
@@ -149,33 +178,288 @@ fn trunc(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n).collect::<String>()) }
 }
 
-/// Mask values that look like secrets before command lines leave the machine.
-pub(crate) fn redact_cmd(cmd: &str) -> String {
-    const SECRET: [&str; 7] = ["key", "token", "secret", "passw", "auth", "credential", "bearer"];
-    let is_secret = |s: &str| {
-        let l = s.to_ascii_lowercase();
-        SECRET.iter().any(|w| l.contains(w))
-    };
-    let mut out = Vec::new();
-    let mut mask_next = false;
-    for tok in cmd.split_whitespace() {
-        if mask_next {
-            out.push("***".to_string());
-            mask_next = false;
-            continue;
+// ---------- redaction ----------
+//
+// Everything in the request except fat's own system prompt is passed through [`redact`]:
+// command lines, cwd and other paths, port notes, container names, findings, the question.
+
+/// Words that make a `key=value` / `--flag value` / `Header: value` secret.
+const SECRET_WORDS: [&str; 13] =
+    ["key", "token", "secret", "passw", "pwd", "auth", "credential", "bearer", "session", "cookie", "private", "signature", "pass"];
+const MASK: &str = "***";
+
+fn secret_name(name: &str) -> bool {
+    let l = name.trim_start_matches('-').to_ascii_lowercase();
+    // "pass" alone, or as a word part (PGPASS, pass_file), but not "passive"/"compass".
+    !l.is_empty()
+        && SECRET_WORDS.iter().any(|w| {
+            if *w == "pass" {
+                l == "pass" || l.ends_with("pass") || l.contains("pass_") || l.contains("pass-")
+            } else {
+                l.contains(w)
+            }
+        })
+}
+
+/// Known credential shapes: provider API keys and tokens, AWS key ids, JWTs.
+fn known_secret(w: &str) -> bool {
+    const PREFIXES: [(&str, usize); 12] = [
+        ("sk-", 16),
+        ("ghp_", 20),
+        ("gho_", 20),
+        ("ghu_", 20),
+        ("ghs_", 20),
+        ("ghr_", 20),
+        ("github_pat_", 20),
+        ("glpat-", 16),
+        ("npm_", 30),
+        ("xoxb-", 10),
+        ("xoxp-", 10),
+        ("AIza", 30),
+    ];
+    let tail_ok = |t: &str, n: usize| t.len() >= n && t.chars().all(|c| c.is_ascii_alphanumeric() || "-_".contains(c));
+    if PREFIXES.iter().any(|(p, n)| w.strip_prefix(p).is_some_and(|t| tail_ok(t, *n))) {
+        return true;
+    }
+    // Slack: xoxa-, xoxr-, xoxs-, xapp-...
+    if (w.starts_with("xox") || w.starts_with("xapp-")) && w.len() >= 15 && w.contains('-') {
+        return true;
+    }
+    // AWS access key ids.
+    if (w.starts_with("AKIA") || w.starts_with("ASIA")) && w.len() == 20 && w.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+        return true;
+    }
+    // JWT: three base64url parts, the first two starting with '{"' encoded.
+    let parts: Vec<&str> = w.split('.').collect();
+    if parts.len() == 3 && parts[0].starts_with("eyJ") && parts[1].starts_with("eyJ") && parts.iter().all(|p| !p.is_empty()) {
+        return true;
+    }
+    false
+}
+
+/// A long opaque blob (hex or base64): probably a token, a key or a hash of one.
+fn blob(w: &str) -> bool {
+    let w = w.trim_end_matches('=');
+    if w.len() < 32 || w.contains('.') {
+        return false;
+    }
+    let hex = w.chars().all(|c| c.is_ascii_hexdigit());
+    let b64 = w.chars().all(|c| c.is_ascii_alphanumeric() || "+/_-".contains(c))
+        && w.chars().any(|c| c.is_ascii_digit())
+        && w.chars().any(|c| c.is_ascii_alphabetic());
+    hex || b64
+}
+
+/// Mask word-like runs inside one whitespace-free token.
+fn mask_words(tok: &str) -> String {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || "-_.+=".contains(c);
+    let mut out = String::with_capacity(tok.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        if !word.is_empty() {
+            // `KEY=abc` keeps its key: only the value part is judged.
+            let (head, val) = match word.split_once('=') {
+                Some((k, v)) if !k.is_empty() => (format!("{k}="), v.to_string()),
+                _ => (String::new(), word.clone()),
+            };
+            if known_secret(&val) || blob(&val) || known_secret(word) {
+                out.push_str(&head);
+                out.push_str(MASK);
+            } else {
+                out.push_str(word);
+            }
+            word.clear();
         }
-        if let Some((k, _)) = tok.split_once('=').filter(|(k, _)| is_secret(k)) {
-            out.push(format!("{k}=***"));
-        } else if tok.starts_with('-') && is_secret(tok) {
-            out.push(tok.to_string());
-            mask_next = true;
-        } else if tok.len() >= 32 && tok.chars().all(|c| c.is_ascii_alphanumeric() || "-_".contains(c)) && tok.chars().any(|c| c.is_ascii_digit()) {
-            out.push("***".to_string()); // long opaque blob: probably a token
+    };
+    for c in tok.chars() {
+        if is_word(c) {
+            word.push(c);
         } else {
-            out.push(tok.to_string());
+            flush(&mut word, &mut out);
+            out.push(c);
         }
     }
-    out.join(" ")
+    flush(&mut word, &mut out);
+    out
+}
+
+/// `scheme://user:pass@host` -> `scheme://***@host`.
+fn mask_userinfo(tok: &str) -> String {
+    let Some(i) = tok.find("://") else { return tok.to_string() };
+    let rest = &tok[i + 3..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..end].rfind('@') {
+        Some(at) => format!("{}{MASK}{}", &tok[..i + 3], &rest[at..]),
+        None => tok.to_string(),
+    }
+}
+
+/// `a=1&token=x;password=y` style pairs inside a token: mask the secret ones' values.
+fn mask_pairs(tok: &str) -> String {
+    let mut out = String::with_capacity(tok.len());
+    let mut rest = tok;
+    while let Some(eq) = rest.find(['=', ':']) {
+        let (before, after) = rest.split_at(eq);
+        let sep = &after[..1];
+        let after = &after[1..];
+        // The key is the trailing name-like run before the separator.
+        let kstart = before.rfind(|c: char| !(c.is_ascii_alphanumeric() || "-_.".contains(c))).map_or(0, |i| i + 1);
+        let key = &before[kstart..];
+        let vend = after.find(['&', ';', ',', '"', '\'', ' ', ')', ']', '}']).unwrap_or(after.len());
+        let value = &after[..vend];
+        out.push_str(before);
+        out.push_str(sep);
+        // ':' only counts for "Header:value" shapes, not URLs ("https://") or ports ("host:80").
+        let pair = sep == "=" || !value.starts_with('/') && !value.chars().all(|c| c.is_ascii_digit());
+        if pair && !value.is_empty() && secret_name(key) && value != MASK {
+            out.push_str(MASK);
+            rest = &after[vend..];
+        } else {
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Redact secrets from free text (a command line, a path, a note): API keys and tokens,
+/// `password=` / `token=` style pairs, `--token X` / `--password X` / `-pX` arguments,
+/// `Bearer X`, URLs with credentials, and long hex / base64 blobs.
+pub(crate) fn redact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut mask_next = false;
+    let mut user_next = false;
+    let mut i = 0;
+    let b = text.as_bytes();
+    while i < b.len() {
+        // Copy whitespace as-is.
+        let ws_end = text[i..].find(|c: char| !c.is_whitespace()).map_or(text.len(), |j| i + j);
+        out.push_str(&text[i..ws_end]);
+        i = ws_end;
+        if i >= b.len() {
+            break;
+        }
+        let end = text[i..].find(char::is_whitespace).map_or(text.len(), |j| i + j);
+        let tok = &text[i..end];
+        i = end;
+        if mask_next {
+            // "Authorization: Bearer X": the scheme stays, the credential after it goes.
+            let scheme = ["bearer", "basic", "token", "digest"].contains(&tok.to_ascii_lowercase().trim_start_matches(['"', '\'']));
+            if scheme {
+                out.push_str(tok);
+            } else {
+                out.push_str(MASK);
+                mask_next = false;
+            }
+            continue;
+        }
+        if user_next {
+            // curl -u user:password
+            user_next = false;
+            if let Some((u, _)) = tok.split_once(':') {
+                out.push_str(&format!("{u}:{MASK}"));
+                continue;
+            }
+        }
+        let lower = tok.to_ascii_lowercase();
+        if lower == "bearer" || tok == "Basic" || tok == "Token" {
+            out.push_str(tok);
+            mask_next = true;
+            continue;
+        }
+        if tok.starts_with('-') && !tok.contains('=') {
+            if tok == "-u" || tok == "--user" {
+                out.push_str(tok);
+                user_next = true;
+                continue;
+            }
+            // mysql -pSECRET (attached). Ports (-p8080) and well-known flags that happen to
+            // start with -p (find -print, cc -pthread) stay.
+            const P_FLAGS: [&str; 12] = ["-print", "-print0", "-printf", "-prune", "-path", "-perm", "-pthread", "-pipe", "-pedantic", "-pie", "-pg", "-pic"];
+            if tok.len() > 2 && tok.starts_with("-p") && !tok[2..].chars().all(|c| c.is_ascii_digit()) && !P_FLAGS.contains(&tok) {
+                out.push_str("-p");
+                out.push_str(MASK);
+                continue;
+            }
+            if secret_name(tok) {
+                out.push_str(tok);
+                mask_next = true;
+                continue;
+            }
+        }
+        // "Authorization:" / "X-Api-Key:" header names: the value is the next token.
+        if let Some(k) = tok.strip_suffix(':').or_else(|| tok.strip_suffix('=')).filter(|k| !k.is_empty())
+            && secret_name(k.trim_start_matches(['"', '\'']))
+        {
+            out.push_str(tok);
+            mask_next = true;
+            continue;
+        }
+        out.push_str(&mask_words(&mask_pairs(&mask_userinfo(tok))));
+    }
+    out
+}
+
+/// Kept for callers that only redact command lines.
+pub(crate) fn redact_cmd(cmd: &str) -> String {
+    redact(cmd)
+}
+
+/// The home directory and user name to hide from requests (None if unknown).
+fn identity() -> (Option<String>, Option<String>) {
+    let home = dirs::home_dir().map(|h| h.to_string_lossy().trim_end_matches('/').to_string()).filter(|h| h.len() > 1);
+    let user = std::env::var("USER").ok().or_else(|| std::env::var("LOGNAME").ok()).filter(|u| !u.is_empty());
+    (home, user)
+}
+
+/// `text` with every occurrence of `word` that is not part of a longer alphanumeric run replaced.
+fn replace_word(text: &str, word: &str, with: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(word) {
+        let before = rest[..i].chars().next_back();
+        let after = rest[i + word.len()..].chars().next();
+        let bounded = !before.is_some_and(|c| c.is_alphanumeric()) && !after.is_some_and(|c| c.is_alphanumeric());
+        out.push_str(&rest[..i]);
+        out.push_str(if bounded { with } else { word });
+        rest = &rest[i + word.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Redact every string in a JSON value, replace the home directory with `~` and the user
+/// name (as a whole value or a /Users/<name> or /home/<name> path part) with "me".
+pub(crate) fn redact_value(v: &mut Value, home: Option<&str>, user: Option<&str>) {
+    match v {
+        Value::String(s) => {
+            let mut t = redact(s);
+            if let Some(h) = home {
+                t = t.replace(h, "~");
+            }
+            if let Some(u) = user {
+                if t == u {
+                    t = "me".into();
+                }
+                for base in ["/Users/", "/home/"] {
+                    t = t.replace(&format!("{base}{u}/"), &format!("{base}me/"));
+                    if t.ends_with(&format!("{base}{u}")) {
+                        let n = t.len() - u.len();
+                        t.replace_range(n.., "me");
+                    }
+                }
+                // Elsewhere (encoded paths like "-Users-alice-code"), as a whole word only, and
+                // only for names long enough not to be a common word ("dev", "app").
+                if u.len() >= 4 {
+                    t = replace_word(&t, u, "me");
+                }
+            }
+            *s = t;
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| redact_value(x, home, user)),
+        Value::Object(o) => o.values_mut().for_each(|x| redact_value(x, home, user)),
+        _ => {}
+    }
 }
 
 fn proc_json(snap: &Snapshot, p: &Proc, cmd_len: usize) -> Value {
@@ -296,14 +580,20 @@ fn context_with(snap: &Snapshot, findings: &[Finding], scale: usize, cmd_len: us
 }
 
 /// Compact JSON digest of the snapshot, kept under ~20KB by shrinking lists if needed.
+/// Every string in it is redacted (secrets, home directory, user name) before it is measured.
 pub fn build_context(snap: &Snapshot, findings: &[Finding]) -> String {
+    let (home, user) = identity();
+    let render = |mut v: Value| {
+        redact_value(&mut v, home.as_deref(), user.as_deref());
+        v.to_string()
+    };
     for (scale, cmd_len) in [(4, 80), (4, 40), (3, 0), (2, 0), (1, 0)] {
-        let s = context_with(snap, findings, scale, cmd_len).to_string();
+        let s = render(context_with(snap, findings, scale, cmd_len));
         if s.len() <= MAX_CONTEXT_BYTES {
             return s;
         }
     }
-    let s = context_with(snap, &findings[..findings.len().min(3)], 1, 0).to_string();
+    let s = render(context_with(snap, &findings[..findings.len().min(3)], 1, 0));
     s.chars().take(MAX_CONTEXT_BYTES).collect()
 }
 
@@ -690,6 +980,79 @@ mod tests {
     fn redaction() {
         assert_eq!(redact_cmd("curl -H x --token abc PASSWORD=x run"), "curl -H x --token *** PASSWORD=*** run");
         assert_eq!(redact_cmd("ls -la /tmp"), "ls -la /tmp");
+        let cases = [
+            ("node app.js --api-key=sk-ant-api03-AbCdEfGhIjKlMnOpQrSt", "node app.js --api-key=***"),
+            ("git clone https://ghp_abcdefghijklmnopqrstuvwxyz0123@github.com/x/y", "git clone https://***@github.com/x/y"),
+            ("psql postgres://admin:s3cr3t@db:5432/app", "psql postgres://***@db:5432/app"),
+            ("mysql -uroot -phunter2 db", "mysql -uroot -p*** db"),
+            ("mysql --password hunter2", "mysql --password ***"),
+            ("curl -u bob:hunter2 -H Authorization: Bearer abc.def", "curl -u bob:*** -H Authorization: Bearer ***"),
+            ("curl -H 'Authorization: Bearer xyz123'", "curl -H 'Authorization: Bearer ***"),
+            ("env AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE x", "env AWS_SECRET_ACCESS_KEY=*** AWS_ACCESS_KEY_ID=*** x"),
+            ("bot --slack xoxb-1234567890-abcdefghij", "bot --slack ***"),
+            ("gh --with github_pat_11ABCDEFG0123456789_abcdefghijklmnop", "gh --with ***"),
+            ("app --jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl", "app --jwt ***"),
+            ("wget https://x.io/f?a=1&token=abc123&b=2", "wget https://x.io/f?a=1&token=***&b=2"),
+            ("run --session-id 0123456789abcdef0123456789abcdef", "run --session-id ***"),
+            ("sha 0123456789abcdef0123456789abcdef0123", "sha ***"),
+            ("cc -pthread -O2 -p8080 x.c", "cc -pthread -O2 -p8080 x.c"),
+            ("find . -print -prune", "find . -print -prune"),
+            ("vite --port 5173 --host 0.0.0.0", "vite --port 5173 --host 0.0.0.0"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact(input), want, "{input}");
+        }
+    }
+
+    #[test]
+    fn built_request_never_contains_secrets() {
+        let secrets = [
+            "sk-ant-api03-SECRETSECRETSECRET01",
+            "ghp_SECRETsecretSECRETsecret0123456",
+            "hunter2pw",
+            "AKIAZZZZZZZZZZZZZZZZ",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.SIGNATURExyz",
+            "s3cr3tpass",
+            "xoxp-111-222-333-SECRETSLACK",
+            "deadbeefdeadbeefdeadbeefdeadbeef00",
+            "tok_in_url_123",
+        ];
+        let mut s = snap();
+        s.procs[1].cmd = format!(
+            "node server.js --api-key {} GITHUB_TOKEN={} --password {} -p{} https://u:{}@h/x",
+            secrets[0], secrets[1], secrets[2], secrets[5], secrets[5]
+        );
+        s.procs[2].cmd = format!("aws s3 ls AWS_ACCESS_KEY_ID={} Authorization: Bearer {} {}", secrets[3], secrets[4], secrets[6]);
+        s.procs[2].cpu = 500.0;
+        s.ports[0].note = format!("vite dev · ~/code/app?token={} · {}", secrets[8], secrets[7]);
+        s.containers = vec![crate::model::Container { name: "db".into(), image: format!("reg.io/x:{}", secrets[7]), status: "up".into(), ..Default::default() }];
+        let f = vec![Finding {
+            severity: "warn".into(),
+            title: format!("node --password {} is hot", secrets[2]),
+            detail: format!("cwd /tmp/x  cmd: curl -H 'Authorization: Bearer {}'", secrets[4]),
+            pids: vec![500],
+            action: Some("pause 500".into()),
+        }];
+        let q = format!("why is my key {} slow", secrets[0]);
+        let body = request_json(&q, &s, &f, "claude-opus-5-5");
+        for sec in secrets {
+            if let Some(i) = body.find(sec) {
+                panic!("{sec} leaked into the request: …{}…", &body[i.saturating_sub(120)..(i + 40).min(body.len())]);
+            }
+        }
+        // Still useful: names, pids, the question's intent.
+        assert!(body.contains("server.js") && body.contains(r#"pid\":500"#) && body.contains("slow"), "{body}");
+        // dry run prints exactly that body and sends nothing (no key in tests).
+        let (dry, note) = dry_run(&q, &s, &f, &crate::config::AskCfg::default());
+        assert_eq!(dry, body);
+        assert!(note.contains("dry run"), "{note}");
+    }
+
+    #[test]
+    fn home_and_user_name_are_replaced() {
+        let mut v = json!({"cwd": "/Users/alice/code/app", "user": "alice", "h": "/home/alice", "n": "alicex", "e": "/tmp/-Users-alice-x"});
+        redact_value(&mut v, Some("/Users/alice"), Some("alice"));
+        assert_eq!(v, json!({"cwd": "~/code/app", "user": "me", "h": "/home/me", "n": "alicex", "e": "/tmp/-Users-me-x"}));
     }
 
     #[test]

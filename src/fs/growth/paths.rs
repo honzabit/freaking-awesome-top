@@ -1,4 +1,4 @@
-//! Path helpers: stat with birth time, TCC-protected locations, fat's own directories.
+//! Path helpers: stat with birth time, TCC-protected roots (rules in `fs::tcc`), fat's own directories.
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
@@ -71,73 +71,14 @@ pub fn state_dir() -> PathBuf {
     dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("fat")
 }
 
-/// macOS locations whose contents (or even metadata) are guarded by TCC: stat/readdir from a
-/// terminal without Full Disk Access pops a permission prompt. Relative to $HOME unless absolute.
-#[cfg(target_os = "macos")]
-const TCC_PROTECTED: &[&str] = &[
-    "Desktop",
-    "Documents",
-    "Downloads",
-    "Pictures/Photos Library.photoslibrary",
-    "Music/Music",
-    "Movies/TV",
-    "Library/Mail",
-    "Library/Messages",
-    "Library/Calendars",
-    "Library/Reminders",
-    "Library/Safari",
-    "Library/Cookies",
-    "Library/HomeKit",
-    "Library/IdentityServices",
-    "Library/Metadata/CoreSpotlight",
-    "Library/PersonalizationPortrait",
-    "Library/Suggestions",
-    "Library/Accounts",
-    "Library/Containers",
-    "Library/Group Containers",
-    "Library/Mobile Documents",
-    "Library/CloudStorage",
-    "Library/Application Support/AddressBook",
-    "Library/Application Support/CallHistoryDB",
-    "Library/Application Support/CallHistoryTransactions",
-    "Library/Application Support/com.apple.TCC",
-    "Library/Application Support/Knowledge",
-    "Library/Application Support/FaceTime",
-    "Library/Application Support/MobileSync",
-    "/Volumes",
-    "/Library/Application Support/com.apple.TCC",
-];
-
-/// The TCC-protected root containing `path`, if any (always None off macOS).
+/// The TCC-protected root containing `path`, if any (always None off macOS). The rules are
+/// shared with the scanner ([`crate::fs::tcc`]); they guard every user's home, not only
+/// $HOME (fat may run as root).
 pub fn protected_root(path: &str, home: &str) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        // The same rules guard every user's home, not only $HOME (fat may run as root).
         let owner = owner_home(path);
-        let homes = [home, owner.as_deref().unwrap_or("")];
-        let mut roots: Vec<String> = Vec::new();
-        for p in TCC_PROTECTED {
-            if p.starts_with('/') {
-                roots.push((*p).to_string());
-            } else {
-                roots.extend(homes.iter().filter(|h| !h.is_empty()).map(|h| format!("{h}/{p}")));
-            }
-        }
-        for root in roots {
-            if super::under_prefix(path, &root) {
-                // /Volumes/X: the protected unit is the volume.
-                if root == "/Volumes" {
-                    let rest = &path["/Volumes".len()..];
-                    let name = rest.trim_start_matches('/').split('/').next().unwrap_or("");
-                    if name.is_empty() {
-                        return None;
-                    }
-                    return Some(format!("/Volumes/{name}"));
-                }
-                return Some(root);
-            }
-        }
-        None
+        crate::fs::tcc::protected_root(path, &[home, owner.as_deref().unwrap_or("")])
     }
     #[cfg(not(target_os = "macos"))]
     {

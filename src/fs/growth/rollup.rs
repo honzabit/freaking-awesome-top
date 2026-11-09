@@ -1,9 +1,12 @@
 //! Merge per-source observations and roll them up into a short list of growers.
 //!
-//! Rule (contract): a parent is listed only when no single child explains >= 80% of its
-//! delta. A child of a listed path is listed too when it carries >= 20% of that parent's
-//! delta (so "~/Library +1 GB" can sit above "Caches +600 MB" and "Logs +400 MB", but not
-//! above 300 one-megabyte files).
+//! Rule (contract): the list is as specific as the evidence allows and never repeats bytes.
+//! A directory is broken down into the children that carry >= 10% of its delta (homes, "/"
+//! and other generic directories always are); a directory none of whose children matter is
+//! listed itself. A broken-down parent appears again only as "other under X"
+//! ([`Grower::other`]) when the part its listed children leave unexplained is significant
+//! (>= max(20% of its delta, 10 MB)). So "~/Library +1 GB" becomes "Caches +600 MB" and
+//! "Logs +400 MB", while 300 one-megabyte files stay one "dir +300 MB" row.
 use super::super::{Evidence, Grower};
 use std::collections::HashMap;
 
@@ -131,7 +134,6 @@ fn parent(p: &str) -> Option<&str> {
 #[derive(Default)]
 struct Node {
     path: String,
-    parent: Option<usize>,
     children: Vec<usize>,
     own: Option<Item>,
     delta: i64,
@@ -182,7 +184,6 @@ pub fn rollup(root: &str, items: Vec<Item>, cap: usize) -> Vec<Grower> {
             let i = nodes.len();
             nodes.push(Node {
                 path: c.clone(),
-                parent: Some(par),
                 is_dir: true,
                 ..Default::default()
             });
@@ -257,91 +258,194 @@ pub fn rollup(root: &str, items: Vec<Item>, cap: usize) -> Vec<Grower> {
         n.evidence = ev;
     }
 
-    let to_grower = |n: &Node| Grower {
-        path: n.path.clone(),
-        is_dir: n.is_dir,
-        delta: n.delta,
-        size: n.size.unwrap_or(0),
-        files_touched: n.touched,
-        writers: n.writers.clone(),
-        evidence: n.evidence.clone(),
+    select_growers(&nodes, cap)
+}
+
+/// A parent is shown as "other under X" only when what its listed children leave unexplained
+/// is at least this much (and at least [`REMAINDER_SHARE`] of the parent's delta).
+pub const MIN_REMAINDER: i64 = 10 << 20;
+/// ... and at least this share (percent) of the parent's delta.
+pub const REMAINDER_SHARE: i64 = 20;
+/// A child is worth descending into when it carries at least this share (percent) of its
+/// parent's delta.
+const CHILD_SHARE: i64 = 10;
+
+/// Directories that never make a useful headline on their own ("/", homes, ~/Library, ...):
+/// always broken down into their children when any child moved.
+fn is_generic(p: &str) -> bool {
+    const FIXED: &[&str] = &[
+        "/", "/Users", "/home", "/root", "/var/root", "/private", "/private/var", "/private/var/root", "/var",
+        "/System", "/System/Volumes", "/System/Volumes/Data", "/Volumes", "/mnt", "/media",
+    ];
+    if FIXED.contains(&p) {
+        return true;
+    }
+    let parts: Vec<&str> = p.trim_start_matches('/').split('/').collect();
+    let p = parts.as_slice();
+    let data = |p: &[&str]| -> bool {
+        matches!(p, ["Users" | "home", _] | ["Users" | "home", _, "Library" | ".local" | ".cache"])
     };
-    let dominated = |n: &Node, key: &dyn Fn(&Node) -> i128| {
-        let k = key(n);
-        n.children.iter().any(|&c| {
-            let kc = key(&nodes[c]);
-            kc.signum() == k.signum() && kc.abs() * 10 >= k.abs() * 8
-        })
-    };
-    let mut picked: Vec<usize> = vec![];
-    let select = |key: &dyn Fn(&Node) -> i128, picked: &mut Vec<usize>, limit: usize| {
-        let mut cand: Vec<usize> = (1..nodes.len())
-            .filter(|&i| key(&nodes[i]) != 0 && !dominated(&nodes[i], key))
+    data(p) || matches!(p, ["System", "Volumes", "Data", rest @ ..] if data(rest))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Pick {
+    /// The node's whole subtree.
+    Path(usize),
+    /// What the listed children of the node leave unexplained.
+    Other(usize, i64),
+}
+
+fn select_growers(nodes: &[Node], cap: usize) -> Vec<Grower> {
+    let top: i64 = nodes.iter().skip(1).map(|n| n.delta.saturating_abs()).max().unwrap_or(0);
+    // Ignore dust: below 0.5% of the biggest mover.
+    let dust = top / 200;
+    let mut picks: Vec<Pick> = vec![];
+    // Iterative, so a very deep tree cannot overflow the stack.
+    let mut stack: Vec<usize> = vec![0];
+    while let Some(i) = stack.pop() {
+        let n = &nodes[i];
+        let d = n.delta;
+        let always = i == 0 || is_generic(&n.path);
+        let thr = if always { dust } else { dust.max(d.saturating_abs() * CHILD_SHARE / 100) };
+        let mut kids: Vec<usize> = n
+            .children
+            .iter()
+            .copied()
+            .filter(|&c| nodes[c].delta != 0 && nodes[c].delta.saturating_abs() >= thr.max(1))
             .collect();
-        cand.sort_by(|&a, &b| {
-            key(&nodes[b])
-                .abs()
-                .cmp(&key(&nodes[a]).abs())
-                .then(nodes[a].path.cmp(&nodes[b].path))
-        });
-        let top = cand.first().map(|&i| key(&nodes[i]).abs()).unwrap_or(0);
-        for i in cand {
-            if picked.len() >= limit {
-                break;
+        kids.sort_by(|&a, &b| nodes[b].delta.saturating_abs().cmp(&nodes[a].delta.saturating_abs()).then(nodes[a].path.cmp(&nodes[b].path)));
+        kids.truncate(cap);
+        if kids.is_empty() {
+            // Nothing deeper explains it: the node itself is the most specific answer.
+            if i != 0 && d != 0 {
+                picks.push(Pick::Path(i));
             }
-            let k = key(&nodes[i]).abs();
-            // Ignore dust: below 0.5% of the biggest mover.
-            if k * 200 < top {
-                break;
-            }
-            // Nearest picked ancestor must not dwarf this one.
-            let mut a = nodes[i].parent;
-            let mut ok = true;
-            while let Some(ai) = a {
-                if picked.contains(&ai) {
-                    ok = key(&nodes[ai]).abs() <= k * 5;
-                    break;
-                }
-                a = nodes[ai].parent;
-            }
-            if ok && !picked.contains(&i) {
-                picked.push(i);
-            }
+            continue;
         }
+        let explained: i64 = kids.iter().map(|&c| nodes[c].delta).sum();
+        let rest = d - explained;
+        if rest != 0 && rest.signum() == d.signum() && rest.saturating_abs() >= MIN_REMAINDER.max(d.saturating_abs() * REMAINDER_SHARE / 100) {
+            picks.push(Pick::Other(i, rest));
+        }
+        // Reverse so the biggest child is expanded first (only matters for determinism).
+        stack.extend(kids.into_iter().rev());
+    }
+
+    let listed_kids = |i: usize| -> Vec<usize> {
+        picks
+            .iter()
+            .map(|p| match *p {
+                Pick::Path(c) | Pick::Other(c, _) => c,
+            })
+            .filter(|&c| c != i && super::under_prefix(&nodes[c].path, &nodes[i].path))
+            .collect()
     };
-    select(&|n: &Node| n.delta as i128, &mut picked, cap);
-    let n_bytes = picked.len();
-    if n_bytes < cap {
-        // Touched-only paths (unknown byte deltas) by file count, only where bytes are zero.
-        let mut extra: Vec<usize> = vec![];
-        select(
-            &|n: &Node| if n.delta == 0 { n.touched as i128 } else { 0 },
-            &mut extra,
-            cap - n_bytes,
-        );
-        // Skip touched-only nodes inside an already-picked byte grower.
-        for e in extra {
-            let mut a = nodes[e].parent;
-            let mut inside = false;
-            while let Some(ai) = a {
-                if picked[..n_bytes].contains(&ai) {
-                    inside = true;
-                    break;
+    let mut out: Vec<Grower> = picks
+        .iter()
+        .map(|p| match *p {
+            Pick::Path(i) => {
+                let n = &nodes[i];
+                Grower {
+                    path: n.path.clone(),
+                    is_dir: n.is_dir,
+                    delta: n.delta,
+                    size: n.size.unwrap_or(0),
+                    files_touched: n.touched,
+                    writers: n.writers.clone(),
+                    evidence: n.evidence.clone(),
+                    other: false,
                 }
-                a = nodes[ai].parent;
             }
-            if !inside {
-                picked.push(e);
+            Pick::Other(i, rest) => {
+                // Writers, evidence and touched files of the part that is not listed below.
+                let n = &nodes[i];
+                let listed = listed_kids(i);
+                let mut w: Vec<(u32, String, u64)> = vec![];
+                let mut ev: Vec<Evidence> = vec![];
+                let mut touched = 0u64;
+                let unlisted = n.children.iter().copied().filter(|c| !listed.iter().any(|&l| l == *c || super::under_prefix(&nodes[l].path, &nodes[*c].path)));
+                for c in unlisted {
+                    merge_writers(&mut w, &nodes[c].writers);
+                    touched += nodes[c].touched;
+                    for e in &nodes[c].evidence {
+                        if !ev.contains(e) {
+                            ev.push(*e);
+                        }
+                    }
+                }
+                if let Some(own) = &n.own {
+                    merge_writers(&mut w, &own.writers);
+                    touched += own.touched;
+                    for e in &own.evidence {
+                        if !ev.contains(e) {
+                            ev.push(*e);
+                        }
+                    }
+                }
+                if ev.is_empty() {
+                    ev = n.evidence.clone();
+                }
+                ev.sort_by_key(|e| rank(*e));
+                Grower {
+                    path: n.path.clone(),
+                    is_dir: true,
+                    delta: rest,
+                    size: n.size.unwrap_or(0),
+                    files_touched: touched,
+                    writers: w,
+                    evidence: ev,
+                    other: true,
+                }
             }
+        })
+        .collect();
+    out.sort_by(|a, b| b.delta.cmp(&a.delta).then(a.other.cmp(&b.other)).then(a.path.cmp(&b.path)));
+    // Keep the biggest movers either way (a big shrink beats a tiny growth).
+    if out.len() > cap {
+        let mut by_abs: Vec<usize> = (0..out.len()).collect();
+        by_abs.sort_by(|&a, &b| out[b].delta.saturating_abs().cmp(&out[a].delta.saturating_abs()).then(a.cmp(&b)));
+        let keep: std::collections::HashSet<usize> = by_abs.into_iter().take(cap).collect();
+        out = out.into_iter().enumerate().filter(|(i, _)| keep.contains(i)).map(|(_, g)| g).collect();
+    }
+
+    // Touched-only paths (unknown byte deltas, e.g. protected dirs counted by events) fill the
+    // remaining slots, by file count, never overlapping a listed path.
+    if out.len() < cap {
+        let top_t = nodes.iter().skip(1).filter(|n| n.delta == 0).map(|n| n.touched).max().unwrap_or(0);
+        let mut cand: Vec<usize> = (1..nodes.len())
+            .filter(|&i| {
+                let n = &nodes[i];
+                n.delta == 0
+                    && n.touched > 0
+                    && n.touched * 200 >= top_t
+                    // A child carrying >= 80% of the touches is the better answer.
+                    && !n.children.iter().any(|&c| nodes[c].delta == 0 && nodes[c].touched * 10 >= n.touched * 8)
+                    && !(is_generic(&n.path) && n.children.iter().any(|&c| nodes[c].touched > 0))
+            })
+            .collect();
+        cand.sort_by(|&a, &b| nodes[b].touched.cmp(&nodes[a].touched).then(nodes[a].path.cmp(&nodes[b].path)));
+        for i in cand {
+            if out.len() >= cap {
+                break;
+            }
+            let p = &nodes[i].path;
+            if out.iter().any(|g| super::under_prefix(p, &g.path) || super::under_prefix(&g.path, p)) {
+                continue;
+            }
+            let n = &nodes[i];
+            out.push(Grower {
+                path: n.path.clone(),
+                is_dir: n.is_dir,
+                delta: 0,
+                size: n.size.unwrap_or(0),
+                files_touched: n.touched,
+                writers: n.writers.clone(),
+                evidence: n.evidence.clone(),
+                other: false,
+            });
         }
     }
-    let mut out: Vec<Grower> = picked.iter().map(|&i| to_grower(&nodes[i])).collect();
-    out.sort_by(|a, b| {
-        b.delta
-            .cmp(&a.delta)
-            .then(b.files_touched.cmp(&a.files_touched))
-            .then(a.path.cmp(&b.path))
-    });
     out
 }
 
@@ -363,43 +467,94 @@ mod tests {
         g.iter().map(|g| (g.path.as_str(), g.delta)).collect()
     }
 
-    #[test]
-    fn single_dominant_child_hides_parents() {
-        let g = rollup("/", vec![item("/a/b/c/big.log", 1000), item("/a/x.txt", 10)], 50);
-        // /a, /a/b, /a/b/c are all explained by big.log; x.txt is dust (< 0.5%? no: 1%) but kept.
-        assert_eq!(paths(&g), vec![("/a/b/c/big.log", 1000), ("/a/x.txt", 10)]);
+    const MB: i64 = 1 << 20;
+
+    fn no_overlap(g: &[Grower]) {
+        // Disjoint: a path and something below it appear together only as "other under X".
+        for a in g {
+            for b in g {
+                if a.path != b.path && super::super::under_prefix(&b.path, &a.path) {
+                    assert!(a.other, "{} listed in full above {}: {:?}", a.path, b.path, paths(g));
+                }
+            }
+        }
     }
 
     #[test]
-    fn parent_listed_when_no_child_dominates() {
+    fn single_dominant_child_hides_parents() {
+        let g = rollup("/", vec![item("/a/b/c/big.log", 1000 * MB), item("/a/x.txt", 10 * MB)], 50);
+        // /a, /a/b, /a/b/c are all explained by big.log; x.txt is 1% of /a: not worth a row,
+        // and 10 MB is below the 20% remainder share.
+        assert_eq!(paths(&g), vec![("/a/b/c/big.log", 1000 * MB)]);
+        no_overlap(&g);
+    }
+
+    #[test]
+    fn parent_is_broken_down_without_repeating_bytes() {
         let g = rollup(
             "/",
-            vec![
-                item("/u/lib/caches/a", 500),
-                item("/u/lib/logs/b", 400),
-                item("/u/lib/tmp/c", 100),
-            ],
+            vec![item("/u/lib/caches/a", 500 * MB), item("/u/lib/logs/b", 400 * MB), item("/u/lib/tmp/c", 100 * MB)],
             50,
         );
         let p = paths(&g);
-        assert_eq!(p[0], ("/u/lib", 1000));
-        assert!(p.contains(&("/u/lib/caches/a", 500)));
-        assert!(p.contains(&("/u/lib/logs/b", 400)));
-        assert!(
-            !p.contains(&("/u/lib/tmp/c", 100)),
-            "10% child of a listed parent is hidden: {p:?}"
-        );
-        // /u is dominated by /u/lib (100%)
-        assert!(!p.iter().any(|x| x.0 == "/u"));
+        // Every child carries >= 10%: all three are listed, nothing is left for "other".
+        assert_eq!(p, vec![("/u/lib/caches/a", 500 * MB), ("/u/lib/logs/b", 400 * MB), ("/u/lib/tmp/c", 100 * MB)]);
+        assert!(!g.iter().any(|x| x.other));
+        no_overlap(&g);
+    }
+
+    #[test]
+    fn significant_remainder_becomes_other_under_parent() {
+        // 600 MB in one file, 400 MB spread over 100 small files of the same dir.
+        let mut items = vec![item("/w/proj/out/big.bin", 600 * MB)];
+        items.extend((0..100).map(|i| item(&format!("/w/proj/out/f{i}"), 4 * MB)));
+        let g = rollup("/", items, 50);
+        let p = paths(&g);
+        assert_eq!(p[0], ("/w/proj/out/big.bin", 600 * MB));
+        assert_eq!(p[1], ("/w/proj/out", 400 * MB), "{p:?}");
+        assert!(g[1].other && !g[0].other);
+        assert_eq!(g[1].files_touched, 100, "touches of the unlisted part only");
+        assert_eq!(g.len(), 2, "{p:?}");
+        no_overlap(&g);
+    }
+
+    #[test]
+    fn small_remainder_is_not_listed() {
+        // 15 MB unexplained of 1 GB: below 20% of the parent.
+        let mut items = vec![item("/w/a/big", 1000 * MB)];
+        items.extend((0..5).map(|i| item(&format!("/w/a/s{i}"), 3 * MB)));
+        let g = rollup("/", items, 50);
+        assert_eq!(paths(&g), vec![("/w/a/big", 1000 * MB)]);
+        // 30% unexplained but only 3 MB: below the 10 MB floor.
+        let g = rollup("/", vec![item("/v/k/x", 7 * MB), item("/v/k/y1", MB / 2), item("/v/k/y2", MB / 2), item("/v/k/y3", MB / 2), item("/v/k/y4", MB / 2), item("/v/k/y5", MB / 2), item("/v/k/y6", MB / 2)], 50);
+        assert!(!g.iter().any(|x| x.other), "{:?}", paths(&g));
+    }
+
+    #[test]
+    fn home_and_root_are_never_the_headline_when_something_deeper_explains() {
+        // Lots of small growers directly in a home dir, plus one project: the home dir itself
+        // only shows up as "other under ~".
+        let mut items = vec![item("/Users/me/code/app/target/debug/app", 300 * MB)];
+        items.extend((0..40).map(|i| item(&format!("/Users/me/dl{i}.bin"), 8 * MB)));
+        let g = rollup("/", items, 50);
+        assert_eq!(g[0].path, "/Users/me/code/app/target/debug/app");
+        assert!(!g.iter().any(|x| x.path == "/" || (x.path == "/Users/me" && !x.other) || x.path == "/Users"), "{:?}", paths(&g));
+        no_overlap(&g);
+        // A home dir with many equal children is broken down into them (it is generic).
+        let items: Vec<Item> = (0..5).map(|i| item(&format!("/Users/me/p{i}/f"), 100 * MB)).collect();
+        let g = rollup("/", items, 50);
+        assert_eq!(g.len(), 5, "{:?}", paths(&g));
+        assert!(g.iter().all(|x| x.path.starts_with("/Users/me/p")));
     }
 
     #[test]
     fn many_small_files_collapse_into_dir() {
-        let items: Vec<Item> = (0..300).map(|i| item(&format!("/d/f{i}"), 1 << 20)).collect();
+        let items: Vec<Item> = (0..300).map(|i| item(&format!("/d/x/f{i}"), MB)).collect();
         let g = rollup("/", items, 50);
         assert_eq!(g.len(), 1, "{:?}", paths(&g));
-        assert_eq!(g[0].path, "/d");
-        assert_eq!(g[0].delta, 300 << 20);
+        assert_eq!(g[0].path, "/d/x");
+        assert!(!g[0].other);
+        assert_eq!(g[0].delta, 300 * MB);
         assert_eq!(g[0].files_touched, 300);
     }
 
@@ -415,25 +570,23 @@ mod tests {
 
     #[test]
     fn scan_diff_total_overrides_sum_of_children() {
-        let mut d = item("/v/lib", 5000);
+        let mut d = item("/v/lib", 5000 * MB);
         d.total = true;
         d.is_dir = true;
         d.evidence = vec![Evidence::ScanDiff];
-        let g = rollup("/", vec![d, item("/v/lib/a", 600), item("/v/lib/b", 400)], 50);
+        let g = rollup("/", vec![d, item("/v/lib/a", 600 * MB), item("/v/lib/b", 400 * MB)], 50);
         let p = paths(&g);
-        assert_eq!(p[0], ("/v/lib", 5000));
+        // a (12%) is worth a row, b (8%) is not; the scan says 5 GB in total, so 4.4 GB is
+        // "other under /v/lib", with the scan as its evidence.
+        assert_eq!(p, vec![("/v/lib", 4400 * MB), ("/v/lib/a", 600 * MB)]);
+        assert!(g[0].other);
         assert_eq!(g[0].evidence, vec![Evidence::ScanDiff, Evidence::Fsevents]);
-        // a (12%) and b (8%) are below the 20% child rule.
-        assert_eq!(g.len(), 1, "{p:?}");
+        no_overlap(&g);
     }
 
     #[test]
     fn under_filters_and_root_not_listed() {
-        let g = rollup(
-            "/home/u",
-            vec![item("/home/u/a/x", 10), item("/home/u/b/y", 10), item("/etc/z", 99)],
-            50,
-        );
+        let g = rollup("/home/u", vec![item("/home/u/a/x", 10), item("/home/u/b/y", 10), item("/etc/z", 99)], 50);
         let p = paths(&g);
         assert!(!p.iter().any(|x| x.0 == "/home/u" || x.0 == "/etc/z"), "{p:?}");
         assert_eq!(p.len(), 2);

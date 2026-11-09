@@ -3,21 +3,23 @@
 //! The slow sources run in a background thread that keeps a cached `Extras`; the sample path only
 //! reads that cache. Fast sources are read inline.
 //!
-//! * macOS: `pmset` / `ioreg` (background), sysctl (inline).
+//! * macOS: native APIs (see `sys::darwin`): IOKit IOAccelerator "PerformanceStatistics" (GPU),
+//!   IOPowerSources (battery), the `com.apple.system.thermalpressurelevel` notify state
+//!   (thermal), all in the background thread; sysctl inline. `ioreg` / `pmset` only run when a
+//!   native call fails (`sys::run_fallback`: LC_ALL=C, 3 s timeout).
 //! * Linux: sysfs/procfs only (see `mod lx`): PSI `/proc/pressure`, `/proc/meminfo`,
 //!   `/sys/class/thermal` + `/sys/class/hwmon`, `/sys/class/power_supply`, `/sys/class/drm` +
 //!   DRM fdinfo, and `nvidia-smi` only when that binary exists (1s timeout). Every reader takes a
 //!   root path so it is unit-tested against fixture trees; missing files degrade to None/"unknown".
 
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::model::{Gpu, Psi};
 
-/// `ioreg` costs ~15ms CPU per run; 4s keeps the always-on recorder cheap.
+/// The native IOKit read is ~0.1 ms (the `ioreg` fallback ~15 ms CPU); 4s keeps the recorder cheap.
 pub const GPU_EVERY: Duration = Duration::from_secs(4);
 pub const THERMAL_EVERY: Duration = Duration::from_secs(10);
 pub const BATTERY_EVERY: Duration = Duration::from_secs(30);
@@ -126,9 +128,10 @@ fn poll_loop(weak: Weak<Shared>) {
     }
 }
 
+/// Fallback shell-out (macOS `pmset` / `ioreg`), only when the native API failed.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd).args(args).stdin(std::process::Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    crate::sys::run_fallback(cmd, args, Duration::from_secs(3)).filter(|s| !s.trim().is_empty())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -213,16 +216,24 @@ pub fn sysctl_i32(_name: &str) -> Option<i32> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Thermal (pmset -g therm)
+// Thermal (macOS: notify thermal pressure; fallback `pmset -g therm`)
 
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn thermal() -> String {
     if cfg!(target_os = "linux") {
         return lx::read_thermal(std::path::Path::new("/sys/class")).level.to_string();
     }
+    #[cfg(target_os = "macos")]
+    if !crate::sys::force_fallback()
+        && let Some(level) = crate::sys::darwin::thermal::pressure_level()
+    {
+        crate::sys::note_source("thermal", "notify");
+        return crate::sys::darwin::thermal::label(level).into();
+    }
     if !cfg!(target_os = "macos") {
         return "unknown".into();
     }
+    crate::sys::note_source("thermal", "pmset");
     run("pmset", &["-g", "therm"]).map(|s| parse_therm(&s).to_string()).unwrap_or_else(|| "unknown".into())
 }
 
@@ -262,16 +273,24 @@ pub fn parse_therm(s: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------------------------
-// GPU (ioreg)
+// GPU (macOS: IOKit IOAccelerator; fallback `ioreg`)
 
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn gpus() -> Vec<Gpu> {
     if cfg!(target_os = "linux") {
         return lx::GpuSampler::default().sample().0;
     }
+    #[cfg(target_os = "macos")]
+    if !crate::sys::force_fallback()
+        && let Some(g) = crate::sys::darwin::iokit::gpus()
+    {
+        crate::sys::note_source("gpu", "iokit");
+        return g;
+    }
     if !cfg!(target_os = "macos") {
         return Vec::new();
     }
+    crate::sys::note_source("gpu", "ioreg");
     run("ioreg", &["-r", "-d", "1", "-c", "IOAccelerator"]).map(|s| parse_ioreg_gpus(&s)).unwrap_or_default()
 }
 
@@ -327,15 +346,23 @@ fn dict_num(s: &str, key: &str) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Battery (pmset -g batt)
+// Battery (macOS: IOPowerSources; fallback `pmset -g batt`)
 
 pub fn battery() -> (Option<f32>, Option<bool>) {
     if cfg!(target_os = "linux") {
         return lx::read_battery(std::path::Path::new("/sys/class/power_supply"));
     }
+    #[cfg(target_os = "macos")]
+    if !crate::sys::force_fallback()
+        && let Some(b) = crate::sys::darwin::iokit::battery()
+    {
+        crate::sys::note_source("battery", "iokit");
+        return b;
+    }
     if !cfg!(target_os = "macos") {
         return (None, None);
     }
+    crate::sys::note_source("battery", "pmset");
     run("pmset", &["-g", "batt"]).map(|s| parse_batt(&s)).unwrap_or((None, None))
 }
 
@@ -396,10 +423,10 @@ fn friendly_host(raw: Option<String>) -> String {
     let _ = looks_bad;
     #[cfg(target_os = "macos")]
     if looks_bad
-        && let Ok(o) = std::process::Command::new("/usr/sbin/scutil").args(["--get", "LocalHostName"]).output()
+        && let Some(o) = crate::sys::run_fallback("/usr/sbin/scutil", &["--get", "LocalHostName"], Duration::from_secs(1))
     {
-        let name = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        if o.status.success() && !name.is_empty() {
+        let name = o.trim().to_string();
+        if !name.is_empty() && !name.contains(' ') {
             return name;
         }
     }
@@ -1082,6 +1109,7 @@ pub mod lx {
         use std::process::Stdio;
         let mut child = std::process::Command::new(cmd)
             .args(args)
+            .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1479,6 +1507,36 @@ mod tests {
         let m = lx::parse_nvidia_pmon(pmon);
         assert_eq!(m.len(), 2);
         assert_eq!((m[&2345], m[&7777]), (12.0, 55.0));
+    }
+
+    /// Native IOKit / notify values against `ioreg` / `pmset` at the same moment:
+    /// `cargo test native_matches_shellouts -- --ignored --nocapture`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn native_matches_shellouts() {
+        use crate::sys::darwin::{iokit, thermal};
+        let t = Instant::now();
+        let (g, b, th) = (iokit::gpus().unwrap(), iokit::battery().unwrap(), thermal::pressure_level().unwrap());
+        let dn = t.elapsed();
+        let t = Instant::now();
+        let g2 = parse_ioreg_gpus(&run("ioreg", &["-r", "-d", "1", "-c", "IOAccelerator"]).unwrap());
+        let b2 = parse_batt(&run("pmset", &["-g", "batt"]).unwrap());
+        let th2 = parse_therm(&run("pmset", &["-g", "therm"]).unwrap());
+        let ds = t.elapsed();
+        println!("native  ({dn:?}): gpu {g:?} battery {b:?} thermal {} ({th})", thermal::label(th));
+        println!("shell   ({ds:?}): gpu {g2:?} battery {b2:?} thermal {th2}");
+        assert_eq!(g.len(), g2.len());
+        for (a, b) in g.iter().zip(&g2) {
+            assert_eq!(a.name, b.name);
+            assert!((a.util - b.util).abs() <= 25.0, "util moves, but not that much");
+            assert!(a.mem_used.abs_diff(b.mem_used) <= b.mem_used / 5 + (64 << 20), "{} vs {}", a.mem_used, b.mem_used);
+        }
+        assert_eq!(b.1, b2.1, "on battery");
+        assert!(b.0.zip(b2.0).is_none_or(|(x, y)| (x - y).abs() <= 1.0) && b.0.is_some() == b2.0.is_some());
+        if th2 != "unknown" {
+            assert_eq!(thermal::label(th), th2);
+        }
     }
 
     /// The real-runtime paths never panic and are consistent with each other.

@@ -1,39 +1,10 @@
 # fat — Fucking Awesome Top
 
-`htop` tells you **what** is running. `fat` tells you **why**, **since when**, **what it costs**
-(CPU, RAM, watts, GPU, disk, network, ports), and lets you do something about it **safely**
-(pause before kill, undo everything).
-
-There is one engine with two interfaces:
-
-- **A terminal UI for humans.** It is built with ratatui and has live, tree and time-travel views.
-- **An MCP / JSON interface for agents.** Every view is also a tool or a `--json` flag.
-
-What makes it different:
-
-- **Flight recorder with time travel.** `fat record` keeps about 3 days of compact history in SQLite (around 27 MB/day at 2s).
-  In the TUI you can scrub back to the moment the fan spun up and see which process caused it.
-- **Blame chains.** `fat why <pid>` gives the cause, not just a number. For example:
-  "mds_stores is hot → Spotlight is indexing → because `npm install` in ~/code/app is writing 40k files → add `.metadata_never_index`".
-  It shows the ancestry (shell / terminal / editor / agent / launchd), how long the process has been hot, its children and what they cost, and the ports it owns.
-- **Every modern resource.** Covers per-process energy (watts, from the kernel's per-task energy counters on macOS,
-  RAPL package energy on Linux), GPU, thermal state and temperatures, memory pressure (and Linux PSI stall times for
-  cpu, memory and io), battery, and per-process net and disk rates.
-- **Ports are first-class.** Shows every listening socket and its owner, with a framework hint ("node · vite dev · ~/code/app · up 3h").
-  It also flags **orphans**: dev servers whose launcher died and that were re-parented to launchd (macOS) or to init /
-  a systemd user manager (Linux).
-- **Safe, reversible actions.** Pause (SIGSTOP) before kill, renice, and kill a whole tree.
-  Everything is journaled and `fat undo` reverses it. fat refuses to touch launchd, WindowServer, kernel_task
-  (macOS), init/systemd, kernel threads and the session's display/dbus daemons (Linux),
-  its own ancestors, processes owned by other users, and recycled pids.
-- **Resource budgets for commands (and agents).** For example, `fat run --cpu 200 --mem 4G --time 10m -- cargo build`.
-- **One tree for local, containers and ssh hosts.** Supports docker, podman, OrbStack, colima and nerdctl, plus any host that has `fat` installed.
-  On Linux every process is tagged with its cgroup and container, so you can filter the process list by container name.
-- **Storage: what eats your disk, and what is filling it right now.** The Fs tab and `fat fs` show disk usage of every
-  directory from `/` down (a cached, low-priority background scan), which paths grew in the last 10 minutes and which
-  processes are writing there, space held by deleted-but-open files, and when each volume will be full. fat only reads:
-  it never deletes, moves or truncates your files.
-- **Plain-language `ask`.** Ask "why is this machine hot?" and get an answer, offline from rules or richer through Claude if you set an API key.
+**fat is best at answering "why is my machine slow, hot or full, and what can I safely do about it?"**
+- `fat` opens instantly on your processes sorted by CPU, with CPU, memory, power and thermal gauges on top.
+- `fat why <pid>` says who started a process, since when and what it costs; `fat doctor` ranks what is wrong.
+- `fat fs --growth` names the path and the process filling your disk right now.
+- First aid you can take back: pause and renice are journaled and undone with `fat undo` (kill asks first, and can't be).
 
 First-class on **macOS** (developed on Apple Silicon, macOS 15) and **Linux** (x86_64 and aarch64, kernel 4.20+ for PSI,
 cgroup v2 recommended). On Linux it reads procfs and sysfs directly. It never needs `sudo`; root only adds visibility
@@ -48,58 +19,57 @@ cargo install --path .
 
 ## Quick tour
 
+`fat --help` groups the commands the same way.
+
 ```sh
-fat                         # the TUI
+# Everyday
+fat                         # the TUI: processes by CPU (h for keys)
 fat snapshot [--json] [--top 25]
 fat ports [--json]          # listeners, owners, ⚠ orphans
-fat why <pid> [--json]      # blame chain + evidence + suggested fixes
-fat doctor [--json]         # whole-machine diagnosis, ranked crit > warn > info
-fat ask "why is this machine hot"
-
-fat record                  # flight recorder (foreground; run it under launchd / systemd / tmux)
-fat history --since 1h      # timeline (avg cpu/mem/power, top process per bucket)
-fat history --since 1h --spikes
-fat history --at 10m        # the machine as it was 10 minutes ago
-
-fat pause <pid>             # SIGSTOP — undoable
-fat resume <pid>            # SIGCONT
-fat renice <pid> 10         # lower priority
-fat kill <pid> [--tree] [--force]
-fat undo [id]               # undo last (or a specific) action
-fat log [--json]            # action journal
-
-fat run --cpu 150 --mem 2G --time 10m --procs 64 --on-violation pause|kill|warn -- <cmd...>
-fat fleet [--json]          # containers + ssh hosts
-
 fat fs [PATH] [--depth N] [--top 25] [--wait 2m] [--json]   # disk usage of PATH's children (default /)
 fat fs --growth [--since 10m] [--under PATH] [--json]     # what is eating space right now
 fat fs --volumes [--json]                                 # capacity, fill rate, ETA to full, I/O
 fat fs --largest 20 PATH                                  # biggest files / dirs below PATH
+fat why <pid> [--json]      # blame chain + evidence + suggested fixes
+fat doctor [--json]         # whole-machine diagnosis, ranked crit > warn > info
+fat ask "why is this machine hot"
+fat ask --dry-run "why is this machine hot"   # print the exact (redacted) API request; send nothing
+
+# Actions (journaled)
+fat pause <pid>             # SIGSTOP; undoable
+fat resume <pid>            # SIGCONT
+fat renice <pid> 10         # lower priority; undoable (lowering nice again may need root)
+fat kill <pid> [--tree] [--force]   # TERM (KILL with --force); NOT undoable
+fat undo [id]               # undo the last pause/renice (or a specific one)
+fat log [--json]            # action journal
+
+# Flight recorder
+fat record                  # foreground; see "Run the flight recorder always-on" below
+fat history --since 1h      # timeline (avg cpu/mem/power, top process per bucket)
+fat history --since 1h --spikes
+fat history --at 10m        # the machine as it was 10 minutes ago
+
+# Advanced
+fat run --cpu 150 --mem 2G --time 10m --procs 64 --on-violation pause|kill|warn -- <cmd...>
+fat fleet [--json]          # containers + ssh hosts
 fat mcp                     # MCP server on stdio
 ```
-
-How `fat run` enforces a budget:
-
-- It runs the command in its own process group and checks the whole tree every 500 ms.
-- **CPU** is in per-core percent, so 100 means one full core. A CPU breach must persist for two consecutive checks to count.
-- **pause** (the default) stops the group and prints how to resume it. **kill** sends TERM, then KILL after 3 seconds.
-- A `--time` overrun always stops the job, unless the policy is `warn`.
-- The exit code is the child's own, or 128 + the signal number if it was killed.
 
 ### TUI keys
 
 | Key | Action |
 | --- | --- |
-| `1`–`7`, `Tab` | views: Procs · Ports · Fs · Fleet · Timeline · Doctor · Log |
+| `1`–`5`, `Tab` | views: Procs · Ports · Fs · Timeline · Doctor (`6` Fleet appears only when containers run or `[[hosts]]` are configured) |
 | `↑↓ PgUp PgDn g G` | move |
 | `c m p n d i N` | sort by cpu · mem · power · net · disk · pid · name (press again to reverse) |
 | `t` | process tree |
 | `/` | filter by name, command line, container name / id / image, or cgroup path (`Esc` clears it) |
 | `Enter` / `w` | why: the blame chain (a side panel at 120+ columns, otherwise an overlay) |
-| `space` / `z` | pause / resume |
-| `r` | renice (default +10) |
-| `k` / `K` | terminate / terminate the whole tree (asks for confirmation; in Ports, `k` kills the tree) |
-| `u` | undo the last action |
+| `space` / `z` | pause / resume (undoable) |
+| `r` | renice (default +10; undoable) |
+| `k` / `K` | terminate / terminate the whole tree (asks for confirmation; **not undoable**; in Ports, `k` kills the tree) |
+| `u` | undo the last pause or renice |
+| `a` | action log (an overlay on any view): everything fat did; `⏎` undoes the selected entry if it can be undone |
 | `← → [ ] { }` | time travel through history (`{ }` = ×10) |
 | `s` · `+`/`-` | jump to the next spike · zoom the window (5m … 24h) |
 | `L` / `Esc` | back to live |
@@ -114,6 +84,93 @@ biggest entries below here, `r` rescans this directory, `/` filters, and `⏎` o
 
 While you are rewinding, every view shows a big `⏪ REWIND hh:mm:ss` badge, and actions are refused because they would hit processes from the past.
 In the Doctor view, `Enter` runs a finding's suggested action after you confirm it.
+`doctor` and `why` never suggest pausing or killing a *hub*, a process whose cost is really other work: a VM host
+(OrbStack Helper, Docker Desktop's VM, qemu, UTM), a container runtime, shim or a container's pid 1, init, a browser's
+or Electron app's main process, your shell, terminal, tmux, ssh or agent session, WindowServer, the kernel. They
+name the workload instead ("OrbStack 2.8G (VM: containers db 328M ...)": `docker stop db`, or lower the VM memory
+limit; "Brave 4.1G across 23 processes": close heavy tabs). GUI apps get "quit <App>", and root/system services get
+service-manager advice. Memory findings rank whole apps and VMs, not single processes. Only your own CLI/dev
+processes get a runnable `pause` / `kill`.
+
+## Run the flight recorder always-on (optional)
+
+Time travel (`←` in the TUI, `fat history`) only has data for the times something was recording: the TUI records while
+it is open, and `fat record` records in the foreground. To record all the time, run `fat record` as a background
+service. fat does not install one for you; copy and paste one of these. Disk use is about 27 MB per day at the default
+interval, kept for `history_days` (default 3, so about 80 MB; see [Configuration](#configuration)). The recorder runs
+at low CPU and I/O priority and uses about 1–2% of one core.
+
+**macOS (launchd LaunchAgent).** This writes `~/Library/LaunchAgents/dev.fat.record.plist` with the absolute path of
+your `fat` (launchd does not expand `~`), checks it, and starts it:
+
+```sh
+FAT="$(command -v fat || echo "$HOME/.cargo/bin/fat")"
+mkdir -p ~/Library/LaunchAgents ~/Library/Logs
+cat > ~/Library/LaunchAgents/dev.fat.record.plist <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>             <string>dev.fat.record</string>
+  <key>ProgramArguments</key>  <array><string>$FAT</string><string>record</string></array>
+  <key>RunAtLoad</key>         <true/>
+  <key>KeepAlive</key>         <true/>
+  <key>ThrottleInterval</key>  <integer>30</integer>
+  <key>ProcessType</key>       <string>Background</string>
+  <key>LowPriorityIO</key>     <true/>
+  <key>Nice</key>              <integer>10</integer>
+  <key>StandardOutPath</key>   <string>$HOME/Library/Logs/fat-record.log</string>
+  <key>StandardErrorPath</key> <string>$HOME/Library/Logs/fat-record.log</string>
+</dict>
+</plist>
+PLIST
+plutil -lint ~/Library/LaunchAgents/dev.fat.record.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.fat.record.plist
+```
+
+- Check: `launchctl print gui/$(id -u)/dev.fat.record | grep -E 'state|pid'`, `tail ~/Library/Logs/fat-record.log`
+  (its first line says where it writes), and after a minute `fat history --since 5m`.
+- After upgrading fat: `launchctl kickstart -k gui/$(id -u)/dev.fat.record`.
+- Uninstall: `launchctl bootout gui/$(id -u)/dev.fat.record && rm ~/Library/LaunchAgents/dev.fat.record.plist`.
+  The history stays in `~/Library/Application Support/fat/history.db`; delete it yourself if you want it gone.
+
+**Linux (systemd user unit).** Save this as `~/.config/systemd/user/fat-record.service` (change the `ExecStart` path
+if fat is not in `~/.cargo/bin`):
+
+```ini
+[Unit]
+Description=fat flight recorder (fat record)
+
+[Service]
+ExecStart=%h/.cargo/bin/fat record
+Nice=19
+IOSchedulingClass=idle
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now fat-record
+loginctl enable-linger "$USER"   # keep recording while you are logged out, and from boot (may need sudo)
+```
+
+- Check: `systemctl --user status fat-record`, `journalctl --user -u fat-record -n 20`, and after a minute
+  `fat history --since 5m`.
+- After upgrading fat: `systemctl --user restart fat-record`.
+- Uninstall: `systemctl --user disable --now fat-record`, then `rm ~/.config/systemd/user/fat-record.service` and
+  `systemctl --user daemon-reload` (and `loginctl disable-linger "$USER"` if you enabled it only for this). The
+  history stays in `~/.local/share/fat/history.db`.
+
+For a whole-machine recorder that sees every user's io and power, run the same unit as a system service
+(`/etc/systemd/system/`, `ExecStart=/usr/local/bin/fat record`) as root.
+
+Only one fat records at a time: a TUI opened while the service runs reads the service's history instead of writing
+its own, and a second `fat record` waits until the first stops.
 
 ## For agents: MCP
 
@@ -140,10 +197,26 @@ The server provides these tools:
 - **Storage (read-only):** `fs_volumes` (capacity, `fill_bps`, `eta_full_s`, I/O), `fs_list {path, depth?, limit?,
   wait_seconds?}` (du-style children with `known` advice for common space hogs), `fs_largest {path, n?}` and
   `fs_growth {since?, under?}` (growing paths with their writers and evidence, top writers, deleted-but-open files).
-- **Destructive, annotated as such:** `pause`, `resume`, `renice`, `kill`, `undo`.
+- **Side effects, off by default:** `pause`, `resume`, `renice`, `kill`, `undo` (annotated as destructive). An
+  agent can't signal anything until you allow it in the config:
+
+  ```toml
+  [mcp]
+  allow_actions = ["pause", "resume", "renice", "undo"]   # or "all"; default: none
+  ```
+
+  Disabled tools stay in `tools/list`, marked `DISABLED` in their description, and calling one returns an error that
+  says how to enable it. That is deliberate: an agent that can't see the tool tends to conclude fat can't do it and
+  reach for a shell `kill`, while one that reads "disabled, ask the user to add X" asks you. The refusal happens in
+  the server, so a listed tool is never a way around the setting.
+- **`kill` takes two calls.** The first signals nothing: it returns a preview (the process, its command and user,
+  the signal, its ancestors, for `tree: true` every descendant and whether it would be skipped as protected, or why
+  fat would refuse) and a `confirm_token`. The token works once, for 60 seconds, for that pid, that signal and that
+  process's start time, so a pid reused in between is refused. The second call, with the token, signals.
 
 Every result carries the same object twice: as pretty JSON text and as `structuredContent`.
-Every action returns an id that `undo` accepts. The same safety rules as the CLI apply.
+Pause, resume and renice return an id that `undo` accepts; a kill is journaled but can't be undone. The same safety
+rules as the CLI apply.
 For one-off scripting, every CLI view also has `--json`.
 
 ## Configuration
@@ -160,11 +233,52 @@ history_days = 3           # flight-recorder retention
 enabled = true             # use the Claude API when ANTHROPIC_API_KEY is set
 model   = "claude-opus-5-5"
 
+[mcp]
+allow_actions = []         # side-effect tools agents may use: "pause", "resume", "renice", "kill", "undo", or "all"
+
 [[hosts]]
 name     = "devbox"
 ssh      = "me@devbox.local"   # defaults to name; uses BatchMode, 3s connect timeout
 fat_path = "~/.cargo/bin/fat"  # defaults to "fat"
 ```
+
+## Everything else it does
+
+There is one engine with two interfaces: a ratatui terminal UI for humans (live, tree and time-travel views), and
+an MCP / JSON interface for agents (every view is also a tool or a `--json` flag).
+
+- **Flight recorder with time travel.** `fat record` keeps about 3 days of compact history in SQLite (around 27 MB/day at 2s).
+  In the TUI you can scrub back to the moment the fan spun up and see which process caused it.
+- **Blame chains.** `fat why <pid>` gives the cause, not just a number. For example:
+  "mds_stores is hot → Spotlight is indexing → because `npm install` in ~/code/app is writing 40k files → add `.metadata_never_index`".
+  It shows the ancestry (shell / terminal / editor / agent / launchd), how long the process has been hot, its children and what they cost, and the ports it owns.
+- **Every modern resource.** Covers per-process energy (watts, from the kernel's per-task energy counters on macOS,
+  RAPL package energy on Linux), GPU, thermal state and temperatures, memory pressure (and Linux PSI stall times for
+  cpu, memory and io), battery, and per-process net and disk rates.
+- **Ports are first-class.** Shows every listening socket and its owner, with a framework hint ("node · vite dev · ~/code/app · up 3h").
+  It also flags **orphans**: dev servers whose launcher died and that were re-parented to launchd (macOS) or to init /
+  a systemd user manager (Linux).
+- **Safe actions.** Pause (SIGSTOP) before kill, renice, and kill a whole tree. Everything is journaled. Pause,
+  resume and renice are undoable (`fat undo`); TERM and KILL are not, so pause a suspect first: that gives you a
+  window to see whether it was the culprit before anything is lost. fat refuses to touch launchd, WindowServer, kernel_task
+  (macOS), init/systemd, kernel threads and the session's display/dbus daemons (Linux),
+  its own ancestors, processes owned by other users, and recycled pids.
+- **Resource budgets for commands (and agents).** For example, `fat run --cpu 200 --mem 4G --time 10m -- cargo build`.
+- **One tree for local, containers and ssh hosts.** Supports docker, podman, OrbStack, colima and nerdctl, plus any host that has `fat` installed.
+  On Linux every process is tagged with its cgroup and container, so you can filter the process list by container name.
+- **Storage: what eats your disk, and what is filling it right now.** The Fs tab and `fat fs` show disk usage of every
+  directory from `/` down (a cached, low-priority background scan), which paths grew in the last 10 minutes and which
+  processes are writing there, space held by deleted-but-open files, and when each volume will be full. fat only reads:
+  it never deletes, moves or truncates your files.
+- **Plain-language `ask`.** Ask "why is this machine hot?" and get an answer, offline from rules or richer through Claude if you set an API key.
+
+How `fat run` enforces a budget:
+
+- It runs the command in its own process group and checks the whole tree every 500 ms.
+- **CPU** is in per-core percent, so 100 means one full core. A CPU breach must persist for two consecutive checks to count.
+- **pause** (the default) stops the group and prints how to resume it. **kill** sends TERM, then KILL after 3 seconds.
+- A `--time` overrun always stops the job, unless the policy is `warn`.
+- The exit code is the child's own, or 128 + the signal number if it was killed.
 
 ## Storage
 
@@ -181,7 +295,11 @@ Three questions, one tab (`3`, right after Ports) and one command (`fat fs`):
 - **What is eating my space so fast?** The Δ column shows how much each child grew in the window (10m, 1h or 24h; `w`
   cycles), and WRITE/s which processes write there. `g` switches to a flat list of the fastest growers anywhere, the
   space held by deleted-but-still-open files (restarting the holder frees it), and the top writing processes
-  (`⏎` = why). `fat fs --growth --since 10m` prints the same.
+  (`⏎` = why). `fat fs --growth --since 10m` prints the same. The list is as specific as the evidence allows and
+  never counts bytes twice: a directory is broken down into the children that carry its growth (a home directory or
+  `/` always is), and shows up itself only as "other under DIR" with what those children leave unexplained, when
+  that is at least 20% of it and 10 MB. Deleted-but-open files are grouped by the process holding them; files under
+  1 MB are only counted.
 - **Which volume, and when is it full?** The strip at the top shows every volume with used/total, the fill rate
   (`+1.2G/10m`), `full in 3h` (yellow under a day, red under 2 hours), device I/O and macOS purgeable space.
 
@@ -229,8 +347,9 @@ restart), and large swap files in `/System/Volumes/VM`.
 
 Everything works on Linux, and several things work better than on macOS, because Linux exposes more of the
 kernel's own accounting. fat reads procfs and sysfs directly. A sample of about 1,000 processes takes roughly
-10–30 ms, and the sample path spawns no subprocesses. The only child processes are `ss` (every 2s, for
-per-process network rates) and the container CLIs (cached).
+10–30 ms, and the sample path spawns no subprocesses. Per-process network rates come from a netlink
+`sock_diag` dump every 2s (about 0.2–1 ms of CPU, versus 2–18 ms for the `ss` it replaced). The only child processes
+are the container CLIs (cached), and `ss` only if netlink is unavailable.
 
 ### What you get on Linux
 
@@ -279,7 +398,7 @@ per-process network rates) and the container CLIs (cached).
 - **Ports and orphans without lsof.** Ports come from `/proc/net/{tcp,tcp6,udp,udp6}` of fat's own network
   namespace and of every other one it can see (`/proc/<pid>/net/*`; all containers' as root, tagged "in
   container <id>"), and owners from `/proc/<pid>/fd`. As root, per-process traffic is also read from each
-  container's namespace (`nsenter -n ss`). A dev server re-parented to pid 1 or to a `systemd --user` subreaper is flagged as an orphan.
+  container's namespace (a netlink socket opened inside it with `setns`). A dev server re-parented to pid 1 or to a `systemd --user` subreaper is flagged as an orphan.
 
 ### Data sources
 
@@ -287,14 +406,14 @@ per-process network rates) and the container CLIs (cached).
 | --- | --- | --- |
 | Process list, cpu, memory, threads, nice | `proc_pid_rusage`, `proc_pidinfo`, `sysinfo` | `/proc/<pid>/stat`, `status` |
 | Per-process disk I/O | `proc_pid_rusage` | `/proc/<pid>/io` (own processes, or all as root); system totals `/proc/diskstats` |
-| Per-process network | `nettop` | `ss -tinpeH` tcp_info byte counters (own sockets, or all as root, every netns); system totals `/proc/net/dev` |
+| Per-process network | `nettop` | `NETLINK_SOCK_DIAG` tcp_info byte counters + `/proc/<pid>/fd` owners (own sockets, or all as root, every netns; `ss -tinpeH` fallback); system totals `/proc/net/dev` |
 | Power | per-task energy (`ri_energy_nj`) → `rusage` | RAPL `/sys/class/powercap/intel-rapl:*/energy_uj` → `rapl`, else CPU-time model → `estimate` |
 | Memory pressure | `kern.memorystatus_vm_pressure_level` | `/proc/pressure/memory`, `/proc/meminfo` |
 | CPU / io pressure | none | `/proc/pressure/{cpu,io}` (PSI, kernel 4.20+, `psi=1`) |
-| Thermal | `pmset -g therm` (state word) | `/sys/class/hwmon/*/temp*_input`, `/sys/class/thermal/thermal_zone*` (°C) |
-| Battery | `pmset -g batt` | `/sys/class/power_supply/BAT*` |
-| GPU | `ioreg -c IOAccelerator` | `/sys/class/drm` and DRM fdinfo; `nvidia-smi` if installed |
-| Listening ports | `lsof` | `/proc/net/*` + `/proc/<pid>/fd` |
+| Thermal | notify `com.apple.system.thermalpressurelevel` (state word) | `/sys/class/hwmon/*/temp*_input`, `/sys/class/thermal/thermal_zone*` (°C) |
+| Battery | IOKit `IOPSCopyPowerSourcesInfo` | `/sys/class/power_supply/BAT*` |
+| GPU | IOKit `IOAccelerator` | `/sys/class/drm` and DRM fdinfo; `nvidia-smi` if installed |
+| Listening ports | libproc socket fds | `/proc/net/*` + `/proc/<pid>/fd` |
 | cgroup / container | none | `/proc/<pid>/cgroup` (v2) → container id; names from docker / podman / nerdctl |
 | Containers | docker / podman (OrbStack, colima contexts) | docker / podman (incl. the podman-docker shim), nerdctl fallback |
 
@@ -309,7 +428,7 @@ fat never needs root on Linux. As a normal user:
   (With `hidepid=2` on `/proc` you only see your own.)
 - **Disk rates, cwd and exe for your own processes only.** For other users these read 0 / empty (the system
   disk and network totals are still complete).
-- **Network rates for your own sockets only**, because `ss` hides other users' pids.
+- **Network rates for your own sockets only**, because other users' `/proc/<pid>/fd` (socket owners) are unreadable.
 - **Listeners for every port, but owners only for your own.** Others show as pid 0, "owner hidden (needs root)".
 - **No RAPL.** `energy_uj` has been root-only since CVE-2020-8694, so power is `~est`. To allow it for a group, use
   `sudo chmod g+r /sys/class/powercap/intel-rapl:*/energy_uj` with a udev rule.
@@ -327,7 +446,7 @@ cargo install --path .
 cargo build --release && install -m755 target/release/fat ~/.local/bin/   # Debian/Ubuntu: apt install build-essential
 ```
 
-`ss` (iproute2) is used for per-process network rates if present. Everything else is read from `/proc` and `/sys`.
+`ss` (iproute2) is used for per-process network rates only if netlink `sock_diag` is blocked. Everything else is read from `/proc` and `/sys`.
 
 ### Running in a container
 
@@ -342,65 +461,14 @@ docker run --rm -it --pid=host --cgroupns=host --network=host \
 
 - `--pid=host` gives the whole host's process tree.
 - `--cgroupns=host` gives real cgroup paths, so the CONTAINER column works.
-- `--network=host` makes `/proc/net/*` and `ss` show the host's sockets.
+- `--network=host` makes `/proc/net/*` and netlink show the host's sockets.
 - Add `--privileged`, or `--cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH`, for root-level visibility (RAPL, other users' io and sockets).
 
 In Kubernetes the equivalent is a DaemonSet with `hostPID: true` and `hostNetwork: true`.
 
 ### Keep the flight recorder running
 
-**Linux (systemd user unit).** Save this as `~/.config/systemd/user/fat-record.service`:
-
-```ini
-[Unit]
-Description=fat flight recorder
-After=default.target
-
-[Service]
-ExecStart=%h/.cargo/bin/fat record
-Restart=on-failure
-RestartSec=5
-Nice=10
-IOSchedulingClass=idle
-# fat record needs no privileges
-NoNewPrivileges=yes
-
-[Install]
-WantedBy=default.target
-```
-
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now fat-record
-sudo loginctl enable-linger "$USER"   # keep recording while you are logged out
-journalctl --user -u fat-record -f    # logs
-```
-
-For a whole-machine recorder that sees everyone's io and power, install the same unit as a system service in
-`/etc/systemd/system/` with `ExecStart=/usr/local/bin/fat record` and run it as root.
-
-**macOS (launchd agent).** Save this as `~/Library/LaunchAgents/dev.fat.record.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>             <string>dev.fat.record</string>
-  <key>ProgramArguments</key>  <array><string>/Users/you/.cargo/bin/fat</string><string>record</string></array>
-  <key>RunAtLoad</key>         <true/>
-  <key>KeepAlive</key>         <true/>
-  <key>ProcessType</key>       <string>Background</string>
-  <key>LowPriorityIO</key>     <true/>
-  <key>StandardErrorPath</key> <string>/tmp/fat-record.log</string>
-</dict>
-</plist>
-```
-
-```sh
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.fat.record.plist
-launchctl kickstart -k gui/$(id -u)/dev.fat.record    # restart after upgrading fat
-```
+See [Run the flight recorder always-on](#run-the-flight-recorder-always-on-optional) (systemd user unit).
 
 ## Design notes
 
@@ -416,11 +484,18 @@ launchctl kickstart -k gui/$(id -u)/dev.fat.record    # restart after upgrading 
 | Threads, nice | `proc_pidinfo`, `getpriority` | |
 | Memory, command, cwd, user | `sysinfo` | Built without its rayon thread pool, because spinning workers cost about 4% of a core. |
 | Memory pressure | `sysctl kern.memorystatus_vm_pressure_level` | |
-| Thermal | `pmset -g therm` | Every 10s. |
-| Battery | `pmset -g batt` | Every 30s. |
-| GPU utilization and memory | `ioreg -c IOAccelerator` | Every 4s. |
-| Listening ports | `lsof -iTCP -sTCP:LISTEN -iUDP` | Cached 5s, with a 350 ms timeout. |
-| Per-process network | `nettop -L 1` | Every 2s, in a background thread. |
+| Thermal | notify state `com.apple.system.thermalpressurelevel` | Every 10s. The level behind `NSProcessInfo.thermalState`: nominal, fair, serious, critical. |
+| Battery | IOKit `IOPSCopyPowerSourcesInfo` | Every 30s. |
+| GPU utilization and memory | IOKit `IOAccelerator` `PerformanceStatistics` | Every 4s. |
+| Listening ports | libproc: `PROC_PIDLISTFDS` + `PROC_PIDFDSOCKETINFO` | Cached 5s. About 3 ms, against about 50 ms for `lsof`. Without root, only your own processes, as with `lsof`. |
+| Disk I/O per volume | IOKit `IOBlockStorageDriver` `Statistics` | Every 5s, mapped to BSD disks through the registry tree. |
+| Deleted-but-open files | libproc vnode fds and mapped regions with link count 0 | On demand, cached 15s. |
+| Open files of disk writers | libproc `PROC_PIDFDVNODEPATHINFO` | Write-mode regular files of the top writers. |
+
+All of these are native calls with no child process. `lsof`, `ioreg` and `pmset` run only if a native
+call fails, with `LC_ALL=C` and a timeout. `FAT_DEBUG_SOURCES=1` prints the source each subsystem used
+to stderr. `FAT_FORCE_FALLBACK=1` forces the command-line tools.
+| Per-process network | `nettop -L 1` | Every 2s, in a background thread, with `LC_ALL=C` and a 3s timeout. Columns are found from the header row. |
 | Containers | `docker` / `podman` `ps` and `stats` | Run in the background and cached 5s. |
 | Remote hosts | `ssh host fat snapshot --json` | |
 
@@ -438,15 +513,19 @@ Each entry records the pid's start time, so undo never signals a recycled pid.
 
 **Privacy.** Everything stays on your machine: the history DB, the journal and all collection.
 The one exception is `ask`. When `ANTHROPIC_API_KEY` is set (and `[ask] enabled`), it sends a compact summary to the
-Anthropic API: about 20 KB at most, with the top processes, ports, containers and doctor findings. Command lines are
-redacted for anything that looks like a token, key or password. Without a key, `ask` answers offline from rules.
+Anthropic API: about 20 KB at most, with the top processes, ports, containers and doctor findings. Every string in
+that request is redacted first: API keys and tokens (`sk-…`, `ghp_…`, `github_pat_…`, `xox…`, `AKIA…`, JWTs, `Bearer …`),
+`password=` / `token=` / `secret=` style values, the value after `--token` / `--password` and in `-pX`, credentials in
+URLs (`user:pass@`), and long hex or base64 blobs; your home directory becomes `~` and your user name `me`.
+`fat ask --dry-run QUESTION` prints exactly the body that would be sent, and sends nothing. Without a key, `ask`
+answers offline from rules.
 
 ## Performance (macOS: M3 Max, ~1,050 processes)
 
 | What | Measured |
 | --- | --- |
 | `Collector::sample()` | First sample about 80 ms, then 20–30 ms. |
-| `fat record` at a 2s interval | About 1.5% of one core for its own process. About 4% including the `lsof`, `nettop` and `ioreg` children it spawns. |
+| `fat record` at a 2s interval | About 1.3% of one core for its own process. About 2.3% including `nettop`, the only child it still spawns (it was about 4% when ports, GPU, battery and thermal also came from `lsof`, `ioreg` and `pmset`). |
 | TUI at 1.5s | About 2% of a core. |
 | Fs background scan | Capped at 0.25 core (1 core while the Fs tab is visible). After a full scan of `/` (19.9M files): CLI peak RSS about 120 MB, TUI about 200 MB in total. |
 | History writes | About 0.5 ms per sample, about 27 MB/day. |

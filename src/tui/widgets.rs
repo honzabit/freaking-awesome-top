@@ -314,6 +314,55 @@ pub fn evidence_tags(ev: &[crate::fs::Evidence]) -> String {
     ev.iter().map(|e| evidence_tag(*e)).collect::<Vec<_>>().join(",")
 }
 
+/// How a grower's path reads in a list: "other under /x/" for a remainder row.
+pub fn grower_label(g: &crate::fs::Grower) -> String {
+    let slash = if g.is_dir && !g.path.ends_with('/') { "/" } else { "" };
+    if g.other { format!("other under {}{slash}", g.path) } else { format!("{}{slash}", g.path) }
+}
+
+/// Deleted-but-open files smaller than this are counted, not listed.
+pub const DELETED_MIN_BYTES: u64 = 1 << 20;
+
+/// Deleted-but-still-open files held by one process.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeletedGroup {
+    pub pid: u32,
+    pub name: String,
+    pub files: usize,
+    pub bytes: u64,
+    /// The biggest of its files.
+    pub biggest: String,
+}
+
+/// Deleted-but-open files (pid, name, path, bytes) grouped by the process holding them,
+/// biggest first. Files under `min` bytes are left out and returned as (count, bytes).
+pub fn group_deleted(v: &[(u32, String, String, u64)], min: u64) -> (Vec<DeletedGroup>, usize, u64) {
+    // (group, size of its biggest file)
+    let mut groups: Vec<(DeletedGroup, u64)> = Vec::new();
+    let (mut small, mut small_bytes) = (0usize, 0u64);
+    for (pid, name, path, b) in v {
+        if *b < min {
+            small += 1;
+            small_bytes += b;
+            continue;
+        }
+        match groups.iter_mut().find(|(g, _)| g.pid == *pid) {
+            Some((g, top)) => {
+                g.files += 1;
+                g.bytes += b;
+                if *b > *top {
+                    *top = *b;
+                    g.biggest = path.clone();
+                }
+            }
+            None => groups.push((DeletedGroup { pid: *pid, name: name.clone(), files: 1, bytes: *b, biggest: path.clone() }, *b)),
+        }
+    }
+    let mut groups: Vec<DeletedGroup> = groups.into_iter().map(|(g, _)| g).collect();
+    groups.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.pid.cmp(&b.pid)));
+    (groups, small, small_bytes)
+}
+
 /// Growth coloring: big positive deltas are hot, shrinking is green.
 pub fn delta_style(d: i64) -> Style {
     if d >= 1 << 30 {
@@ -370,6 +419,24 @@ pub fn volume_hidden(v: &crate::fs::Volume, all: &[crate::fs::Volume]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleted_files_group_by_holder() {
+        let v = vec![
+            (9, "java".to_string(), "/tmp/a.log".to_string(), 3 << 30),
+            (7, "Chrome".to_string(), "/tmp/c1".to_string(), 1 << 10),
+            (9, "java".to_string(), "/tmp/b.log".to_string(), 5 << 30),
+            (7, "Chrome".to_string(), "/tmp/c2".to_string(), 2 << 20),
+            (7, "Chrome".to_string(), "/tmp/c3".to_string(), 512),
+        ];
+        let (g, small, small_bytes) = group_deleted(&v, DELETED_MIN_BYTES);
+        assert_eq!(g.len(), 2);
+        assert_eq!((g[0].pid, g[0].files, g[0].bytes, g[0].biggest.as_str()), (9, 2, 8 << 30, "/tmp/b.log"));
+        assert_eq!((g[1].pid, g[1].files, g[1].bytes), (7, 1, 2 << 20));
+        assert_eq!((small, small_bytes), (2, 1024 + 512));
+        let other = crate::fs::Grower { path: "/w".into(), is_dir: true, other: true, ..Default::default() };
+        assert_eq!(grower_label(&other), "other under /w/");
+    }
 
     #[test]
     fn storage_formatting() {
