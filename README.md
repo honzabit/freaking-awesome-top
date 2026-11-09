@@ -195,11 +195,16 @@ Every growth number says where it came from:
 | `scan-diff` | Two scans of the tree compared: exact, but coarse in time. |
 | `mtime≤` | Modified within the window, at its current size: an upper bound on growth. |
 
-**How the scan behaves.** Nothing touches storage until you open the Fs tab (or run `fat fs`). Then `/` is scanned in
+**How the scan behaves.** No directory is read until you open the Fs tab (or run `fat fs`); before that the TUI only
+asks each mounted volume for its capacity (`statfs`, every sample, on its own thread) and, once a minute, lists the
+deleted files processes still hold open, for the volume strip and `fat doctor`. Then `/` is scanned in
 the background at the lowest priority (macOS `QOS_CLASS_BACKGROUND`, which also throttles its I/O; Linux nice 19 and
 the idle I/O class), the directory you are looking at first, with partial results as it goes. It is held to a quarter of
-a core, one core while the Fs tab is on screen, and 1.5 cores for the directory you opened (so a first full scan of a
-20M-file Mac takes roughly 15 minutes with the tab open, longer in the background). Results are cached on disk, so the
+a core, one core while the Fs tab is on screen, and 1.5 cores for the directory you opened; `fat fs PATH` and the MCP
+`fs_*` tools run at utility priority (macOS `QOS_CLASS_UTILITY`; Linux nice 10) within the same 1.5 cores (so a first
+full scan of a 20M-file Mac takes roughly 15 minutes with the tab open, longer in the background). Every 10 minutes the
+tree is re-checked: directories whose entries changed, whose big files changed, that hold files written in the last hour,
+or (macOS) that FSEvents reported changed are re-read; everything else waits for the 6-hourly full pass. Results are cached on disk, so the
 next start shows numbers immediately, resumes an interrupted first scan instead of starting over, and refreshes them.
 Sizes count APFS clones in full, like `du`, so on a Mac with many cloned files (uv, pnpm, `cp -c`) the tree can add up
 to more than the volume's used space. Network, FUSE, autofs and removable mounts are never

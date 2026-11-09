@@ -88,10 +88,29 @@ fn range_end(p: &[u8]) -> Vec<u8> {
 
 impl Db {
     pub fn open(path: &Path) -> anyhow::Result<Db> {
+        use std::os::unix::fs::PermissionsExt;
         if let Some(dir) = path.parent()
             && !dir.as_os_str().is_empty()
         {
             std::fs::create_dir_all(dir)?;
+            // fat's own cache dir: private (it lists every directory on the disk, and names
+            // from inside privacy-protected folders the user opened).
+            if dir.file_name().is_some_and(|n| n == "fat") {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        // Create the file 0600 before SQLite opens it (its -wal/-shm copy this mode).
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path);
+        }
+        for suffix in ["", "-wal", "-shm", ".writer-lock"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(suffix);
+            let p = PathBuf::from(p);
+            if std::fs::metadata(&p).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+            }
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(3))?;
@@ -110,7 +129,9 @@ impl Db {
                 big BLOB
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS dirs_written ON dirs(written_at);
-             CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER);",
+             CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER);
+             -- Subtrees deleted by a writer, so other processes drop them too.
+             CREATE TABLE IF NOT EXISTS gone (path BLOB PRIMARY KEY, written_at INTEGER);",
         )?;
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         Ok(Db { conn, path: path.to_path_buf(), lock: None })
@@ -125,7 +146,8 @@ impl Db {
         use std::os::fd::AsRawFd;
         let mut p = self.path.as_os_str().to_owned();
         p.push(".writer-lock");
-        let Ok(mut f) = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(p)
+        use std::os::unix::fs::OpenOptionsExt;
+        let Ok(mut f) = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600).open(p)
         else {
             return false;
         };
@@ -184,13 +206,19 @@ impl Db {
         let tx = self.conn.transaction()?;
         {
             let mut del = tx.prepare("DELETE FROM dirs WHERE path = ?1 OR (path > ?2 AND path < ?3)")?;
+            let mut gone = tx.prepare(
+                "INSERT INTO gone(path, written_at) VALUES (?1, ?2) ON CONFLICT(path) DO UPDATE SET written_at = excluded.written_at",
+            )?;
             for p in removed {
                 let mut lo = p.clone();
                 if lo != b"/" {
                     lo.push(b'/');
                 }
                 del.execute(params![p, lo, range_end(p)])?;
+                gone.execute(params![p, now])?;
             }
+            // Readers re-read the cache every few seconds; a day of tombstones is plenty.
+            tx.execute("DELETE FROM gone WHERE written_at < ?1", params![now - 86_400_000])?;
             let mut ins = tx.prepare(
                 "INSERT INTO dirs (path, size, apparent, files, newest, denied, own_size, own_apparent, own_files, own_newest,
                     own_denied, flags, scanned_at, written_at, dev, ino, mtime, ctime, self_size, self_apparent, big)
@@ -244,11 +272,27 @@ impl Db {
         Ok(())
     }
 
-    /// Roots other processes asked the background scanner to keep fresh ("want:<root>").
-    pub fn wants(&self) -> Vec<String> {
-        let Ok(mut st) = self.conn.prepare("SELECT k FROM meta WHERE k LIKE 'want:%'") else { return Vec::new() };
-        st.query_map([], |r| r.get::<_, String>(0))
-            .map(|it| it.filter_map(Result::ok).map(|k| k[5..].to_string()).collect())
+    pub fn del_meta(&self, k: &str) -> anyhow::Result<()> {
+        self.conn.execute("DELETE FROM meta WHERE k = ?1", params![k])?;
+        Ok(())
+    }
+
+    /// Roots other processes asked the background scanner to keep fresh ("want:<root>"),
+    /// with when they last asked.
+    pub fn wants(&self) -> Vec<(String, i64)> {
+        let Ok(mut st) = self.conn.prepare("SELECT k, v FROM meta WHERE k LIKE 'want:%'") else { return Vec::new() };
+        st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0))))
+            .map(|it| it.filter_map(Result::ok).map(|(k, v)| (k[5..].to_string(), v)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Subtrees a writer deleted after `since` (epoch ms): (path, when).
+    pub fn gone_since(&self, since: Ts) -> Vec<(Vec<u8>, Ts)> {
+        let Ok(mut st) = self.conn.prepare("SELECT path, written_at FROM gone WHERE written_at > ?1") else {
+            return Vec::new();
+        };
+        st.query_map(params![since], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)))
+            .map(|it| it.filter_map(Result::ok).collect())
             .unwrap_or_default()
     }
 }

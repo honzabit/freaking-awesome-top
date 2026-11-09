@@ -25,6 +25,9 @@ use std::path::PathBuf;
 
 #[cfg(target_os = "macos")]
 mod fsevents;
+/// Live FSEvents tail, also used by the scanner's re-stat.
+#[cfg(target_os = "macos")]
+pub(crate) use fsevents::Journal;
 mod mtime;
 mod openfiles;
 mod paths;
@@ -986,7 +989,9 @@ fn scan_diff(
     let Ok(Some((t0, old))) = h.dir_sizes_near(from, root) else {
         return vec![];
     };
-    if t0 < from - window_ms.max(10 * 60_000) {
+    // The baseline may precede the window a little (snapshots come every few minutes), but
+    // the diff is shown as this window's growth: at most half a window (<= 5 min) early.
+    if t0 < from - scan_diff_slack(window_ms) {
         return vec![];
     }
     let (t1, new, complete) = match h.dir_sizes_near(now, root) {
@@ -1014,8 +1019,15 @@ fn scan_diff(
         }
     }
     if complete {
+        let home = paths::home();
         for (p, o) in &old {
-            if !seen.contains(p.as_str()) && *o >= 1 << 20 {
+            // Missing from the newer snapshot is not proof of deletion (it may not have been
+            // tracked then): only a path that is really gone counts as freed.
+            if !seen.contains(p.as_str())
+                && *o >= 1 << 20
+                && paths::protected_root(p, &home).is_none()
+                && std::fs::symlink_metadata(p).is_err()
+            {
                 let mut x = Obs::new(p.clone(), Evidence::ScanDiff);
                 x.is_dir = true;
                 x.delta = Some(-(*o as i64));
@@ -1039,6 +1051,12 @@ fn scan_diff(
         ));
     }
     out
+}
+
+/// How long before the window's start a scan-diff baseline may be (half the window, at most
+/// 5 minutes, so a diff spans at most 1.5x the window it is reported for).
+fn scan_diff_slack(window_ms: i64) -> i64 {
+    (window_ms / 2).min(5 * 60_000)
 }
 
 /// For files with an unknown delta, use the scanner's earlier listing of their parent dir.

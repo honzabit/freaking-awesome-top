@@ -26,7 +26,7 @@
 //!
 //! * `volume_ids` / `volumes` — per-volume (used, avail, total, read/write bps) change points:
 //!   a row when used/avail moves >= 1 MiB, I/O changes notably, or every 60 s.
-//! * `fs_snaps` / `fs_dirs` — directory sizes from the background scanner every 15 min
+//! * `fs_snaps` / `fs_dirs` — directory sizes from the background scanner every 5 min
 //!   (depth <= 3 plus anything >= 1% of its volume, <= 2000 paths), delta encoded against a
 //!   daily key snapshot. `proc_writes` integrates the procs' recorded disk write rates (the top
 //!   disk writers are always part of the recorded set).
@@ -1005,6 +1005,17 @@ impl History {
         Ok(out)
     }
 
+    /// Seed a [`crate::fs::volumes::Volumes`] fill-rate window from recorded volume use, so a
+    /// short-lived caller (CLI, MCP, a new TUI) reports a real 10-minute rate, not noise.
+    pub fn seed_volumes(&self, v: &mut crate::fs::volumes::Volumes, now: Ts) {
+        for m in self.volume_mounts().unwrap_or_default() {
+            if let Ok(s) = self.volume_series(&m, now - crate::fs::volumes::FILL_WINDOW_MS, now) {
+                let pts: Vec<(Ts, u64)> = s.into_iter().filter(|p| p.0 <= now).map(|(t, u, _)| (t, u)).collect();
+                v.seed(&m, &pts);
+            }
+        }
+    }
+
     /// Mounts that have recorded volume rows.
     pub fn volume_mounts(&self) -> anyhow::Result<Vec<String>> {
         let mut st = self.conn.prepare_cached("SELECT mount FROM volume_ids ORDER BY mount")?;
@@ -1514,7 +1525,7 @@ fn install_stop_handlers() {
 }
 
 /// Directory-size snapshots are taken this often by the recorder.
-pub const DIR_SNAPSHOT_EVERY: Duration = Duration::from_secs(15 * 60);
+pub const DIR_SNAPSHOT_EVERY: Duration = Duration::from_secs(5 * 60);
 /// Deeper than [`DIR_SNAPSHOT_DEPTH`], a dir/file is recorded only when it holds at least
 /// 1/DIR_BIG_FRACTION of its volume's used space.
 const DIR_SNAPSHOT_DEPTH: usize = 3;
@@ -1549,12 +1560,7 @@ impl FsRecorder {
 
     /// Seed fill-rate windows from recorded history so ETAs are available right after start.
     pub fn seed_from(&mut self, hist: &History, now: Ts) {
-        for m in hist.volume_mounts().unwrap_or_default() {
-            if let Ok(s) = hist.volume_series(&m, now - crate::fs::volumes::FILL_WINDOW_MS, now) {
-                let pts: Vec<(Ts, u64)> = s.into_iter().map(|(t, u, _)| (t, u)).collect();
-                self.vols.seed(&m, &pts);
-            }
-        }
+        hist.seed_volumes(&mut self.vols, now);
     }
 
     pub fn tick(&mut self, hist: &mut History, ts: Ts) -> anyhow::Result<()> {
@@ -1595,7 +1601,11 @@ pub fn dir_snapshot(sc: &crate::fs::scan::Scanner, vols: &[crate::fs::Volume]) -
             break;
         }
         let Some(l) = sc.list(&path) else { continue };
-        if seen.insert(l.dir.path.clone()) && !l.dir.partial {
+        // A dir being re-read (restat, rescan, a full pass) is `partial` but still shows its
+        // previous complete numbers: record those. Leaving it out would record it as gone
+        // and turn into a fake "freed" scan diff.
+        let ok = |e: &crate::fs::DirEntry| !e.partial || sc.measured(&e.path);
+        if seen.insert(l.dir.path.clone()) && ok(&l.dir) {
             out.push((l.dir.path.clone(), l.dir.size, l.dir.files));
         }
         if depth >= DIR_MAX_DEPTH {
@@ -1603,7 +1613,7 @@ pub fn dir_snapshot(sc: &crate::fs::scan::Scanner, vols: &[crate::fs::Volume]) -
         }
         let big = crate::fs::volumes::volume_for(vols, &path).map_or(u64::MAX, |v| (v.used / DIR_BIG_FRACTION).max(1));
         for c in l.children {
-            if c.partial || c.mount_point || seen.contains(&c.path) {
+            if !ok(&c) || c.mount_point || seen.contains(&c.path) {
                 continue;
             }
             let shallow = depth < DIR_SNAPSHOT_DEPTH;

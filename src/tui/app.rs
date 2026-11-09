@@ -277,6 +277,10 @@ pub fn child_growth(path: &str, growers: &[Grower]) -> ChildGrowth {
 }
 
 /// Row order for the growth view: growers, then deleted-but-open files, then top writers.
+/// Deleted-but-open files shown in the growth view: at most this many, at least this big.
+pub const DELETED_ROWS: usize = 8;
+pub const DELETED_MIN_BYTES: u64 = 1 << 20;
+
 pub fn growth_rows(g: &Growth, filter_lower: &str) -> Vec<GrowthRow> {
     let mut v: Vec<GrowthRow> = Vec::new();
     // Paths merely touched (no net change, no writer) are noise here.
@@ -288,7 +292,18 @@ pub fn growth_rows(g: &Growth, filter_lower: &str) -> Vec<GrowthRow> {
             .filter(|(_, x)| contains_ci(&x.path, filter_lower) || x.writers.iter().any(|w| contains_ci(&w.1, filter_lower)))
             .map(|(i, _)| GrowthRow::Grower(i)),
     );
-    v.extend(g.deleted_open.iter().enumerate().filter(|(_, x)| contains_ci(&x.1, filter_lower) || contains_ci(&x.2, filter_lower)).map(|(i, _)| GrowthRow::Deleted(i)));
+    // Deleted-but-open files: only the ones worth restarting a process for, biggest first
+    // (browsers alone hold hundreds of small temp files).
+    let mut del: Vec<usize> = g
+        .deleted_open
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.3 >= DELETED_MIN_BYTES)
+        .filter(|(_, x)| contains_ci(&x.1, filter_lower) || contains_ci(&x.2, filter_lower))
+        .map(|(i, _)| i)
+        .collect();
+    del.sort_by_key(|&i| std::cmp::Reverse(g.deleted_open[i].3));
+    v.extend(del.into_iter().take(DELETED_ROWS).map(GrowthRow::Deleted));
     v.extend(g.writers.iter().enumerate().filter(|(_, x)| contains_ci(&x.1, filter_lower)).map(|(i, _)| GrowthRow::Writer(i)));
     v
 }
@@ -462,7 +477,11 @@ impl FsView {
             FsMode::Tree => {
                 let (cg, rows) = {
                     let children: &[DirEntry] = self.tree_children();
-                    let growers: &[Grower] = self.growth.as_ref().map(|g| g.growers.as_slice()).unwrap_or(&[]);
+                    // Rewound: live growth (now-window..now) does not belong next to past sizes.
+                    let growers: &[Grower] = match self.past_view() {
+                        Some(_) => &[],
+                        None => self.growth.as_ref().map(|g| g.growers.as_slice()).unwrap_or(&[]),
+                    };
                     let cg: Vec<ChildGrowth> = children.iter().map(|c| child_growth(&c.path, growers)).collect();
                     let rows = fs_order(children, &cg, self.sort, f);
                     (cg, rows)

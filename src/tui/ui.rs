@@ -562,7 +562,16 @@ fn volume_line(app: &App, v: &Volume, mount_w: usize, width: u16) -> Line<'stati
         Some(u) if app.cursor.is_some() => (u, true),
         _ => (v.used, false),
     };
-    let ratio = if v.total == 0 { 0.0 } else if past { used as f64 / v.total as f64 } else { volume_ratio(v) };
+    // Same meaning live and rewound: the share of the container in use (APFS volumes share
+    // one), assuming the other volumes in it did not change.
+    let ratio = if v.total == 0 {
+        0.0
+    } else if past {
+        let others = v.total.saturating_sub(v.avail).saturating_sub(v.used);
+        ((others + used) as f64 / v.total as f64).min(1.0)
+    } else {
+        volume_ratio(v)
+    };
     let mut spans = vec![
         Span::styled(format!(" {:<w$} ", clip(&v.mount, mount_w), w = mount_w), Style::default().bold()),
         Span::styled(bar(ratio, bw), Style::default().fg(fill_color(ratio))),
@@ -590,7 +599,8 @@ fn volume_line(app: &App, v: &Volume, mount_w: usize, width: u16) -> Line<'stati
     }
     let mut tags = Vec::new();
     if v.remote {
-        tags.push("network");
+        // Same words as `fat fs --volumes`: a remote APFS/HFS volume is an external disk/image.
+        tags.push(if v.fstype == "apfs" || v.fstype == "hfs" { "external" } else { "network" });
     }
     if v.read_only {
         tags.push("ro");
@@ -628,11 +638,16 @@ fn scan_status(app: &App) -> Vec<Span<'static>> {
     }
     let locked = l.children.iter().filter(|c| c.denied > 0 && !c.mount_point).count();
     if l.dir.denied > 0 && l.dir.size == 0 && l.children.is_empty() {
-        v.push(Span::styled("  🔒 not read (macOS privacy or permissions)", Style::default().fg(Color::Yellow)));
+        let why = if cfg!(target_os = "macos") { "macOS privacy or permissions" } else { "permission denied" };
+        v.push(Span::styled(format!("  🔒 not read ({why})"), Style::default().fg(Color::Yellow)));
     } else if locked > 0 {
         let s = if locked == 1 { "" } else { "s" };
         v.push(Span::styled(
-            format!("  🔒 {locked} subdir{s} with unread parts: ⏎ on one reads it (or grant Full Disk Access)"),
+            if cfg!(target_os = "macos") {
+                format!("  🔒 {locked} subdir{s} with unread parts: ⏎ on one reads it (or grant Full Disk Access)")
+            } else {
+                format!("  🔒 {locked} subdir{s} could not be read (permission denied): not counted")
+            },
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -702,7 +717,10 @@ fn draw_fs(f: &mut Frame, app: &mut App, area: Rect) {
         crumb.push(Span::styled(text, Style::default().fg(Color::Magenta).bold()));
     }
     crumb.push(Span::raw("  "));
-    crumb.extend(scan_status(app));
+    if fs.past_view().is_none() || fs.mode != FsMode::Tree {
+        // The live scan's status does not describe recorded sizes.
+        crumb.extend(scan_status(app));
+    }
     if !fs.filter.is_empty() {
         crumb.push(Span::styled(format!("  /{}", fs.filter), Style::default().fg(Color::Yellow)));
     }
@@ -851,7 +869,8 @@ fn draw_fs_tree(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
         cells.push(num(if g.delta == 0 { "-".into() } else { fmt_delta(g.delta) }, delta_style(g.delta)));
         if wide {
             cells.push(num(fmt_rate(g.write_bps), rate_style(g.write_bps)));
-            cells.push(num(fmt_count(e.files), dim()));
+            // The recorder keeps sizes only: no file counts for the past.
+            cells.push(num(if past.is_some() { "-".into() } else { fmt_count(e.files) }, dim()));
         }
         if mid {
             cells.push(num(fmt_mtime_age(e.newest_mtime, app.now), dim()));
@@ -872,7 +891,11 @@ fn draw_fs_tree(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
         } else if past.is_none() && fs.current().is_some_and(|l| l.dir.files > 1) {
             "expanding… this directory was summarized by the background scan; its entries appear in a moment".to_string()
         } else if dir_denied {
-            "🔒 this directory could not be read (protected). ⏎ from its parent reads it once, or grant Full Disk Access.".to_string()
+            if cfg!(target_os = "macos") {
+                "🔒 this directory could not be read (protected). ⏎ from its parent reads it once, or grant Full Disk Access.".to_string()
+            } else {
+                "🔒 this directory could not be read (permission denied). Run fat as its owner, or as root.".to_string()
+            }
         } else {
             "empty (or not scanned yet)".to_string()
         };
@@ -889,14 +912,21 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
         return;
     };
     let total: i64 = g.volumes.iter().map(|(_, d)| *d).sum();
+    // No volume samples cover the window (no recorder history yet): unknown, not "0".
+    let vol_text = if g.volumes.is_empty() { "volumes ?".to_string() } else { format!("volumes {}", fmt_delta(total)) };
+    let shown_deleted = fs.grows.iter().filter(|r| matches!(r, GrowthRow::Deleted(_))).count();
+    let deleted_text = if shown_deleted < g.deleted_open.len() {
+        format!("{} deleted-open ({shown_deleted} shown)", g.deleted_open.len())
+    } else {
+        format!("{} deleted-open", g.deleted_open.len())
+    };
     let title = Line::from(vec![
         Span::styled(" What is eating space ", Style::default().bold()),
-        Span::styled(format!("last {win} · volumes {} ", fmt_delta(total)), delta_style(total)),
+        Span::styled(format!("last {win} · {vol_text} "), if g.volumes.is_empty() { dim() } else { delta_style(total) }),
         Span::styled(
             format!(
-                "· {} growers · {} deleted-open · {} writers ",
+                "· {} growers · {deleted_text} · {} writers ",
                 fs.grows.iter().filter(|r| matches!(r, GrowthRow::Grower(_))).count(),
-                g.deleted_open.len(),
                 g.writers.len()
             ),
             dim(),

@@ -67,6 +67,9 @@ pub struct Options {
     /// Cache write / (non-writer) cache re-read cadence.
     pub flush_interval: Duration,
     pub reload_interval: Duration,
+    /// macOS: the background writer tails FSEvents so the 10-minute re-stat also re-reads
+    /// directories whose files changed in place (or inside folded subtrees).
+    pub watch_changes: bool,
 }
 
 impl Default for Options {
@@ -89,12 +92,25 @@ impl Default for Options {
             background: true,
             flush_interval: Duration::from_secs(30),
             reload_interval: Duration::from_secs(15),
+            watch_changes: cfg!(target_os = "macos"),
         }
     }
 }
 
 /// Files kept by name in a directory the user looks at.
 const EXPAND_FILES: usize = 200;
+/// A kept directory whose newest file is younger than this is re-read on every re-stat
+/// (files growing in place do not change their directory's mtime).
+const HOT_SECS: i64 = 3600;
+/// Kept directories with files written this recently get their folded subtrees checked a
+/// few levels deep on each re-stat (one level otherwise).
+const WARM_SECS: i64 = 7 * 86_400;
+/// At most this many hot / hinted directories are re-read per re-stat pass.
+const MAX_HOT_REREADS: usize = 2000;
+/// Remembered `want:` roots expire after this long without being asked for again.
+const WANT_TTL_MS: i64 = 30 * 86_400_000;
+/// Max hinted paths kept between re-stats (beyond it they fold into parent directories).
+const MAX_HINTS: usize = 50_000;
 
 #[derive(PartialEq, Eq)]
 struct QItem {
@@ -156,17 +172,25 @@ struct St {
     /// Jobs queued / pass roots completed since the last `take_signals` (wakeup accounting).
     pushed: usize,
     finished: bool,
+    /// When the remembered `want:` roots were last loaded (writer).
+    last_wants: Ts,
 }
 
 struct Shared {
     st: Mutex<St>,
     work: Condvar,
     done: Condvar,
-    links: Mutex<HashSet<(u64, u64)>>,
+    /// Hardlinked files: (dev, ino) -> owner directory key (see `sys::read_dir`).
+    links: Mutex<HashMap<(u64, u64), u64>>,
+    /// Paths reported changed (FSEvents, `hint_changed`) since the last re-stat.
+    hints: Mutex<HashSet<Vec<u8>>>,
     db: Option<Mutex<cache::Db>>,
     opts: Options,
     shutdown: AtomicBool,
     paused: AtomicBool,
+    /// On-demand (CLI / MCP) helper threads running now: they share the focus budget with
+    /// background workers doing boosted jobs.
+    helpers: std::sync::atomic::AtomicUsize,
     budget_milli: AtomicU32,
 }
 
@@ -234,7 +258,7 @@ fn row_of(t: &Tree, id: Id) -> cache::Row {
         path: t.path(id),
         total: n.total,
         own: n.own,
-        flags: n.flags & (F_MOUNT | F_PROTECTED | F_DENIED | F_FOLDED | F_DESCEND),
+        flags: n.flags & (F_MOUNT | F_PROTECTED | F_DENIED | F_FOLDED | F_DESCEND | F_LISTED),
         at: n.at,
         dev: n.dev,
         ino: n.ino,
@@ -412,7 +436,10 @@ impl St {
             n.self_size = r.self_size;
             n.self_apparent = r.self_apparent;
             n.big = r.big;
-            n.flags &= !(F_DENIED | F_FOLDED | F_PROTECTED);
+            n.flags &= !(F_DENIED | F_FOLDED | F_PROTECTED | F_LISTED);
+            if job.expand {
+                n.flags |= F_LISTED;
+            }
         }
         let old = std::mem::take(&mut self.tree.m(id).children);
         let mut by_name: HashMap<Box<[u8]>, Id> = HashMap::with_capacity(old.len());
@@ -506,6 +533,16 @@ impl St {
         if pending == 0 {
             self.complete(id, opts);
         }
+    }
+
+    /// A measured dir whose listing lacks its files (folded subdirs, or read without keeping
+    /// top files by name): re-reading just this directory fills them in.
+    fn needs_expand(&self, id: Id) -> bool {
+        let n = self.tree.n(id);
+        n.state == State::Done
+            && n.flags & (F_PROTECTED | F_DENIED) == 0
+            && (!n.has(F_MOUNT) || n.has(F_DESCEND))
+            && (n.has(F_FOLDED) || (!n.has(F_LISTED) && n.own.files > 0))
     }
 
     fn can_fold(&self, c: Id) -> bool {
@@ -705,6 +742,31 @@ impl St {
         }
     }
 
+    /// Subtrees the writer deleted: drop them unless this process measured them since.
+    fn drop_gone(&mut self, gone: Vec<(Vec<u8>, Ts)>) {
+        for (p, at) in gone {
+            let Some(id) = self.tree.find(&p) else { continue };
+            if id == ROOT {
+                continue;
+            }
+            let n = self.tree.n(id);
+            if n.in_flight() || n.at > at || self.tree.subtree(id).iter().any(|&x| self.tree.n(x).in_flight()) {
+                continue;
+            }
+            let parent = n.parent;
+            let mut ignore = Vec::new();
+            self.tree.remove(id, &mut ignore);
+            let mut q = parent;
+            while q != NONE && self.tree.n(q).state == State::Done {
+                self.tree.recompute(q);
+                if self.tree.n(q).has(F_MOUNT) {
+                    break;
+                }
+                q = self.tree.n(q).parent;
+            }
+        }
+    }
+
     fn merge_rows(&mut self, rows: Vec<cache::Row>) {
         for r in rows {
             let id = self.tree.find_or_create(&r.path);
@@ -752,6 +814,7 @@ impl Scanner {
             mounts: sys::mounts(),
             fda: !opts.protect || sys::full_disk_access(&home),
             protect: opts.protect,
+            other_homes: if opts.protect { sys::user_homes(&home) } else { Vec::new() },
             home,
             extra_protected: opts.extra_protected.iter().map(|p| norm(p)).collect(),
             allowed: Vec::new(),
@@ -776,6 +839,7 @@ impl Scanner {
             keep_depth: opts.keep_depth,
             pushed: 0,
             finished: false,
+            last_wants: 0,
         };
         if let Some(db) = &db {
             if let Ok(rows) = db.load_all() {
@@ -788,11 +852,13 @@ impl Scanner {
             st: Mutex::new(st),
             work: Condvar::new(),
             done: Condvar::new(),
-            links: Mutex::new(HashSet::new()),
+            links: Mutex::new(HashMap::new()),
+            hints: Mutex::new(HashSet::new()),
             db: db.map(Mutex::new),
             opts,
             shutdown: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            helpers: std::sync::atomic::AtomicUsize::new(0),
             budget_milli: AtomicU32::new(budget),
         });
         Scanner { h: Arc::new(Handle { sh }) }
@@ -834,7 +900,7 @@ impl Scanner {
         }
         for i in 0..sh.opts.threads.max(1) {
             let s = sh.clone();
-            let _ = thread::Builder::new().name(format!("fat-scan-{i}")).spawn(move || worker(s, true, None));
+            let _ = thread::Builder::new().name(format!("fat-scan-{i}")).spawn(move || worker(s, true, None, 0.0));
         }
         let s = sh.clone();
         let _ = thread::Builder::new().name("fat-scan-sched".into()).spawn(move || coordinator(s));
@@ -842,9 +908,16 @@ impl Scanner {
 
     /// Ensure `root` (and the volume tree it belongs to) is being kept fresh in the background.
     /// `explicit` = the user asked for it (allows remote/protected paths once).
+    /// A path that is not an existing directory is ignored (no phantom node, no remembered root).
     pub fn ensure(&self, root: &str, explicit: bool) {
         let p = norm(root);
         let sh = self.sh();
+        // Only stat what we may touch: a background caller must not probe inside a
+        // protected dir (that alone can raise a privacy prompt).
+        let may_stat = explicit || lock(&sh.st).policy.background_ok(&p);
+        if may_stat && !sys::lstat(&p).is_some_and(|s| s.4) {
+            return;
+        }
         let completed = sh.db.as_ref().and_then(|db| lock(db).meta(&format!("completed:{}", lossy(&p)))).unwrap_or(0);
         {
             let mut st = lock(&sh.st);
@@ -887,10 +960,9 @@ impl Scanner {
             let mut x = st.tree.find(&p);
             match x {
                 Some(id) => {
-                    let n = st.tree.n(id);
-                    if n.state == State::Done && n.has(F_FOLDED) {
+                    if st.needs_expand(id) {
                         st.requeue(id, false, true);
-                    } else if n.in_flight() {
+                    } else if st.tree.n(id).in_flight() {
                         st.tree.m(id).flags |= F_EXPAND;
                     }
                 }
@@ -1028,6 +1100,25 @@ impl Scanner {
 
     /// Blocking one-shot scan for the CLI (`fat fs PATH --wait`), with a deadline.
     pub fn scan_blocking(&self, path: &str, deadline_ms: u64) -> Option<Listing> {
+        self.blocking(path, deadline_ms, false)
+    }
+
+    /// `path`'s listing with its files listed by name: a measured directory whose files were
+    /// not kept (folded subdirs, or read by the background walk) has just that directory
+    /// re-read (its measured subdirectories are reused). Waits up to `deadline_ms`.
+    pub fn expand(&self, path: &str, deadline_ms: u64) -> Option<Listing> {
+        let p = norm(path);
+        let needed = {
+            let st = lock(&self.sh().st);
+            st.tree.find(&p).is_some_and(|id| st.needs_expand(id))
+        };
+        if !needed {
+            return self.list(path);
+        }
+        self.blocking(path, deadline_ms, true)
+    }
+
+    fn blocking(&self, path: &str, deadline_ms: u64, expand_only: bool) -> Option<Listing> {
         let p = norm(path);
         let sh = self.sh().clone();
         let deadline = Instant::now() + Duration::from_millis(deadline_ms);
@@ -1050,7 +1141,15 @@ impl Scanner {
             };
             return Some(Listing { dir: e, children: Vec::new(), progress: ScanProgress::default() });
         }
-        {
+        if expand_only {
+            let mut st = lock(&sh.st);
+            let id = st.tree.find_or_create(&p);
+            if st.needs_expand(id) {
+                st.requeue(id, false, true);
+            }
+            st.blocking.push(p.clone());
+            st.rebuild_queue();
+        } else {
             let mut st = lock(&sh.st);
             st.allow(&p);
             let i = st.add_root(&p, false, 0);
@@ -1070,10 +1169,20 @@ impl Scanner {
         }
         sh.work.notify_all();
         let stop = Arc::new(AtomicBool::new(false));
-        let helpers: Vec<_> = (0..sh.opts.threads.max(1))
+        let n = sh.opts.threads.max(1);
+        // On-demand work is not background work, but it still runs below interactive
+        // priority and within the focus CPU budget (shared with background workers that may
+        // pick up the same boosted jobs).
+        let others = if lock(&sh.st).started { n } else { 0 };
+        let share = sh.opts.focus_budget.max(0.0) as f64 / (n + others) as f64;
+        sh.helpers.fetch_add(n, AO::SeqCst);
+        let helpers: Vec<_> = (0..n)
             .filter_map(|i| {
                 let (s, stop) = (sh.clone(), stop.clone());
-                thread::Builder::new().name(format!("fat-scan-cli-{i}")).spawn(move || worker(s, false, Some(stop))).ok()
+                thread::Builder::new()
+                    .name(format!("fat-scan-cli-{i}"))
+                    .spawn(move || worker(s, false, Some(stop), share))
+                    .ok()
             })
             .collect();
         let mut completed = 0;
@@ -1092,7 +1201,8 @@ impl Scanner {
                 st.blocking.remove(i);
             }
             st.rebuild_queue();
-            if st.tree.find(&p).is_some_and(|id| st.tree.n(id).state == State::Done)
+            if !expand_only
+                && st.tree.find(&p).is_some_and(|id| st.tree.n(id).state == State::Done)
                 && let Some(r) = st.roots.iter_mut().find(|r| r.path == p)
             {
                 r.completed_at = now_ms();
@@ -1104,6 +1214,7 @@ impl Scanner {
         for h in helpers {
             let _ = h.join();
         }
+        sh.helpers.fetch_sub(n, AO::SeqCst);
         flush(&sh);
         if completed > 0
             && let Some(db) = &sh.db
@@ -1136,6 +1247,20 @@ impl Scanner {
             }
         }
         out
+    }
+
+    /// Paths that changed (from a file-event source): the next re-stat re-reads the deepest
+    /// kept directory holding each, even when only a file grew in place.
+    #[allow(dead_code)] // API for the growth tracker / TUI
+    pub fn hint_changed<I: IntoIterator<Item = String>>(&self, paths: I) {
+        add_hints(self.sh(), paths.into_iter().map(String::into_bytes));
+    }
+
+    /// `path` has a complete measurement (its listing may be `partial` only because it is
+    /// being re-read: the numbers shown are then the previous complete ones).
+    pub fn measured(&self, path: &str) -> bool {
+        let st = lock(&self.sh().st);
+        st.tree.find(&norm(path)).is_some_and(|id| st.tree.n(id).at > 0)
     }
 
     /// Kept index nodes (memory diagnostics).
@@ -1230,9 +1355,12 @@ impl Throttle {
     }
 }
 
-fn worker(sh: Arc<Shared>, background: bool, stop: Option<Arc<AtomicBool>>) {
+/// `share`: CPU budget (cores) of this thread when not `background` (0 = unlimited).
+fn worker(sh: Arc<Shared>, background: bool, stop: Option<Arc<AtomicBool>>, share: f64) {
     if background {
         sys::set_background(true);
+    } else {
+        sys::set_utility();
     }
     let mut lowered = background;
     let mut throttle = Throttle::new();
@@ -1272,13 +1400,16 @@ fn worker(sh: Arc<Shared>, background: bool, stop: Option<Arc<AtomicBool>>) {
         }
         if background {
             // Focused work gets a larger budget than the walk behind it, but is still paced.
-            let budget = if job.boosted {
-                sh.opts.focus_budget as f64
+            let threads = sh.opts.threads.max(1);
+            let (budget, n) = if job.boosted {
+                (sh.opts.focus_budget as f64, threads + sh.helpers.load(AO::Relaxed))
             } else {
-                sh.budget_milli.load(AO::Relaxed) as f64 / 1000.0
+                (sh.budget_milli.load(AO::Relaxed) as f64 / 1000.0, threads)
             };
-            let share = budget / sh.opts.threads.max(1) as f64;
+            let share = budget / n as f64;
             throttle.pace(share, budget > 0.0, &sh);
+        } else {
+            throttle.pace(share, share > 0.0, &sh);
         }
     }
 }
@@ -1314,6 +1445,8 @@ fn coordinator(sh: Arc<Shared>) {
     let mut last_flush = Instant::now();
     let mut last_reload = Instant::now();
     let mut last_mounts = Instant::now();
+    let mut changes: Option<Changes> = None;
+    let mut last_drain = Instant::now();
     loop {
         if sh.shutdown.load(AO::Relaxed) {
             break;
@@ -1345,6 +1478,15 @@ fn coordinator(sh: Arc<Shared>) {
             }
         }
         if sh.opts.background && (writer || sh.db.is_none()) {
+            if sh.opts.watch_changes && changes.is_none() {
+                changes = Changes::start(&sh);
+            }
+            if let Some(c) = &changes
+                && last_drain.elapsed() >= Duration::from_secs(5)
+            {
+                last_drain = Instant::now();
+                c.drain(&sh);
+            }
             schedule(&sh);
         } else if let Some(db) = &sh.db
             && last_reload.elapsed() >= sh.opts.reload_interval
@@ -1363,10 +1505,53 @@ fn coordinator(sh: Arc<Shared>) {
     flush(&sh);
 }
 
+fn add_hints(sh: &Shared, paths: impl Iterator<Item = Vec<u8>>) {
+    let mut h = lock(&sh.hints);
+    for p in paths {
+        if h.len() >= MAX_HINTS {
+            // Full: keep the parent directory instead (one re-read covers its files).
+            let mut q = p;
+            if let Some(i) = q.iter().rposition(|&b| b == b'/') {
+                q.truncate(i.max(1));
+            }
+            h.insert(q);
+        } else {
+            h.insert(p);
+        }
+    }
+}
+
+/// macOS: live FSEvents feed of changed paths for the re-stat (writer only).
+#[cfg(target_os = "macos")]
+struct Changes(crate::fs::growth::Journal);
+#[cfg(target_os = "macos")]
+impl Changes {
+    fn start(sh: &Shared) -> Option<Changes> {
+        let mut exclude: Vec<String> = Vec::new();
+        if let Some(p) = sh.opts.cache_path.as_ref().and_then(|p| p.parent()) {
+            exclude.push(p.to_string_lossy().into_owned());
+        }
+        Some(Changes(crate::fs::growth::Journal::start(vec!["/".into()], 0, 20_000, exclude)))
+    }
+    fn drain(&self, sh: &Shared) {
+        let paths = std::mem::take(&mut lock(&self.0.state).paths);
+        add_hints(sh, paths.into_keys().map(String::into_bytes));
+    }
+}
+#[cfg(not(target_os = "macos"))]
+struct Changes;
+#[cfg(not(target_os = "macos"))]
+impl Changes {
+    fn start(_sh: &Shared) -> Option<Changes> {
+        None
+    }
+    fn drain(&self, _sh: &Shared) {}
+}
+
 /// Non-writer: pull what the background scanner (another process) wrote.
 fn reload(sh: &Shared, db: &Mutex<cache::Db>) {
     let since = lock(&sh.st).last_reload;
-    let (rows, updated, completed) = {
+    let (rows, updated, completed, gone) = {
         let db = lock(db);
         let updated = db.meta("updated").unwrap_or(0);
         if updated <= since {
@@ -1375,9 +1560,10 @@ fn reload(sh: &Shared, db: &Mutex<cache::Db>) {
         let roots: Vec<Vec<u8>> = lock(&sh.st).roots.iter().map(|r| r.path.clone()).collect();
         let completed: Vec<(Vec<u8>, Ts)> =
             roots.into_iter().filter_map(|r| db.meta(&format!("completed:{}", lossy(&r))).map(|t| (r, t))).collect();
-        (db.load_since(since).unwrap_or_default(), updated, completed)
+        (db.load_since(since).unwrap_or_default(), updated, completed, db.gone_since(since))
     };
     let mut st = lock(&sh.st);
+    st.drop_gone(gone);
     st.merge_rows(rows);
     st.last_reload = updated;
     for (p, t) in completed {
@@ -1390,20 +1576,13 @@ fn reload(sh: &Shared, db: &Mutex<cache::Db>) {
 /// Writer: keep background roots fresh (full pass when never/long ago completed, quick
 /// re-stat otherwise).
 fn schedule(sh: &Arc<Shared>) {
-    if let Some(db) = &sh.db {
-        let wants = lock(db).wants();
-        if !wants.is_empty() {
-            let mut st = lock(&sh.st);
-            for w in wants {
-                let p = norm(&w);
-                if !st.roots.iter().any(|r| r.path == p) {
-                    let completed = lock(db).meta(&format!("completed:{w}")).unwrap_or(0);
-                    st.add_root(&p, true, completed);
-                }
-            }
-        }
-    }
     let now = now_ms();
+    if let Some(db) = &sh.db
+        && now - lock(&sh.st).last_wants >= 60_000
+    {
+        lock(&sh.st).last_wants = now;
+        load_wants(sh, db, now);
+    }
     let full_ms = sh.opts.full_interval.as_millis() as i64;
     let restat_ms = sh.opts.restat_interval.as_millis() as i64;
     let mut restat: Option<Vec<u8>> = None;
@@ -1416,9 +1595,27 @@ fn schedule(sh: &Arc<Shared>) {
                 continue;
             }
             let path = st.roots[i].path.clone();
+            // A root inside another background root is kept fresh by that one's passes:
+            // no full pass or re-stat of its own (it would redo the same directories).
+            if let Some(outer) = st
+                .roots
+                .iter()
+                .filter(|o| o.background && o.path != path && under(&path, &o.path))
+                .map(|o| o.completed_at)
+                .max()
+            {
+                let done = st.tree.find(&path).is_some_and(|id| st.tree.n(id).state == State::Done);
+                let r = &mut st.roots[i];
+                r.full_running = false;
+                if done && outer > r.completed_at {
+                    r.completed_at = outer;
+                }
+                continue;
+            }
             let id = st.tree.find_or_create(&path);
             let (in_flight, done) = (st.tree.n(id).in_flight(), st.tree.n(id).state == State::Done);
-            if in_flight {
+            // A blocking (CLI / MCP) scan of it is finishing: it records the completion.
+            if in_flight || st.blocking.iter().any(|b| under(&path, b)) {
                 continue;
             }
             if st.roots[i].full_running {
@@ -1447,7 +1644,8 @@ fn schedule(sh: &Arc<Shared>) {
                     // Never completed (e.g. fat was quit mid-scan): resume from the cached
                     // finished subtrees instead of starting over; a stale tree is redone.
                     let resume = r_completed == 0;
-                    st.requeue(id, !resume, false);
+                    let listed = st.tree.n(id).has(F_LISTED);
+                    st.requeue(id, !resume, listed);
                 } else {
                     st.roots[i].full_running = false;
                     st.roots[i].completed_at = now;
@@ -1473,38 +1671,178 @@ fn schedule(sh: &Arc<Shared>) {
     }
 }
 
-/// Re-stat every kept directory under `root`; re-read the ones whose entries changed.
-fn restat_pass(sh: &Arc<Shared>, root: &[u8]) {
-    let items: Vec<(Id, u32, Vec<u8>, u64, i64, i64)> = {
-        let st = lock(&sh.st);
-        let Some(rid) = st.tree.find(root) else { return };
-        st.tree
-            .subtree(rid)
-            .into_iter()
-            .filter(|&x| {
-                let n = st.tree.n(x);
-                n.state == State::Done
-                    && n.at > 0
-                    && n.flags & (F_PROTECTED | F_DENIED) == 0
-                    && (!n.has(F_MOUNT) || n.has(F_DESCEND))
-            })
-            .map(|x| {
-                let n = st.tree.n(x);
-                (x, n.stamp, st.tree.path(x), n.ino, n.mtime, n.ctime)
-            })
-            .collect()
+/// Writer: turn remembered `want:` roots into background roots. Drops wants that expired,
+/// no longer exist, or are already covered by an enclosing remembered root; never stats a
+/// want this process may not touch in the background (protected / network / removable).
+fn load_wants(sh: &Shared, db: &Mutex<cache::Db>, now: Ts) {
+    let wants = lock(db).wants();
+    if wants.is_empty() {
+        return;
+    }
+    let policy = lock(&sh.st).policy.clone();
+    let paths: Vec<Vec<u8>> = wants.iter().map(|(w, _)| norm(w)).collect();
+    let mut drop_keys = Vec::new();
+    let mut add = Vec::new();
+    for ((w, at), p) in wants.iter().zip(&paths) {
+        let nested = paths.iter().any(|o| o != p && under(p, o));
+        if now - at > WANT_TTL_MS || nested {
+            drop_keys.push(w.clone());
+            continue;
+        }
+        if !policy.background_ok(p) {
+            continue; // kept for a process that is asked for it again; not walked here
+        }
+        if !sys::lstat(p).is_some_and(|s| s.4) {
+            drop_keys.push(w.clone());
+            continue;
+        }
+        add.push((p.clone(), w.clone()));
+    }
+    {
+        let db = lock(db);
+        for w in &drop_keys {
+            let _ = db.del_meta(&format!("want:{w}"));
+        }
+    }
+    let completed: Vec<(Vec<u8>, Ts)> = {
+        let db = lock(db);
+        add.into_iter().map(|(p, w)| (p, db.meta(&format!("completed:{w}")).unwrap_or(0))).collect()
     };
-    let mut changed: Vec<(Id, u32)> = Vec::new();
+    let mut st = lock(&sh.st);
+    for (p, c) in completed {
+        if !st.roots.iter().any(|r| r.path == p) {
+            st.add_root(&p, true, c);
+        }
+    }
+}
+
+/// One kept directory to re-stat.
+struct Restat {
+    id: Id,
+    stamp: u32,
+    path: Vec<u8>,
+    ino: u64,
+    mtime: i64,
+    ctime: i64,
+    at: Ts,
+    folded: bool,
+    /// Something below was written in the last week.
+    warm: bool,
+    /// Names of kept child nodes (re-stat'ed on their own).
+    kept: HashSet<Box<[u8]>>,
+    big: Vec<(Box<[u8]>, u64, i64)>,
+}
+
+/// Re-stat every kept directory under `root`; re-read the ones whose entries changed, whose
+/// named big files changed, that have a folded subdirectory modified since they were
+/// measured, that hold recently written files (in-place growth leaves the dir's mtime alone),
+/// or that FSEvents / `hint_changed` reported. Never enters protected dirs or unscanned
+/// mounts unless this process was explicitly asked for them.
+fn restat_pass(sh: &Arc<Shared>, root: &[u8]) {
+    let now = now_ms();
+    let hints: Vec<Vec<u8>> = lock(&sh.hints).drain().collect();
+    let policy = lock(&sh.st).policy.clone();
+    let (items, mut changed) = {
+        let st = lock(&sh.st);
+        let Some(rid) = st.tree.find(root).filter(|_| policy.background_ok(root)) else {
+            drop(st);
+            finish_restat(sh, root);
+            return;
+        };
+        let mut items: Vec<Restat> = Vec::new();
+        let mut hot: Vec<(i64, Id, u32)> = Vec::new();
+        let mut stack = vec![rid];
+        while let Some(x) = stack.pop() {
+            let n = st.tree.n(x);
+            let path = st.tree.path(x);
+            if x != rid && policy.blocks(&path) {
+                continue;
+            }
+            let readable = n.flags & (F_PROTECTED | F_DENIED) == 0 && (!n.has(F_MOUNT) || n.has(F_DESCEND));
+            if !readable {
+                continue;
+            }
+            if n.state == State::Done && n.at > 0 {
+                if n.own.newest >= now / 1000 - HOT_SECS {
+                    hot.push((n.own.newest, x, n.stamp));
+                }
+                items.push(Restat {
+                    id: x,
+                    stamp: n.stamp,
+                    ino: n.ino,
+                    mtime: n.mtime,
+                    ctime: n.ctime,
+                    at: n.at,
+                    folded: n.has(F_FOLDED),
+                    warm: n.own.newest >= now / 1000 - WARM_SECS,
+                    kept: if n.has(F_FOLDED) { n.children.iter().map(|&c| st.tree.n(c).name.clone()).collect() } else { HashSet::new() },
+                    big: n.big.iter().map(|f| (f.name.clone(), f.size, f.mtime)).collect(),
+                    path,
+                });
+            }
+            stack.extend(n.children.iter().copied());
+        }
+        hot.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut changed: Vec<(Id, u32)> = hot.into_iter().take(MAX_HOT_REREADS).map(|(_, x, s)| (x, s)).collect();
+        // Hinted paths: re-read the deepest kept directory holding each one.
+        let mut hinted = 0;
+        for h in hints {
+            if hinted >= MAX_HOT_REREADS || !under(&h, root) {
+                continue;
+            }
+            let mut q = h;
+            let id = loop {
+                match q.iter().rposition(|&b| b == b'/') {
+                    Some(0) => q.truncate(1),
+                    Some(i) => q.truncate(i),
+                    None => break None,
+                }
+                if let Some(id) = st.tree.find(&q) {
+                    break Some(id);
+                }
+                if q == b"/" {
+                    break None;
+                }
+            };
+            if let Some(id) = id
+                && under(&q, root)
+                && st.tree.n(id).state == State::Done
+                && policy.background_ok(&q)
+            {
+                changed.push((id, st.tree.n(id).stamp));
+                hinted += 1;
+            }
+        }
+        (items, changed)
+    };
     let mut throttle = Throttle::new();
-    for (i, (id, stamp, path, ino, mtime, ctime)) in items.iter().enumerate() {
+    let mut work = 0usize;
+    for it in &items {
         if sh.shutdown.load(AO::Relaxed) {
             return;
         }
-        match sys::lstat(path) {
-            Some((_, i2, m2, c2, true)) if i2 == *ino && m2 == *mtime && c2 == *ctime => {}
-            _ => changed.push((*id, *stamp)),
+        work += 1;
+        let same = matches!(sys::lstat(&it.path), Some((_, i2, m2, c2, true)) if i2 == it.ino && m2 == it.mtime && c2 == it.ctime);
+        let big_same = || {
+            it.big.iter().all(|(name, size, mtime)| {
+                sys::lstat_file(&sys::join(&it.path, name)).is_some_and(|(s, m)| s == *size && m == *mtime)
+            })
+        };
+        // Folded subdirs have no node of their own: look for one modified since this dir was
+        // measured (a few levels deep for dirs written to this week, one level otherwise).
+        let folded_same = || {
+            let skip = |p: &[u8], level: usize| {
+                (level == 0 && p.rsplit(|&b| b == b'/').next().is_some_and(|n| it.kept.contains(n))) || policy.blocks(p)
+            };
+            !it.folded
+                || !sys::subdir_changed_after(&it.path, it.at.saturating_mul(1_000_000), if it.warm { 4 } else { 1 }, 256, &skip)
+        };
+        if !same || !big_same() || !folded_same() {
+            changed.push((it.id, it.stamp));
         }
-        if i % 64 == 63 {
+        work += it.big.len() + it.folded as usize * 4;
+        if work >= 64 {
+            work = 0;
             let budget = sh.budget_milli.load(AO::Relaxed) as f64 / 1000.0;
             throttle.pace(budget, budget > 0.0, sh);
         }
@@ -1517,15 +1855,21 @@ fn restat_pass(sh: &Arc<Shared>, root: &[u8]) {
         // A vanished dir: re-read its parent instead.
         let target = if sys::lstat(&st.tree.path(id)).is_some_and(|s| s.4) { id } else { st.tree.n(id).parent };
         if target != NONE && st.tree.n(target).state == State::Done {
-            st.requeue(target, false, false);
+            // A dir whose files were listed stays listed (and unfolded) across the refresh.
+            let listed = st.tree.n(target).has(F_LISTED);
+            st.requeue(target, false, listed);
         }
     }
+    drop(st);
+    finish_restat(sh, root);
+}
+
+fn finish_restat(sh: &Shared, root: &[u8]) {
     let now = now_ms();
-    if let Some(r) = st.roots.iter_mut().find(|r| r.path == root) {
+    if let Some(r) = lock(&sh.st).roots.iter_mut().find(|r| r.path == root) {
         r.restat_running = false;
         r.last_restat = now;
     }
-    drop(st);
     sh.work.notify_all();
 }
 

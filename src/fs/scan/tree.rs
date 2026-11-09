@@ -23,6 +23,7 @@ pub const F_DIRTY: u16 = 64; // changed since the last cache flush
 pub const F_PERSISTED: u16 = 128; // has a row in the cache
 pub const F_DESCEND: u16 = 256; // mount that is scanned as its own tree
 pub const F_COUNTED: u16 = 512; // counted in the parent's `pending`
+pub const F_LISTED: u16 = 1024; // last read kept its top files by name (an expanded read)
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Agg {

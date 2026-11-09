@@ -112,14 +112,18 @@ const TCC_PROTECTED: &[&str] = &[
 pub fn protected_root(path: &str, home: &str) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
+        // The same rules guard every user's home, not only $HOME (fat may run as root).
+        let owner = owner_home(path);
+        let homes = [home, owner.as_deref().unwrap_or("")];
+        let mut roots: Vec<String> = Vec::new();
         for p in TCC_PROTECTED {
-            let root = if p.starts_with('/') {
-                (*p).to_string()
-            } else if home.is_empty() {
-                continue;
+            if p.starts_with('/') {
+                roots.push((*p).to_string());
             } else {
-                format!("{home}/{p}")
-            };
+                roots.extend(homes.iter().filter(|h| !h.is_empty()).map(|h| format!("{h}/{p}")));
+            }
+        }
+        for root in roots {
             if super::under_prefix(path, &root) {
                 // /Volumes/X: the protected unit is the volume.
                 if root == "/Volumes" {
@@ -140,6 +144,19 @@ pub fn protected_root(path: &str, home: &str) -> Option<String> {
         let _ = (path, home);
         None
     }
+}
+
+/// The home directory `path` is in, judged from the path alone (/Users/<name>, /var/root).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn owner_home(path: &str) -> Option<String> {
+    for base in ["/private/var/root", "/var/root"] {
+        if super::under_prefix(path, base) {
+            return Some(base.to_string());
+        }
+    }
+    let rest = path.strip_prefix("/Users/")?;
+    let name = rest.split('/').next().filter(|n| !n.is_empty() && *n != "Shared")?;
+    Some(format!("/Users/{name}"))
 }
 
 /// Full Disk Access granted to this process (macOS). Opening the per-user TCC database
@@ -193,6 +210,11 @@ mod tests {
             );
             assert_eq!(protected_root("/Volumes", h), None);
             assert_eq!(protected_root("/Users/z/Library/Caches/x", h), None);
+            // Another user's home (fat running as root, $HOME=/var/root).
+            assert_eq!(
+                protected_root("/Users/other/Desktop/x", "/var/root").as_deref(),
+                Some("/Users/other/Desktop")
+            );
         } else {
             assert_eq!(protected_root("/home/z/Documents/a", "/home/z"), None);
         }

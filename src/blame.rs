@@ -366,10 +366,17 @@ fn rule_volume_full(watched: &[&Volume], fs: &FsFacts, out: &mut Vec<Finding>) {
         if !top.is_empty() {
             detail.push_str(&format!(" Growing lately: {}.", top.iter().map(|x| grower_text(x)).collect::<Vec<_>>().join(", ")));
         }
-        detail.push_str(&format!(" See what uses it: the Fs tab, or `fat fs {}`; `fat fs --growth` for recent growth.", v.mount));
+        detail.push_str(&format!(" See what uses it: the Fs tab, or `fat fs {}`; `fat fs --growth` for recent growth.", fs_browse_root(&v.mount)));
         let pids = top.iter().flat_map(|x| x.writers.iter().map(|w| w.0)).collect();
         out.push(finding(sev, format!("Disk {} is {:.0}% full ({} left)", v.mount, r * 100.0, human_bytes(v.avail)), detail, pids, None));
     }
+}
+
+/// Where `fat fs` shows a volume's usage. On macOS the Data volume's contents are reached
+/// through "/" (firmlinks: /Users, /Applications, /private ...); listing
+/// /System/Volumes/Data itself shows almost nothing.
+fn fs_browse_root(mount: &str) -> &str {
+    if cfg!(target_os = "macos") && mount == "/System/Volumes/Data" { "/" } else { mount }
 }
 
 fn rule_volume_filling(watched: &[&Volume], fs: &FsFacts, out: &mut Vec<Finding>) {
@@ -3567,7 +3574,9 @@ mod tests {
         assert_eq!(titles, vec!["Disk /Volumes/T7 is 98% full (10.0G left)", "Disk /System/Volumes/Data is 95% full (50.0G left)"], "{f:#?}");
         assert_eq!(f[0].severity, "crit");
         assert_eq!(f[1].severity, "warn");
-        assert!(f[1].detail.contains("purgeable") && f[1].detail.contains("fat fs /System/Volumes/Data"));
+        let browse = if cfg!(target_os = "macos") { "`fat fs /`" } else { "`fat fs /System/Volumes/Data`" };
+        assert!(f[1].detail.contains("purgeable") && f[1].detail.contains(browse), "{}", f[1].detail);
+        assert!(f[0].detail.contains("`fat fs /Volumes/T7`"));
         // below 90%: nothing
         assert!(diagnose_fs(&FsFacts { volumes: vec![vol("/", 100 * GB, 20 * GB)], ..Default::default() }).is_empty());
     }

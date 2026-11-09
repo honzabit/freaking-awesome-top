@@ -235,9 +235,10 @@ fn spawn_sampler(cfg: Config, tx: Sender<Msg>, fs: Arc<FsShared>) {
                         if !vols.is_empty() {
                             let _ = guarded(|| h.record_volumes(now, &vols));
                         }
-                    } else if h.is_writer() && last_prune.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
-                        last_prune = Some(Instant::now());
-                        let _ = guarded(|| h.prune(keep_days));
+                        if last_prune.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
+                            last_prune = Some(Instant::now());
+                            let _ = guarded(|| h.prune(keep_days));
+                        }
                     }
                 }
             }
@@ -411,9 +412,17 @@ fn spawn_fleet(cfg: Config, tx: Sender<Msg>) {
 }
 
 /// Volumes every `interval_ms`, deleted-but-open files every 60s. A panic in either disables it.
-fn spawn_volumes(interval_ms: u64, tx: Sender<Msg>, shared: Arc<FsShared>) {
+fn spawn_volumes(interval_ms: u64, history_path: Option<String>, tx: Sender<Msg>, shared: Arc<FsShared>) {
     let _ = thread::Builder::new().name("fat-volumes".into()).spawn(move || {
         let mut vols = guarded(crate::fs::volumes::Volumes::new).ok();
+        // Fill rates from the first sample on, instead of extrapolating a few seconds.
+        if let Some(v) = vols.as_mut() {
+            let _ = guarded(|| {
+                if let Ok(h) = History::open(history_path.as_deref()) {
+                    h.seed_volumes(v, now_ms());
+                }
+            });
+        }
         let mut deleted_ok = true;
         let mut last_deleted = i64::MIN / 2;
         loop {
@@ -831,7 +840,7 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
     let fs_shared = Arc::new(FsShared::default());
     spawn_sampler(cfg.clone(), tx.clone(), fs_shared.clone());
     spawn_fleet(cfg.clone(), tx.clone());
-    spawn_volumes(cfg.interval_ms, tx.clone(), fs_shared.clone());
+    spawn_volumes(cfg.interval_ms, cfg.history_path.clone(), tx.clone(), fs_shared.clone());
 
     let mut app = App::new(cfg.interval_ms);
     app.config_path = config_path;

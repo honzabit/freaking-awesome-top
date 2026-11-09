@@ -24,8 +24,10 @@ use std::time::{Duration, Instant};
 
 /// Window used for the fill-rate regression.
 pub const FILL_WINDOW_MS: i64 = 10 * 60_000;
-/// Minimum time span of samples before a fill rate is reported.
-const FILL_MIN_SPAN_MS: i64 = 1_000;
+/// Minimum time span of samples before a fill rate is reported. APFS `used` moves by MBs to
+/// GBs from one second to the next (swap, purgeable space), so a shorter span is noise, not a
+/// rate. One-shot callers seed the window from recorder history instead.
+const FILL_MIN_SPAN_MS: i64 = 60_000;
 /// Purgeable is comparatively slow to compute (CoreFoundation asks the APFS driver).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const PURGEABLE_EVERY: Duration = Duration::from_secs(60);
@@ -323,7 +325,7 @@ impl Volumes {
 // ---- pure helpers (all platforms, unit-tested) ------------------------------------------------
 
 /// Least-squares slope of used bytes over time, bytes/sec. None with < 2 points or a span
-/// shorter than a second.
+/// shorter than a minute.
 pub fn fill_rate(pts: &[(Ts, u64)]) -> Option<f64> {
     if pts.len() < 2 {
         return None;
@@ -1322,12 +1324,13 @@ garbage line without separator
         assert_eq!(fill_rate(&[]), None);
         assert_eq!(fill_rate(&[(0, 100)]), None);
         assert_eq!(fill_rate(&[(0, 100), (500, 200)]), None, "span too short");
+        assert_eq!(fill_rate(&[(0, 100), (1300, 9_000_000)]), None, "1.3 s is noise, not a 10m rate");
         // 1 MB/s exactly.
-        let pts: Vec<(Ts, u64)> = (0..10).map(|i| (i * 2000, 1_000_000_000 + i as u64 * 2_000_000)).collect();
+        let pts: Vec<(Ts, u64)> = (0..10).map(|i| (i * 20_000, 1_000_000_000 + i as u64 * 20_000_000)).collect();
         let r = fill_rate(&pts).unwrap();
         assert!((r - 1_000_000.0).abs() < 1e-3, "{r}");
         // Shrinking.
-        let pts: Vec<(Ts, u64)> = (0..5).map(|i| (i * 1000, 5000 - i as u64 * 100)).collect();
+        let pts: Vec<(Ts, u64)> = (0..5).map(|i| (i * 20_000, 50_000 - i as u64 * 2000)).collect();
         assert!((fill_rate(&pts).unwrap() + 100.0).abs() < 1e-9);
         // Noise around a trend still gives the trend.
         let pts: Vec<(Ts, u64)> =
@@ -1520,7 +1523,11 @@ garbage line without separator
         std::thread::sleep(Duration::from_millis(1100));
         let b = v.sample();
         let p = b.iter().find(|x| x.primary).unwrap();
-        assert!(p.fill_bps.is_some(), "{p:?}");
+        assert!(p.fill_bps.is_none(), "one second is too short for a fill rate: {p:?}");
+        // Seeded from (recorded) history spanning minutes: a rate.
+        v.seed(&p.mount, &[(now_ms() - 120_000, p.used), (now_ms() - 60_000, p.used)]);
+        let c = v.sample();
+        assert!(c.iter().find(|x| x.primary).unwrap().fill_bps.is_some());
         let all = Volumes::with_all(true).sample();
         assert!(all.len() >= b.len());
     }

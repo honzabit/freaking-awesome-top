@@ -87,14 +87,17 @@ pub fn under(path: &[u8], prefix: &[u8]) -> bool {
 
 /// Read one directory: aggregate its files, list its subdirectories (classified by `policy`).
 /// `keep_files`: how many of the largest files to keep by name (besides those >= `big_file`).
-/// `links` dedupes hardlinked files (nlink > 1) across the whole pass.
+/// `links` dedupes hardlinked files (nlink > 1): (dev, ino) -> the directory that counts it
+/// ([`owner_key`] of its path). Re-reading that same directory counts the file again; any
+/// other directory holding a link to it skips it.
 pub fn read_dir(
     path: &[u8],
     big_file: u64,
     keep_files: usize,
     policy: &Policy,
-    links: &Mutex<HashSet<(u64, u64)>>,
+    links: &Mutex<HashMap<(u64, u64), u64>>,
 ) -> Result<DirRead, i32> {
+    let owner = owner_key(path);
     let c = CString::new(path).map_err(|_| libc::EINVAL)?;
     // SAFETY: plain syscalls on a NUL-terminated path / fds we own; every exit closes them.
     unsafe {
@@ -124,6 +127,7 @@ pub fn read_dir(
             ..Default::default()
         };
         let mut kept: Vec<BigFile> = Vec::new();
+        let mut here: HashSet<(u64, u64)> = HashSet::new();
         loop {
             let ent = libc::readdir(dir);
             if ent.is_null() {
@@ -162,8 +166,9 @@ pub fn read_dir(
             }
             if s.st_nlink as u64 > 1 && (s.st_mode & libc::S_IFMT) == libc::S_IFREG {
                 let key = (s.st_dev as u64, s.st_ino as u64);
-                let fresh = links.lock().map(|mut l| l.insert(key)).unwrap_or(true);
-                if !fresh {
+                let mine = links.lock().map(|mut l| *l.entry(key).or_insert(owner) == owner).unwrap_or(true);
+                // Two links in this same directory: once.
+                if !mine || !here.insert(key) {
                     continue;
                 }
             }
@@ -183,6 +188,75 @@ pub fn read_dir(
         out.big = kept;
         Ok(out)
     }
+}
+
+/// Stable 64-bit key (FNV-1a) of a directory path: the owner of a hardlink in `links`.
+pub fn owner_key(path: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in path {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// lstat a file: (allocated bytes, mtime seconds). None when missing.
+pub fn lstat_file(path: &[u8]) -> Option<(u64, i64)> {
+    let c = CString::new(path).ok()?;
+    // SAFETY: lstat into a zeroed stat buffer.
+    unsafe {
+        let mut s: libc::stat = std::mem::zeroed();
+        if libc::lstat(c.as_ptr(), &mut s) != 0 {
+            return None;
+        }
+        Some(((s.st_blocks as u64).saturating_mul(512), s.st_mtime as i64))
+    }
+}
+
+/// A directory below `path` (at most `depth` levels down, at most `max_dirs` looked at) has an
+/// mtime or ctime after `after_ns`. Only directory entries are stat'ed (d_type); symlinks and
+/// other filesystems are not followed, and `skip(path, level)` dirs (kept nodes, protected
+/// dirs) are neither stat'ed nor entered.
+pub fn subdir_changed_after(
+    path: &[u8],
+    after_ns: i64,
+    depth: usize,
+    max_dirs: usize,
+    skip: &dyn Fn(&[u8], usize) -> bool,
+) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Some((dev, ..)) = lstat(path) else { return false };
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(std::ffi::OsStr::from_bytes(path).into(), 0)];
+    let mut seen = 0usize;
+    while let Some((dir, d)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let p = e.path();
+            let pb = p.as_os_str().as_bytes();
+            if skip(pb, d) {
+                continue;
+            }
+            seen += 1;
+            match lstat(pb) {
+                Some((dv, _, m, c, true)) if dv == dev => {
+                    if m > after_ns || c > after_ns {
+                        return true;
+                    }
+                }
+                _ => continue,
+            }
+            if seen >= max_dirs {
+                return false;
+            }
+            if d + 1 < depth {
+                stack.push((p, d + 1));
+            }
+        }
+    }
+    false
 }
 
 /// Keep files >= `big_file` (at most 64) plus the `keep` largest overall; largest first.
@@ -402,6 +476,9 @@ pub struct Policy {
     /// Apply macOS TCC rules (on by default on macOS).
     pub protect: bool,
     pub home: Vec<u8>,
+    /// Other users' home directories (macOS /Users/*): the same TCC rules apply there, e.g.
+    /// when fat runs as root.
+    pub other_homes: Vec<Vec<u8>>,
     /// Extra protected paths (tests).
     pub extra_protected: Vec<Vec<u8>>,
     /// Explicitly requested subtrees: protected and non-pseudo mounts may be read there.
@@ -423,12 +500,17 @@ impl Policy {
         if self.extra_protected.iter().any(|p| p.as_slice() == path) {
             return Some(PROTECTED_HINT);
         }
-        if !self.protect || self.fda || self.home.is_empty() {
+        if !self.protect || self.fda {
             return None;
         }
-        let mut pre = self.home.clone();
-        pre.push(b'/');
-        let rel = path.strip_prefix(pre.as_slice())?;
+        std::iter::once(&self.home).chain(self.other_homes.iter()).filter(|h| !h.is_empty()).find_map(|h| {
+            let mut pre = h.clone();
+            pre.push(b'/');
+            Self::protected_rel(path.strip_prefix(pre.as_slice())?)
+        })
+    }
+
+    fn protected_rel(rel: &[u8]) -> Option<&'static str> {
         if TCC_HOME.iter().any(|p| p.as_bytes() == rel) {
             return Some(PROTECTED_HINT);
         }
@@ -475,10 +557,55 @@ impl Policy {
         Kind::Normal
     }
 
-    /// Classify a path used directly as a scan root (no parent read).
+    /// `path` itself may not be entered by a background walk: protected, or a mount point
+    /// that is not scanned on its own (network, removable, pseudo), unless explicitly asked for.
+    pub fn blocks(&self, path: &[u8]) -> bool {
+        if path == b"/" {
+            return false;
+        }
+        if self.firmlink_skip.contains(path) {
+            return true;
+        }
+        if let Some(m) = self.mounts.get(path)
+            && (m.pseudo() || !(self.auto_descend(path, m) || self.allowed(path)))
+        {
+            return true;
+        }
+        !self.allowed(path) && self.protected(path).is_some()
+    }
+
+    /// The first proper ancestor of `path` (below "/") that [`Self::blocks`], if any.
+    fn blocking_ancestor<'a>(&self, path: &'a [u8]) -> Option<&'a [u8]> {
+        let mut i = 1;
+        while let Some(off) = path[i..].iter().position(|&b| b == b'/') {
+            let q = &path[..i + off];
+            if self.blocks(q) {
+                return Some(q);
+            }
+            i += off + 1;
+        }
+        None
+    }
+
+    /// A background job (restat, a remembered root) may read `path`: neither it nor any
+    /// ancestor is protected or an unscanned mount, unless this process was asked for it.
+    pub fn background_ok(&self, path: &[u8]) -> bool {
+        !self.blocks(path) && self.blocking_ancestor(path).is_none()
+    }
+
+    /// Classify a path used directly as a scan root (no parent read). A path *below* a
+    /// protected dir or an unscanned mount inherits its kind.
     pub fn root_kind(&self, path: &[u8]) -> Kind {
         if path == b"/" {
             return Kind::Normal;
+        }
+        if let Some(q) = self.blocking_ancestor(path) {
+            let pseudo = self.mounts.get(q).is_some_and(|m| m.pseudo());
+            return if self.mounts.contains_key(q) || self.firmlink_skip.contains(q) || pseudo {
+                Kind::Mount { descend: false }
+            } else {
+                Kind::Protected
+            };
         }
         if let Some(m) = self.mounts.get(path) {
             let descend = !m.pseudo() && (self.auto_descend(path, m) || self.allowed(path));
@@ -488,6 +615,40 @@ impl Policy {
             return Kind::Protected;
         }
         Kind::Normal
+    }
+}
+
+/// macOS: home directories of other local users (/Users/*, /var/root), for the TCC rules.
+pub fn user_homes(home: &[u8]) -> Vec<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let mut out: Vec<Vec<u8>> = std::fs::read_dir("/Users")
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.path().as_os_str().as_bytes().to_vec())
+                .filter(|p| !p.ends_with(b"/Shared"))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.push(b"/var/root".to_vec());
+    out.push(b"/private/var/root".to_vec());
+    out.retain(|p| p.as_slice() != home);
+    out.sort();
+    out
+}
+
+/// Lower the calling thread for an on-demand (CLI / MCP) scan: utility QoS on macOS (below
+/// interactive work, I/O moderately throttled), nice 10 + best-effort/7 I/O on Linux.
+pub fn set_utility() {
+    set_background(false);
+    #[cfg(target_os = "linux")]
+    // SAFETY: setpriority on our own thread id.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::c_int;
+        libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, 10);
     }
 }
 

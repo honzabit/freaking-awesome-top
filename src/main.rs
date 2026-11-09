@@ -176,7 +176,7 @@ fn ago_ms(s: &str) -> Result<i64> {
 
 #[derive(clap::Args, Debug, PartialEq)]
 struct FsArgs {
-    /// Directory to inspect (absolute or relative). Default "/".
+    /// Directory to inspect (absolute or relative). Default "/". With --growth: only growth below it.
     path: Option<String>,
     /// Levels of subdirectories to print.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=6))]
@@ -257,7 +257,7 @@ fn fmt_listing(l: &fs::Listing, depth: u8, top: usize, now: model::Ts, list: &mu
     let mut notes = Vec::new();
     fmt_children(&mut out, l, depth, top, 0, now, list, &mut notes);
     if l.children.iter().any(|c| c.denied > 0) || l.dir.denied > 0 {
-        let _ = writeln!(out, "🔒 = could not be read (permissions / macOS privacy): not counted. Grant your terminal Full Disk Access, or pass the dir itself.");
+        let _ = writeln!(out, "{}", locked_legend());
     }
     for (name, k) in notes {
         let _ = writeln!(out, "  💡 {name}: {k}");
@@ -322,6 +322,31 @@ fn fmt_children(
     if l.children.len() > top {
         let rest = &l.children[top..];
         let _ = writeln!(out, "{:>8} {:>4}  {:<12} {:>7} {:>8}  {indent}… {} more", hb(rest.iter().map(|c| c.size).sum()), "", "", "", "", rest.len());
+    }
+    let (files, bytes) = mcp::unlisted(l);
+    if !l.dir.partial && files > 0 && bytes > 0 {
+        // Loose files the index does not keep by name: so the rows add up to the directory.
+        let ratio = bytes as f64 / parent as f64;
+        let _ = writeln!(
+            out,
+            "{:>8} {:>3.0}%  {:<12} {:>7} {:>8}  {indent}({} other file{} not listed by name)",
+            hb(bytes),
+            ratio * 100.0,
+            tui::widgets::bar(ratio, 12),
+            files,
+            "",
+            files,
+            if files == 1 { "" } else { "s" },
+        );
+    }
+}
+
+/// What 🔒 means, and what to do about it, on this OS.
+fn locked_legend() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "🔒 = not read (macOS privacy or permissions): not counted. Pass the dir itself (`fat fs DIR`) to read it, or grant your terminal Full Disk Access."
+    } else {
+        "🔒 = could not be read (permission denied): not counted. Run fat as the directory's owner, or as root."
     }
 }
 
@@ -435,10 +460,16 @@ fn fmt_volumes(vols: &[fs::Volume]) -> String {
 }
 
 /// Storage facts for `fat doctor` (one volume sample; deleted-but-open files). Empty on failure.
-fn fs_facts() -> blame::FsFacts {
+fn fs_facts(h: Option<&history::History>) -> blame::FsFacts {
     let guard = |f: &mut dyn FnMut()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_ok();
     let mut facts = blame::FsFacts::default();
-    guard(&mut || facts.volumes = fs::volumes::Volumes::new().sample());
+    guard(&mut || {
+        let mut v = fs::volumes::Volumes::new();
+        if let Some(h) = h {
+            h.seed_volumes(&mut v, model::now_ms());
+        }
+        facts.volumes = v.sample();
+    });
     guard(&mut || facts.deleted_open = fs::volumes::deleted_open());
     facts
 }
@@ -447,6 +478,11 @@ fn run_fs(a: FsArgs, cfg: &config::Config) -> Result<()> {
     let now = model::now_ms();
     if a.volumes {
         let mut v = fs::volumes::Volumes::new();
+        // FILL/10m and the ETA come from recorded volume use (`fat record` or a TUI); two
+        // samples a second apart are too close for a rate.
+        if let Ok(h) = history::History::open(cfg.history_path.as_deref()) {
+            h.seed_volumes(&mut v, now);
+        }
         let _ = v.sample();
         // The disk I/O poller needs two readings (~0.9 s apart) for a rate.
         std::thread::sleep(std::time::Duration::from_millis(1300));
@@ -462,7 +498,14 @@ fn run_fs(a: FsArgs, cfg: &config::Config) -> Result<()> {
         if window_ms <= 0 {
             anyhow::bail!("--since must be positive");
         }
-        let under = a.under.as_deref().map(|u| abs_path(Some(u)));
+        // `fat fs PATH --growth` means growth under PATH (same as --under PATH).
+        let under = match (a.under.as_deref(), a.path.as_deref()) {
+            (Some(u), Some(p)) if abs_path(Some(u)) != abs_path(Some(p)) => {
+                anyhow::bail!("give the directory once: either PATH or --under (got {p} and {u})")
+            }
+            (Some(u), _) | (None, Some(u)) => Some(abs_path(Some(u))),
+            (None, None) => None,
+        };
         let mut t = fs::growth::Tracker::new();
         // Collector samples give per-process write rates for attribution.
         // Three samples ~0.8 s apart, so a bursty writer is caught writing at least once.
@@ -483,6 +526,9 @@ fn run_fs(a: FsArgs, cfg: &config::Config) -> Result<()> {
     }
     let path = abs_path(a.path.as_deref());
     let wait_ms = a.wait.as_deref().map(budget::parse_duration).transpose()?.map(|s| s * 1000);
+    if let Some(p) = mcp::path_problem(&path) {
+        anyhow::bail!("{p}");
+    }
     let sc = fs::scan::Scanner::new();
     // Typing a path is explicit intent: protected or mounted dirs may be read.
     sc.ensure(&path, true);
@@ -508,8 +554,11 @@ fn run_fs(a: FsArgs, cfg: &config::Config) -> Result<()> {
         None => mcp::list_expanded(&sc, &path, 10_000).or_else(|| sc.scan_blocking(&path, 10_000)),
     };
     let Some(l) = l else {
-        anyhow::bail!("nothing measured under {path} yet — is it readable? (try --wait 2m)");
+        anyhow::bail!("nothing measured under {path} yet: the scan is still running (try --wait 2m)");
     };
+    if l.dir.denied > 0 && l.dir.files == 0 && l.children.is_empty() {
+        anyhow::bail!("{path}: could not be read ({})", mcp::unreadable_hint());
+    }
     let mut lookup = |p: &str| mcp::list_expanded(&sc, p, 3000);
     if a.json {
         let mut v = mcp::listing_json(&l, a.depth as usize, a.top.max(1), &mut lookup);
@@ -615,7 +664,7 @@ fn main() -> Result<()> {
                 s.containers = fleet::containers();
             }
             let h = history::History::open(cfg.history_path.as_deref()).ok();
-            let f = blame::diagnose_with_fs(&s, h.as_ref(), &fs_facts());
+            let f = blame::diagnose_with_fs(&s, h.as_ref(), &fs_facts(h.as_ref()));
             if json {
                 print_json(&f)?;
             } else if f.is_empty() {
@@ -831,7 +880,13 @@ mod tests {
         assert!(out.starts_with("/w  1000B  (9 files · still scanning 43%: sizes are lower bounds · as of 2m ago)"), "{out}");
         assert!(out.contains("    600B  60%  ███████▎····       3   2m ago  node_modules/"), "{out}");
         assert!(out.contains("    500B  83%  ██████████··       3   2m ago    react/"), "depth 2 nests children\n{out}");
-        assert!(out.contains("?   0%") && out.contains("secret/ 🔒") && out.contains("Full Disk Access"), "{out}");
+        assert!(out.contains("?   0%") && out.contains("secret/ 🔒") && out.contains(locked_legend()), "{out}");
+        assert_eq!(out.contains("Full Disk Access"), cfg!(target_os = "macos"), "{out}");
+        assert!(!out.contains("not listed by name"), "partial listings have no remainder row\n{out}");
+        // A complete listing whose loose files are not all listed gets a remainder row.
+        let done = fs::Listing { dir: fs::DirEntry { files: 9, ..de("/w", 1000, true) }, children: vec![de("/w/a", 600, true)], ..Default::default() };
+        let rest = fmt_listing(&done, 1, 3, 1_120_000, &mut |_| None);
+        assert!(rest.contains("    400B  40%") && rest.contains("(6 other files not listed by name)"), "{rest}");
         assert!(out.contains("… 1 more"), "{out}");
         assert!(out.contains("💡 node_modules: npm"), "{out}");
         let g = fs::Growth {

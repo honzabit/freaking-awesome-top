@@ -110,6 +110,10 @@ impl State {
     fn volumes(&mut self) -> Result<Vec<crate::fs::Volume>> {
         if self.fs.volumes.is_none() {
             let mut v = guard(crate::fs::volumes::Volumes::new).ok_or_else(|| anyhow!("volume listing is unavailable"))?;
+            // Fill rates need minutes of samples: take them from the recorder's history.
+            if let Some(h) = self.history.as_ref() {
+                let _ = guard(AssertUnwindSafe(|| h.seed_volumes(&mut v, crate::model::now_ms())));
+            }
             guard(AssertUnwindSafe(|| v.sample())).ok_or_else(|| anyhow!("volume listing failed"))?;
             std::thread::sleep(Duration::from_millis(1000));
             self.fs.volumes = Some(v);
@@ -997,18 +1001,49 @@ pub fn listing_json(l: &crate::fs::Listing, depth: usize, limit: usize, list: &m
         let rest = &l.children[limit..];
         out["more"] = json!({ "count": rest.len(), "size": rest.iter().map(|c| c.size).sum::<u64>() });
     }
+    let (files, bytes) = unlisted(l);
+    if !l.dir.partial && bytes > 0 && files > 0 {
+        // Loose files not listed by name: so the children add up to the directory.
+        out["other_files"] = json!({ "count": files, "size": bytes });
+    }
     out
 }
 
-/// A listing with its children: small completed subtrees are kept folded (size only) by the
-/// scanner, so a folded one is focused (re-expanded) and scanned for up to `wait_ms`.
+/// A listing with its children: the scanner keeps small completed subtrees folded (size
+/// only) and the background walk does not keep loose files by name, so such a directory is
+/// re-read (just itself) for up to `wait_ms` to list them.
 pub fn list_expanded(sc: &crate::fs::scan::Scanner, path: &str, wait_ms: u64) -> Option<crate::fs::Listing> {
     let l = sc.list(path)?;
-    if l.children.is_empty() && l.dir.is_dir && l.dir.files > 1 {
-        sc.focus(path);
-        return sc.scan_blocking(path, wait_ms).or(Some(l));
+    if l.dir.is_dir && !l.dir.partial {
+        return sc.expand(path, wait_ms).or(Some(l));
     }
     Some(l)
+}
+
+/// Bytes and files of `l.dir` that no listed child accounts for (loose files not listed by
+/// name, the directory's own inode): (files, bytes).
+pub fn unlisted(l: &crate::fs::Listing) -> (u64, u64) {
+    let kids: u64 = l.children.iter().filter(|c| !c.mount_point).map(|c| c.size).sum();
+    let files: u64 = l.children.iter().filter(|c| !c.mount_point).map(|c| c.files).sum();
+    (l.dir.files.saturating_sub(files), l.dir.size.saturating_sub(kids))
+}
+
+/// Why `path` cannot be listed, if it is missing or not a directory/file we can stat.
+pub fn path_problem(path: &str) -> Option<String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(format!("{path}: no such file or directory")),
+        Err(e) => Some(format!("{path}: {e}")),
+    }
+}
+
+/// Hint for a directory that could not be read.
+pub fn unreadable_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "permission denied or blocked by macOS privacy: grant your terminal Full Disk Access, or check the dir's permissions"
+    } else {
+        "permission denied: run fat as the directory's owner or as root"
+    }
 }
 
 fn progress_json(p: &crate::fs::ScanProgress) -> Value {
@@ -1031,18 +1066,23 @@ fn tool_fs_list(state: &mut State, args: &Value) -> Result<Value> {
     }
     let limit = arg_u64(args, "limit")?.unwrap_or(30).clamp(1, 200) as usize;
     let wait = arg_u64(args, "wait_seconds")?.unwrap_or(10).min(120);
+    if let Some(p) = path_problem(&path) {
+        bail!("{p}");
+    }
     let sc = state.scanner()?.clone();
-    // The agent asked for this path: that is explicit intent (protected dirs may be read).
-    let l = match list_expanded(&sc, &path, wait * 1000) {
-        Some(l) => Some(l),
-        None => {
-            sc.ensure(&path, true);
-            sc.scan_blocking(&path, wait * 1000)
-        }
+    // The agent asked for this path: that is explicit intent (a protected dir or a mount
+    // the background walk skipped is read now).
+    sc.ensure(&path, true);
+    let l = match sc.list(&path) {
+        Some(l) if !l.dir.partial => list_expanded(&sc, &path, wait * 1000),
+        _ => sc.scan_blocking(&path, wait * 1000),
     };
     let Some(l) = l else {
-        bail!("nothing measured under {path} yet (scan still running or path unreadable); retry with a larger `wait_seconds`");
+        bail!("nothing measured under {path} yet: the scan is still running; retry with a larger `wait_seconds`");
     };
+    if l.dir.denied > 0 && l.dir.files == 0 && l.children.is_empty() {
+        bail!("{path}: could not be read ({})", unreadable_hint());
+    }
     let mut lookup = |p: &str| list_expanded(&sc, p, 3000);
     let mut v = listing_json(&l, depth as usize, limit, &mut lookup);
     v["progress"] = progress_json(&l.progress);
@@ -1055,12 +1095,18 @@ fn tool_fs_largest(state: &mut State, args: &Value) -> Result<Value> {
     if !(1..=200).contains(&n) {
         bail!("`n` must be 1..=200");
     }
+    if let Some(p) = path_problem(&path) {
+        bail!("{p}");
+    }
     let sc = state.scanner()?.clone();
     let mut v = sc.largest(&path, n as usize);
     if v.is_empty() {
         sc.ensure(&path, true);
-        let _ = sc.scan_blocking(&path, 15_000);
+        let l = sc.scan_blocking(&path, 15_000);
         v = sc.largest(&path, n as usize);
+        if v.is_empty() && l.as_ref().is_some_and(|l| l.dir.denied > 0 && l.dir.files == 0) {
+            bail!("{path}: could not be read ({})", unreadable_hint());
+        }
     }
     Ok(json!({ "path": path, "count": v.len(), "entries": v.iter().map(entry_json).collect::<Vec<_>>() }))
 }

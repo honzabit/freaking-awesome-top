@@ -86,8 +86,46 @@ fn opts() -> Options {
         protect: false,
         battery_check: false,
         background: false,
+        watch_changes: false,
         ..Options::default()
     }
+}
+
+fn wait_for(what: &str, secs: u64, f: &dyn Fn() -> bool) {
+    let t0 = Instant::now();
+    while !f() {
+        assert!(t0.elapsed() < Duration::from_secs(secs), "timeout: {what}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Set a path's atime/mtime to `secs_ago` seconds in the past.
+fn age(p: &Path, secs_ago: u64) {
+    let t = std::time::SystemTime::now() - Duration::from_secs(secs_ago);
+    let f = std::fs::File::open(p).unwrap();
+    f.set_times(std::fs::FileTimes::new().set_accessed(t).set_modified(t)).unwrap();
+}
+
+/// Age every file and directory of the fixture (children before parents).
+fn age_tree(p: &Path, secs_ago: u64) {
+    for e in std::fs::read_dir(p).unwrap().flatten() {
+        if e.file_type().unwrap().is_dir() {
+            age_tree(&e.path(), secs_ago);
+        } else {
+            age(&e.path(), secs_ago);
+        }
+    }
+    age(p, secs_ago);
+}
+
+fn bg_opts() -> Options {
+    Options { threads: 2, background: true, budget: 0.0, restat_interval: Duration::from_millis(1), ..opts() }
+}
+
+fn wait_complete(sc: &Scanner, root: &str) {
+    wait_for("background scan completes", 20, &|| {
+        sc.progress().iter().any(|p| p.root == root && p.completed_at > 0) && sc.list(root).is_some_and(|l| !l.dir.partial)
+    });
 }
 
 fn child<'a>(l: &'a Listing, name: &str) -> &'a DirEntry {
@@ -107,6 +145,7 @@ fn queue_root(sc: &Scanner, path: &str) {
     let p = norm(path);
     let mut st = lock(&sc.sh().st);
     st.add_root(&p, false, 0);
+    st.allow(&p);
     let id = st.tree.find_or_create(&p);
     assert!(st.prepare_root(id, &p));
     st.requeue(id, true, true);
@@ -584,4 +623,297 @@ fn bench_real_paths() {
             }
         }
     }
+}
+
+/// Re-reading a directory that counted a hardlinked file counts it again (the dedupe set
+/// records which directory owns each link); another directory's link still does not count.
+#[test]
+fn hardlink_reread_keeps_links() {
+    let fx = Fx::new("hard-reread");
+    fx.file("a/big", 400_000);
+    fx.file("a/small", 1_000);
+    std::fs::hard_link(fx.p("a/big"), fx.p("a/big-link")).unwrap();
+    fx.dir("b");
+    std::fs::hard_link(fx.p("a/big"), fx.p("b/other-link")).unwrap();
+    let sc = Scanner::with_options(opts());
+    let root = fx.s("");
+    let l = sc.scan_blocking(&root, 30_000).unwrap();
+    let a0 = sc.list(&fx.s("a")).unwrap().dir.size;
+    let b0 = sc.list(&fx.s("b")).unwrap().dir.size;
+    // Whichever directory was read first owns the link; the other does not count it.
+    assert!((a0 >= 400_000) != (b0 >= 400_000), "a {a0} b {b0}");
+    for dir in ["a", "b", "a"] {
+        {
+            let mut st = lock(&sc.sh().st);
+            let id = st.tree.find(&norm(&fx.s(dir))).unwrap();
+            assert!(st.requeue(id, false, false));
+        }
+        while step(&sc).is_some() {}
+        assert_eq!(sc.list(&fx.s("a")).unwrap().dir.size, a0, "after re-reading {dir}");
+        assert_eq!(sc.list(&fx.s("b")).unwrap().dir.size, b0, "after re-reading {dir}");
+        assert_eq!(sc.list(&root).unwrap().dir.size, l.dir.size);
+    }
+    // A full rescan of the root (links kept from the earlier pass) agrees too.
+    let l2 = sc.scan_blocking(&root, 30_000).unwrap();
+    assert_eq!(l2.dir.size, l.dir.size);
+}
+
+/// A snapshot taken while a measured dir is being re-read records its previous numbers (not
+/// "gone"), so the recorder never reports a fake "freed" scan diff.
+#[test]
+fn snapshot_during_reread_keeps_dirs() {
+    let fx = Fx::new("snap-reread");
+    fx.file("a/big", 3_000_000);
+    fx.file("b/x", 10_000);
+    let sc = Scanner::with_options(opts());
+    let root = fx.s("");
+    sc.ensure(&root, false);
+    sc.scan_blocking(&root, 30_000).unwrap();
+    {
+        let mut st = lock(&sc.sh().st);
+        let i = st.roots.iter().position(|r| r.path == norm(&root)).unwrap();
+        st.roots[i].completed_at = now_ms();
+    }
+    let snap = |sc: &Scanner| crate::history::dir_snapshot(sc, &[]).expect("completed root");
+    let s1 = snap(&sc);
+    let a = fx.s("a");
+    let a_size = s1.iter().find(|r| r.0 == a).expect("a recorded").1;
+    {
+        let mut st = lock(&sc.sh().st);
+        let id = st.tree.find(&norm(&a)).unwrap();
+        st.requeue(id, false, false);
+    }
+    assert!(sc.list(&a).unwrap().dir.partial);
+    let s2 = snap(&sc);
+    assert_eq!(s2.iter().find(|r| r.0 == a).map(|r| r.1), Some(a_size), "{s2:?}");
+    // A full pass in progress (every dir partial) still records everything.
+    {
+        let mut st = lock(&sc.sh().st);
+        let id = st.tree.find(&norm(&root)).unwrap();
+        st.requeue(id, true, false);
+    }
+    let s3 = snap(&sc);
+    for r in &s1 {
+        assert!(s3.iter().any(|x| x.0 == r.0 && x.1 == r.1), "{} missing during a full pass: {s3:?}", r.0);
+    }
+}
+
+/// A file growing in place (the directory's mtime does not change) is picked up by the
+/// re-stat, not only by the 6-hourly full pass.
+#[test]
+fn restat_sees_in_place_growth() {
+    let fx = Fx::new("inplace");
+    fx.file("a/log", 10_000);
+    let sc = Scanner::with_options(bg_opts());
+    let root = fx.s("");
+    sc.ensure(&root, false);
+    wait_complete(&sc, &root);
+    let before = sc.list(&root).unwrap().dir.size;
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(fx.p("a/log")).unwrap();
+        f.write_all(&vec![0x5au8; 2_000_000]).unwrap();
+    }
+    wait_for("restat sees the appended 2 MB", 20, &|| sc.list(&root).is_some_and(|l| l.dir.size > before + 1_500_000));
+}
+
+/// The same for a cold tree (nothing written in the last hour): a named big file that grew,
+/// and a new file inside a folded subdirectory.
+#[test]
+fn restat_sees_changes_in_cold_tree() {
+    let fx = Fx::new("cold");
+    fx.file("p/q/f", 5_000);
+    fx.file("p/keep", 5_000);
+    fx.file("big/blob", 300_000);
+    age_tree(&fx.root, 3 * 3600);
+    let o = Options { keep_depth: 1, fold_bytes: 1 << 20, big_file: 250_000, ..bg_opts() };
+    let sc = Scanner::with_options(o);
+    let root = fx.s("");
+    sc.ensure(&root, false);
+    wait_complete(&sc, &root);
+    assert!(sc.list(&fx.s("p/q")).is_none(), "p/q is folded into p");
+    let before = sc.list(&root).unwrap().dir.size;
+    // New file in the folded p/q: p/q's mtime changes, p's does not.
+    fx.file("p/q/new-big", 3_000_000);
+    age(&fx.p("p/q/new-big"), 3 * 3600);
+    wait_for("restat sees the file in the folded dir", 20, &|| sc.list(&root).is_some_and(|l| l.dir.size > before + 2_500_000));
+    let mid = sc.list(&root).unwrap().dir.size;
+    // A big file kept by name grows in place, and is made to look old.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(fx.p("big/blob")).unwrap();
+        f.write_all(&vec![0x5au8; 1_000_000]).unwrap();
+    }
+    age(&fx.p("big/blob"), 2 * 3600);
+    wait_for("restat sees the grown big file", 20, &|| sc.list(&root).is_some_and(|l| l.dir.size > mid + 800_000));
+}
+
+/// A reader process drops directories the writer deleted (it only received upserts before).
+#[test]
+fn reader_drops_deleted_dirs() {
+    let fx = Fx::new("reader-gone");
+    fx.file("keep/a", 10_000);
+    fx.file("gone/big", 3_000_000);
+    let db = Fx::new("reader-gone-db");
+    let o = Options {
+        cache_path: Some(db.p("fs-index.db")),
+        background: true,
+        flush_interval: Duration::from_millis(50),
+        reload_interval: Duration::from_millis(50),
+        ..opts()
+    };
+    let root = fx.s("");
+    let a = Scanner::with_options(o.clone());
+    a.ensure(&root, false);
+    wait_for("a is writer", 20, &|| lock(&a.sh().st).writer);
+    wait_complete(&a, &root);
+    let b = Scanner::with_options(o);
+    b.ensure(&root, false);
+    assert!(b.list(&fx.s("gone")).is_some(), "b loaded a's cache");
+    std::fs::remove_dir_all(fx.p("gone")).unwrap();
+    a.rescan(&root);
+    wait_for("b drops gone/", 20, &|| {
+        b.list(&root).is_some_and(|l| l.children.iter().all(|c| c.name != "gone") && l.dir.size < 1_000_000)
+    });
+    assert!(b.list(&fx.s("gone")).is_none());
+    let l = b.list(&root).unwrap();
+    let sum: u64 = l.children.iter().map(|c| c.size).sum();
+    assert!(sum <= l.dir.size, "children larger than parent: {l:?}");
+}
+
+/// A protected dir the user opened once (in an earlier process) is not re-read by a later
+/// background process: not by its re-stat, and not as a remembered root.
+#[test]
+fn later_background_process_keeps_out_of_protected() {
+    let fx = Fx::new("tcc-later");
+    fx.file("pub/a", 10_000);
+    fx.file("Private/sub/f", 10_000);
+    let db = Fx::new("tcc-later-db");
+    let o = Options {
+        cache_path: Some(db.p("fs-index.db")),
+        extra_protected: vec![fx.s("Private")],
+        flush_interval: Duration::from_millis(50),
+        ..opts()
+    };
+    let root = fx.s("");
+    {
+        // Process A: the user opens Private (and a dir inside it) explicitly.
+        let a = Scanner::with_options(o.clone());
+        a.ensure(&root, false);
+        a.scan_blocking(&root, 30_000).unwrap();
+        a.ensure(&fx.s("Private"), true);
+        a.scan_blocking(&fx.s("Private"), 30_000).unwrap();
+        a.ensure(&fx.s("Private/sub"), true);
+        assert_eq!(a.list(&fx.s("Private/sub")).unwrap().dir.files, 1);
+        a.flush();
+    }
+    fx.file("Private/sub/new", 10_000);
+    // Process B: background writer, only asked for the root.
+    let b = Scanner::with_options(Options { background: true, restat_interval: Duration::from_millis(1), ..o });
+    b.ensure(&root, false);
+    wait_for("b is writer", 20, &|| lock(&b.sh().st).writer);
+    thread::sleep(Duration::from_secs(3));
+    assert!(b.protected_hint(&fx.s("Private")).is_some());
+    assert!(!b.progress().iter().any(|p| p.root.starts_with(&fx.s("Private"))), "{:?}", b.progress());
+    let files = b.list(&fx.s("Private/sub")).map(|l| l.dir.files);
+    assert!(files.is_none_or(|f| f == 1), "b read the protected dir in the background: {files:?}");
+}
+
+/// Paths that are not directories never become nodes or remembered roots, and nested or
+/// stale remembered roots are pruned.
+#[test]
+fn wants_are_validated_and_pruned() {
+    let fx = Fx::new("wants");
+    fx.file("pub/a", 10_000);
+    fx.file("pub/inner/b", 10_000);
+    let db = Fx::new("wants-db");
+    let o = Options { cache_path: Some(db.p("fs-index.db")), ..opts() };
+    let root = fx.s("");
+    {
+        let a = Scanner::with_options(o.clone());
+        a.ensure(&fx.s("nonexistent"), true);
+        a.ensure(&fx.s("pub/a"), true); // a file
+        a.ensure(&fx.s("pub"), true);
+        a.ensure(&fx.s("pub/inner"), true);
+        assert!(lock(&a.sh().st).tree.find(&norm(&fx.s("nonexistent"))).is_none());
+        assert!(!a.progress().iter().any(|p| p.root.ends_with("nonexistent") || p.root.ends_with("/a")));
+        a.scan_blocking(&root, 30_000).unwrap();
+        assert!(a.list(&root).unwrap().children.iter().all(|c| c.name != "nonexistent"));
+    }
+    {
+        let d = cache::Db::open(&db.p("fs-index.db")).unwrap();
+        let w: Vec<String> = d.wants().into_iter().map(|w| w.0).collect();
+        assert!(w.contains(&fx.s("pub")) && w.contains(&fx.s("pub/inner")), "{w:?}");
+        assert!(!w.iter().any(|w| w.ends_with("nonexistent") || w.ends_with("/a")), "{w:?}");
+        d.set_meta(&format!("want:{}", fx.s("old")), 1).unwrap();
+        d.set_meta(&format!("want:{}", fx.s("vanished")), now_ms()).unwrap();
+    }
+    let b = Scanner::with_options(Options { background: true, ..o.clone() });
+    b.ensure(&fx.s("pub"), false);
+    wait_for("b is writer and loaded wants", 20, &|| lock(&b.sh().st).writer && lock(&b.sh().st).last_wants > 0);
+    thread::sleep(Duration::from_millis(200));
+    let w: Vec<String> = cache::Db::open(&db.p("fs-index.db")).unwrap().wants().into_iter().map(|w| w.0).collect();
+    assert_eq!(w, vec![fx.s("pub")], "nested, expired and vanished wants are dropped");
+    drop(b);
+}
+
+/// A remembered root below a mount that is not scanned in the background (network,
+/// removable) or below a protected dir is not walked by a later process.
+#[test]
+fn root_kind_inherits_from_ancestors() {
+    let mut mounts = HashMap::new();
+    mounts.insert(b"/Users/me/OrbStack".to_vec(), sys::MountInfo { fstype: "nfs".into(), source: "orb:/".into() });
+    let p = Policy {
+        mounts,
+        protect: true,
+        home: b"/Users/me".to_vec(),
+        other_homes: vec![b"/Users/other".to_vec()],
+        ..Default::default()
+    };
+    assert_eq!(p.root_kind(b"/Users/me/OrbStack/docker/containers"), Kind::Mount { descend: false });
+    assert_eq!(p.root_kind(b"/Users/me/Documents/proj"), Kind::Protected);
+    assert_eq!(p.root_kind(b"/Users/other/Desktop/x"), Kind::Protected);
+    assert_eq!(p.root_kind(b"/Users/me/src"), Kind::Normal);
+    assert!(!p.background_ok(b"/Users/me/Documents/proj/x") && p.background_ok(b"/Users/me/src/x"));
+    // Asked for explicitly in this process: allowed.
+    let mut q = p.clone();
+    q.allowed.push(b"/Users/me/Documents/proj".to_vec());
+    assert_eq!(q.root_kind(b"/Users/me/Documents/proj"), Kind::Normal);
+    assert!(q.background_ok(b"/Users/me/Documents/proj/x"));
+    // Root with $HOME=/var/root still protects other users' private folders.
+    let root = Policy { protect: true, home: b"/var/root".to_vec(), other_homes: vec![b"/Users/me".to_vec()], ..Default::default() };
+    assert_eq!(root.classify(b"/Users/me/Desktop", 1, 1), Kind::Protected);
+}
+
+/// The background walk does not keep loose files by name; `expand` re-reads just that
+/// directory so its listing adds up, reusing measured subdirectories.
+#[test]
+fn expand_lists_loose_files() {
+    let fx = Fx::new("expand");
+    fx.file("d/f1", 300_000);
+    fx.file("d/f2", 200_000);
+    fx.file("d/sub/g", 10_000);
+    let sc = Scanner::with_options(opts());
+    let root = fx.s("");
+    {
+        let mut st = lock(&sc.sh().st);
+        let p = norm(&root);
+        st.add_root(&p, false, 0);
+        let id = st.tree.find_or_create(&p);
+        assert!(st.prepare_root(id, &p));
+        st.requeue(id, true, false); // like the background walk: no names kept
+    }
+    while step(&sc).is_some() {}
+    let d = fx.s("d");
+    let l = sc.list(&d).unwrap();
+    assert_eq!(l.children.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["sub"]);
+    assert!(crate::mcp::unlisted(&l).1 >= 500_000);
+    let e = sc.expand(&d, 30_000).unwrap();
+    assert!(!e.dir.partial);
+    assert_eq!((e.dir.size, e.dir.files), (l.dir.size, l.dir.files));
+    let names: Vec<&str> = e.children.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["f1", "f2", "sub"]);
+    assert_eq!(crate::mcp::unlisted(&e).0, 0);
+    // Already listed: nothing to do.
+    assert_eq!(sc.expand(&d, 30_000).unwrap(), sc.list(&d).unwrap());
 }
