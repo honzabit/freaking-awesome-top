@@ -387,11 +387,15 @@ fn select_growers(nodes: &[Node], cap: usize) -> Vec<Grower> {
                     ev = n.evidence.clone();
                 }
                 ev.sort_by_key(|e| rank(*e));
+                // SIZE of the remainder too, not the whole directory: the outermost listed
+                // paths below it have rows of their own, so their bytes are not counted twice.
+                let outer = listed.iter().filter(|&&l| !listed.iter().any(|&m| m != l && super::under_prefix(&nodes[l].path, &nodes[m].path)));
+                let listed_size: u64 = outer.map(|&l| nodes[l].size.unwrap_or(0)).sum();
                 Grower {
                     path: n.path.clone(),
                     is_dir: true,
                     delta: rest,
-                    size: n.size.unwrap_or(0),
+                    size: n.size.unwrap_or(0).saturating_sub(listed_size),
                     files_touched: touched,
                     writers: w,
                     evidence: ev,
@@ -514,6 +518,9 @@ mod tests {
         assert_eq!(p[1], ("/w/proj/out", 400 * MB), "{p:?}");
         assert!(g[1].other && !g[0].other);
         assert_eq!(g[1].files_touched, 100, "touches of the unlisted part only");
+        // SIZE is the remainder's (1000 MB dir - the listed 600 MB file), never the whole dir:
+        // summing the SIZE column must not count big.bin twice.
+        assert_eq!(g[1].size, 400 * MB as u64, "other's size excludes listed rows");
         assert_eq!(g.len(), 2, "{p:?}");
         no_overlap(&g);
     }

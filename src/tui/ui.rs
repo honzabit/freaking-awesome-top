@@ -1310,14 +1310,14 @@ fn draw_log(f: &mut Frame, app: &App, full: Rect) {
             Span::styled("most recent first ", dim()),
         ]))
         .title_bottom(Line::styled(
-            " ⏎ undo selected · u undo last · pause/resume/renice are undoable; TERM/KILL are not · Esc close ",
+            " ⏎ undo selected · u undo last · TERM/KILL can't be undone · Esc close ",
             dim(),
         ));
     if app.log.is_empty() {
         let t = Text::from(vec![
             Line::styled("No actions yet.", Style::default().bold()),
             Line::styled("Pause (space), renice (r) or terminate (k) a process: every action lands here.", dim()),
-            Line::styled("A pause or renice can be undone with u; a terminate cannot (pause first to try it out).", dim()),
+            Line::styled("A pause can be undone with u (a renice too, as root); a terminate cannot (pause first to try it out).", dim()),
         ]);
         f.render_widget(Paragraph::new(t).block(block), area);
         return;
@@ -1543,12 +1543,39 @@ const HELP: &[(&str, &str)] = &[
     ("q / Ctrl-C", "quit"),
 ];
 
+/// Width of the help's key column (right-aligned key + two spaces).
+const HELP_KEY_W: usize = 20;
+
+/// The help text for an inner width of `inner` columns: descriptions wrap at word boundaries
+/// onto continuation lines under the description column, so nothing is cut off.
+fn help_lines(inner: usize) -> Vec<Line<'static>> {
+    let desc_w = inner.saturating_sub(HELP_KEY_W).max(16);
+    let mut out = Vec::new();
+    for (k, d) in HELP {
+        let mut rows: Vec<String> = vec![String::new()];
+        for w in d.split(' ') {
+            let cur = rows.last_mut().expect("non-empty");
+            if !cur.is_empty() && cur.chars().count() + 1 + w.chars().count() > desc_w {
+                rows.push(w.to_string());
+            } else {
+                if !cur.is_empty() {
+                    cur.push(' ');
+                }
+                cur.push_str(w);
+            }
+        }
+        for (i, row) in rows.into_iter().enumerate() {
+            let key = if i == 0 { format!("{k:>18}  ") } else { " ".repeat(HELP_KEY_W) };
+            out.push(Line::from(vec![Span::styled(key, Style::default().fg(Color::Yellow).bold()), Span::raw(row)]));
+        }
+    }
+    out
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
-    let r = centered(78.min(area.width.saturating_sub(2)), (HELP.len() as u16 + 4).min(area.height), area);
-    let lines: Vec<Line> = HELP
-        .iter()
-        .map(|(k, d)| Line::from(vec![Span::styled(format!("{k:>18}  "), Style::default().fg(Color::Yellow).bold()), Span::raw(*d)]))
-        .collect();
+    let width = 100.min(area.width.saturating_sub(2));
+    let lines = help_lines(width.saturating_sub(2) as usize);
+    let r = centered(width, (lines.len() as u16 + 2).min(area.height), area);
     f.render_widget(Clear, r);
     f.render_widget(
         Paragraph::new(lines).block(
@@ -2085,5 +2112,25 @@ mod tests {
         let out = render(&mut c, 160, 48);
         assert!(out.contains("recorded") && out.contains("300.0G") && !out.contains("400.0G"), "{out}");
         assert!(out.contains("600.0G/994.0G") && out.contains("⏪"), "{out}");
+    }
+
+    #[test]
+    fn help_lines_wrap_instead_of_cutting_off() {
+        for inner in [76usize, 98, 40] {
+            let lines = help_lines(inner);
+            let text: String = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect();
+            for l in &lines {
+                let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
+                // Only a single word longer than the column may overflow (narrow terminals).
+                let one_word = !l.spans[1].content.contains(' ');
+                assert!(w <= inner || one_word, "{inner}: {w} > {inner}: {text}");
+            }
+            // Every word of every description survives, including the NOT-undoable warning.
+            for (_, d) in HELP {
+                for word in d.split(' ') {
+                    assert!(text.contains(word), "{inner}: lost {word:?}");
+                }
+            }
+        }
     }
 }

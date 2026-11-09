@@ -1217,6 +1217,15 @@ mod tests {
             Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
         }
 
+        /// CPU of the whole process, so the setns+socket thread that `open_socket_in_netns`
+        /// spawns per foreign netns is counted too (a thread clock would miss it).
+        fn process_cpu() -> Duration {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: valid timespec out-pointer.
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+            Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+        }
+
         fn children_cpu() -> Duration {
             // SAFETY: zeroed rusage is a valid out-buffer.
             let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
@@ -1235,10 +1244,18 @@ mod tests {
             let (mut a, b) = pair("127.0.0.1:0", 1, 1).unwrap();
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let st = stop.clone();
+            // Held while netlink cost is measured with the process clock, so the pump's own
+            // CPU is not billed to netlink (the sink then blocks in read and costs nothing).
+            let quiet = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let qt = quiet.clone();
             let mut b2 = b.try_clone().unwrap();
             let pump = std::thread::spawn(move || {
                 let chunk = vec![3u8; 200_000];
                 while !st.load(std::sync::atomic::Ordering::Relaxed) {
+                    if qt.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
                     a.write_all(&chunk).unwrap();
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1266,17 +1283,23 @@ mod tests {
             let first = nl.sample(&foreign).unwrap().0;
             println!("netlink first sample (cold owner cache): {:?} wall, {:?} cpu, {} sockets", t.elapsed(), thread_cpu() - c, first.len());
             for _ in 0..n {
-                let (t, c) = (Instant::now(), thread_cpu());
+                // A full sampler cycle: the sampler loop re-lists foreign netns every time and
+                // spawns one setns thread per netns, so both are inside the measurement.
+                quiet.store(true, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(20));
+                let (t, c) = (Instant::now(), process_cpu());
+                let foreign = if root { crate::collect::ports::foreign_netns(super::super::MAX_NETNS) } else { Vec::new() };
                 nl_socks = nl.sample(&foreign).unwrap().0.len();
                 nl_wall += t.elapsed();
-                nl_cpu += thread_cpu() - c;
+                nl_cpu += process_cpu().saturating_sub(c);
+                quiet.store(false, std::sync::atomic::Ordering::Relaxed);
                 let (t, c, k) = (Instant::now(), thread_cpu(), children_cpu());
                 ss_socks = ss().len();
                 ss_wall += t.elapsed();
                 ss_cpu += (thread_cpu() - c) + (children_cpu() - k);
             }
             let per = |d: Duration| d / n;
-            println!("netlink: {:?} wall, {:?} cpu per sample ({nl_socks} sockets with traffic+owner)", per(nl_wall), per(nl_cpu));
+            println!("netlink: {:?} wall, {:?} cpu per cycle incl. netns walk + setns threads ({nl_socks} sockets with traffic+owner)", per(nl_wall), per(nl_cpu));
             println!("ss:      {:?} wall, {:?} cpu per sample incl. child ({ss_socks} sockets with pid)", per(ss_wall), per(ss_cpu));
             // Agreement: both methods over the same 2s window.
             let (n0, s0, t0) = (nl.sample(&foreign).unwrap().0, ss(), Instant::now());

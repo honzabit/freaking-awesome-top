@@ -440,7 +440,8 @@ pub fn listeners() -> Option<Vec<Listener>> {
 /// Deleted regular files (link count 0) still held open or mapped: (pid, name, path, size bytes),
 /// one entry per (dev, inode), under the lowest pid holding it. Like `lsof +L1` this covers
 /// open fds and memory-mapped files (a replaced executable or dylib still in use); the mapped
-/// walk is most of the cost (~20 regions per process). Mapped files whose vnode attributes the
+/// walk is most of the cost: every region of every process, 0.22-0.4 s for one user's ~600
+/// processes on macOS 15, no faster than `lsof +L1`. Mapped files whose vnode attributes the
 /// kernel withholds (all-zero stat, seen for files in TCC-protected folders) are skipped: their
 /// link count is unknown. `uid`: only that user's processes
 /// (None = all, for root). None only when the process list cannot be read.

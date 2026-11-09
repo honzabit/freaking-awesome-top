@@ -15,6 +15,9 @@ const KB: u64 = 1024;
 const MB: u64 = 1024 * KB;
 const GB: u64 = 1024 * MB;
 const MIN_MS: i64 = 60_000;
+/// Renice +10 is only undoable by root: lowering nice back is privileged on macOS and on Linux
+/// (RLIMIT_NICE 0 by default), so advice never calls it reversible.
+const RENICE_UNDO: &str = " (undoing it needs root)";
 
 pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation {
     let Some(p) = snap.proc(pid) else {
@@ -215,8 +218,10 @@ pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation
         };
         suggestions.push(msg);
         suggestions.extend(hub_suggestions);
-        if p.pid != 0 && p.pid != 1 && p.name != "kernel_task" && hub.is_none() {
-            suggestions.push(format!("if it's hurting right now, lower its priority: fat renice {pid} 10"));
+        // Through the gate like every other suggestion: an OS part gets no renice either
+        // (root daemons can't be reniced by the user, and with sudo only root could undo it).
+        if let Some(a) = cx.advise(p, Want::Renice).action {
+            suggestions.push(format!("if it's hurting right now, lower its priority: fat {a}{RENICE_UNDO}"));
         }
     } else if let Some(Block::Hub(h)) = &block {
         if os == Os::Linux && matches!(h, Hub::ContainerInit { .. }) {
@@ -233,7 +238,7 @@ pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation
         }
         suggestions.push(cx.block_note(p, b));
         if let Some(a) = cx.advise(p, Want::Renice).action {
-            suggestions.push(format!("lower its priority (reversible): fat {a}"));
+            suggestions.push(format!("lower its priority: fat {a}{RENICE_UNDO}"));
         }
     } else {
         if os == Os::Linux {
@@ -241,7 +246,7 @@ pub fn explain(snap: &Snapshot, pid: u32, hist: Option<&History>) -> Explanation
         }
         let end = cx.advise(p, Want::End);
         suggestions.push(format!("pause it (reversible): fat pause {pid}"));
-        suggestions.push(format!("lower its priority (reversible): fat renice {pid} 10"));
+        suggestions.push(format!("lower its priority: fat renice {pid} 10{RENICE_UNDO}"));
         match end.action {
             Some(a) if a.contains("--tree") => {
                 suggestions.push(format!("stop the tree ({} procs): fat {a}", descendants.len() + 1))
@@ -285,6 +290,38 @@ pub fn diagnose(snap: &Snapshot, hist: Option<&History>) -> Vec<Finding> {
 
     out.sort_by_key(|f| std::cmp::Reverse(severity_rank(&f.severity)));
     out
+}
+
+/// The hub gate for side-effect paths (MCP pause/kill, TUI confirms): why freezing or ending
+/// `pid` would take other work down with it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HubGate {
+    /// One sentence naming what it hosts and what to do instead (blame's hub note).
+    pub note: String,
+    /// A VM/container host, runtime, container pid 1, init, browser or app main process, the
+    /// display server or the kernel: agents are refused. False for a session (shell,
+    /// terminal, editor, agent), which only gets a warning: ending one is sometimes the point.
+    pub hard: bool,
+}
+
+/// The hub gate for `pid` (None = not a hub). Used for Pause/Term/Kill/KillTree only.
+pub fn hub_gate(snap: &Snapshot, pid: u32) -> Option<HubGate> {
+    gate_of(&Ctx::new(snap, platform(snap)), snap.proc(pid)?)
+}
+
+fn gate_of(cx: &Ctx<'_>, p: &Proc) -> Option<HubGate> {
+    let h = cx.hub(p)?;
+    let hard = !matches!(h, Hub::Session { .. });
+    Some(HubGate { note: cx.block_note(p, &Block::Hub(h)), hard })
+}
+
+/// The first hard hub among `pid`'s descendants (a tree kill would end it too).
+pub fn hub_in_tree(snap: &Snapshot, pid: u32) -> Option<(u32, HubGate)> {
+    let cx = Ctx::new(snap, platform(snap));
+    snap.descendants(pid)
+        .into_iter()
+        .filter(|d| !is_zombie(d))
+        .find_map(|d| gate_of(&cx, d).filter(|g| g.hard).map(|g| (d.pid, g)))
 }
 
 /// True when some process hosts containers (a VM host like OrbStack Helper or Docker Desktop's

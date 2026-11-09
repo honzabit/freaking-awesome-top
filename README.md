@@ -4,7 +4,8 @@
 - `fat` opens instantly on your processes sorted by CPU, with CPU, memory, power and thermal gauges on top.
 - `fat why <pid>` says who started a process, since when and what it costs; `fat doctor` ranks what is wrong.
 - `fat fs --growth` names the path and the process filling your disk right now.
-- First aid you can take back: pause and renice are journaled and undone with `fat undo` (kill asks first, and can't be).
+- First aid you can take back: pause is journaled and undone with `fat undo`; so is renice, though only root can lower
+  nice again. Kill can't be undone: the TUI and MCP ask first, the CLI `fat kill` acts at once.
 
 First-class on **macOS** (developed on Apple Silicon, macOS 15) and **Linux** (x86_64 and aarch64, kernel 4.20+ for PSI,
 cgroup v2 recommended). On Linux it reads procfs and sysfs directly. It never needs `sudo`; root only adds visibility
@@ -38,8 +39,8 @@ fat ask --dry-run "why is this machine hot"   # print the exact (redacted) API r
 # Actions (journaled)
 fat pause <pid>             # SIGSTOP; undoable
 fat resume <pid>            # SIGCONT
-fat renice <pid> 10         # lower priority; undoable (lowering nice again may need root)
-fat kill <pid> [--tree] [--force]   # TERM (KILL with --force); NOT undoable
+fat renice <pid> 10         # lower priority; journaled, but undoing it needs root
+fat kill <pid> [--tree | --force]  # TERM (KILL with --force); NOT undoable; no prompt
 fat undo [id]               # undo the last pause/renice (or a specific one)
 fat log [--json]            # action journal
 
@@ -66,12 +67,12 @@ fat mcp                     # MCP server on stdio
 | `/` | filter by name, command line, container name / id / image, or cgroup path (`Esc` clears it) |
 | `Enter` / `w` | why: the blame chain (a side panel at 120+ columns, otherwise an overlay) |
 | `space` / `z` | pause / resume (undoable) |
-| `r` | renice (default +10; undoable) |
+| `r` | renice (default +10; undoing it needs root) |
 | `k` / `K` | terminate / terminate the whole tree (asks for confirmation; **not undoable**; in Ports, `k` kills the tree) |
 | `u` | undo the last pause or renice |
 | `a` | action log (an overlay on any view): everything fat did; `⏎` undoes the selected entry if it can be undone |
-| `← → [ ] { }` | time travel through history (`{ }` = ×10) |
-| `s` · `+`/`-` | jump to the next spike · zoom the window (5m … 24h) |
+| `← → [ ] { }` | in Timeline (`4`): time travel through history (`{ }` = ×10) |
+| `s` · `+`/`-` | in Timeline (`4`): jump to the next spike · zoom the window (5m … 24h) |
 | `L` / `Esc` | back to live |
 | `?` | ask in plain language |
 | `h` | help |
@@ -91,10 +92,13 @@ name the workload instead ("OrbStack 2.8G (VM: containers db 328M ...)": `docker
 limit; "Brave 4.1G across 23 processes": close heavy tabs). GUI apps get "quit <App>", and root/system services get
 service-manager advice. Memory findings rank whole apps and VMs, not single processes. Only your own CLI/dev
 processes get a runnable `pause` / `kill`.
+The same gate guards the actions themselves: MCP `pause` and `kill` refuse a hub (and a tree with one inside) and
+name the workload instead, and in the TUI, pausing or terminating one (`space`, `k`, `K`, also in Ports, where a
+forwarded container port belongs to the VM host) asks first and says what it hosts.
 
 ## Run the flight recorder always-on (optional)
 
-Time travel (`←` in the TUI, `fat history`) only has data for the times something was recording: the TUI records while
+Time travel (`←` in the TUI's Timeline view, `fat history`) only has data for the times something was recording: the TUI records while
 it is open, and `fat record` records in the foreground. To record all the time, run `fat record` as a background
 service. fat does not install one for you; copy and paste one of these. Disk use is about 27 MB per day at the default
 interval, kept for `history_days` (default 3, so about 80 MB; see [Configuration](#configuration)). The recorder runs
@@ -258,8 +262,8 @@ an MCP / JSON interface for agents (every view is also a tool or a `--json` flag
 - **Ports are first-class.** Shows every listening socket and its owner, with a framework hint ("node · vite dev · ~/code/app · up 3h").
   It also flags **orphans**: dev servers whose launcher died and that were re-parented to launchd (macOS) or to init /
   a systemd user manager (Linux).
-- **Safe actions.** Pause (SIGSTOP) before kill, renice, and kill a whole tree. Everything is journaled. Pause,
-  resume and renice are undoable (`fat undo`); TERM and KILL are not, so pause a suspect first: that gives you a
+- **Safe actions.** Pause (SIGSTOP) before kill, renice, and kill a whole tree. Everything is journaled. Pause and
+  resume are undoable (`fat undo`), renice too as root (a user can't lower nice again); TERM and KILL are not, so pause a suspect first: that gives you a
   window to see whether it was the culprit before anything is lost. fat refuses to touch launchd, WindowServer, kernel_task
   (macOS), init/systemd, kernel threads and the session's display/dbus daemons (Linux),
   its own ancestors, processes owned by other users, and recycled pids.
@@ -348,7 +352,8 @@ restart), and large swap files in `/System/Volumes/VM`.
 Everything works on Linux, and several things work better than on macOS, because Linux exposes more of the
 kernel's own accounting. fat reads procfs and sysfs directly. A sample of about 1,000 processes takes roughly
 10–30 ms, and the sample path spawns no subprocesses. Per-process network rates come from a netlink
-`sock_diag` dump every 2s (about 0.2–1 ms of CPU, versus 2–18 ms for the `ss` it replaced). The only child processes
+`sock_diag` dump every 2s (about 0.2–1 ms of CPU per cycle; up to about 2.5 ms as root, which also walks every
+container's network namespace; versus 2–19 ms for the `ss` it replaced). The only child processes
 are the container CLIs (cached), and `ss` only if netlink is unavailable.
 
 ### What you get on Linux

@@ -1502,7 +1502,18 @@ impl App {
             self.set_status("⏪ viewing the past — press L to return to live before acting", true);
             return Vec::new();
         }
+        // blame's hub gate: a VM host, runtime, container pid 1, browser/app main process or
+        // session takes everything it hosts with it, so say so before acting.
+        let hub = self.view().and_then(|s| crate::blame::hub_gate(s, pid)).map(|g| g.note);
+        let hub_warn = hub.as_deref().map(|n| format!(" WARNING: {n}.")).unwrap_or_default();
         match code {
+            KeyCode::Char(' ') | KeyCode::Char('z') if !paused && hub.is_some() => {
+                self.modal = Modal::Confirm {
+                    prompt: format!("Pause {pid} ({name})? It freezes everything it hosts.{hub_warn}"),
+                    cmd: Command::Act { kind: ActionKind::Pause, pid, nice: None, start },
+                };
+                Vec::new()
+            }
             KeyCode::Char(' ') | KeyCode::Char('z') => {
                 let kind = if paused { ActionKind::Resume } else { ActionKind::Pause };
                 vec![Command::Act { kind, pid, nice: None, start }]
@@ -1513,14 +1524,14 @@ impl App {
             }
             KeyCode::Char('k') if !k_is_tree => {
                 self.modal = Modal::Confirm {
-                    prompt: format!("Send TERM to {pid} ({name})? This cannot be undone (space pauses it instead, which can)."),
+                    prompt: format!("Send TERM to {pid} ({name})? This cannot be undone (space pauses it instead, which can).{hub_warn}"),
                     cmd: Command::Act { kind: ActionKind::Term, pid, nice: None, start },
                 };
                 Vec::new()
             }
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.modal = Modal::Confirm {
-                    prompt: format!("Terminate {pid} ({name}) AND all its descendants? This cannot be undone."),
+                    prompt: format!("Terminate {pid} ({name}) AND all its descendants? This cannot be undone.{hub_warn}"),
                     cmd: Command::Act { kind: ActionKind::KillTree, pid, nice: None, start },
                 };
                 Vec::new()
@@ -1693,8 +1704,13 @@ impl App {
                     Some((kind, pid, nice)) => {
                         // Identity from the snapshot the finding was computed on, not today's.
                         let start = self.findings_starts.get(&pid).copied().unwrap_or(0);
+                        let warn = match kind {
+                            ActionKind::Term | ActionKind::Kill | ActionKind::KillTree => " This cannot be undone.",
+                            ActionKind::Renice => " Undoing it needs root.",
+                            _ => "",
+                        };
                         self.modal = Modal::Confirm {
-                            prompt: format!("Run suggested action: {action}?"),
+                            prompt: format!("Run suggested action: {action}?{warn}"),
                             cmd: Command::Act { kind, pid, nice, start },
                         };
                     }
@@ -2465,6 +2481,63 @@ pub(crate) mod tests {
         assert_eq!(parse_action("Pause 55 (node)"), Some((ActionKind::Pause, 55, None)));
         assert_eq!(parse_action("restart docker"), None);
         assert_eq!(parse_action("pause it"), None);
+    }
+
+    #[test]
+    fn ports_actions_on_the_vm_host_warn_and_pause_asks_first() {
+        let mut s = snap(1_000_000);
+        let helper = "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper";
+        s.procs.push(Proc { exe: helper.into(), cmd: helper.into(), ..proc(13792, 1, "OrbStack Helper", 30.0, 2 << 30) });
+        s.ports.push(Port { proto: Proto::Tcp, addr: "127.0.0.1".into(), port: 8080, pid: 13792, process: "OrbStack Helper".into(), state: "LISTEN".into(), orphan: false, note: String::new() });
+        let mut a = App::new(1000);
+        a.now = 1_000_000;
+        a.on_snapshot(s);
+        a.on_key(key('2'));
+        a.ensure_rows();
+        for _ in 0..10 {
+            if a.selected_port().is_some_and(|p| p.pid == 13792) {
+                break;
+            }
+            a.on_key(code(KeyCode::Down));
+        }
+        assert_eq!(a.selected_port().map(|p| p.pid), Some(13792));
+        // space no longer freezes the VM at once: it asks, naming what it hosts.
+        assert!(a.on_key(key(' ')).is_empty());
+        match &a.modal {
+            Modal::Confirm { prompt, cmd } => {
+                assert!(prompt.contains("WARNING") && prompt.contains("OrbStack VM"), "{prompt}");
+                assert!(matches!(cmd, Command::Act { kind: ActionKind::Pause, pid: 13792, .. }));
+            }
+            m => panic!("{m:?}"),
+        }
+        a.on_key(code(KeyCode::Esc));
+        // k (tree kill on Ports) says it is the VM host, besides "cannot be undone".
+        a.on_key(key('k'));
+        match &a.modal {
+            Modal::Confirm { prompt, .. } => assert!(prompt.contains("cannot be undone") && prompt.contains("OrbStack VM"), "{prompt}"),
+            m => panic!("{m:?}"),
+        }
+        a.on_key(code(KeyCode::Esc));
+        // A plain process still pauses with one key, and its prompt has no warning.
+        let mut b = app();
+        assert_eq!(b.on_key(key(' ')), vec![Command::Act { kind: ActionKind::Pause, pid: 200, nice: None, start: 1700000200 }]);
+        b.on_key(key('k'));
+        assert!(matches!(&b.modal, Modal::Confirm { prompt, .. } if !prompt.contains("WARNING")));
+    }
+
+    #[test]
+    fn doctor_kill_confirmation_says_it_cannot_be_undone() {
+        let mut a = app();
+        a.on_key(key('5'));
+        a.set_findings_with_starts(
+            vec![Finding { severity: "warn".into(), title: "orphan".into(), detail: "".into(), pids: vec![200], action: Some("kill 200 --tree".into()) }],
+            HashMap::from([(200, 42)]),
+        );
+        a.on_key(code(KeyCode::Enter));
+        match &a.modal {
+            Modal::Confirm { prompt, .. } => assert!(prompt.contains("cannot be undone"), "{prompt}"),
+            m => panic!("{m:?}"),
+        }
     }
 
     #[test]

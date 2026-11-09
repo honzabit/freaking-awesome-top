@@ -1086,7 +1086,7 @@ mod tests {
         assert_eq!(m.action.as_deref(), Some("kill 3001"));
         assert!(m.detail.contains("leaky (pid 3001) 20.0G"), "{}", m.detail);
         let e = explain(&s, 3000, None);
-        assert!(e.suggestions.iter().any(|x| x == "pause it (reversible): fat pause 3000"));
+        assert!(e.suggestions.iter().any(|x| x == "pause it (reversible): fat pause 3000"), "{:?}", e.suggestions);
         assert!(e.suggestions.iter().any(|x| x == "stop it: fat kill 3000"));
     }
 
@@ -1250,6 +1250,64 @@ mod tests {
         for pid in hub_pids {
             let e = explain(&s, pid, None);
             assert!(!says_stop(&e, pid), "why {pid}: {:?}", e.suggestions);
+        }
+    }
+
+    #[test]
+    fn hub_gate_covers_vm_host_browser_main_and_container_init() {
+        let mut ps = mac_base();
+        let helper = "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper";
+        ps.push(mp(13792, 1, "OrbStack Helper", helper, 300.0, 2800 * MB));
+        brave(&mut ps);
+        ps.push(mp(900, 102, "java", "/usr/bin/java", 5.0, GB));
+        ps.push(mp(901, 900, "java-child", "/usr/bin/java", 0.0, MB));
+        let mut s = mac(ps);
+        s.containers = vec![ct("db", "orbstack", 328 * MB)];
+        let g = super::super::hub_gate(&s, 13792).expect("VM host is a hub");
+        assert!(g.hard && g.note.contains("OrbStack VM") && g.note.contains("docker stop db"), "{g:?}");
+        let g = super::super::hub_gate(&s, 1686).expect("browser main is a hub");
+        assert!(g.hard && g.note.contains("Brave's main process"), "{g:?}");
+        // A renderer, a plain user process: no gate (the TUI/MCP act as before).
+        assert_eq!(super::super::hub_gate(&s, 52510), None);
+        assert_eq!(super::super::hub_gate(&s, 900), None);
+        // A session hub only warns.
+        let g = super::super::hub_gate(&s, 102).expect("login shell");
+        assert!(!g.hard, "{g:?}");
+        // A tree kill of the terminal would end the shell inside: found; java's tree has none.
+        assert_eq!(super::super::hub_in_tree(&s, 900), None);
+        let mut s2 = s.clone();
+        s2.procs.push(mp(950, 900, "OrbStack Helper", helper, 0.0, MB));
+        assert_eq!(super::super::hub_in_tree(&s2, 900).map(|x| x.0), Some(950));
+
+        // Linux: a container's pid 1 seen from the host.
+        let mut l = mp(333184, 333100, "clickhouse-server", "/usr/bin/clickhouse", 50.0, GB);
+        l.cgroup = "/system.slice/docker-f592d553aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.scope".into();
+        l.container = Some("f592d553aaaa".into());
+        let mut shim = mp(333100, 1, "containerd-shim", "/usr/bin/containerd-shim-runc-v2", 0.0, 10 * MB);
+        shim.user = "root".into();
+        let mut init = mp(1, 0, "systemd", "/sbin/init", 0.0, 10 * MB);
+        init.user = "root".into();
+        let mut ls = mac(vec![init, shim, l]);
+        ls.system.os = "Linux 24.04 Ubuntu".into();
+        let g = super::super::hub_gate(&ls, 333184).expect("container pid 1");
+        assert!(g.hard && g.note.contains("pid 1 of container"), "{g:?}");
+    }
+
+    #[test]
+    fn why_never_calls_renice_reversible_and_skips_it_for_os_daemons() {
+        let mut ps = mac_base();
+        let mut mds = mp(75606, 1, "mds_stores", "/System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Support/mds_stores", 90.0, 200 * MB);
+        mds.user = "root".into();
+        ps.push(mds);
+        ps.push(mp(900, 102, "java", "/usr/bin/java", 95.0, GB));
+        let s = mac(ps);
+        let e = explain(&s, 75606, None);
+        assert!(!e.suggestions.iter().any(|x| x.contains("renice")), "OS daemon: {:?}", e.suggestions);
+        let e = explain(&s, 900, None);
+        let r = e.suggestions.iter().find(|x| x.contains("fat renice 900 10")).expect("renice offered for own process");
+        assert!(r.contains("needs root") && !r.contains("reversible"), "{r}");
+        for f in diagnose(&s, None) {
+            assert!(!f.detail.contains("renice") || !f.detail.contains("reversible"), "{f:?}");
         }
     }
 }

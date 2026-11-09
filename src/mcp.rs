@@ -43,8 +43,11 @@ and `ask {question}` for a plain-language answer. For disk space: `fs_volumes` (
 in the last 10 minutes': growing paths, their writers, deleted-but-open files). The fs tools only read; fat never deletes files. \
 Side-effect tools (`pause`, `resume`, `renice`, `kill`, `undo`) are off unless the user enabled them in fat's config \
 (`[mcp] allow_actions`); a disabled one returns an error saying how. Do not work around a disabled tool with a shell `kill`: \
-tell the user. All actions are journaled. `pause` (SIGSTOP; undo with `resume` or `undo`) and `renice` are undoable; `kill` \
-is NOT undoable, so prefer pausing a suspect first. `kill` takes two calls: the first returns a preview (what would be \
+tell the user. All actions are journaled. `pause` (SIGSTOP; undo with `resume` or `undo`) is undoable; `renice` is journaled, but \
+only root can lower nice again, so as a normal user a renice can't be taken back; `kill` is NOT undoable, so prefer \
+pausing a suspect first. `pause` and `kill` are refused for hubs, processes whose cost is other work (a VM or container \
+host such as OrbStack Helper, a container runtime or a container's pid 1, init, a browser's or app's main process, the \
+display server): the refusal names the workload to act on instead (`docker stop <name>`, close a tab), so tell the user. `kill` takes two calls: the first returns a preview (what would be \
 signalled, protection checks, the tree) and a short-lived `confirm_token`; call `kill` again with that token to act. \
 Pass the `start_time` (and `name`) you saw in snapshot/process with every action, so a pid that was reused by another \
 process in the meantime is refused instead of signalled. Processes with `usage_unknown: true` belong to other users and \
@@ -87,6 +90,9 @@ struct KillToken {
     start_time: Option<u64>,
     kind: ActionKind,
     issued: Instant,
+    /// KillTree: the (pid, start time) of every descendant the preview showed. Only these
+    /// (still alive, same start time) are signalled; anything forked since is left alone.
+    tree: Vec<(u32, u64)>,
 }
 
 /// `[mcp]` in fat's config file (parsed here: the rest of the file belongs to `Config`).
@@ -576,7 +582,7 @@ pub fn tools() -> Vec<Value> {
         tool(
             "pause",
             "Pause process",
-            "Freeze a process with SIGSTOP. Undoable (resume or undo) — prefer this over kill to test whether a process is the culprit. Refused for system/session daemons (launchd, WindowServer, cfprefsd on macOS; init, systemd, dbus, the display server on Linux, ...) that other apps block on. Pass `start_time` from snapshot so a reused pid is never hit. Returns an action record with an id for `undo`.",
+            "Freeze a process with SIGSTOP. Undoable (resume or undo) — prefer this over kill to test whether a process is the culprit. Refused for hubs (a VM/container host like OrbStack Helper, a container runtime or a container's pid 1, a browser's or app's main process: freezing one freezes everything it hosts; the refusal says what to act on instead) and for system/session daemons (launchd, WindowServer, cfprefsd on macOS; init, systemd, dbus, the display server on Linux, ...) that other apps block on. Pass `start_time` from snapshot so a reused pid is never hit. Returns an action record with an id for `undo`.",
             schema(target_schema(json!({})), &["pid"]),
             true,
         ),
@@ -590,7 +596,7 @@ pub fn tools() -> Vec<Value> {
         tool(
             "renice",
             "Change priority",
-            "Set a process's nice value (-20 highest priority .. 20 lowest). Raising nice (deprioritizing) is allowed for your own processes; lowering usually needs root. Undoable.",
+            "Set a process's nice value (-20 highest priority .. 20 lowest). Raising nice (deprioritizing) is allowed for your own processes; lowering usually needs root, so undoing a renice also needs root (the result's `undoable` says whether this one can be undone).",
             schema(
                 target_schema(json!({
                     "nice": { "type": "integer", "minimum": -20, "maximum": 20, "description": "New nice value." }
@@ -602,7 +608,7 @@ pub fn tools() -> Vec<Value> {
         tool(
             "kill",
             "Terminate process",
-            "Terminate a process with SIGTERM (graceful; a paused process is continued so it can act on it). `tree: true` terminates the process and all its descendants; `force: true` sends SIGKILL instead. NOT undoable — consider `pause` first. Two steps: a call without `confirm_token` signals nothing and returns a preview (target, signal, protection checks, the tree that would be hit) plus a `confirm_token` valid for 60 s; repeat the call with the same pid/tree/force and that token to execute. The token is single-use and bound to that process's start time, so a reused pid is refused. Journaled.",
+            "Terminate a process with SIGTERM (graceful; a paused process is continued so it can act on it). `tree: true` terminates the process and all its descendants (SIGTERM, leaves first; it can't be combined with `force`); `force: true` sends SIGKILL instead. Refused for hubs (a VM/container host, runtime, container pid 1, browser or app main process), and a tree that contains one. NOT undoable — consider `pause` first. Two steps: a call without `confirm_token` signals nothing and returns a preview (target, signal, protection checks, the tree that would be hit) plus a `confirm_token` valid for 60 s; repeat the call with the same pid/tree/force and that token to execute. The token is single-use and bound to that process's start time, so a reused pid is refused; for a tree it is also bound to the previewed descendants, and processes that appeared since the preview are left alone. Journaled.",
             schema(
                 target_schema(json!({
                     "tree": { "type": "boolean", "default": false, "description": "Also terminate all descendants." },
@@ -995,7 +1001,51 @@ fn apply(state: &mut State, kind: ActionKind, pid: u32, nice: Option<i32>, args:
 
 fn tool_pause(state: &mut State, args: &Value) -> Result<Value> {
     let pid = arg_pid(args)?;
+    let snap = state.snapshot()?;
+    let (refusal, _) = hub_check(snap, ActionKind::Pause, pid);
+    if let Some(r) = refusal {
+        bail!("Pause {pid} refused: {r}");
+    }
     apply(state, ActionKind::Pause, pid, None, args)
+}
+
+/// blame's hub gate for an agent's Pause/Term/Kill/KillTree: (refusal, warning). A hard hub
+/// (VM/container host, runtime, container pid 1, init, browser/app main process, display,
+/// kernel) is refused, and so is a tree with one inside; a session hub only warns.
+fn hub_check(snap: &Snapshot, kind: ActionKind, pid: u32) -> (Option<String>, Option<String>) {
+    if !matches!(kind, ActionKind::Pause | ActionKind::Term | ActionKind::Kill | ActionKind::KillTree) {
+        return (None, None);
+    }
+    let verb = if kind == ActionKind::Pause { "freezes" } else { "ends" };
+    match crate::blame::hub_gate(snap, pid) {
+        Some(g) if g.hard => {
+            return (Some(format!("{}; {kind:?} {verb} everything it hosts. Not offered to agents: tell the user", g.note)), None);
+        }
+        Some(g) => return (None, Some(g.note)),
+        None => {}
+    }
+    if kind == ActionKind::KillTree
+        && let Some((d, g)) = crate::blame::hub_in_tree(snap, pid)
+    {
+        return (Some(format!("its tree contains pid {d}: {}; end the specific job instead of the whole tree", g.note)), None);
+    }
+    (None, None)
+}
+
+/// `snap` minus the descendants of `pid` that are not in the previewed `tree` (same pid and
+/// start time), so a tree kill signals only what the preview showed.
+fn restrict_tree(snap: &Snapshot, pid: u32, tree: &[(u32, u64)]) -> (Snapshot, Vec<u32>) {
+    let drop: std::collections::HashSet<u32> = snap
+        .descendants(pid)
+        .into_iter()
+        .filter(|d| !tree.iter().any(|&(tp, ts)| tp == d.pid && (ts == 0 || d.start_time == 0 || ts.abs_diff(d.start_time) <= 2)))
+        .map(|d| d.pid)
+        .collect();
+    let mut out = snap.clone();
+    out.procs.retain(|p| !drop.contains(&p.pid));
+    let mut new: Vec<u32> = drop.into_iter().collect();
+    new.sort_unstable();
+    (out, new)
 }
 
 fn tool_resume(state: &mut State, args: &Value) -> Result<Value> {
@@ -1014,6 +1064,9 @@ fn tool_renice(state: &mut State, args: &Value) -> Result<Value> {
 
 fn tool_kill(state: &mut State, args: &Value) -> Result<Value> {
     let pid = arg_pid(args)?;
+    if arg_bool(args, "tree")? && arg_bool(args, "force")? {
+        bail!("`tree` and `force` can't be combined: a tree kill sends SIGTERM leaves-first. Kill the tree, then `force` any pid that survives");
+    }
     let kind = if arg_bool(args, "tree")? {
         ActionKind::KillTree
     } else if arg_bool(args, "force")? {
@@ -1042,8 +1095,16 @@ fn tool_kill(state: &mut State, args: &Value) -> Result<Value> {
             if snap.proc(pid).is_none() {
                 bail!("no process with pid {pid}");
             }
-            let r = state.actions()?.apply_expect(kind, pid, None, &snap, expect.as_ref());
+            // Re-checked at execute: the tree may have grown a hub since the preview.
+            let (snap, unseen) = if kind == ActionKind::KillTree { restrict_tree(&snap, pid, &t.tree) } else { (snap, Vec::new()) };
+            if let (Some(r), _) = hub_check(&snap, kind, pid) {
+                bail!("{kind:?} {pid} refused: {r}");
+            }
+            let mut r = state.actions()?.apply_expect(kind, pid, None, &snap, expect.as_ref());
             state.last = None;
+            if !unseen.is_empty() {
+                r.message = format!("{}; left alone {} process(es) not in the preview: {unseen:?}", r.message, unseen.len());
+            }
             action_result(r)
         }
     }
@@ -1072,16 +1133,27 @@ fn kill_preview(state: &mut State, kind: ActionKind, pid: u32, args: &Value) -> 
             d
         }).collect::<Vec<_>>());
     }
-    if let Some(r) = pv.refusal {
+    let (hub_refusal, hub_warning) = hub_check(&snap, kind, pid);
+    let refusal = match (pv.refusal, hub_refusal) {
+        (Some(a), Some(b)) => Some(format!("{a}; and {b}")),
+        (a, b) => a.or(b),
+    };
+    if let Some(r) = refusal {
         v["refused"] = json!(r);
         v["note"] = json!("fat would refuse this; no token issued");
         return Ok(v);
     }
-    if let Some(w) = pv.warning {
-        v["warning"] = json!(w);
+    let warning: Vec<String> = pv.warning.into_iter().chain(hub_warning).collect();
+    if !warning.is_empty() {
+        v["warning"] = json!(warning.join("; "));
     }
     let token = new_token(pid);
-    state.kill_tokens.push(KillToken { token: token.clone(), pid, start_time: pv.start_time.or((p.start_time != 0).then_some(p.start_time)), kind, issued: Instant::now() });
+    let tree: Vec<(u32, u64)> = if kind == ActionKind::KillTree {
+        pv.tree.iter().map(|(cpid, _, _)| (*cpid, snap.proc(*cpid).map_or(0, |c| c.start_time))).collect()
+    } else {
+        Vec::new()
+    };
+    state.kill_tokens.push(KillToken { token: token.clone(), pid, start_time: pv.start_time.or((p.start_time != 0).then_some(p.start_time)), kind, issued: Instant::now(), tree });
     v["confirm_token"] = json!(token);
     v["expires_in_s"] = json!(KILL_TOKEN_TTL.as_secs());
     v["next"] = json!(format!("This cannot be undone. To proceed, call kill again with pid {pid}{} and confirm_token. Consider `pause` first.", match kind {
@@ -1484,7 +1556,7 @@ mod tests {
         assert_eq!(r["isError"], true);
 
         // 5. Expired tokens are dropped.
-        s.kill_tokens.push(KillToken { token: "old".into(), pid: 42, start_time: None, kind: ActionKind::Term, issued: Instant::now() - KILL_TOKEN_TTL - Duration::from_secs(1) });
+        s.kill_tokens.push(KillToken { token: "old".into(), pid: 42, start_time: None, kind: ActionKind::Term, issued: Instant::now() - KILL_TOKEN_TTL - Duration::from_secs(1), tree: vec![] });
         let r = tool_call(&mut s, "kill", json!({"pid": 42, "confirm_token": "old"}));
         assert!(r["structuredContent"]["error"].as_str().unwrap().contains("expired"));
         let _ = std::fs::remove_file(&journal);
@@ -1799,5 +1871,82 @@ mod tests {
         assert_eq!(j["growers"][0]["writers"][0]["pid"], 9);
         assert_eq!(j["deleted_open"]["by_process"][0]["bytes"], 1u64 << 30);
         assert_eq!(j["deleted_open"]["by_process"][0]["files"], 1);
+    }
+
+    fn hp(pid: u32, ppid: u32, name: &str, exe: &str) -> Proc {
+        Proc { pid, ppid, name: name.into(), cmd: exe.into(), exe: exe.into(), user: "me".into(), start_time: 1_700_000_000 + pid as u64, ..Default::default() }
+    }
+
+    fn hub_snap() -> Snapshot {
+        let mut s = Snapshot::default();
+        s.system.os = "macOS 15.6".into();
+        let helper = "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper";
+        let mut l = hp(1, 0, "launchd", "/sbin/launchd");
+        l.user = "root".into();
+        s.procs = vec![
+            l,
+            hp(13792, 1, "OrbStack Helper", helper),
+            hp(1686, 1, "Brave Browser", "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+            hp(1700, 1686, "Brave Browser Helper (Renderer)", "/Applications/Brave Browser.app/Contents/Frameworks/Brave Browser Helper (Renderer).app/Contents/MacOS/Brave Browser Helper (Renderer)"),
+            hp(900, 1, "node", "/usr/local/bin/node"),
+            hp(901, 900, "node", "/usr/local/bin/node"),
+            hp(902, 901, "esbuild", "/usr/local/bin/esbuild"),
+        ];
+        s
+    }
+
+    #[test]
+    fn agent_pause_and_kill_refuse_hubs() {
+        let s = hub_snap();
+        for kind in [ActionKind::Pause, ActionKind::Term, ActionKind::Kill, ActionKind::KillTree] {
+            let (r, _) = hub_check(&s, kind, 13792);
+            let r = r.unwrap_or_else(|| panic!("{kind:?} of the VM host must be refused"));
+            assert!(r.contains("OrbStack VM") && r.contains("tell the user"), "{r}");
+            assert!(hub_check(&s, kind, 1686).0.is_some_and(|r| r.contains("Brave's main process")), "{kind:?} browser main");
+            assert_eq!(hub_check(&s, kind, 900), (None, None), "{kind:?} a plain process");
+        }
+        // Renice and resume are not gated (renice of a VM host is blame's call, not a freeze).
+        assert_eq!(hub_check(&s, ActionKind::Renice, 13792), (None, None));
+        assert_eq!(hub_check(&s, ActionKind::Resume, 13792), (None, None));
+        // A tree with a hub inside is refused for KillTree only.
+        let mut s2 = s.clone();
+        s2.procs.push(hp(950, 902, "OrbStack Helper", "/Applications/OrbStack.app/Contents/MacOS/OrbStack Helper"));
+        assert!(hub_check(&s2, ActionKind::KillTree, 900).0.is_some_and(|r| r.contains("pid 950")));
+        assert_eq!(hub_check(&s2, ActionKind::Term, 900).0, None);
+
+        // Through the tools: preview refuses with no token; pause errors without signalling.
+        let mut st = State::empty();
+        st.allowed = vec!["kill".into(), "pause".into()];
+        st.last = Some((Instant::now(), s.clone()));
+        st.samples = 2;
+        let r = tool_call(&mut st, "kill", json!({"pid": 13792}));
+        let p = &r["structuredContent"];
+        assert!(p["refused"].as_str().is_some_and(|x| x.contains("OrbStack VM")), "{r}");
+        assert!(p["confirm_token"].is_null(), "{r}");
+        st.last = Some((Instant::now(), s.clone()));
+        let r = tool_call(&mut st, "pause", json!({"pid": 13792}));
+        assert_eq!(r["isError"], true, "{r}");
+        assert!(r["structuredContent"]["error"].as_str().unwrap().contains("refused"), "{r}");
+        // tree + force is rejected instead of silently sending TERM.
+        st.last = Some((Instant::now(), s));
+        let r = tool_call(&mut st, "kill", json!({"pid": 900, "tree": true, "force": true}));
+        assert!(r["structuredContent"]["error"].as_str().unwrap().contains("can't be combined"), "{r}");
+    }
+
+    #[test]
+    fn tree_kill_token_covers_only_the_previewed_descendants() {
+        let s = hub_snap();
+        // Previewed: 901 and 902. Since then 903 was forked under 901, and 902's pid was reused.
+        let tree = vec![(901, 1_700_000_901), (902, 1_700_000_902)];
+        let mut now = s.clone();
+        now.procs.push(hp(903, 901, "sh", "/bin/sh"));
+        now.procs.iter_mut().find(|p| p.pid == 902).unwrap().start_time += 500;
+        let (r, unseen) = restrict_tree(&now, 900, &tree);
+        assert_eq!(unseen, vec![902, 903]);
+        let left: Vec<u32> = r.descendants(900).iter().map(|p| p.pid).collect();
+        assert_eq!(left, vec![901]);
+        assert!(r.proc(900).is_some() && r.proc(13792).is_some(), "the rest of the snapshot is kept");
+        // Unchanged tree: nothing dropped.
+        assert!(restrict_tree(&s, 900, &tree).1.is_empty());
     }
 }

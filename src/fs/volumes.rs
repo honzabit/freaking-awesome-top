@@ -35,7 +35,9 @@ const FILL_MIN_SPAN_MS: i64 = 60_000;
 const PURGEABLE_EVERY: Duration = Duration::from_secs(60);
 /// (pid, process name, path, bytes).
 type DeletedFile = (u32, String, String, u64);
-/// `deleted_open()` result cache (the native macOS scan is ~10 ms; the lsof fallback ~0.25 s CPU).
+/// `deleted_open()` result cache. A scan is not cheap: the native macOS walk took 0.22-0.4 s for
+/// one user's processes (measured; more as root), about what `lsof +L1` costs (~0.25 s), because
+/// it visits every mapped region of every process.
 const DELETED_TTL: Duration = Duration::from_secs(15);
 
 /// Stateful so it can compute I/O and fill rates between calls.

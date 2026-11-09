@@ -105,12 +105,13 @@ enum Cmd {
     Pause { pid: u32 },
     /// Resume a paused process (SIGCONT).
     Resume { pid: u32 },
-    /// Change priority. Undoable (lowering nice again may need root).
+    /// Change priority. Journaled; undoing a +N needs root (lowering nice is privileged).
     Renice { pid: u32, nice: i32 },
-    /// Terminate (TERM). NOT undoable: pause first to try it out. --tree: whole subtree; --force: KILL.
+    /// Terminate (TERM), no prompt. NOT undoable: pause first to try it out. --tree: whole subtree (TERM); --force: KILL.
     Kill {
         pid: u32,
-        #[arg(long)]
+        /// TERM the whole subtree, leaves first. Can't be combined with --force.
+        #[arg(long, conflicts_with = "force")]
         tree: bool,
         #[arg(long)]
         force: bool,
@@ -141,7 +142,7 @@ enum Cmd {
 /// from each subcommand's own about text; `help_groups_cover_every_subcommand` keeps it whole).
 const HELP_GROUPS: &[(&str, &[&str])] = &[
     ("Everyday", &["snapshot", "ports", "fs", "why", "doctor", "ask"]),
-    ("Actions (pause/resume/renice can be undone; kill cannot)", &["pause", "resume", "renice", "kill", "undo", "log"]),
+    ("Actions (pause/resume can be undone, renice as root; kill cannot)", &["pause", "resume", "renice", "kill", "undo", "log"]),
     ("Flight recorder", &["record", "history"]),
     ("Advanced", &["run", "fleet", "mcp"]),
 ];
@@ -879,6 +880,15 @@ mod tests {
             Some(Cmd::Fs(a)) => Ok(a),
             _ => Err("not fs".into()),
         }
+    }
+
+    #[test]
+    fn kill_tree_and_force_do_not_combine() {
+        // A tree kill sends TERM; --force used to be dropped silently and the result said "[ok]".
+        let e = Cli::try_parse_from(["fat", "kill", "123", "--tree", "--force"]).err().expect("rejected");
+        assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict, "{e}");
+        assert!(matches!(Cli::try_parse_from(["fat", "kill", "123", "--tree"]).unwrap().cmd, Some(Cmd::Kill { tree: true, force: false, .. })));
+        assert!(matches!(Cli::try_parse_from(["fat", "kill", "123", "--force"]).unwrap().cmd, Some(Cmd::Kill { tree: false, force: true, .. })));
     }
 
     #[test]

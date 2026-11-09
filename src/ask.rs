@@ -183,22 +183,42 @@ fn trunc(s: &str, n: usize) -> String {
 // Everything in the request except fat's own system prompt is passed through [`redact`]:
 // command lines, cwd and other paths, port notes, container names, findings, the question.
 
-/// Words that make a `key=value` / `--flag value` / `Header: value` secret.
-const SECRET_WORDS: [&str; 13] =
-    ["key", "token", "secret", "passw", "pwd", "auth", "credential", "bearer", "session", "cookie", "private", "signature", "pass"];
 const MASK: &str = "***";
 
+/// Whether a `key=value` / `--flag value` / `Header: value` name says the value is secret.
+/// Judged per word part (split on `-`, `_`, `.`), so `--passphrase`, `BORG_PASSPHRASE`,
+/// `PGPASSWORD`, `x-api-key` and `GITHUB_TOKEN` are secret while `--bypass-cache`, `--compass`,
+/// `--author`, `--keychain` and `$PWD` (the working directory) are not.
 fn secret_name(name: &str) -> bool {
-    let l = name.trim_start_matches('-').to_ascii_lowercase();
-    // "pass" alone, or as a word part (PGPASS, pass_file), but not "passive"/"compass".
-    !l.is_empty()
-        && SECRET_WORDS.iter().any(|w| {
-            if *w == "pass" {
-                l == "pass" || l.ends_with("pass") || l.contains("pass_") || l.contains("pass-")
-            } else {
-                l.contains(w)
-            }
-        })
+    let raw = name.trim_start_matches('-');
+    // The shell's working-directory variables, not a password.
+    if raw == "PWD" || raw == "OLDPWD" {
+        return false;
+    }
+    let l = raw.to_ascii_lowercase();
+    // A file descriptor or file holding the secret is not the secret (`--passphrase-fd 0`).
+    if l.is_empty() || l.ends_with("-fd") || l.ends_with("_fd") {
+        return false;
+    }
+    // Words that end in these letters without being about secrets.
+    const NOT_PASS: &[&str] = &["bypass", "compass", "encompass", "surpass", "trespass", "overpass", "underpass", "impass"];
+    const NOT_KEY: &[&str] = &["monkey", "hotkey", "turkey", "donkey", "hockey", "jockey", "whiskey"];
+    l.split(['-', '_', '.']).filter(|w| !w.is_empty()).any(|w| {
+        const CONTAINS: &[&str] = &["token", "secret", "passw", "passphrase", "credential", "cookie", "signature", "apikey", "privatekey"];
+        CONTAINS.iter().any(|c| w.contains(c))
+            || matches!(w, "pw" | "pin" | "bearer" | "private")
+            || w.starts_with("session")
+            || (w.ends_with("pass") && !NOT_PASS.contains(&w))
+            || (w.ends_with("pwd") && w != "cwd")
+            || (w.ends_with("key") && !NOT_KEY.contains(&w))
+            || (w.ends_with("auth") || (w.starts_with("auth") && !w.starts_with("author")) || w == "authorization")
+    })
+}
+
+/// Short flags whose next argument is a password for one program: `sshpass -p X`,
+/// `redis-cli -a X`. Elsewhere `-p 8080` is a port and `-a` means "all".
+fn program_secret_flag(prog: &str, flag: &str) -> bool {
+    matches!((prog, flag), ("sshpass", "-p") | ("redis-cli", "-a"))
 }
 
 /// Known credential shapes: provider API keys and tokens, AWS key ids, JWTs.
@@ -329,6 +349,9 @@ pub(crate) fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut mask_next = false;
     let mut user_next = false;
+    // Basename of the most recent program word (the first token, or one after `|`, `;`, `&&`, sudo, env).
+    let mut prog = String::new();
+    let mut want_prog = true;
     let mut i = 0;
     let b = text.as_bytes();
     while i < b.len() {
@@ -342,6 +365,12 @@ pub(crate) fn redact(text: &str) -> String {
         let end = text[i..].find(char::is_whitespace).map_or(text.len(), |j| i + j);
         let tok = &text[i..end];
         i = end;
+        if want_prog && !tok.starts_with('-') && !tok.contains('=') {
+            prog = tok.rsplit('/').next().unwrap_or(tok).to_string();
+            want_prog = matches!(prog.as_str(), "sudo" | "env" | "exec" | "nohup" | "time" | "nice");
+        } else if matches!(tok, "|" | ";" | "&&" | "||") {
+            want_prog = true;
+        }
         if mask_next {
             // "Authorization: Bearer X": the scheme stays, the credential after it goes.
             let scheme = ["bearer", "basic", "token", "digest"].contains(&tok.to_ascii_lowercase().trim_start_matches(['"', '\'']));
@@ -371,6 +400,11 @@ pub(crate) fn redact(text: &str) -> String {
             if tok == "-u" || tok == "--user" {
                 out.push_str(tok);
                 user_next = true;
+                continue;
+            }
+            if program_secret_flag(&prog, tok) {
+                out.push_str(tok);
+                mask_next = true;
                 continue;
             }
             // mysql -pSECRET (attached). Ports (-p8080) and well-known flags that happen to
@@ -998,6 +1032,25 @@ mod tests {
             ("cc -pthread -O2 -p8080 x.c", "cc -pthread -O2 -p8080 x.c"),
             ("find . -print -prune", "find . -print -prune"),
             ("vite --port 5173 --host 0.0.0.0", "vite --port 5173 --host 0.0.0.0"),
+            // Passphrases and program-specific short password flags.
+            ("gpg --batch --passphrase hunterPHRASE1 -d f", "gpg --batch --passphrase *** -d f"),
+            ("BORG_PASSPHRASE=borgSECRET2 borg create", "BORG_PASSPHRASE=*** borg create"),
+            ("RESTIC_PASSWORD=r3st1c restic backup", "RESTIC_PASSWORD=*** restic backup"),
+            ("sshpass -p sshSECRET3 ssh h", "sshpass -p *** ssh h"),
+            ("/usr/bin/sshpass -p sshSECRET3 ssh h", "/usr/bin/sshpass -p *** ssh h"),
+            ("redis-cli -a redisSECRET4 ping", "redis-cli -a *** ping"),
+            ("PGPASS=x psql", "PGPASS=*** psql"),
+            ("gpg --passphrase-fd 0 -d f", "gpg --passphrase-fd 0 -d f"),
+            // Ports and "all" flags elsewhere stay.
+            ("ssh -p 2222 host", "ssh -p 2222 host"),
+            ("ls -a /tmp", "ls -a /tmp"),
+            // Flags that only contain "pass", "auth" or "key" keep their values.
+            ("x --bypass-cache foo", "x --bypass-cache foo"),
+            ("x --compass foo", "x --compass foo"),
+            ("git log --author bob", "git log --author bob"),
+            ("security --keychain login", "security --keychain login"),
+            ("PWD=/Users/x/code OLDPWD=/tmp sh", "PWD=/Users/x/code OLDPWD=/tmp sh"),
+            ("curl -H x-api-key: k3y", "curl -H x-api-key: ***"),
         ];
         for (input, want) in cases {
             assert_eq!(redact(input), want, "{input}");
