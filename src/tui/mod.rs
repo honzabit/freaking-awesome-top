@@ -8,6 +8,11 @@
 //! - history: owns a read-side History; timeline, spikes, time-travel loads and explain run
 //!   here so SQLite never stalls input or rendering (requests are coalesced)
 //! - fleet: containers every ~5s, remote hosts every ~10s
+//! - fat-volumes: mounted volumes every sample (statfs can hang on a dead network mount, so it
+//!   never runs on the sampler), deleted-but-open files every ~60s; feeds the Fs tab and doctor
+//! - fat-fs: started the first time the Fs tab is opened (never before): owns the Scanner
+//!   (background du of "/"); listings, rescans, largest-entry and time-travel queries run here
+//! - fat-fs-growth: owns the growth Tracker (fed every collector sample) and builds reports
 //! - ask: one short-lived thread per question
 //!
 //! Calls into other modules are wrapped in [`guarded`] so a panic in a collector
@@ -21,6 +26,7 @@ use crate::actions::Actions;
 use crate::config::Config;
 use crate::history::History;
 use crate::history::Point;
+use crate::fs::{DirEntry, Growth, Listing, Volume};
 use crate::model::{Container, Explanation, Finding, Snapshot, Ts, now_ms};
 use app::{App, Command, HostRow};
 use crossterm::event::{self, Event, KeyEventKind};
@@ -34,7 +40,7 @@ use std::io::Stdout;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -49,6 +55,43 @@ enum Msg {
     Timeline(Option<(Vec<Point>, Vec<Ts>)>),
     Past(Ts, Option<Box<Snapshot>>),
     Why(Result<Explanation, String>),
+    FsVolumes(Ts, Vec<Volume>),
+    FsListing(String, Option<Listing>),
+    FsGrowth(Box<Growth>),
+    FsLargest(String, Vec<DirEntry>),
+    FsPast(Box<app::FsPast>),
+    FsError(String),
+}
+
+/// Work for the storage thread.
+enum FsReq {
+    List { path: String, explicit: bool },
+    Growth { window_ms: i64, under: Option<String> },
+    Rescan(String),
+    Largest(String),
+    At { ts: Ts, path: String },
+    /// Every collector sample, for the growth tracker's open-file attribution.
+    Observe(Box<Snapshot>),
+}
+
+/// Storage facts shared between threads (plain data only: the engines stay on their threads).
+#[derive(Default)]
+struct FsShared {
+    volumes: Mutex<Vec<Volume>>,
+    deleted_open: Mutex<Vec<(u32, String, String, u64)>>,
+    growth: Mutex<Option<Growth>>,
+    /// Set once the storage thread runs; the sampler forwards snapshots to it.
+    observe: Mutex<Option<Sender<FsReq>>>,
+}
+
+impl FsShared {
+    fn facts(&self) -> crate::blame::FsFacts {
+        crate::blame::FsFacts {
+            volumes: self.volumes.lock().map(|v| v.clone()).unwrap_or_default(),
+            growth: self.growth.lock().ok().and_then(|g| g.clone()),
+            deleted_open: self.deleted_open.lock().map(|v| v.clone()).unwrap_or_default(),
+        }
+    }
 }
 
 /// Work for the history thread.
@@ -153,7 +196,7 @@ fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
 
 // ------------------------------------------------------------------ background threads
 
-fn spawn_sampler(cfg: Config, tx: Sender<Msg>) {
+fn spawn_sampler(cfg: Config, tx: Sender<Msg>, fs: Arc<FsShared>) {
     thread::spawn(move || {
         let interval = Duration::from_millis(cfg.interval_ms.max(250));
         let mut col = match guarded(crate::collect::Collector::new) {
@@ -186,15 +229,29 @@ fn spawn_sampler(cfg: Config, tx: Sender<Msg>) {
                     // record() is a no-op while another fat (e.g. `fat record`) holds the lease.
                     if guarded(|| h.record(&snap)).is_err() {
                         hist = None;
+                    } else if h.is_writer() {
+                        // Same storage rows `fat record` keeps, so time travel shows volume use.
+                        let vols = fs.volumes.lock().map(|v| v.clone()).unwrap_or_default();
+                        if !vols.is_empty() {
+                            let _ = guarded(|| h.record_volumes(now, &vols));
+                        }
                     } else if h.is_writer() && last_prune.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
                         last_prune = Some(Instant::now());
                         let _ = guarded(|| h.prune(keep_days));
                     }
                 }
             }
+            // The growth tracker attributes writes to processes; only once the Fs tab started it.
+            if let Some(obs) = fs.observe.lock().ok().and_then(|o| o.clone())
+                && obs.send(FsReq::Observe(Box::new(snap.clone()))).is_err()
+                && let Ok(mut o) = fs.observe.lock()
+            {
+                *o = None;
+            }
             if diagnose_ok && now - last_diag >= 5000 {
                 last_diag = now;
-                match guarded(|| crate::blame::diagnose(&snap, hist.as_ref())) {
+                let facts = fs.facts();
+                match guarded(|| crate::blame::diagnose_with_fs(&snap, hist.as_ref(), &facts)) {
                     Ok(f) => {
                         let starts = finding_starts(&f, &snap);
                         if tx.send(Msg::Findings(f, starts)).is_err() {
@@ -353,6 +410,233 @@ fn spawn_fleet(cfg: Config, tx: Sender<Msg>) {
     });
 }
 
+/// Volumes every `interval_ms`, deleted-but-open files every 60s. A panic in either disables it.
+fn spawn_volumes(interval_ms: u64, tx: Sender<Msg>, shared: Arc<FsShared>) {
+    let _ = thread::Builder::new().name("fat-volumes".into()).spawn(move || {
+        let mut vols = guarded(crate::fs::volumes::Volumes::new).ok();
+        let mut deleted_ok = true;
+        let mut last_deleted = i64::MIN / 2;
+        loop {
+            if let Some(v) = vols.as_mut() {
+                match guarded(|| v.sample()) {
+                    Ok(list) => {
+                        if let Ok(mut s) = shared.volumes.lock() {
+                            *s = list.clone();
+                        }
+                        if tx.send(Msg::FsVolumes(now_ms(), list)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => vols = None,
+                }
+            }
+            let now = now_ms();
+            if deleted_ok && now - last_deleted >= 60_000 {
+                last_deleted = now;
+                match guarded(crate::fs::volumes::deleted_open) {
+                    Ok(d) => {
+                        if let Ok(mut s) = shared.deleted_open.lock() {
+                            *s = d;
+                        }
+                    }
+                    Err(_) => deleted_ok = false,
+                }
+            }
+            if vols.is_none() && !deleted_ok {
+                return;
+            }
+            thread::sleep(Duration::from_millis(interval_ms.max(500)));
+        }
+    });
+}
+
+/// Background scan CPU budget (cores) while the Fs tab is visible / otherwise.
+const FS_BUDGET_VISIBLE: f32 = 1.0;
+const FS_BUDGET_IDLE: f32 = 0.25;
+
+/// The storage thread: created on the first Fs command. Engines are built here and never leave
+/// it. Requests are coalesced (only the newest listing / growth / largest query matters).
+fn spawn_fs(history_path: Option<String>, tx: Sender<Msg>, shared: Arc<FsShared>) -> Sender<FsReq> {
+    let (req_tx, rx) = mpsc::channel::<FsReq>();
+    if let Ok(mut o) = shared.observe.lock() {
+        *o = Some(req_tx.clone());
+    }
+    let _ = thread::Builder::new().name("fat-fs".into()).spawn(move || {
+        let scanner = match guarded(|| {
+            let s = crate::fs::scan::Scanner::new();
+            // Keep "/" fresh in the background (low priority; skips network mounts and
+            // TCC-protected dirs until the user opens one).
+            s.ensure("/", false);
+            s
+        }) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(Msg::FsError(format!("scanner unavailable ({e})")));
+                return;
+            }
+        };
+        // Growth reports can take seconds (journal replay, mtime walks): their own thread, so
+        // listings stay responsive. The tracker never leaves it.
+        let (gtx, grx) = mpsc::channel::<FsReq>();
+        {
+            let (sc, tx, shared, hp) = (scanner.clone(), tx.clone(), shared.clone(), history_path.clone());
+            let _ = thread::Builder::new().name("fat-fs-growth".into()).spawn(move || growth_loop(grx, sc, hp, tx, shared));
+        }
+        let hist = guarded(|| History::open(history_path.as_deref())).ok().and_then(Result::ok);
+        let mut focused = String::new();
+        let mut explicit_done: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // While the Fs tab is on screen (it polls listings) the background scan may use a whole
+        // core; otherwise it stays at the scanner's default quarter core.
+        let mut fast_until: Option<std::time::Instant> = None;
+        loop {
+            let next = rx.recv_timeout(Duration::from_secs(5));
+            // Checked on every wake-up: process samples (Observe) arrive constantly.
+            if fast_until.is_some_and(|t| std::time::Instant::now() >= t) {
+                fast_until = None;
+                let _ = guarded(|| scanner.set_budget(FS_BUDGET_IDLE));
+            }
+            let first = match next {
+                Ok(r) => r,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            };
+            let (mut list, mut largest, mut at) = (None, None, None);
+            let mut rescans: Vec<String> = Vec::new();
+            for req in std::iter::once(first).chain(rx.try_iter()) {
+                match req {
+                    FsReq::List { path, explicit } => list = Some((path, explicit)),
+                    FsReq::Growth { window_ms, under } => {
+                        let _ = gtx.send(FsReq::Growth { window_ms, under });
+                    }
+                    FsReq::Largest(p) => largest = Some(p),
+                    FsReq::At { ts, path } => at = Some((ts, path)),
+                    FsReq::Rescan(p) => {
+                        if !rescans.contains(&p) {
+                            rescans.push(p)
+                        }
+                    }
+                    FsReq::Observe(s) => {
+                        let _ = gtx.send(FsReq::Observe(s));
+                    }
+                }
+            }
+            for p in rescans {
+                if let Err(e) = guarded(|| scanner.rescan(&p)) {
+                    let _ = tx.send(Msg::FsError(format!("rescan failed ({e})")));
+                    return;
+                }
+            }
+            if let Some((path, explicit)) = list {
+                if fast_until.is_none() {
+                    let _ = guarded(|| scanner.set_budget(FS_BUDGET_VISIBLE));
+                }
+                fast_until = Some(std::time::Instant::now() + Duration::from_secs(15));
+                let r = guarded(|| {
+                    // The user opened a protected / mounted dir: allow reading it (once per path).
+                    if explicit && explicit_done.insert(path.clone()) {
+                        scanner.ensure(&path, true);
+                    }
+                    if path != focused {
+                        scanner.focus(&path);
+                    }
+                    scanner.list(&path)
+                });
+                match r {
+                    Ok(l) => {
+                        focused = path.clone();
+                        if tx.send(Msg::FsListing(path, l)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::FsError(format!("listing failed ({e})")));
+                        return;
+                    }
+                }
+            }
+            if let Some((ts, path)) = at {
+                let past = fs_past(hist.as_ref(), ts, &path, &shared);
+                if tx.send(Msg::FsPast(Box::new(past))).is_err() {
+                    return;
+                }
+            }
+            if let Some(p) = largest {
+                let v = guarded(|| scanner.largest(&p, 50)).unwrap_or_default();
+                if tx.send(Msg::FsLargest(p, v)).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    req_tx
+}
+
+/// The growth thread: owns the Tracker, observes every sample, answers growth reports
+/// (coalesced: only the newest request in a burst is computed).
+fn growth_loop(rx: Receiver<FsReq>, scanner: crate::fs::scan::Scanner, history_path: Option<String>, tx: Sender<Msg>, shared: Arc<FsShared>) {
+    let mut tracker = guarded(crate::fs::growth::Tracker::new).ok();
+    let hist = guarded(|| History::open(history_path.as_deref())).ok().and_then(Result::ok);
+    let mut growth_err = false;
+    while let Ok(first) = rx.recv() {
+        let mut growth = None;
+        for req in std::iter::once(first).chain(rx.try_iter()) {
+            match req {
+                FsReq::Observe(s) => {
+                    if let Some(t) = tracker.as_mut()
+                        && guarded(|| t.observe(&s)).is_err()
+                    {
+                        tracker = None;
+                    }
+                }
+                FsReq::Growth { window_ms, under } => growth = Some((window_ms, under)),
+                _ => {}
+            }
+        }
+        let Some((window_ms, under)) = growth else { continue };
+        let r = match tracker.as_mut() {
+            Some(t) => guarded(|| t.report(window_ms, under.as_deref(), hist.as_ref(), Some(&scanner))),
+            None => Err("the tracker could not start".to_string()),
+        };
+        match r {
+            Ok(g) => {
+                if under.is_none()
+                    && let Ok(mut s) = shared.growth.lock()
+                {
+                    *s = Some(g.clone());
+                }
+                if tx.send(Msg::FsGrowth(Box::new(g))).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                tracker = None;
+                if !growth_err {
+                    growth_err = true;
+                    let _ = tx.send(Msg::FsGrowth(Box::new(Growth { notes: vec![format!("growth tracking unavailable ({e})")], ..Default::default() })));
+                }
+            }
+        }
+    }
+}
+
+/// Recorded directory sizes and volume use at `ts` (empty when the recorder has none).
+fn fs_past(hist: Option<&History>, ts: Ts, path: &str, shared: &FsShared) -> app::FsPast {
+    let Some(h) = hist else { return app::FsPast { ts, path: path.to_string(), ..Default::default() } };
+    let (at, rows) = match guarded(|| h.dir_sizes_near(ts, path)) {
+        Ok(Ok(Some((at, rows)))) => (Some(at), rows),
+        _ => (None, Vec::new()),
+    };
+    let mounts: Vec<String> = shared.volumes.lock().map(|v| v.iter().map(|x| x.mount.clone()).collect()).unwrap_or_default();
+    let vols = mounts
+        .into_iter()
+        .filter_map(|m| {
+            let series = guarded(|| h.volume_series(&m, ts - 15 * 60_000, ts)).ok()?.ok()?;
+            series.last().map(|(_, used, _)| (m, *used))
+        })
+        .collect();
+    app::fs_past_from(ts, path, at, &rows, vols)
+}
+
 // ------------------------------------------------------------------ main loop
 
 struct Ctx {
@@ -362,6 +646,9 @@ struct Ctx {
     actions: Option<Actions>,
     actions_failed: bool,
     tx: Sender<Msg>,
+    fs_shared: Arc<FsShared>,
+    /// Storage thread, started by the first Fs command.
+    fs: Option<Sender<FsReq>>,
 }
 
 impl Ctx {
@@ -375,8 +662,23 @@ impl Ctx {
         self.actions.as_mut()
     }
 
+    fn fs_send(&mut self, app: &mut App, req: FsReq) {
+        if app.fs.error.is_some() {
+            return;
+        }
+        let tx = self.fs.get_or_insert_with(|| spawn_fs(self.cfg.history_path.clone(), self.tx.clone(), self.fs_shared.clone()));
+        if tx.send(req).is_err() {
+            app.set_fs_error("storage thread stopped".into());
+        }
+    }
+
     fn exec(&mut self, app: &mut App, cmd: Command) {
         match cmd {
+            Command::FsList { path, explicit } => self.fs_send(app, FsReq::List { path, explicit }),
+            Command::FsGrowth { window_ms, under } => self.fs_send(app, FsReq::Growth { window_ms, under }),
+            Command::FsRescan(p) => self.fs_send(app, FsReq::Rescan(p)),
+            Command::FsLargest(p) => self.fs_send(app, FsReq::Largest(p)),
+            Command::FsAt { ts, path } => self.fs_send(app, FsReq::At { ts, path }),
             Command::Quit => app.quit = true,
             Command::Act { kind, pid, nice, start } => {
                 let Some(live) = app.live.clone() else {
@@ -464,6 +766,12 @@ fn apply_msg(app: &mut App, msg: Msg) {
         Msg::Past(ts, snap) => app.set_past(ts, snap.map(|s| *s)),
         Msg::Why(Ok(e)) => app.set_why(e),
         Msg::Why(Err(e)) => app.set_status(format!("why unavailable: {e}"), true),
+        Msg::FsVolumes(ts, v) => app.set_volumes(ts, v),
+        Msg::FsListing(p, l) => app.set_fs_listing(&p, l),
+        Msg::FsGrowth(g) => app.set_fs_growth(*g),
+        Msg::FsLargest(p, v) => app.set_fs_largest(&p, v),
+        Msg::FsPast(p) => app.set_fs_past(*p),
+        Msg::FsError(e) => app.set_fs_error(e),
     }
 }
 
@@ -520,15 +828,17 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
     let hist = guarded(|| History::open(cfg.history_path.as_deref())).ok().and_then(Result::ok);
 
     let (tx, rx) = mpsc::channel::<Msg>();
-    spawn_sampler(cfg.clone(), tx.clone());
+    let fs_shared = Arc::new(FsShared::default());
+    spawn_sampler(cfg.clone(), tx.clone(), fs_shared.clone());
     spawn_fleet(cfg.clone(), tx.clone());
+    spawn_volumes(cfg.interval_ms, tx.clone(), fs_shared.clone());
 
     let mut app = App::new(cfg.interval_ms);
     app.config_path = config_path;
     app.history_ok = hist.is_some();
     app.configured_hosts = cfg.hosts.len();
     let hist_tx = spawn_history(hist, tx.clone());
-    let mut ctx = Ctx { cfg, hist: Some(hist_tx), actions: None, actions_failed: false, tx };
+    let mut ctx = Ctx { cfg, hist: Some(hist_tx), actions: None, actions_failed: false, tx, fs_shared, fs: None };
     // Load the journal up front so the Log tab is ready.
     ctx.exec(&mut app, Command::RefreshLog);
 
@@ -567,7 +877,7 @@ mod tests {
     fn exec_degrades_without_backends() {
         // Other modules may be stubs; executing commands must never panic.
         let (tx, _rx) = mpsc::channel();
-        let mut ctx = Ctx { cfg: Config::default(), hist: None, actions: None, actions_failed: false, tx };
+        let mut ctx = Ctx { cfg: Config::default(), hist: None, actions: None, actions_failed: false, tx, fs_shared: Arc::default(), fs: None };
         let mut app = App::new(1000);
         ctx.exec(&mut app, Command::RefreshTimeline { from: 0, to: 1 });
         ctx.exec(&mut app, Command::LoadAt(5));

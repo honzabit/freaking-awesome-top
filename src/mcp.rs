@@ -38,7 +38,9 @@ Use `why {pid}` for a blame chain explaining why a process exists and what it co
 `ports` / `find_port_owner {port}` for listeners (orphaned dev servers are flagged), `history` for the always-on flight \
 recorder (timeline, spikes, or a past snapshot via at_minutes_ago; needs `fat record` running), `containers` for docker/podman/nerdctl \
 (on Linux, `snapshot {container}` lists the host processes inside one container, joined via cgroups), \
-and `ask {question}` for a plain-language answer. Actions are reversible where possible and journaled: prefer `pause` \
+and `ask {question}` for a plain-language answer. For disk space: `fs_volumes` (capacity, fill rate, ETA to full), \
+`fs_list {path}` (du-style sizes, cached background scan), `fs_largest {path}`, and `fs_growth {since}` ('what is eating my space \
+in the last 10 minutes': growing paths, their writers, deleted-but-open files). The fs tools only read; fat never deletes files. Actions are reversible where possible and journaled: prefer `pause` \
 (SIGSTOP, undo with `resume` or `undo`) or `renice` over `kill`; every action returns an id usable with `undo`. \
 Pass the `start_time` (and `name`) you saw in snapshot/process with every action, so a pid that was reused by another \
 process in the meantime is refused instead of signalled. Processes with `usage_unknown: true` belong to other users and \
@@ -59,6 +61,15 @@ pub struct State {
     /// Samples taken by the current collector. The first one has no interval, so its
     /// rates (cpu, power, disk) are all zero and must never be served.
     samples: u32,
+    /// Storage engines, created by the first fs_* call (never at startup).
+    fs: FsEngines,
+}
+
+#[derive(Default)]
+struct FsEngines {
+    scanner: Option<crate::fs::scan::Scanner>,
+    volumes: Option<crate::fs::volumes::Volumes>,
+    tracker: Option<crate::fs::growth::Tracker>,
 }
 
 /// Minimum spacing between a collector's first and second sample for meaningful rates.
@@ -68,7 +79,7 @@ impl State {
     /// State with no backends attached (used by tests and as a fallback).
     #[allow(dead_code)]
     pub fn empty() -> State {
-        State { collector: None, history: None, actions: None, config: Config::default(), last: None, samples: 0 }
+        State { collector: None, history: None, actions: None, config: Config::default(), last: None, samples: 0, fs: FsEngines::default() }
     }
 
     /// Full state: collector (with an initial sample), history DB, action journal.
@@ -85,7 +96,41 @@ impl State {
             log("collector unavailable; snapshot-based tools will fail");
         }
         let samples = u32::from(last.is_some());
-        State { collector, history, actions, config, last, samples }
+        State { collector, history, actions, config, last, samples, fs: FsEngines::default() }
+    }
+
+    fn scanner(&mut self) -> Result<&crate::fs::scan::Scanner> {
+        if self.fs.scanner.is_none() {
+            self.fs.scanner = guard(crate::fs::scan::Scanner::new);
+        }
+        self.fs.scanner.as_ref().ok_or_else(|| anyhow!("the storage scanner is unavailable"))
+    }
+
+    /// Current volumes. A fresh `Volumes` takes two samples 1s apart so I/O rates are real.
+    fn volumes(&mut self) -> Result<Vec<crate::fs::Volume>> {
+        if self.fs.volumes.is_none() {
+            let mut v = guard(crate::fs::volumes::Volumes::new).ok_or_else(|| anyhow!("volume listing is unavailable"))?;
+            guard(AssertUnwindSafe(|| v.sample())).ok_or_else(|| anyhow!("volume listing failed"))?;
+            std::thread::sleep(Duration::from_millis(1000));
+            self.fs.volumes = Some(v);
+        }
+        let v = self.fs.volumes.as_mut().expect("set above");
+        match guard(AssertUnwindSafe(|| v.sample())) {
+            Some(list) => Ok(list),
+            None => {
+                self.fs.volumes = None;
+                bail!("volume listing failed")
+            }
+        }
+    }
+
+    /// Storage facts for doctor (volumes and deleted-but-open files); empty when unavailable.
+    fn fs_facts(&mut self) -> crate::blame::FsFacts {
+        crate::blame::FsFacts {
+            volumes: self.volumes().unwrap_or_default(),
+            growth: None,
+            deleted_open: guard(crate::fs::volumes::deleted_open).unwrap_or_default(),
+        }
     }
 
     /// Current snapshot, re-sampled if the cached one is older than 1s.
@@ -297,6 +342,10 @@ fn handler_for(name: &str) -> Option<Handler> {
         "undo" => tool_undo,
         "containers" => tool_containers,
         "ask" => tool_ask,
+        "fs_volumes" => tool_fs_volumes,
+        "fs_list" => tool_fs_list,
+        "fs_largest" => tool_fs_largest,
+        "fs_growth" => tool_fs_growth,
         _ => return None,
     })
 }
@@ -462,6 +511,63 @@ pub fn tools() -> Vec<Value> {
             "Ask in plain language",
             "Ask a plain-language question about this machine ('why is this machine slow?', 'what is using port 3000?', 'which container is eating memory?'). Answered from a fresh snapshot plus doctor findings.",
             schema(json!({ "question": { "type": "string", "minLength": 1, "description": "The question." } }), &["question"]),
+            false,
+        ),
+        tool(
+            "fs_volumes",
+            "Disk volumes",
+            "Mounted volumes: mount, device, fstype, total/used/avail bytes, macOS purgeable bytes, inode use, read-only / network flags, \
+             device read/write bytes/sec, `fill_bps` (bytes/sec the volume is filling; negative = freeing) and `eta_full_s` (seconds until full at that rate). \
+             The first call takes ~1s to measure rates. Start here for 'my disk is full'.",
+            schema(json!({}), &[]),
+            false,
+        ),
+        tool(
+            "fs_list",
+            "Directory sizes",
+            "Disk usage of a directory's children (like du), largest first: allocated `size` bytes (hard links once), `files` below, `newest_mtime` (epoch s), \
+             `partial` (still being scanned: a lower bound), `denied` (unreadable subdirs: size unknown), `mount_point` (another filesystem, not counted). \
+             `known` gives safe advice for well-known space hogs (caches, node_modules, Docker data). Reads cached scans first and scans up to `wait_seconds` otherwise. \
+             Read-only: fat never deletes anything.",
+            schema(
+                json!({
+                    "path": { "type": "string", "description": "Absolute directory path. Default \"/\"." },
+                    "depth": { "type": "integer", "minimum": 1, "maximum": 4, "default": 1, "description": "Levels of children to include." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 30, "description": "Max children per directory (the rest are summarized)." },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 120, "default": 10, "description": "If nothing is cached for `path`, scan for up to this long." }
+                }),
+                &[],
+            ),
+            false,
+        ),
+        tool(
+            "fs_largest",
+            "Largest files and dirs",
+            "The `n` largest entries (files or directories, any depth) under `path`, without listing a directory next to the single child that explains it. \
+             Uses the cached scan (scanning up to 15s if there is none).",
+            schema(
+                json!({
+                    "path": { "type": "string", "description": "Absolute directory path." },
+                    "n": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20, "description": "How many entries." }
+                }),
+                &["path"],
+            ),
+            false,
+        ),
+        tool(
+            "fs_growth",
+            "What is eating disk space",
+            "What grew in the last `since` (default 10m): per-volume used delta, the paths that grew most (`delta` bytes, rolled up to the deepest \
+             directory that explains it) with the processes seen writing there, top writing processes, space held by deleted-but-still-open files \
+             (restart the holder to free it), and `evidence` per path: fsevents (macOS journal, exact), watch (Linux inotify/fanotify, since fat started), \
+             open_files (files a writer holds open), scan_diff (two scans compared), mtime (modified in the window; an upper bound). `notes` say what evidence was unavailable.",
+            schema(
+                json!({
+                    "since": { "type": "string", "default": "10m", "description": "Window, e.g. 10m, 1h, 24h (max 7d)." },
+                    "under": { "type": "string", "description": "Only paths below this absolute directory." }
+                }),
+                &[],
+            ),
             false,
         ),
     ]
@@ -701,8 +807,9 @@ fn tool_why(state: &mut State, args: &Value) -> Result<Value> {
 
 fn tool_doctor(state: &mut State, _args: &Value) -> Result<Value> {
     state.snapshot()?;
+    let facts = state.fs_facts();
     let snap = &state.last.as_ref().expect("snapshot cached").1;
-    let findings = crate::blame::diagnose(snap, state.history.as_ref());
+    let findings = crate::blame::diagnose_with_fs(snap, state.history.as_ref(), &facts);
     Ok(json!({ "count": findings.len(), "findings": findings }))
 }
 
@@ -820,6 +927,202 @@ fn tool_ask(state: &mut State, args: &Value) -> Result<Value> {
     Ok(json!({ "question": q, "answer": answer, "findings": findings }))
 }
 
+// ---------------------------------------------------------------------------
+// Storage tools
+// ---------------------------------------------------------------------------
+
+/// An absolute path argument ("/" when absent and `default_root`).
+fn arg_path(args: &Value, key: &str, default_root: bool) -> Result<String> {
+    let p = match arg_str(args, key)?.map(str::trim) {
+        Some(p) if !p.is_empty() => p,
+        _ if default_root => "/",
+        _ => bail!("`{key}` is required"),
+    };
+    if !p.starts_with('/') {
+        bail!("`{key}` must be an absolute path (got {p:?})");
+    }
+    if p.split('/').any(|c| c == "..") {
+        bail!("`{key}` must not contain `..`");
+    }
+    Ok(if p.len() > 1 { p.trim_end_matches('/').to_string() } else { p.to_string() })
+}
+
+/// Compact JSON for one entry: zero/false flags are left out.
+pub fn entry_json(e: &crate::fs::DirEntry) -> Value {
+    let mut v = json!({ "name": e.name, "path": e.path, "size": e.size, "files": e.files });
+    if e.is_dir {
+        v["dir"] = json!(true);
+    }
+    if e.apparent > 0 && e.apparent != e.size {
+        v["apparent"] = json!(e.apparent);
+    }
+    if e.newest_mtime > 0 {
+        v["newest_mtime"] = json!(e.newest_mtime);
+    }
+    if e.denied > 0 {
+        v["denied"] = json!(e.denied);
+    }
+    if e.mount_point {
+        v["mount_point"] = json!(true);
+    }
+    if e.partial {
+        v["partial"] = json!(true);
+    }
+    if let Some(k) = crate::blame::explain_path(&e.path).filter(|k| !k.starts_with("inside ")) {
+        v["known"] = json!(k);
+    }
+    v
+}
+
+/// A listing as JSON, recursing `depth - 1` more levels through `list` (cache lookups), at most
+/// `limit` children per directory; the rest are summarized as `more`.
+pub fn listing_json(l: &crate::fs::Listing, depth: usize, limit: usize, list: &mut dyn FnMut(&str) -> Option<crate::fs::Listing>) -> Value {
+    let mut out = entry_json(&l.dir);
+    let mut kids = Vec::new();
+    for c in l.children.iter().take(limit) {
+        let mut v = entry_json(c);
+        if depth > 1 && c.is_dir && !c.mount_point && c.size > 0
+            && let Some(sub) = list(&c.path)
+        {
+            let s = listing_json(&sub, depth - 1, limit, list);
+            v["children"] = s["children"].clone();
+            if let Some(m) = s.get("more") {
+                v["more"] = m.clone();
+            }
+        }
+        kids.push(v);
+    }
+    out["children"] = Value::Array(kids);
+    if l.children.len() > limit {
+        let rest = &l.children[limit..];
+        out["more"] = json!({ "count": rest.len(), "size": rest.iter().map(|c| c.size).sum::<u64>() });
+    }
+    out
+}
+
+/// A listing with its children: small completed subtrees are kept folded (size only) by the
+/// scanner, so a folded one is focused (re-expanded) and scanned for up to `wait_ms`.
+pub fn list_expanded(sc: &crate::fs::scan::Scanner, path: &str, wait_ms: u64) -> Option<crate::fs::Listing> {
+    let l = sc.list(path)?;
+    if l.children.is_empty() && l.dir.is_dir && l.dir.files > 1 {
+        sc.focus(path);
+        return sc.scan_blocking(path, wait_ms).or(Some(l));
+    }
+    Some(l)
+}
+
+fn progress_json(p: &crate::fs::ScanProgress) -> Value {
+    json!({
+        "root": p.root, "running": p.running, "files_seen": p.files_seen, "bytes_seen": p.bytes_seen,
+        "fraction": p.fraction, "completed_at": p.completed_at, "errors": p.errors,
+    })
+}
+
+fn tool_fs_volumes(state: &mut State, _args: &Value) -> Result<Value> {
+    let vols = state.volumes()?;
+    Ok(json!({ "count": vols.len(), "volumes": vols }))
+}
+
+fn tool_fs_list(state: &mut State, args: &Value) -> Result<Value> {
+    let path = arg_path(args, "path", true)?;
+    let depth = arg_u64(args, "depth")?.unwrap_or(1);
+    if !(1..=4).contains(&depth) {
+        bail!("`depth` must be 1..=4");
+    }
+    let limit = arg_u64(args, "limit")?.unwrap_or(30).clamp(1, 200) as usize;
+    let wait = arg_u64(args, "wait_seconds")?.unwrap_or(10).min(120);
+    let sc = state.scanner()?.clone();
+    // The agent asked for this path: that is explicit intent (protected dirs may be read).
+    let l = match list_expanded(&sc, &path, wait * 1000) {
+        Some(l) => Some(l),
+        None => {
+            sc.ensure(&path, true);
+            sc.scan_blocking(&path, wait * 1000)
+        }
+    };
+    let Some(l) = l else {
+        bail!("nothing measured under {path} yet (scan still running or path unreadable); retry with a larger `wait_seconds`");
+    };
+    let mut lookup = |p: &str| list_expanded(&sc, p, 3000);
+    let mut v = listing_json(&l, depth as usize, limit, &mut lookup);
+    v["progress"] = progress_json(&l.progress);
+    Ok(v)
+}
+
+fn tool_fs_largest(state: &mut State, args: &Value) -> Result<Value> {
+    let path = arg_path(args, "path", false)?;
+    let n = arg_u64(args, "n")?.unwrap_or(20);
+    if !(1..=200).contains(&n) {
+        bail!("`n` must be 1..=200");
+    }
+    let sc = state.scanner()?.clone();
+    let mut v = sc.largest(&path, n as usize);
+    if v.is_empty() {
+        sc.ensure(&path, true);
+        let _ = sc.scan_blocking(&path, 15_000);
+        v = sc.largest(&path, n as usize);
+    }
+    Ok(json!({ "path": path, "count": v.len(), "entries": v.iter().map(entry_json).collect::<Vec<_>>() }))
+}
+
+/// Concise growth JSON: top entries of each list.
+pub fn growth_json(g: &crate::fs::Growth, window_ms: i64) -> Value {
+    let growers: Vec<Value> = g
+        .growers
+        .iter()
+        .take(25)
+        .map(|x| {
+            let mut v = json!({ "path": x.path, "delta": x.delta, "size": x.size, "evidence": x.evidence });
+            if x.is_dir {
+                v["dir"] = json!(true);
+            }
+            if x.files_touched > 0 {
+                v["files_touched"] = json!(x.files_touched);
+            }
+            if !x.writers.is_empty() {
+                v["writers"] = json!(x.writers.iter().map(|(p, n, b)| json!({ "pid": p, "name": n, "write_bps": b })).collect::<Vec<_>>());
+            }
+            v
+        })
+        .collect();
+    json!({
+        "from_ts": g.from,
+        "to_ts": g.to,
+        "window_s": window_ms / 1000,
+        "volumes": g.volumes.iter().map(|(m, d)| json!({ "mount": m, "delta": d })).collect::<Vec<_>>(),
+        "growers": growers,
+        "writers": g.writers.iter().take(10).map(|(p, n, b)| json!({ "pid": p, "name": n, "bytes": b })).collect::<Vec<_>>(),
+        "deleted_open": g.deleted_open.iter().take(10).map(|(p, n, path, b)| json!({ "pid": p, "name": n, "path": path, "bytes": b })).collect::<Vec<_>>(),
+        "notes": g.notes,
+    })
+}
+
+fn tool_fs_growth(state: &mut State, args: &Value) -> Result<Value> {
+    let since = arg_str(args, "since")?.unwrap_or("10m");
+    let secs = crate::budget::parse_duration(since).map_err(|e| anyhow!("`since`: {e}"))?;
+    if secs == 0 || secs > 7 * 86_400 {
+        bail!("`since` must be between 1s and 7d");
+    }
+    let under = match args.get("under") {
+        None | Some(Value::Null) => None,
+        _ => Some(arg_path(args, "under", false)?),
+    };
+    // Recent per-process write rates make the open-file attribution work.
+    let snap = state.snapshot().ok().cloned();
+    if state.fs.tracker.is_none() {
+        state.fs.tracker = guard(crate::fs::growth::Tracker::new);
+    }
+    let sc = state.scanner().ok().cloned();
+    let hist = state.history.as_ref();
+    let t = state.fs.tracker.as_mut().ok_or_else(|| anyhow!("growth tracking is unavailable"))?;
+    if let Some(s) = &snap {
+        t.observe(s);
+    }
+    let window_ms = secs as i64 * 1000;
+    let g = t.report(window_ms, under.as_deref(), hist, sc.as_ref());
+    Ok(growth_json(&g, window_ms))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,12 +1196,12 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         for n in [
             "snapshot", "process", "ports", "why", "doctor", "history", "find_port_owner", "pause", "resume", "renice", "kill",
-            "undo", "containers", "ask",
+            "undo", "containers", "ask", "fs_volumes", "fs_list", "fs_largest", "fs_growth",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
             assert!(handler_for(n).is_some(), "no handler for {n}");
         }
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 18);
         for t in tools {
             assert!(t["description"].as_str().unwrap().len() > 20);
             let s = &t["inputSchema"];
@@ -1063,5 +1366,64 @@ mod tests {
         assert!(arg_bool(&json!({"x": 1}), "x").is_err());
         assert!(!arg_bool(&json!({}), "x").unwrap());
         assert_eq!(arg_i64(&json!({"n": -5}), "n").unwrap(), Some(-5));
+    }
+
+    #[test]
+    fn fs_tools_are_read_only_and_validate_arguments() {
+        for t in tools() {
+            if t["name"].as_str().unwrap().starts_with("fs_") {
+                assert_eq!(t["annotations"]["readOnlyHint"], true, "{}", t["name"]);
+                assert!(t["annotations"].get("destructiveHint").is_none());
+            }
+        }
+        let mut s = State::empty();
+        let err = |s: &mut State, name: &str, args: &str| -> String {
+            let r = call(s, &format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#));
+            assert_eq!(r["result"]["isError"], true, "{name} {args}: {r}");
+            r["result"]["structuredContent"]["error"].as_str().unwrap().to_string()
+        };
+        // Bad arguments are rejected before any storage engine is touched.
+        assert!(err(&mut s, "fs_list", r#"{"path":"relative/dir"}"#).contains("absolute"));
+        assert!(err(&mut s, "fs_list", r#"{"path":7}"#).contains("`path` must be a string"));
+        assert!(err(&mut s, "fs_list", r#"{"path":"/a/../b"}"#).contains(".."));
+        assert!(err(&mut s, "fs_list", r#"{"depth":9}"#).contains("depth"));
+        assert!(err(&mut s, "fs_largest", r#"{}"#).contains("`path` is required"));
+        assert!(err(&mut s, "fs_largest", r#"{"path":"/","n":0}"#).contains("`n`"));
+        assert!(err(&mut s, "fs_growth", r#"{"since":"soon"}"#).contains("since"));
+        assert!(err(&mut s, "fs_growth", r#"{"since":"30d"}"#).contains("7d"));
+        assert!(err(&mut s, "fs_growth", r#"{"under":"tmp"}"#).contains("absolute"));
+        assert!(s.fs.scanner.is_none() && s.fs.tracker.is_none(), "no engine started for invalid calls");
+        assert_eq!(arg_path(&json!({"path": "/Users/me/"}), "path", false).unwrap(), "/Users/me");
+        assert_eq!(arg_path(&json!({}), "path", true).unwrap(), "/");
+    }
+
+    #[test]
+    fn fs_json_is_compact_and_recursive() {
+        use crate::fs::{DirEntry, Listing};
+        let de = |p: &str, size: u64, dir: bool| DirEntry { path: p.into(), name: p.rsplit('/').next().unwrap().into(), is_dir: dir, size, files: 1, ..Default::default() };
+        let root = Listing {
+            dir: de("/w", 600, true),
+            children: vec![de("/w/a", 400, true), DirEntry { denied: 2, ..de("/w/node_modules", 150, true) }, de("/w/f", 50, false)],
+            ..Default::default()
+        };
+        let mut lookup = |p: &str| (p == "/w/a").then(|| Listing { dir: de("/w/a", 400, true), children: vec![de("/w/a/x", 300, false), de("/w/a/y", 100, false)], ..Default::default() });
+        let v = listing_json(&root, 2, 2, &mut lookup);
+        assert_eq!(v["size"], 600);
+        assert_eq!(v["children"].as_array().unwrap().len(), 2);
+        assert_eq!(v["more"], json!({"count": 1, "size": 50}));
+        assert_eq!(v["children"][0]["children"][0]["name"], "x");
+        assert_eq!(v["children"][1]["denied"], 2);
+        assert!(v["children"][1]["known"].as_str().unwrap().contains("npm"));
+        assert!(v["children"][0].get("partial").is_none(), "false flags left out");
+        let g = crate::fs::Growth {
+            growers: vec![crate::fs::Grower { path: "/w/a".into(), is_dir: true, delta: 5, writers: vec![(9, "cc".into(), 7)], evidence: vec![crate::fs::Evidence::OpenFiles], ..Default::default() }],
+            deleted_open: vec![(3, "x".into(), "/tmp/z".into(), 1 << 30)],
+            ..Default::default()
+        };
+        let j = growth_json(&g, 600_000);
+        assert_eq!(j["window_s"], 600);
+        assert_eq!(j["growers"][0]["evidence"][0], "open_files");
+        assert_eq!(j["growers"][0]["writers"][0]["pid"], 9);
+        assert_eq!(j["deleted_open"][0]["bytes"], 1u64 << 30);
     }
 }

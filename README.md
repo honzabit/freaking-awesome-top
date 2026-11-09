@@ -29,6 +29,10 @@ What makes it different:
 - **Resource budgets for commands (and agents).** For example, `fat run --cpu 200 --mem 4G --time 10m -- cargo build`.
 - **One tree for local, containers and ssh hosts.** Supports docker, podman, OrbStack, colima and nerdctl, plus any host that has `fat` installed.
   On Linux every process is tagged with its cgroup and container, so you can filter the process list by container name.
+- **Storage: what eats your disk, and what is filling it right now.** The Fs tab and `fat fs` show disk usage of every
+  directory from `/` down (a cached, low-priority background scan), which paths grew in the last 10 minutes and which
+  processes are writing there, space held by deleted-but-open files, and when each volume will be full. fat only reads:
+  it never deletes, moves or truncates your files.
 - **Plain-language `ask`.** Ask "why is this machine hot?" and get an answer, offline from rules or richer through Claude if you set an API key.
 
 First-class on **macOS** (developed on Apple Silicon, macOS 15) and **Linux** (x86_64 and aarch64, kernel 4.20+ for PSI,
@@ -66,6 +70,11 @@ fat log [--json]            # action journal
 
 fat run --cpu 150 --mem 2G --time 10m --procs 64 --on-violation pause|kill|warn -- <cmd...>
 fat fleet [--json]          # containers + ssh hosts
+
+fat fs [PATH] [--depth N] [--top 25] [--wait 2m] [--json]   # disk usage of PATH's children (default /)
+fat fs --growth [--since 10m] [--under PATH] [--json]     # what is eating space right now
+fat fs --volumes [--json]                                 # capacity, fill rate, ETA to full, I/O
+fat fs --largest 20 PATH                                  # biggest files / dirs below PATH
 fat mcp                     # MCP server on stdio
 ```
 
@@ -81,7 +90,7 @@ How `fat run` enforces a budget:
 
 | Key | Action |
 | --- | --- |
-| `1`–`6`, `Tab` | views: Procs · Ports · Fleet · Timeline · Doctor · Log |
+| `1`–`7`, `Tab` | views: Procs · Ports · Fs · Fleet · Timeline · Doctor · Log |
 | `↑↓ PgUp PgDn g G` | move |
 | `c m p n d i N` | sort by cpu · mem · power · net · disk · pid · name (press again to reverse) |
 | `t` | process tree |
@@ -97,6 +106,11 @@ How `fat run` enforces a budget:
 | `?` | ask in plain language |
 | `h` | help |
 | `q` / `Ctrl-C` | quit |
+
+In the **Fs** tab: `⏎` / `→` / `l` opens a directory, `←` / `Backspace` goes up, `s` cycles the sort (size · growth ·
+io · name · files · age), `g` toggles the growth view, `w` (or `+`/`-`) cycles the window (10m · 1h · 24h), `b` lists the
+biggest entries below here, `r` rescans this directory, `/` filters, and `⏎` on a writer row explains that process.
+`h` stays help and `L` stays "back to live", as in every other view.
 
 While you are rewinding, every view shows a big `⏪ REWIND hh:mm:ss` badge, and actions are refused because they would hit processes from the past.
 In the Doctor view, `Enter` runs a finding's suggested action after you confirm it.
@@ -123,6 +137,9 @@ The server provides these tools:
   `snapshot` takes `sort`, `limit`, `filter` and `container` (a container name or id prefix: only that container's
   processes). Its result includes `psi`, `temp_c` and `power_source` (null where the platform has none), and each
   containerised process carries `container` (12-char id), `container_name` and `cgroup`.
+- **Storage (read-only):** `fs_volumes` (capacity, `fill_bps`, `eta_full_s`, I/O), `fs_list {path, depth?, limit?,
+  wait_seconds?}` (du-style children with `known` advice for common space hogs), `fs_largest {path, n?}` and
+  `fs_growth {since?, under?}` (growing paths with their writers and evidence, top writers, deleted-but-open files).
 - **Destructive, annotated as such:** `pause`, `resume`, `renice`, `kill`, `undo`.
 
 Every result carries the same object twice: as pretty JSON text and as `structuredContent`.
@@ -148,6 +165,60 @@ name     = "devbox"
 ssh      = "me@devbox.local"   # defaults to name; uses BatchMode, 3s connect timeout
 fat_path = "~/.cargo/bin/fat"  # defaults to "fat"
 ```
+
+## Storage
+
+Three questions, one tab (`3`, right after Ports) and one command (`fat fs`):
+
+- **What eats my storage?** The table lists the children of the current directory with their allocated size (hard
+  links counted once), a bar and share of the parent, files below, and the age of the newest change. Drill in with `⏎`,
+  go up with `←`. A dir with `⛁` is another filesystem (not counted), `🔒` could not be read, `…` is still being scanned
+  (numbers are a lower bound). The line under the table explains well-known space hogs with safe advice: `~/Library/Caches`,
+  Xcode DerivedData and CoreSimulator, Docker Desktop and OrbStack data, `~/.cargo/registry`, Rust `target/`,
+  `node_modules`, `~/.npm`, `~/.cache`, Chrome profiles, `/private/var/vm` (swap), `/private/var/folders`, APFS local
+  snapshots; on Linux `/var/log/journal` (`journalctl --vacuum-size`), `/var/lib/docker` (`docker system df` / `prune`),
+  `/var/cache/apt`, snap revisions.
+- **What is eating my space so fast?** The Δ column shows how much each child grew in the window (10m, 1h or 24h; `w`
+  cycles), and WRITE/s which processes write there. `g` switches to a flat list of the fastest growers anywhere, the
+  space held by deleted-but-still-open files (restarting the holder frees it), and the top writing processes
+  (`⏎` = why). `fat fs --growth --since 10m` prints the same.
+- **Which volume, and when is it full?** The strip at the top shows every volume with used/total, the fill rate
+  (`+1.2G/10m`), `full in 3h` (yellow under a day, red under 2 hours), device I/O and macOS purgeable space.
+
+Every growth number says where it came from:
+
+| Evidence | Meaning |
+| --- | --- |
+| `fsevents` | macOS FSEvents journal replay: exact paths, works retroactively (even for the time before fat started). |
+| `watch` | Linux fanotify (root) or inotify watches: exact paths, only since fat started watching. |
+| `open-files` | Files a writing process holds open, sized now vs earlier: attributes growth to a process. |
+| `scan-diff` | Two scans of the tree compared: exact, but coarse in time. |
+| `mtime≤` | Modified within the window, at its current size: an upper bound on growth. |
+
+**How the scan behaves.** Nothing touches storage until you open the Fs tab (or run `fat fs`). Then `/` is scanned in
+the background at the lowest priority (macOS `QOS_CLASS_BACKGROUND`, which also throttles its I/O; Linux nice 19 and
+the idle I/O class), the directory you are looking at first, with partial results as it goes. It is held to a quarter of
+a core, one core while the Fs tab is on screen, and 1.5 cores for the directory you opened (so a first full scan of a
+20M-file Mac takes roughly 15 minutes with the tab open, longer in the background). Results are cached on disk, so the
+next start shows numbers immediately, resumes an interrupted first scan instead of starting over, and refreshes them.
+Sizes count APFS clones in full, like `du`, so on a Mac with many cloned files (uv, pnpm, `cp -c`) the tree can add up
+to more than the volume's used space. Network, FUSE, autofs and removable mounts are never
+descended automatically (open one with `⏎` to read it), and on macOS the Data volume is counted once even though
+`/Users`, `/Applications`, `/private` … reach it through firmlinks. `fat record` also records volume use and directory
+sizes, so rewinding (`←` in Timeline, then `3`) shows the sizes as they were, marked `⏪ as of hh:mm:ss`.
+
+**Privacy (macOS).** Reading `~/Desktop`, `~/Documents`, `~/Downloads`, Mail, Messages, Photos libraries and removable
+or network volumes from a terminal triggers "Terminal would like to access …" prompts unless the terminal has Full Disk
+Access. The background scan never reads those places: they show as `🔒 protected` and are not counted. Pressing `⏎`
+on one (or `fat fs ~/Documents`, or the `fs_list` tool) reads it because you asked. If the terminal already has Full
+Disk Access, fat detects it and scans everything.
+
+**fat never deletes.** No key, command or tool removes, moves or truncates files; fat only writes its own cache and
+database. The advice it prints is for you to act on.
+
+Doctor adds storage findings: a volume ≥ 90% full (crit at 97%), a volume that will be full within a day (crit within
+2 hours, naming the paths and processes growing), more than 1 GiB held by deleted-but-open files (naming the process to
+restart), and large swap files in `/System/Volumes/VM`.
 
 ## Linux
 
@@ -372,6 +443,7 @@ redacted for anything that looks like a token, key or password. Without a key, `
 | `Collector::sample()` | First sample about 80 ms, then 20–30 ms. |
 | `fat record` at a 2s interval | About 1.5% of one core for its own process. About 4% including the `lsof`, `nettop` and `ioreg` children it spawns. |
 | TUI at 1.5s | About 2% of a core. |
+| Fs background scan | Capped at 0.25 core (1 core while the Fs tab is visible). After a full scan of `/` (19.9M files): CLI peak RSS about 120 MB, TUI about 200 MB in total. |
 | History writes | About 0.5 ms per sample, about 27 MB/day. |
 
 ## Known limitations

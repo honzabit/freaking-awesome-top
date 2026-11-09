@@ -8,6 +8,7 @@ mod budget;
 mod collect;
 mod config;
 mod fleet;
+mod fs;
 mod history;
 mod mcp;
 mod model;
@@ -117,6 +118,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Disk usage: what eats storage, and what is filling it right now. Read-only.
+    ///
+    /// `fat fs [PATH]` lists the children of PATH (default "/") by size from the cached
+    /// background scan, scanning if needed. `--growth` answers "what grew in the last 10
+    /// minutes", `--volumes` lists filesystems, `--largest N` the N biggest entries below PATH.
+    Fs(FsArgs),
     /// Serve the MCP protocol on stdio (for agents).
     Mcp,
 }
@@ -165,6 +172,352 @@ fn print_action(r: &model::ActionRecord) {
 
 fn ago_ms(s: &str) -> Result<i64> {
     Ok(budget::parse_duration(s)? as i64 * 1000)
+}
+
+#[derive(clap::Args, Debug, PartialEq)]
+struct FsArgs {
+    /// Directory to inspect (absolute or relative). Default "/".
+    path: Option<String>,
+    /// Levels of subdirectories to print.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=6))]
+    depth: u8,
+    /// Wait up to this long (e.g. 30, 2m) for the scan of PATH to complete.
+    #[arg(long)]
+    wait: Option<String>,
+    /// Max entries per directory.
+    #[arg(long, default_value_t = 25)]
+    top: usize,
+    /// What grew recently (paths, writers, deleted-but-open files) instead of sizes.
+    #[arg(long, conflicts_with_all = ["volumes", "largest"])]
+    growth: bool,
+    /// Growth window, e.g. 10m, 1h, 24h.
+    #[arg(long, default_value = "10m", requires = "growth")]
+    since: String,
+    /// Only growth below this directory.
+    #[arg(long, requires = "growth")]
+    under: Option<String>,
+    /// Mounted volumes: capacity, fill rate, ETA to full, I/O.
+    #[arg(long, conflicts_with = "largest")]
+    volumes: bool,
+    /// The N largest files/directories below PATH.
+    #[arg(long, value_name = "N")]
+    largest: Option<usize>,
+    #[arg(long)]
+    json: bool,
+}
+
+/// Absolute, slash-trimmed form of a user-supplied path (lexical: no symlink resolution).
+fn abs_path(p: Option<&str>) -> String {
+    let p = p.map(str::trim).filter(|p| !p.is_empty()).unwrap_or("/");
+    let expanded = match p.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => dirs::home_dir().map(|h| format!("{}{rest}", h.display())).unwrap_or_else(|| p.to_string()),
+        _ => p.to_string(),
+    };
+    let abs = std::path::absolute(&expanded).map(|a| a.display().to_string()).unwrap_or(expanded);
+    let mut parts: Vec<&str> = Vec::new();
+    for c in abs.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+fn hb(b: u64) -> String {
+    tui::widgets::fmt_bytes(b)
+}
+
+/// Aligned table of a listing's children (recursing through `list` up to `depth`).
+fn fmt_listing(l: &fs::Listing, depth: u8, top: usize, now: model::Ts, list: &mut dyn FnMut(&str) -> Option<fs::Listing>) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let p = &l.progress;
+    let mut status = Vec::new();
+    status.push(format!("{} files", l.dir.files));
+    if l.dir.partial {
+        let pct = p.fraction.filter(|_| p.running).map(|f| format!(" {:.0}%", f * 100.0)).unwrap_or_default();
+        status.push(format!("still scanning{pct}: sizes are lower bounds"));
+    } else if p.running {
+        // A finished tree being re-checked for changes: the numbers are complete.
+        status.push("re-checking in the background".to_string());
+    }
+    let at = if l.dir.scanned_at > 0 { l.dir.scanned_at } else { p.completed_at };
+    if at > 0 {
+        status.push(format!("as of {}", tui::widgets::fmt_ago((now - at) / 1000)));
+    }
+    let _ = writeln!(out, "{}  {}  ({})", l.dir.path, hb(l.dir.size), status.join(" · "));
+    if let Some(k) = blame::explain_path(&l.dir.path) {
+        let _ = writeln!(out, "  💡 {k}");
+    }
+    let _ = writeln!(out, "{:>8} {:>4}  {:<12} {:>7} {:>8}  NAME", "SIZE", "%", "", "FILES", "NEWEST");
+    let mut notes = Vec::new();
+    fmt_children(&mut out, l, depth, top, 0, now, list, &mut notes);
+    if l.children.iter().any(|c| c.denied > 0) || l.dir.denied > 0 {
+        let _ = writeln!(out, "🔒 = could not be read (permissions / macOS privacy): not counted. Grant your terminal Full Disk Access, or pass the dir itself.");
+    }
+    for (name, k) in notes {
+        let _ = writeln!(out, "  💡 {name}: {k}");
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fmt_children(
+    out: &mut String,
+    l: &fs::Listing,
+    depth: u8,
+    top: usize,
+    level: usize,
+    now: model::Ts,
+    list: &mut dyn FnMut(&str) -> Option<fs::Listing>,
+    notes: &mut Vec<(String, String)>,
+) {
+    use std::fmt::Write;
+    let parent = l.dir.size.max(1);
+    let indent = "  ".repeat(level);
+    for c in l.children.iter().take(top) {
+        let ratio = c.size as f64 / parent as f64;
+        let mut name = format!("{indent}{}{}", c.name, if c.is_dir { "/" } else { "" });
+        if c.mount_point {
+            let alias = c.path.strip_prefix("/System/Volumes/Data").filter(|r| cfg!(target_os = "macos") && fs::volumes::firmlinks().iter().any(|f| f == r));
+            match alias.map(|r| r.trim_start_matches('/')) {
+                // macOS firmlink: the same directory as /<name>, counted there.
+                Some(r) => name.push_str(&format!("  ↪ = /{r} (firmlink, counted there)")),
+                None => name.push_str("  ⛁ mount (not counted)"),
+            }
+        } else if c.denied > 0 {
+            name.push_str(" 🔒");
+        }
+        if c.partial {
+            name.push_str(" …");
+        }
+        let size = if c.mount_point && c.size == 0 {
+            "-".to_string()
+        } else if c.denied > 0 && c.size == 0 {
+            "?".to_string()
+        } else {
+            hb(c.size)
+        };
+        let _ = writeln!(
+            out,
+            "{size:>8} {:>3.0}%  {:<12} {:>7} {:>8}  {name}",
+            ratio * 100.0,
+            tui::widgets::bar(ratio, 12),
+            c.files,
+            tui::widgets::fmt_mtime_age(c.newest_mtime, now),
+        );
+        if let Some(k) = blame::explain_path(&c.path).filter(|k| !k.starts_with("inside ")) {
+            notes.push((c.name.clone(), k));
+        }
+        if depth > 1 && c.is_dir && !c.mount_point && c.size > 0
+            && let Some(sub) = list(&c.path)
+        {
+            fmt_children(out, &sub, depth - 1, top, level + 1, now, list, notes);
+        }
+    }
+    if l.children.len() > top {
+        let rest = &l.children[top..];
+        let _ = writeln!(out, "{:>8} {:>4}  {:<12} {:>7} {:>8}  {indent}… {} more", hb(rest.iter().map(|c| c.size).sum()), "", "", "", "", rest.len());
+    }
+}
+
+fn fmt_growth(g: &fs::Growth, window_ms: i64, now: model::Ts) -> String {
+    use std::fmt::Write;
+    use tui::widgets::{evidence_tags, fmt_delta, fmt_window};
+    let mut out = String::new();
+    let _ = writeln!(out, "What grew in the last {}:", fmt_window(window_ms));
+    for (m, d) in &g.volumes {
+        let _ = writeln!(out, "  volume {m}: {}", fmt_delta(*d));
+    }
+    if g.growers.is_empty() {
+        let _ = writeln!(out, "  nothing grew noticeably");
+    } else {
+        let _ = writeln!(out, "{:>9} {:>8} {:>9}  {:<24} PATH", "Δ", "SIZE", "WRITE/s", "EVIDENCE");
+        for x in g.growers.iter().filter(|x| x.delta != 0 || !x.writers.is_empty()) {
+            let rate: u64 = x.writers.iter().map(|w| w.2).sum();
+            let mut who = String::new();
+            if let Some((pid, name, _)) = x.writers.iter().max_by_key(|w| w.2) {
+                who = format!("  ← {name} ({pid})");
+                if x.writers.len() > 1 {
+                    who.push_str(&format!(" +{}", x.writers.len() - 1));
+                }
+            }
+            let _ = writeln!(
+                out,
+                "{:>9} {:>8} {:>9}  {:<24} {}{}{who}",
+                fmt_delta(x.delta),
+                hb(x.size),
+                if rate > 0 { format!("{}/s", hb(rate)) } else { "-".into() },
+                evidence_tags(&x.evidence),
+                x.path,
+                if x.is_dir { "/" } else { "" },
+            );
+        }
+    }
+    let quiet = g.growers.iter().filter(|x| x.delta == 0 && x.writers.is_empty()).count();
+    if quiet > 0 {
+        let n = quiet;
+        let _ = writeln!(out, "  … {n} more paths touched with no net size change (--json lists them)");
+    }
+    if !g.deleted_open.is_empty() {
+        let _ = writeln!(out, "Deleted but still open (space returns when the holder closes them or restarts):");
+        const SHOW: usize = 8;
+        for (pid, name, path, b) in g.deleted_open.iter().take(SHOW) {
+            let _ = writeln!(out, "{:>9}  {path}  held by {name} ({pid})", hb(*b));
+        }
+        if g.deleted_open.len() > SHOW {
+            let rest = &g.deleted_open[SHOW..];
+            let _ = writeln!(out, "{:>9}  … {} more (--json lists them)", hb(rest.iter().map(|d| d.3).sum()), rest.len());
+        }
+    }
+    if !g.writers.is_empty() {
+        let _ = writeln!(out, "Top writers:");
+        for (pid, name, b) in &g.writers {
+            let _ = writeln!(out, "{:>9}  {name} ({pid})   fat why {pid}", hb(*b));
+        }
+    }
+    for n in &g.notes {
+        let _ = writeln!(out, "note: {n}");
+    }
+    if g.to > 0 && now > 0 {
+        let _ = writeln!(out, "(window {} → {}, evidence: fsevents/watch exact · open-files attributed · scan-diff coarse · mtime≤ upper bound)", fmt_hms(g.from), fmt_hms(g.to));
+    }
+    out
+}
+
+fn fmt_hms(ts: model::Ts) -> String {
+    tui::widgets::fmt_clock(ts)
+}
+
+fn fmt_volumes(vols: &[fs::Volume]) -> String {
+    use std::fmt::Write;
+    use tui::widgets::{fmt_eta, fmt_fill, volume_ratio};
+    let mut out = String::new();
+    let w = vols.iter().map(|v| v.mount.chars().count()).max().unwrap_or(5).clamp(5, 40);
+    let _ = writeln!(out, "{:<w$} {:>17} {:>4}  {:<12} {:>8} {:>12}  {:<12} {:<22} TYPE", "MOUNT", "USED/TOTAL", "USE", "", "AVAIL", "FILL/10m", "ETA", "IO r/w");
+    for v in vols {
+        let r = volume_ratio(v);
+        let io = if v.read_bps + v.write_bps > 0 { format!("{}/s {}/s", hb(v.read_bps), hb(v.write_bps)) } else { "-".into() };
+        let mut ty = v.fstype.clone();
+        if v.read_only {
+            ty.push_str(" ro");
+        }
+        if v.remote {
+            ty.push_str(if v.fstype == "apfs" || v.fstype == "hfs" { " external" } else { " network" });
+        }
+        if v.primary {
+            ty.push_str(" primary");
+        }
+        if let Some(p) = v.purgeable.filter(|p| *p > 0) {
+            ty.push_str(&format!(" purgeable {}", hb(p)));
+        }
+        let _ = writeln!(
+            out,
+            "{:<w$} {:>17} {:>3.0}%  {:<12} {:>8} {:>12}  {:<12} {:<22} {ty}",
+            v.mount,
+            format!("{}/{}", hb(v.used), hb(v.total)),
+            r * 100.0,
+            tui::widgets::bar(r, 12),
+            hb(v.avail),
+            fmt_fill(v.fill_bps, 600_000).map(|f| f.trim_end_matches("/10m").to_string()).unwrap_or_else(|| "-".into()),
+            v.eta_full_s.map(fmt_eta).unwrap_or_else(|| "-".into()),
+            io,
+        );
+        if !v.note.is_empty() {
+            let _ = writeln!(out, "{:<w$}   note: {}", "", v.note);
+        }
+    }
+    out
+}
+
+/// Storage facts for `fat doctor` (one volume sample; deleted-but-open files). Empty on failure.
+fn fs_facts() -> blame::FsFacts {
+    let guard = |f: &mut dyn FnMut()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_ok();
+    let mut facts = blame::FsFacts::default();
+    guard(&mut || facts.volumes = fs::volumes::Volumes::new().sample());
+    guard(&mut || facts.deleted_open = fs::volumes::deleted_open());
+    facts
+}
+
+fn run_fs(a: FsArgs, cfg: &config::Config) -> Result<()> {
+    let now = model::now_ms();
+    if a.volumes {
+        let mut v = fs::volumes::Volumes::new();
+        let _ = v.sample();
+        // The disk I/O poller needs two readings (~0.9 s apart) for a rate.
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+        let vols = v.sample();
+        if a.json {
+            return print_json(&vols);
+        }
+        print!("{}", fmt_volumes(&vols));
+        return Ok(());
+    }
+    if a.growth {
+        let window_ms = ago_ms(&a.since)?;
+        if window_ms <= 0 {
+            anyhow::bail!("--since must be positive");
+        }
+        let under = a.under.as_deref().map(|u| abs_path(Some(u)));
+        let mut t = fs::growth::Tracker::new();
+        // Collector samples give per-process write rates for attribution.
+        // Three samples ~0.8 s apart, so a bursty writer is caught writing at least once.
+        let mut c = collect::Collector::new();
+        t.observe(&c.sample());
+        for _ in 0..2 {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            t.observe(&c.sample());
+        }
+        let h = history::History::open(cfg.history_path.as_deref()).ok();
+        let sc = fs::scan::Scanner::new();
+        let g = t.report(window_ms, under.as_deref(), h.as_ref(), Some(&sc));
+        if a.json {
+            return print_json(&g);
+        }
+        print!("{}", fmt_growth(&g, window_ms, now));
+        return Ok(());
+    }
+    let path = abs_path(a.path.as_deref());
+    let wait_ms = a.wait.as_deref().map(budget::parse_duration).transpose()?.map(|s| s * 1000);
+    let sc = fs::scan::Scanner::new();
+    // Typing a path is explicit intent: protected or mounted dirs may be read.
+    sc.ensure(&path, true);
+    if let Some(n) = a.largest {
+        let mut v = sc.largest(&path, n);
+        if v.is_empty() || wait_ms.is_some() {
+            let _ = sc.scan_blocking(&path, wait_ms.unwrap_or(15_000));
+            v = sc.largest(&path, n);
+        }
+        if a.json {
+            return print_json(&v);
+        }
+        if v.is_empty() {
+            println!("nothing measured under {path} yet");
+        }
+        for e in &v {
+            println!("{:>8}  {}{}", hb(e.size), e.path, if e.is_dir { "/" } else { "" });
+        }
+        return Ok(());
+    }
+    let l = match wait_ms {
+        Some(w) => sc.scan_blocking(&path, w),
+        None => mcp::list_expanded(&sc, &path, 10_000).or_else(|| sc.scan_blocking(&path, 10_000)),
+    };
+    let Some(l) = l else {
+        anyhow::bail!("nothing measured under {path} yet — is it readable? (try --wait 2m)");
+    };
+    let mut lookup = |p: &str| mcp::list_expanded(&sc, p, 3000);
+    if a.json {
+        let mut v = mcp::listing_json(&l, a.depth as usize, a.top.max(1), &mut lookup);
+        v["progress"] = serde_json::to_value(&l.progress)?;
+        return print_json(&v);
+    }
+    print!("{}", fmt_listing(&l, a.depth, a.top.max(1), now, &mut lookup));
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -262,7 +615,7 @@ fn main() -> Result<()> {
                 s.containers = fleet::containers();
             }
             let h = history::History::open(cfg.history_path.as_deref()).ok();
-            let f = blame::diagnose(&s, h.as_ref());
+            let f = blame::diagnose_with_fs(&s, h.as_ref(), &fs_facts());
             if json {
                 print_json(&f)?;
             } else if f.is_empty() {
@@ -410,6 +763,91 @@ fn main() -> Result<()> {
             }
         }
         Some(Cmd::Mcp) => mcp::serve()?,
+        Some(Cmd::Fs(a)) => run_fs(a, &cfg)?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> std::result::Result<FsArgs, String> {
+        let mut v = vec!["fat", "fs"];
+        v.extend_from_slice(args);
+        match Cli::try_parse_from(v).map_err(|e| e.to_string())?.cmd {
+            Some(Cmd::Fs(a)) => Ok(a),
+            _ => Err("not fs".into()),
+        }
+    }
+
+    #[test]
+    fn fs_cli_parsing() {
+        let a = parse(&[]).unwrap();
+        assert_eq!((a.path, a.depth, a.growth, a.volumes, a.largest, a.json), (None, 1, false, false, None, false));
+        assert_eq!(a.since, "10m");
+        let a = parse(&["/Users", "--depth", "3", "--json", "--wait", "30"]).unwrap();
+        assert_eq!(a.path.as_deref(), Some("/Users"));
+        assert_eq!(a.depth, 3);
+        assert_eq!(a.wait.as_deref(), Some("30"));
+        assert!(a.json);
+        let a = parse(&["--growth", "--since", "1h", "--under", "/Users/me"]).unwrap();
+        assert!(a.growth);
+        assert_eq!(a.since, "1h");
+        assert_eq!(a.under.as_deref(), Some("/Users/me"));
+        assert!(parse(&["--volumes", "--json"]).unwrap().volumes);
+        let a = parse(&["--largest", "20", "/var"]).unwrap();
+        assert_eq!((a.largest, a.path.as_deref()), (Some(20), Some("/var")));
+        // invalid combinations
+        assert!(parse(&["--since", "1h"]).is_err(), "--since needs --growth");
+        assert!(parse(&["--growth", "--volumes"]).is_err());
+        assert!(parse(&["--depth", "0"]).is_err());
+        assert!(parse(&["--largest", "x"]).is_err());
+    }
+
+    #[test]
+    fn abs_paths() {
+        assert_eq!(abs_path(None), "/");
+        assert_eq!(abs_path(Some("/Users/me/")), "/Users/me");
+        assert_eq!(abs_path(Some("/a/./b/../c")), "/a/c");
+        assert_eq!(abs_path(Some("/..")), "/");
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        assert_eq!(abs_path(Some("x")), format!("{}/x", cwd.trim_end_matches('/')));
+        if let Some(h) = dirs::home_dir() {
+            assert_eq!(abs_path(Some("~/Downloads")), format!("{}/Downloads", h.display()));
+        }
+    }
+
+    #[test]
+    fn fs_human_output() {
+        let de = |p: &str, size: u64, dir: bool| fs::DirEntry { path: p.into(), name: p.rsplit('/').next().unwrap().into(), is_dir: dir, size, files: 3, newest_mtime: 1000, ..Default::default() };
+        let l = fs::Listing {
+            dir: fs::DirEntry { files: 9, scanned_at: 1_000_000, partial: true, ..de("/w", 1000, true) },
+            children: vec![de("/w/node_modules", 600, true), fs::DirEntry { denied: 1, ..de("/w/secret", 0, true) }, de("/w/b", 300, false), de("/w/c", 100, false)],
+            progress: fs::ScanProgress { running: true, fraction: Some(0.43), ..Default::default() },
+        };
+        let mut sub = |p: &str| (p == "/w/node_modules").then(|| fs::Listing { dir: de(p, 600, true), children: vec![de("/w/node_modules/react", 500, true)], ..Default::default() });
+        let out = fmt_listing(&l, 2, 3, 1_120_000, &mut sub);
+        assert!(out.starts_with("/w  1000B  (9 files · still scanning 43%: sizes are lower bounds · as of 2m ago)"), "{out}");
+        assert!(out.contains("    600B  60%  ███████▎····       3   2m ago  node_modules/"), "{out}");
+        assert!(out.contains("    500B  83%  ██████████··       3   2m ago    react/"), "depth 2 nests children\n{out}");
+        assert!(out.contains("?   0%") && out.contains("secret/ 🔒") && out.contains("Full Disk Access"), "{out}");
+        assert!(out.contains("… 1 more"), "{out}");
+        assert!(out.contains("💡 node_modules: npm"), "{out}");
+        let g = fs::Growth {
+            from: 1, to: 2,
+            volumes: vec![("/".into(), 3 << 30)],
+            growers: vec![fs::Grower { path: "/w/logs".into(), is_dir: true, delta: 2 << 30, size: 5 << 30, writers: vec![(42, "node".into(), 1 << 20), (7, "x".into(), 1)], evidence: vec![fs::Evidence::Fsevents, fs::Evidence::OpenFiles], ..Default::default() }],
+            writers: vec![(42, "node".into(), 2 << 30)],
+            deleted_open: vec![(9, "java".into(), "/tmp/old.log".into(), 3 << 30)],
+            notes: vec!["fanotify needs root".into()],
+        };
+        let out = fmt_growth(&g, 600_000, 5);
+        assert!(out.contains("last 10m") && out.contains("volume /: +3.0G"), "{out}");
+        assert!(out.contains("    +2.0G     5.0G    1.0M/s  fsevents,open-files      /w/logs/  ← node (42) +1"), "{out}");
+        assert!(out.contains("held by java (9)") && out.contains("fat why 42") && out.contains("note: fanotify"), "{out}");
+        let vols = vec![fs::Volume { mount: "/".into(), fstype: "apfs".into(), total: 100 << 30, used: 95 << 30, avail: 5 << 30, primary: true, fill_bps: Some(1e6), eta_full_s: Some(5000), ..Default::default() }];
+        let out = fmt_volumes(&vols);
+        assert!(out.contains("95.0G/100.0G  95%") && out.contains("full in 1h") && out.contains("apfs primary"), "{out}");
+    }
 }

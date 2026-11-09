@@ -2,6 +2,7 @@
 //! Side effects are requested as [`Command`]s which `tui::mod` executes and
 //! feeds back through the `set_*` / `*_done` methods.
 
+use crate::fs::{DirEntry, Evidence, Grower, Growth, Listing, Volume};
 use crate::history::Point;
 use crate::model::{ActionKind, ActionRecord, Container, Explanation, Finding, Proc, Snapshot, Ts};
 use crate::tui::widgets::contains_ci;
@@ -26,6 +27,7 @@ const RING_CMD_MAX: usize = 160;
 pub enum Tab {
     Procs,
     Ports,
+    Fs,
     Fleet,
     Timeline,
     Doctor,
@@ -33,11 +35,12 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [Tab::Procs, Tab::Ports, Tab::Fleet, Tab::Timeline, Tab::Doctor, Tab::Log];
+    pub const ALL: [Tab; 7] = [Tab::Procs, Tab::Ports, Tab::Fs, Tab::Fleet, Tab::Timeline, Tab::Doctor, Tab::Log];
     pub fn title(self) -> &'static str {
         match self {
             Tab::Procs => "Procs",
             Tab::Ports => "Ports",
+            Tab::Fs => "Fs",
             Tab::Fleet => "Fleet",
             Tab::Timeline => "Timeline",
             Tab::Doctor => "Doctor",
@@ -91,6 +94,15 @@ pub enum Command {
     RefreshLog,
     RefreshTimeline { from: Ts, to: Ts },
     LoadAt(Ts),
+    /// Storage: children of `path`. `explicit` = the user drilled into a protected / mounted
+    /// entry, which allows reading it (TCC-protected dirs, network mounts) this once.
+    FsList { path: String, explicit: bool },
+    /// Storage growth report for the last `window_ms` (`under` = only paths below it).
+    FsGrowth { window_ms: i64, under: Option<String> },
+    FsRescan(String),
+    FsLargest(String),
+    /// Recorded directory sizes below `path` and volume use near `ts` (time travel).
+    FsAt { ts: Ts, path: String },
     Quit,
 }
 
@@ -138,6 +150,448 @@ pub struct Row {
     pub depth: u16,
 }
 
+// -------------------------------------------------------------------- storage (Fs tab)
+
+/// Growth windows cycled with `w` in the Fs tab.
+pub const FS_WINDOWS: [i64; 3] = [10 * 60_000, 3_600_000, 24 * 3_600_000];
+/// Listing refresh while the tree is still being scanned / once it is complete.
+const FS_LIST_REFRESH_MS: i64 = 1000;
+const FS_LIST_IDLE_REFRESH_MS: i64 = 5000;
+const FS_GROWTH_REFRESH_MS: i64 = 5000;
+/// In-memory volume history for time travel without the recorder.
+const FS_VOL_RING: usize = 600;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsSort {
+    Size,
+    Growth,
+    Io,
+    Name,
+    Files,
+    Age,
+}
+
+impl FsSort {
+    pub const ALL: [FsSort; 6] = [FsSort::Size, FsSort::Growth, FsSort::Io, FsSort::Name, FsSort::Files, FsSort::Age];
+    pub fn label(self) -> &'static str {
+        match self {
+            FsSort::Size => "size",
+            FsSort::Growth => "growth",
+            FsSort::Io => "io",
+            FsSort::Name => "name",
+            FsSort::Files => "files",
+            FsSort::Age => "age",
+        }
+    }
+    pub fn next(self) -> FsSort {
+        let i = FsSort::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        FsSort::ALL[(i + 1) % FsSort::ALL.len()]
+    }
+}
+
+/// What the Fs tab's main table shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsMode {
+    /// Children of the current directory.
+    Tree,
+    /// Fastest growers anywhere, deleted-but-open files, top writers.
+    Growth,
+    /// Largest entries below the current directory.
+    Largest,
+}
+
+/// One row of the growth view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrowthRow {
+    Grower(usize),
+    Deleted(usize),
+    Writer(usize),
+}
+
+/// What the growth report says about one directory (from growers at or below it).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChildGrowth {
+    pub delta: i64,
+    /// Sum of the write rates of distinct processes seen writing below it.
+    pub write_bps: u64,
+    pub evidence: Vec<Evidence>,
+    /// The fastest of those writers: (pid, name, bytes/sec).
+    pub top_writer: Option<(u32, String, u64)>,
+}
+
+/// `p` is `dir` or below it (component-wise: "/a/bc" is not below "/a/b").
+pub fn path_within(p: &str, dir: &str) -> bool {
+    let dir = if dir.len() > 1 { dir.trim_end_matches('/') } else { dir };
+    if dir == "/" {
+        return p.starts_with('/');
+    }
+    p == dir || (p.starts_with(dir) && p.as_bytes().get(dir.len()) == Some(&b'/'))
+}
+
+/// "/a/b" -> "/a", "/a" -> "/", "/" -> None.
+pub fn parent_dir(p: &str) -> Option<String> {
+    let t = p.trim_end_matches('/');
+    if t.is_empty() {
+        return None;
+    }
+    match t.rfind('/') {
+        Some(0) => Some("/".into()),
+        Some(i) => Some(t[..i].to_string()),
+        None => None,
+    }
+}
+
+/// Δ, writers and evidence for `path` from the growers at or below it. Growers nested under
+/// another matching grower are skipped so a rolled-up parent and its child are not counted twice.
+pub fn child_growth(path: &str, growers: &[Grower]) -> ChildGrowth {
+    let mut under: Vec<&Grower> = growers.iter().filter(|g| path_within(&g.path, path)).collect();
+    under.sort_by(|a, b| a.path.len().cmp(&b.path.len()).then_with(|| a.path.cmp(&b.path)));
+    under.dedup_by(|a, b| a.path == b.path);
+    let mut out = ChildGrowth::default();
+    let mut kept: Vec<&Grower> = Vec::new();
+    for g in under {
+        if kept.iter().any(|k| path_within(&g.path, &k.path)) {
+            continue;
+        }
+        kept.push(g);
+    }
+    let mut writers: HashMap<u32, (String, u64)> = HashMap::new();
+    for g in &kept {
+        out.delta = out.delta.saturating_add(g.delta);
+        for e in &g.evidence {
+            if !out.evidence.contains(e) {
+                out.evidence.push(*e);
+            }
+        }
+    }
+    // Writers are attributed per grower; nested growers' writers count too (same process once).
+    for g in growers.iter().filter(|g| path_within(&g.path, path)) {
+        for (pid, name, bps) in &g.writers {
+            let w = writers.entry(*pid).or_insert_with(|| (name.clone(), 0));
+            w.1 = w.1.max(*bps);
+        }
+    }
+    out.write_bps = writers.values().map(|w| w.1).sum();
+    out.top_writer = writers.into_iter().max_by_key(|(pid, w)| (w.1, std::cmp::Reverse(*pid))).map(|(pid, (n, b))| (pid, n, b));
+    out
+}
+
+/// Row order for the growth view: growers, then deleted-but-open files, then top writers.
+pub fn growth_rows(g: &Growth, filter_lower: &str) -> Vec<GrowthRow> {
+    let mut v: Vec<GrowthRow> = Vec::new();
+    // Paths merely touched (no net change, no writer) are noise here.
+    v.extend(
+        g.growers
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.delta != 0 || !x.writers.is_empty())
+            .filter(|(_, x)| contains_ci(&x.path, filter_lower) || x.writers.iter().any(|w| contains_ci(&w.1, filter_lower)))
+            .map(|(i, _)| GrowthRow::Grower(i)),
+    );
+    v.extend(g.deleted_open.iter().enumerate().filter(|(_, x)| contains_ci(&x.1, filter_lower) || contains_ci(&x.2, filter_lower)).map(|(i, _)| GrowthRow::Deleted(i)));
+    v.extend(g.writers.iter().enumerate().filter(|(_, x)| contains_ci(&x.1, filter_lower)).map(|(i, _)| GrowthRow::Writer(i)));
+    v
+}
+
+/// Sorted, filtered order of a listing's children. Each sort has its natural direction:
+/// biggest / fastest / newest first, names ascending.
+pub fn fs_order(children: &[DirEntry], growth: &[ChildGrowth], sort: FsSort, filter_lower: &str) -> Vec<usize> {
+    let mut v: Vec<usize> = (0..children.len()).filter(|&i| contains_ci(&children[i].name, filter_lower)).collect();
+    let delta = |i: usize| growth.get(i).map_or(0, |c| c.delta);
+    let io = |i: usize| growth.get(i).map_or(0, |c| c.write_bps);
+    v.sort_by(|&a, &b| {
+        let (x, y) = (&children[a], &children[b]);
+        let o = match sort {
+            FsSort::Size => y.size.cmp(&x.size),
+            FsSort::Growth => delta(b).cmp(&delta(a)),
+            FsSort::Io => io(b).cmp(&io(a)),
+            FsSort::Name => x.name.to_lowercase().cmp(&y.name.to_lowercase()),
+            FsSort::Files => y.files.cmp(&x.files),
+            FsSort::Age => y.newest_mtime.cmp(&x.newest_mtime),
+        };
+        o.then_with(|| y.size.cmp(&x.size)).then_with(|| x.name.cmp(&y.name))
+    });
+    v
+}
+
+/// What the recorder knew about a directory at a past moment.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FsPast {
+    /// Requested time and directory.
+    pub ts: Ts,
+    pub path: String,
+    /// Time of the recorded directory snapshot used (None = nothing recorded that early).
+    pub at: Option<Ts>,
+    /// Recorded size of `path` itself.
+    pub dir_size: Option<u64>,
+    pub children: Vec<DirEntry>,
+    /// (mount, used) recorded near `ts`.
+    pub vols: Vec<(String, u64)>,
+}
+
+/// Build an [`FsPast`] from recorded (path, size) rows at and below `path`.
+pub fn fs_past_from(ts: Ts, path: &str, at: Option<Ts>, rows: &[(String, u64)], vols: Vec<(String, u64)>) -> FsPast {
+    let dir = if path.len() > 1 { path.trim_end_matches('/') } else { path };
+    let mut children: Vec<DirEntry> = rows
+        .iter()
+        .filter(|(p, _)| parent_dir(p).as_deref() == Some(dir))
+        .map(|(p, size)| DirEntry {
+            path: p.clone(),
+            name: p.rsplit('/').next().unwrap_or_default().to_string(),
+            // The recorder keeps sizes, not kinds; most recorded entries are directories.
+            is_dir: true,
+            size: *size,
+            scanned_at: at.unwrap_or(0),
+            ..Default::default()
+        })
+        .collect();
+    children.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+    let dir_size = rows.iter().find(|(p, _)| p == dir).map(|(_, s)| *s);
+    FsPast { ts, path: dir.to_string(), at, dir_size, children, vols }
+}
+
+pub struct FsView {
+    /// The tab was opened at least once: the storage engines run from then on.
+    pub opened: bool,
+    /// Directory shown in the tree view.
+    pub path: String,
+    /// The user explicitly opened this protected / mounted dir: reading below it is allowed.
+    pub explicit_root: Option<String>,
+    pub listing: Option<Listing>,
+    /// When `listing` arrived (epoch ms).
+    pub listing_at: Ts,
+    pub volumes: Vec<Volume>,
+    /// (ts, [(mount, used)]) for time travel within this session.
+    pub vol_ring: VecDeque<(Ts, Vec<(String, u64)>)>,
+    pub growth: Option<Growth>,
+    pub growth_at: Ts,
+    pub window: usize,
+    pub sort: FsSort,
+    pub mode: FsMode,
+    /// Largest entries below `largest_path` (None = loading).
+    pub largest: Option<Vec<DirEntry>>,
+    pub largest_path: String,
+    pub filter: String,
+    filter_lower: String,
+    /// Row order for the current mode (indices into children / largest; growth uses `grows`).
+    pub rows: Vec<usize>,
+    pub grows: Vec<GrowthRow>,
+    /// Per child of `listing`, aligned with `listing.children`.
+    pub child_growth: Vec<ChildGrowth>,
+    rows_dirty: bool,
+    pub sel: usize,
+    pub offset: usize,
+    /// Name of the selected entry, kept across refreshes and re-sorts.
+    sel_name: Option<String>,
+    pub error: Option<String>,
+    last_list_req: Ts,
+    last_growth_req: Ts,
+    /// Mirrors `App::cursor` (time travel).
+    pub cursor: Option<Ts>,
+    pub past: Option<FsPast>,
+    last_past_req: Option<(Ts, String)>,
+}
+
+impl Default for FsView {
+    fn default() -> Self {
+        FsView {
+            opened: false,
+            path: "/".into(),
+            explicit_root: None,
+            listing: None,
+            listing_at: 0,
+            volumes: Vec::new(),
+            vol_ring: VecDeque::new(),
+            growth: None,
+            growth_at: 0,
+            window: 0,
+            sort: FsSort::Size,
+            mode: FsMode::Tree,
+            largest: None,
+            largest_path: String::new(),
+            filter: String::new(),
+            filter_lower: String::new(),
+            rows: Vec::new(),
+            grows: Vec::new(),
+            child_growth: Vec::new(),
+            rows_dirty: true,
+            sel: 0,
+            offset: 0,
+            sel_name: None,
+            error: None,
+            last_list_req: i64::MIN / 2,
+            last_growth_req: i64::MIN / 2,
+            cursor: None,
+            past: None,
+            last_past_req: None,
+        }
+    }
+}
+
+impl FsView {
+    pub fn window_ms(&self) -> i64 {
+        FS_WINDOWS[self.window % FS_WINDOWS.len()]
+    }
+
+    /// Current listing, only if it is for the directory being shown.
+    pub fn current(&self) -> Option<&Listing> {
+        self.listing.as_ref()
+    }
+
+    /// Recorded sizes for the moment being viewed, when rewound and the recorder has them.
+    pub fn past_view(&self) -> Option<&FsPast> {
+        let c = self.cursor?;
+        self.past.as_ref().filter(|p| p.ts == c && p.path == self.path && p.at.is_some())
+    }
+
+    /// Children the tree view shows: recorded ones when rewound (if recorded), else the scan.
+    pub fn tree_children(&self) -> &[DirEntry] {
+        match self.past_view() {
+            Some(p) => &p.children,
+            None => self.listing.as_ref().map(|l| l.children.as_slice()).unwrap_or(&[]),
+        }
+    }
+
+    pub fn ensure_rows(&mut self) {
+        if !self.rows_dirty {
+            return;
+        }
+        self.rows_dirty = false;
+        let f = self.filter_lower.as_str();
+        match self.mode {
+            FsMode::Tree => {
+                let (cg, rows) = {
+                    let children: &[DirEntry] = self.tree_children();
+                    let growers: &[Grower] = self.growth.as_ref().map(|g| g.growers.as_slice()).unwrap_or(&[]);
+                    let cg: Vec<ChildGrowth> = children.iter().map(|c| child_growth(&c.path, growers)).collect();
+                    let rows = fs_order(children, &cg, self.sort, f);
+                    (cg, rows)
+                };
+                self.child_growth = cg;
+                self.rows = rows;
+                self.grows.clear();
+            }
+            FsMode::Largest => {
+                let l: &[DirEntry] = self.largest.as_deref().unwrap_or(&[]);
+                self.rows = (0..l.len()).filter(|&i| contains_ci(&l[i].path, f)).collect();
+                self.grows.clear();
+            }
+            FsMode::Growth => {
+                self.grows = self.growth.as_ref().map(|g| growth_rows(g, f)).unwrap_or_default();
+                self.rows.clear();
+            }
+        }
+        let len = self.len();
+        let found = self.sel_name.clone().and_then(|n| (0..len).find(|&i| self.row_key(i).as_deref() == Some(n.as_str())));
+        self.sel = found.unwrap_or_else(|| self.sel.min(len.saturating_sub(1)));
+    }
+
+    pub fn len(&self) -> usize {
+        if self.mode == FsMode::Growth { self.grows.len() } else { self.rows.len() }
+    }
+
+    /// Stable identity of row `i` for keeping the selection.
+    fn row_key(&self, i: usize) -> Option<String> {
+        match self.mode {
+            FsMode::Tree => Some(self.tree_children().get(*self.rows.get(i)?)?.name.clone()),
+            FsMode::Largest => Some(self.largest.as_ref()?.get(*self.rows.get(i)?)?.path.clone()),
+            FsMode::Growth => {
+                let g = self.growth.as_ref()?;
+                Some(match self.grows.get(i)? {
+                    GrowthRow::Grower(j) => format!("g:{}", g.growers.get(*j)?.path),
+                    GrowthRow::Deleted(j) => format!("d:{}", g.deleted_open.get(*j)?.2),
+                    GrowthRow::Writer(j) => format!("w:{}", g.writers.get(*j)?.0),
+                })
+            }
+        }
+    }
+
+    /// The selected child in tree mode.
+    pub fn selected_entry(&self) -> Option<&DirEntry> {
+        match self.mode {
+            FsMode::Tree => self.tree_children().get(*self.rows.get(self.sel)?),
+            FsMode::Largest => self.largest.as_ref()?.get(*self.rows.get(self.sel)?),
+            FsMode::Growth => None,
+        }
+    }
+
+    pub fn selected_growth(&self) -> Option<GrowthRow> {
+        if self.mode == FsMode::Growth { self.grows.get(self.sel).copied() } else { None }
+    }
+
+    /// Growth numbers of the selected tree child.
+    pub fn selected_child_growth(&self) -> Option<&ChildGrowth> {
+        if self.mode != FsMode::Tree {
+            return None;
+        }
+        self.child_growth.get(*self.rows.get(self.sel)?)
+    }
+
+    fn move_sel(&mut self, delta: isize) {
+        self.ensure_rows();
+        self.sel = step(self.sel, delta, self.len());
+        self.sel_name = self.row_key(self.sel);
+    }
+
+    fn set_mode(&mut self, m: FsMode) {
+        if self.mode != m {
+            self.mode = m;
+            self.sel = 0;
+            self.offset = 0;
+            self.sel_name = None;
+            self.rows_dirty = true;
+        }
+    }
+
+    fn explicit(&self) -> bool {
+        self.explicit_root.as_deref().is_some_and(|r| path_within(&self.path, r))
+    }
+
+    fn list_cmd(&mut self, now: Ts) -> Command {
+        self.last_list_req = now;
+        Command::FsList { path: self.path.clone(), explicit: self.explicit() }
+    }
+
+    fn growth_under(&self) -> Option<String> {
+        // The growth view is "anywhere"; the tree asks about the directory being shown.
+        (self.mode == FsMode::Tree && self.path != "/").then(|| self.path.clone())
+    }
+
+    fn growth_cmd(&mut self, now: Ts) -> Command {
+        self.last_growth_req = now;
+        Command::FsGrowth { window_ms: self.window_ms(), under: self.growth_under() }
+    }
+
+    /// Go to `path`, selecting `select` (a child name) when it shows up.
+    fn go(&mut self, path: String, select: Option<String>, explicit: bool, now: Ts) -> Vec<Command> {
+        if explicit {
+            self.explicit_root = Some(path.clone());
+        } else if !self.explicit_root.as_deref().is_some_and(|r| path_within(&path, r)) {
+            self.explicit_root = None;
+        }
+        let changed = path != self.path;
+        self.path = path;
+        self.set_mode(FsMode::Tree);
+        if changed {
+            self.listing = None;
+            self.sel = 0;
+            self.offset = 0;
+        }
+        self.sel_name = select;
+        self.rows_dirty = true;
+        vec![self.list_cmd(now), self.growth_cmd(now)]
+    }
+
+    /// Used bytes of `mount` nearest to `ts` from this session's samples (time travel).
+    pub fn used_at(&self, mount: &str, ts: Ts) -> Option<(Ts, u64)> {
+        let (at, vols) = self.vol_ring.iter().min_by_key(|(t, _)| (t - ts).abs())?;
+        if (at - ts).abs() > 30_000 {
+            return None;
+        }
+        vols.iter().find(|(m, _)| m == mount).map(|(_, u)| (*at, *u))
+    }
+}
+
 pub struct App {
     pub tab: Tab,
     pub live: Option<Snapshot>,
@@ -180,6 +634,7 @@ pub struct App {
     pub fleet_sel: usize,
     pub doctor_sel: usize,
     pub log_sel: usize,
+    pub fs: FsView,
 
     pub findings: Vec<Finding>,
     /// Start time of each pid the findings mention, from the snapshot they were computed on.
@@ -245,6 +700,7 @@ impl App {
             fleet_sel: 0,
             doctor_sel: 0,
             log_sel: 0,
+            fs: FsView::default(),
             findings: Vec::new(),
             findings_starts: HashMap::new(),
             findings_loaded: false,
@@ -425,7 +881,80 @@ impl App {
         if self.tab == Tab::Timeline && now - self.last_timeline_refresh >= TIMELINE_REFRESH_MS {
             return vec![self.timeline_refresh()];
         }
+        if self.tab == Tab::Fs && self.fs.opened && self.fs.error.is_none() {
+            let mut out = Vec::new();
+            // A summarized (folded) directory is being re-expanded after focus: poll fast too.
+            let scanning = self.fs.listing.as_ref().is_none_or(|l| l.dir.partial || l.progress.running || (l.children.is_empty() && l.dir.files > 1));
+            let every = if scanning { FS_LIST_REFRESH_MS } else { FS_LIST_IDLE_REFRESH_MS };
+            if now - self.fs.last_list_req >= every {
+                out.push(self.fs.list_cmd(now));
+            }
+            if now - self.fs.last_growth_req >= FS_GROWTH_REFRESH_MS {
+                out.push(self.fs.growth_cmd(now));
+            }
+            if let Some(c) = self.cursor {
+                let want = (c, self.fs.path.clone());
+                if self.history_ok && self.fs.last_past_req.as_ref() != Some(&want) {
+                    self.fs.last_past_req = Some(want);
+                    out.push(Command::FsAt { ts: c, path: self.fs.path.clone() });
+                }
+            }
+            return out;
+        }
         Vec::new()
+    }
+
+    // ---------------------------------------------------------------- storage data in
+
+    /// Volumes from the sampler (every sample, whether or not the Fs tab was opened).
+    pub fn set_volumes(&mut self, ts: Ts, vols: Vec<Volume>) {
+        self.fs.vol_ring.push_back((ts, vols.iter().map(|v| (v.mount.clone(), v.used)).collect()));
+        while self.fs.vol_ring.len() > FS_VOL_RING || self.fs.vol_ring.front().is_some_and(|(t, _)| ts - *t > RING_MS) {
+            self.fs.vol_ring.pop_front();
+        }
+        self.fs.volumes = vols;
+    }
+
+    /// Listing for `path`; ignored if the user has moved elsewhere since asking.
+    /// None = nothing known yet (the scan has not reached it).
+    pub fn set_fs_listing(&mut self, path: &str, l: Option<Listing>) {
+        if path != self.fs.path {
+            return;
+        }
+        if let Some(l) = l {
+            self.fs.listing = Some(l);
+            self.fs.listing_at = self.now;
+            if self.fs.mode == FsMode::Tree {
+                self.fs.rows_dirty = true;
+            }
+        }
+    }
+
+    pub fn set_fs_growth(&mut self, g: Growth) {
+        self.fs.growth = Some(g);
+        self.fs.growth_at = self.now;
+        self.fs.rows_dirty = true;
+    }
+
+    /// Recorded storage state for a past moment; ignored unless it is still what is viewed.
+    pub fn set_fs_past(&mut self, p: FsPast) {
+        if self.cursor == Some(p.ts) && p.path == self.fs.path {
+            self.fs.past = Some(p);
+            self.fs.rows_dirty = true;
+        }
+    }
+
+    pub fn set_fs_largest(&mut self, path: &str, v: Vec<DirEntry>) {
+        if path == self.fs.largest_path {
+            self.fs.largest = Some(v);
+            self.fs.rows_dirty = true;
+        }
+    }
+
+    /// The storage engine is unavailable: stop polling it and say why.
+    pub fn set_fs_error(&mut self, e: String) {
+        self.set_status(format!("storage: {e}"), true);
+        self.fs.error = Some(e);
     }
 
     fn timeline_refresh(&mut self) -> Command {
@@ -524,6 +1053,8 @@ impl App {
 
     pub fn jump_to(&mut self, ts: Ts) -> Vec<Command> {
         self.cursor = Some(ts);
+        self.fs.cursor = Some(ts);
+        self.fs.rows_dirty = true;
         self.rows_dirty = true;
         let tol = (self.interval_ms as i64 * 3).max(5000);
         let hit = self
@@ -553,6 +1084,10 @@ impl App {
         self.past = None;
         self.past_loading = false;
         self.rows_dirty = true;
+        self.fs.cursor = None;
+        self.fs.past = None;
+        self.fs.last_past_req = None;
+        self.fs.rows_dirty = true;
     }
 
     fn next_spike(&mut self) -> Vec<Command> {
@@ -616,18 +1151,18 @@ impl App {
             Modal::Help => Vec::new(), // any key closes
             Modal::Filter => {
                 match k.code {
-                    KeyCode::Esc => self.set_filter(String::new()),
+                    KeyCode::Esc => self.set_active_filter(String::new()),
                     KeyCode::Enter => {}
                     KeyCode::Backspace => {
-                        let mut f = self.filter.clone();
+                        let mut f = self.active_filter().to_string();
                         f.pop();
-                        self.set_filter(f);
+                        self.set_active_filter(f);
                         self.modal = Modal::Filter;
                     }
                     KeyCode::Char(c) => {
-                        let mut f = self.filter.clone();
+                        let mut f = self.active_filter().to_string();
                         f.push(c);
-                        self.set_filter(f);
+                        self.set_active_filter(f);
                         self.modal = Modal::Filter;
                     }
                     _ => self.modal = Modal::Filter,
@@ -736,6 +1271,21 @@ impl App {
         self.rows_dirty = true;
     }
 
+    pub fn set_fs_filter(&mut self, f: String) {
+        self.fs.filter_lower = f.to_lowercase();
+        self.fs.filter = f;
+        self.fs.rows_dirty = true;
+    }
+
+    /// The filter the `/` prompt edits: the Fs tab has its own (paths, not processes).
+    pub fn active_filter(&self) -> &str {
+        if self.tab == Tab::Fs { &self.fs.filter } else { &self.filter }
+    }
+
+    fn set_active_filter(&mut self, f: String) {
+        if self.tab == Tab::Fs { self.set_fs_filter(f) } else { self.set_filter(f) }
+    }
+
     pub fn switch_tab(&mut self, t: Tab) -> Vec<Command> {
         if self.tab != t {
             self.why = None;
@@ -744,6 +1294,15 @@ impl App {
         match t {
             Tab::Log => vec![Command::RefreshLog],
             Tab::Timeline => vec![self.timeline_refresh()],
+            Tab::Fs => {
+                // Opening the tab is what starts the storage engines (never before).
+                self.fs.opened = true;
+                if self.fs.error.is_some() {
+                    return Vec::new();
+                }
+                let now = self.now;
+                vec![self.fs.list_cmd(now), self.fs.growth_cmd(now)]
+            }
             _ => Vec::new(),
         }
     }
@@ -754,9 +1313,9 @@ impl App {
                 self.quit = true;
                 return vec![Command::Quit];
             }
-            KeyCode::Char(c @ '1'..='6') => return self.switch_tab(Tab::ALL[(c as u8 - b'1') as usize]),
-            KeyCode::Tab => return self.switch_tab(Tab::ALL[(self.tab.index() + 1) % 6]),
-            KeyCode::BackTab => return self.switch_tab(Tab::ALL[(self.tab.index() + 5) % 6]),
+            KeyCode::Char(c @ '1'..='7') => return self.switch_tab(Tab::ALL[(c as u8 - b'1') as usize]),
+            KeyCode::Tab => return self.switch_tab(Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()]),
+            KeyCode::BackTab => return self.switch_tab(Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]),
             KeyCode::Char('h') | KeyCode::F(1) => {
                 self.modal = Modal::Help;
                 return Vec::new();
@@ -771,6 +1330,20 @@ impl App {
             }
             KeyCode::Char('u') => return vec![Command::Undo],
             KeyCode::Esc => {
+                if self.tab == Tab::Fs {
+                    if !self.fs.filter.is_empty() {
+                        self.set_fs_filter(String::new());
+                        return Vec::new();
+                    }
+                    if self.fs.mode != FsMode::Tree {
+                        self.fs.set_mode(FsMode::Tree);
+                        return Vec::new();
+                    }
+                    if self.rewound() {
+                        self.go_live();
+                    }
+                    return Vec::new();
+                }
                 if !self.filter.is_empty() {
                     self.set_filter(String::new());
                 } else if self.rewound() {
@@ -784,6 +1357,7 @@ impl App {
             Tab::Procs => self.on_procs_key(k),
             Tab::Timeline => self.on_timeline_key(k),
             Tab::Ports => self.on_ports_key(k),
+            Tab::Fs => self.on_fs_key(k),
             Tab::Fleet => {
                 let n = self.fleet_len();
                 list_nav(&mut self.fleet_sel, n, k.code);
@@ -913,6 +1487,109 @@ impl App {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Fs tab. `h` stays help and `L` stays "back to live" as everywhere else, so going up is
+    /// ←/Backspace and the largest-files list is `b` (biggest).
+    fn on_fs_key(&mut self, k: KeyEvent) -> Vec<Command> {
+        let now = self.now;
+        self.fs.ensure_rows();
+        match k.code {
+            KeyCode::Up => self.fs.move_sel(-1),
+            KeyCode::Down => self.fs.move_sel(1),
+            KeyCode::PageUp => self.fs.move_sel(-15),
+            KeyCode::PageDown => self.fs.move_sel(15),
+            KeyCode::Home => self.fs.move_sel(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.fs.move_sel(isize::MAX / 2),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => return self.fs_open_selected(k.code == KeyCode::Enter),
+            KeyCode::Left | KeyCode::Backspace => return self.fs_up(),
+            KeyCode::Char('s') => {
+                if self.fs.mode == FsMode::Tree {
+                    self.fs.sort = self.fs.sort.next();
+                    self.fs.rows_dirty = true;
+                } else {
+                    self.set_status("sorting applies to the directory view (Esc returns to it)", false);
+                }
+            }
+            KeyCode::Char('g') => {
+                let m = if self.fs.mode == FsMode::Growth { FsMode::Tree } else { FsMode::Growth };
+                self.fs.set_mode(m);
+                return vec![self.fs.growth_cmd(now)];
+            }
+            KeyCode::Char('w') | KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('-') => {
+                let n = FS_WINDOWS.len();
+                self.fs.window = if k.code == KeyCode::Char('-') { (self.fs.window + n - 1) % n } else { (self.fs.window + 1) % n };
+                self.set_status(format!("growth window: last {}", crate::tui::widgets::fmt_window(self.fs.window_ms())), false);
+                return vec![self.fs.growth_cmd(now)];
+            }
+            KeyCode::Char('r') => {
+                let p = self.fs.path.clone();
+                self.set_status(format!("rescanning {p} in the background"), false);
+                return vec![Command::FsRescan(p), self.fs.list_cmd(now)];
+            }
+            KeyCode::Char('b') => {
+                self.fs.largest_path = self.fs.path.clone();
+                self.fs.largest = None;
+                self.fs.set_mode(FsMode::Largest);
+                return vec![Command::FsLargest(self.fs.path.clone())];
+            }
+            KeyCode::Char('/') => self.modal = Modal::Filter,
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// ⏎ / → on the selected row: drill into a directory, jump to a grower, or explain a writer.
+    fn fs_open_selected(&mut self, enter: bool) -> Vec<Command> {
+        let now = self.now;
+        match self.fs.mode {
+            FsMode::Tree | FsMode::Largest => {
+                let Some(e) = self.fs.selected_entry() else { return Vec::new() };
+                let (path, is_dir, name) = (e.path.clone(), e.is_dir, e.name.clone());
+                let explicit = e.denied > 0 || e.mount_point;
+                if is_dir {
+                    return self.fs.go(path, None, explicit, now);
+                }
+                if self.fs.mode == FsMode::Largest
+                    && let Some(parent) = parent_dir(&path)
+                {
+                    return self.fs.go(parent, Some(name), false, now);
+                }
+                self.set_status(format!("{name} is a file"), false);
+                Vec::new()
+            }
+            FsMode::Growth => {
+                let (Some(row), Some(g)) = (self.fs.selected_growth(), self.fs.growth.as_ref()) else { return Vec::new() };
+                match row {
+                    GrowthRow::Grower(i) => {
+                        let Some(x) = g.growers.get(i) else { return Vec::new() };
+                        if x.is_dir {
+                            let p = x.path.clone();
+                            self.fs.go(p, None, false, now)
+                        } else {
+                            let name = x.path.rsplit('/').next().unwrap_or_default().to_string();
+                            let parent = parent_dir(&x.path).unwrap_or_else(|| "/".into());
+                            self.fs.go(parent, Some(name), false, now)
+                        }
+                    }
+                    // Only ⏎ explains (→ is navigation).
+                    GrowthRow::Deleted(i) if enter => g.deleted_open.get(i).map(|d| vec![Command::Explain(d.0)]).unwrap_or_default(),
+                    GrowthRow::Writer(i) if enter => g.writers.get(i).map(|w| vec![Command::Explain(w.0)]).unwrap_or_default(),
+                    _ => Vec::new(),
+                }
+            }
+        }
+    }
+
+    fn fs_up(&mut self) -> Vec<Command> {
+        if self.fs.mode != FsMode::Tree {
+            self.fs.set_mode(FsMode::Tree);
+            return Vec::new();
+        }
+        let Some(parent) = parent_dir(&self.fs.path) else { return Vec::new() };
+        let came_from = self.fs.path.trim_end_matches('/').rsplit('/').next().map(str::to_string);
+        let now = self.now;
+        self.fs.go(parent, came_from, false, now)
     }
 
     fn on_doctor_key(&mut self, k: KeyEvent) -> Vec<Command> {
@@ -1466,7 +2143,7 @@ pub(crate) mod tests {
     #[test]
     fn tab_switching() {
         let mut a = app();
-        assert_eq!(a.on_key(key('6')), vec![Command::RefreshLog]);
+        assert_eq!(a.on_key(key('7')), vec![Command::RefreshLog]);
         assert_eq!(a.tab, Tab::Log);
         a.on_key(code(KeyCode::Tab));
         assert_eq!(a.tab, Tab::Procs);
@@ -1474,8 +2151,13 @@ pub(crate) mod tests {
         assert_eq!(a.tab, Tab::Log);
         a.on_key(key('2'));
         assert_eq!(a.tab, Tab::Ports);
-        let cmds = a.on_key(key('4'));
+        a.on_key(code(KeyCode::Tab));
+        assert_eq!(a.tab, Tab::Fs, "Fs sits right after Ports");
+        a.on_key(code(KeyCode::Tab));
+        assert_eq!(a.tab, Tab::Fleet);
+        let cmds = a.on_key(key('5'));
         assert!(matches!(cmds[0], Command::RefreshTimeline { .. }));
+        assert_eq!(Tab::ALL.map(|t| t.title()), ["Procs", "Ports", "Fs", "Fleet", "Timeline", "Doctor", "Log"]);
     }
 
     #[test]
@@ -1669,7 +2351,7 @@ pub(crate) mod tests {
     #[test]
     fn doctor_enter_confirms_suggested_action() {
         let mut a = app();
-        a.on_key(key('5'));
+        a.on_key(key('6'));
         a.set_findings_with_starts(
             vec![
                 Finding { severity: "info".into(), title: "x".into(), detail: "".into(), pids: vec![], action: None },
@@ -1703,5 +2385,280 @@ pub(crate) mod tests {
         a.set_status("hi", false);
         a.tick(a.now + STATUS_MS + 1);
         assert!(a.status.is_none());
+    }
+
+    // ------------------------------------------------------------ Fs tab
+
+    fn de(path: &str, size: u64, is_dir: bool) -> DirEntry {
+        DirEntry {
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap_or("/").into(),
+            is_dir,
+            size,
+            files: size / 100,
+            newest_mtime: (size % 1000) as i64,
+            ..Default::default()
+        }
+    }
+
+    fn listing(dir: &str, children: Vec<DirEntry>, partial: bool) -> Listing {
+        Listing {
+            dir: DirEntry { partial, ..de(dir, children.iter().map(|c| c.size).sum(), true) },
+            children,
+            progress: crate::fs::ScanProgress { root: "/".into(), running: partial, ..Default::default() },
+        }
+    }
+
+    fn grower(path: &str, delta: i64, writers: Vec<(u32, &str, u64)>) -> Grower {
+        Grower {
+            path: path.into(),
+            is_dir: !path.ends_with(".log"),
+            delta,
+            size: delta.max(0) as u64,
+            writers: writers.into_iter().map(|(p, n, b)| (p, n.to_string(), b)).collect(),
+            evidence: vec![Evidence::Fsevents],
+            ..Default::default()
+        }
+    }
+
+    fn fs_app() -> App {
+        let mut a = app();
+        let cmds = a.on_key(key('3'));
+        assert_eq!(a.tab, Tab::Fs);
+        assert_eq!(cmds, vec![Command::FsList { path: "/".into(), explicit: false }, Command::FsGrowth { window_ms: 600_000, under: None }]);
+        a.set_fs_listing(
+            "/",
+            Some(listing(
+                "/",
+                vec![
+                    de("/Users", 500, true),
+                    de("/Applications", 300, true),
+                    DirEntry { denied: 1, ..de("/private", 100, true) },
+                    de("/big.iso", 400, false),
+                ],
+                true,
+            )),
+        );
+        a
+    }
+
+    fn fs_names(a: &mut App) -> Vec<String> {
+        a.fs.ensure_rows();
+        let l = a.fs.listing.as_ref().unwrap();
+        a.fs.rows.iter().map(|&i| l.children[i].name.clone()).collect()
+    }
+
+    #[test]
+    fn fs_tab_is_lazy_and_polls_only_while_visible() {
+        let mut a = app();
+        assert!(!a.fs.opened);
+        assert!(a.tick(a.now + 10_000).is_empty(), "nothing touches storage before the tab is opened");
+        a.on_key(key('3'));
+        assert!(a.fs.opened);
+        // just asked: nothing new until the refresh intervals pass
+        assert!(a.tick(a.now + 10).is_empty());
+        let cmds = a.tick(a.now + FS_GROWTH_REFRESH_MS + 20);
+        assert!(cmds.contains(&Command::FsList { path: "/".into(), explicit: false }), "{cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(c, Command::FsGrowth { .. })));
+        a.on_key(key('1'));
+        assert!(a.tick(a.now + 60_000).is_empty(), "no polling from other tabs");
+        a.on_key(key('3'));
+        a.set_fs_error("not available".into());
+        assert!(a.tick(a.now + 60_000).is_empty(), "a broken engine is not polled");
+    }
+
+    #[test]
+    fn fs_drill_up_and_selection() {
+        let mut a = fs_app();
+        assert_eq!(fs_names(&mut a), vec!["Users", "big.iso", "Applications", "private"]);
+        // a file can't be opened
+        a.on_key(code(KeyCode::Down));
+        assert!(a.on_key(code(KeyCode::Enter)).is_empty());
+        assert!(a.status.as_ref().unwrap().text.contains("file"));
+        // drill into Users
+        a.on_key(code(KeyCode::Home));
+        let cmds = a.on_key(code(KeyCode::Enter));
+        assert_eq!(a.fs.path, "/Users");
+        assert_eq!(cmds[0], Command::FsList { path: "/Users".into(), explicit: false });
+        assert_eq!(cmds[1], Command::FsGrowth { window_ms: 600_000, under: Some("/Users".into()) });
+        assert!(a.fs.listing.is_none(), "old listing dropped");
+        // a stale answer for "/" is ignored
+        a.set_fs_listing("/", Some(listing("/", vec![de("/x", 1, true)], false)));
+        assert!(a.fs.listing.is_none());
+        a.set_fs_listing("/Users", Some(listing("/Users", vec![de("/Users/me", 450, true), de("/Users/Shared", 50, true)], false)));
+        assert_eq!(fs_names(&mut a), vec!["me", "Shared"]);
+        a.on_key(key('l'));
+        assert_eq!(a.fs.path, "/Users/me");
+        // up twice: back at "/" with the dir we came from selected
+        a.on_key(code(KeyCode::Backspace));
+        assert_eq!(a.fs.path, "/Users");
+        let cmds = a.on_key(code(KeyCode::Left));
+        assert_eq!(a.fs.path, "/");
+        assert_eq!(cmds[1], Command::FsGrowth { window_ms: 600_000, under: None });
+        a.set_fs_listing("/", Some(listing("/", vec![de("/Applications", 300, true), de("/Users", 500, true)], false)));
+        a.fs.ensure_rows();
+        assert_eq!(a.fs.selected_entry().unwrap().name, "Users");
+        assert!(a.on_key(code(KeyCode::Left)).is_empty(), "nothing above /");
+        // h is still help, L is still live
+        a.on_key(key('h'));
+        assert_eq!(a.modal, Modal::Help);
+    }
+
+    #[test]
+    fn fs_protected_drill_is_explicit_and_sticky_below() {
+        let mut a = fs_app();
+        a.fs.ensure_rows();
+        while a.fs.selected_entry().unwrap().name != "private" {
+            a.on_key(code(KeyCode::Down));
+        }
+        let cmds = a.on_key(code(KeyCode::Enter));
+        assert_eq!(cmds[0], Command::FsList { path: "/private".into(), explicit: true });
+        a.set_fs_listing("/private", Some(listing("/private", vec![de("/private/var", 90, true)], false)));
+        let cmds = a.on_key(code(KeyCode::Enter));
+        assert_eq!(cmds[0], Command::FsList { path: "/private/var".into(), explicit: true }, "still under the explicit root");
+        a.on_key(code(KeyCode::Left));
+        a.on_key(code(KeyCode::Left));
+        assert_eq!(a.fs.path, "/");
+        assert_eq!(a.tick(a.now + 60_000)[0], Command::FsList { path: "/".into(), explicit: false });
+    }
+
+    #[test]
+    fn fs_sort_cycles_and_keeps_selection() {
+        let mut a = fs_app();
+        a.on_key(code(KeyCode::Down)); // big.iso
+        assert_eq!(a.fs.sort, FsSort::Size);
+        let mut seen = vec![];
+        for _ in 0..6 {
+            a.on_key(key('s'));
+            seen.push(a.fs.sort);
+            a.fs.ensure_rows();
+            assert_eq!(a.fs.selected_entry().unwrap().name, "big.iso", "{:?}", a.fs.sort);
+        }
+        assert_eq!(seen, vec![FsSort::Growth, FsSort::Io, FsSort::Name, FsSort::Files, FsSort::Age, FsSort::Size]);
+        a.fs.sort = FsSort::Name;
+        a.fs.rows_dirty = true;
+        assert_eq!(fs_names(&mut a), vec!["Applications", "big.iso", "private", "Users"]);
+        // filter narrows the children
+        a.on_key(key('/'));
+        for c in "us".chars() {
+            a.on_key(key(c));
+        }
+        a.on_key(code(KeyCode::Enter));
+        assert_eq!(a.fs.filter, "us");
+        assert!(a.filter.is_empty(), "the procs filter is untouched");
+        assert_eq!(fs_names(&mut a), vec!["Users"]);
+        a.on_key(code(KeyCode::Esc));
+        assert!(a.fs.filter.is_empty());
+    }
+
+    #[test]
+    fn fs_growth_view_window_and_writers() {
+        let mut a = fs_app();
+        a.set_fs_growth(Growth {
+            growers: vec![grower("/Users/me/Library/Caches", 3 << 30, vec![(200, "node", 5 << 20)]), grower("/private/var/log/x.log", 1 << 20, vec![])],
+            writers: vec![(200, "node".into(), 3 << 30)],
+            deleted_open: vec![(400, "Chrome".into(), "/tmp/gone".into(), 2 << 30)],
+            ..Default::default()
+        });
+        // Δ attributed to the child holding the grower; growth sort puts it first
+        a.on_key(key('s'));
+        assert_eq!(a.fs.sort, FsSort::Growth);
+        assert_eq!(fs_names(&mut a)[0], "Users");
+        assert_eq!(a.fs.selected_child_growth().unwrap().delta, 3 << 30);
+        // growth view
+        let cmds = a.on_key(key('g'));
+        assert_eq!(cmds, vec![Command::FsGrowth { window_ms: 600_000, under: None }]);
+        assert_eq!(a.fs.mode, FsMode::Growth);
+        a.fs.ensure_rows();
+        assert_eq!(a.fs.grows, vec![GrowthRow::Grower(0), GrowthRow::Grower(1), GrowthRow::Deleted(0), GrowthRow::Writer(0)]);
+        // window cycles 10m -> 1h -> 24h -> 10m
+        assert_eq!(a.on_key(key('w')), vec![Command::FsGrowth { window_ms: 3_600_000, under: None }]);
+        a.on_key(key('w'));
+        assert_eq!(a.fs.window_ms(), 86_400_000);
+        a.on_key(key('w'));
+        assert_eq!(a.fs.window_ms(), 600_000);
+        a.on_key(key('-'));
+        assert_eq!(a.fs.window_ms(), 86_400_000);
+        // ⏎ on a writer row explains the pid; on deleted-open too
+        a.on_key(code(KeyCode::End));
+        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Explain(200)]);
+        a.on_key(code(KeyCode::Up));
+        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Explain(400)]);
+        assert!(a.on_key(code(KeyCode::Right)).is_empty(), "→ only navigates");
+        // ⏎ on a file grower opens its directory with the file selected
+        a.on_key(code(KeyCode::Home));
+        a.on_key(code(KeyCode::Down));
+        let cmds = a.on_key(code(KeyCode::Enter));
+        assert_eq!(a.fs.mode, FsMode::Tree);
+        assert_eq!(a.fs.path, "/private/var/log");
+        assert_eq!(cmds[0], Command::FsList { path: "/private/var/log".into(), explicit: false });
+        a.set_fs_listing("/private/var/log", Some(listing("/private/var/log", vec![de("/private/var/log/a", 9, false), de("/private/var/log/x.log", 5, false)], false)));
+        a.fs.ensure_rows();
+        assert_eq!(a.fs.selected_entry().unwrap().name, "x.log");
+        // Esc leaves the growth view
+        a.on_key(key('g'));
+        a.on_key(code(KeyCode::Esc));
+        assert_eq!(a.fs.mode, FsMode::Tree);
+    }
+
+    #[test]
+    fn fs_largest_rescan_and_no_destructive_keys() {
+        let mut a = fs_app();
+        assert_eq!(a.on_key(key('b')), vec![Command::FsLargest("/".into())]);
+        assert_eq!(a.fs.mode, FsMode::Largest);
+        a.set_fs_largest("/", vec![de("/Users/me/vm.img", 9000, false), de("/Users/me/node_modules", 800, true)]);
+        a.fs.ensure_rows();
+        assert_eq!(a.fs.len(), 2);
+        a.on_key(code(KeyCode::Enter));
+        assert_eq!(a.fs.path, "/Users/me");
+        assert_eq!(a.fs.mode, FsMode::Tree);
+        let cmds = a.on_key(key('r'));
+        assert_eq!(cmds[0], Command::FsRescan("/Users/me".into()));
+        // process-action keys do nothing here (fat never deletes; no signals from the Fs tab)
+        for c in [' ', 'k', 'K', 'z', 'd', 'x'] {
+            for cmd in a.on_key(key(c)) {
+                assert!(!matches!(cmd, Command::Act { .. }), "{c} -> {cmd:?}");
+            }
+            a.modal = Modal::None;
+        }
+    }
+
+    #[test]
+    fn child_growth_sums_without_double_counting() {
+        let gs = vec![
+            grower("/Users/me", 10 << 20, vec![(1, "a", 100)]),
+            grower("/Users/me/cache", 8 << 20, vec![(2, "b", 300), (1, "a", 50)]),
+            grower("/Users/other", 1 << 20, vec![]),
+            grower("/Users/meh", 5, vec![(9, "z", 1)]),
+            grower("/Applications", -(4 << 20), vec![]),
+        ];
+        let me = child_growth("/Users/me", &gs);
+        assert_eq!(me.delta, 10 << 20, "nested grower not added on top of its parent");
+        assert_eq!(me.write_bps, 400, "distinct writers, max rate each");
+        assert_eq!(me.top_writer, Some((2, "b".into(), 300)));
+        let users = child_growth("/Users", &gs);
+        assert_eq!(users.delta, (10 << 20) + (1 << 20) + 5);
+        assert_eq!(child_growth("/Applications", &gs).delta, -(4 << 20));
+        assert_eq!(child_growth("/", &gs).delta, (10 << 20) + (1 << 20) + 5 - (4 << 20));
+        assert_eq!(child_growth("/nope", &gs), ChildGrowth::default());
+        assert!(path_within("/a/b", "/a") && path_within("/a", "/a") && path_within("/a/b", "/a/") && path_within("/x", "/"));
+        assert!(!path_within("/a/bc", "/a/b"));
+        assert_eq!(parent_dir("/a/b"), Some("/a".into()));
+        assert_eq!(parent_dir("/a"), Some("/".into()));
+        assert_eq!(parent_dir("/a/b/"), Some("/a".into()));
+        assert_eq!(parent_dir("/"), None);
+    }
+
+    #[test]
+    fn fs_volume_ring_for_time_travel() {
+        let mut a = app();
+        for i in 0..5 {
+            a.set_volumes(1_000_000 + i * 1000, vec![Volume { mount: "/".into(), used: 100 + i as u64, ..Default::default() }]);
+        }
+        assert_eq!(a.fs.used_at("/", 1_002_100), Some((1_002_000, 102)));
+        assert_eq!(a.fs.used_at("/", 5_000_000), None, "outside what this session saw");
+        assert_eq!(a.fs.used_at("/home", 1_002_000), None);
+        a.set_volumes(1_000_000 + RING_MS + 10_000, vec![]);
+        assert_eq!(a.fs.vol_ring.len(), 1, "ring bounded to RING_MS");
     }
 }

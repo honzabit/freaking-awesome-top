@@ -24,6 +24,13 @@
 //!   the set. All entries of one sample are packed into a single varint blob.
 //!   `at(ts)` replays blobs from the preceding keyframe to `ts`.
 //!
+//! * `volume_ids` / `volumes` — per-volume (used, avail, total, read/write bps) change points:
+//!   a row when used/avail moves >= 1 MiB, I/O changes notably, or every 60 s.
+//! * `fs_snaps` / `fs_dirs` — directory sizes from the background scanner every 15 min
+//!   (depth <= 3 plus anything >= 1% of its volume, <= 2000 paths), delta encoded against a
+//!   daily key snapshot. `proc_writes` integrates the procs' recorded disk write rates (the top
+//!   disk writers are always part of the recorded set).
+//!
 //! Measured on an M3 Max under heavy load (several concurrent cargo builds and
 //! agents): ~630 B/sample marginal ≈ 27 MB/day at 2 s; record() ≈ 0.5 ms avg,
 //! < 3 ms worst (release).
@@ -62,6 +69,9 @@ pub const MAX_AT_GAP_MS: i64 = 15 * 60_000;
 const TOP_CPU: usize = 40;
 const TOP_MEM: usize = 20;
 const TOP_POWER: usize = 20;
+/// Top disk writers are recorded so `proc_writes` can answer "who filled the disk".
+const TOP_DISK: usize = 10;
+const ENTER_DISK_BPS: u64 = 64 * 1024;
 /// Minimum cpu% / power to enter the top-cpu / top-power lists.
 const ENTER_CPU: f32 = 0.5;
 const ENTER_POWER_MW: f32 = 5.0;
@@ -117,7 +127,57 @@ CREATE TABLE IF NOT EXISTS procs (
     ts INTEGER PRIMARY KEY,
     data BLOB NOT NULL
 );
+-- Storage (fs). Additive tables: older DBs simply gain them, no version bump needed.
+CREATE TABLE IF NOT EXISTS volume_ids (
+    id INTEGER PRIMARY KEY,
+    mount TEXT NOT NULL UNIQUE
+);
+-- Change points per volume (a value holds until the next row; rows at least every
+-- VOLUME_EVERY_MS while recording). Bytes and bytes/sec.
+CREATE TABLE IF NOT EXISTS volumes (
+    vid INTEGER NOT NULL,
+    ts INTEGER NOT NULL,
+    used INTEGER NOT NULL,
+    avail INTEGER NOT NULL,
+    total INTEGER NOT NULL,
+    read_bps INTEGER,
+    write_bps INTEGER,
+    PRIMARY KEY (vid, ts)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS volumes_ts ON volumes(ts);
+-- One row per directory-size snapshot; key = 1 for a full snapshot, 0 for a delta.
+CREATE TABLE IF NOT EXISTS fs_snaps (
+    ts INTEGER PRIMARY KEY,
+    key INTEGER NOT NULL
+);
+-- Directory sizes, delta encoded against the preceding key snapshot: a path gets a row
+-- when it is new or its size moved by >= DIR_MIN_DELTA; size = -1 means 'no longer tracked'.
+CREATE TABLE IF NOT EXISTS fs_dirs (
+    path TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    files INTEGER,
+    PRIMARY KEY (path, ts)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS fs_dirs_ts ON fs_dirs(ts);
 ";
+
+/// Last volume row written: (ts, used, avail, read_bps, write_bps).
+type VolRow = (Ts, i64, i64, i64, i64);
+/// A directory-size snapshot: its ts and (path, bytes), largest first.
+pub type DirSnapshot = (Ts, Vec<(String, u64)>);
+
+/// A volume row is written at least this often even when nothing changed.
+pub const VOLUME_EVERY_MS: i64 = 60_000;
+/// ...and sooner when used/avail moved by at least this much.
+const VOLUME_MIN_DELTA: i64 = 1 << 20;
+/// Directory-size snapshots: a full (key) snapshot at least this often.
+pub const DIR_KEY_MS: i64 = 24 * 3_600_000;
+/// Smallest size change that gets a delta row.
+const DIR_MIN_DELTA: i64 = 1 << 20;
+/// Hard cap on rows per directory-size snapshot.
+pub const DIR_MAX_ROWS: usize = 2000;
+
 
 /// Quantized per-process values as stored in `procs`. Also the delta cache.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -401,6 +461,13 @@ pub struct History {
     /// Exclusive writer lease (flock on `<db>.writer-lock`). The delta encoding only replays
     /// correctly from one writer's stream, so only the lease holder records.
     writer: Option<std::fs::File>,
+    /// Last volume row written per mount: (ts, used, avail, read_bps, write_bps).
+    last_vols: HashMap<String, VolRow>,
+    /// mount -> volume_ids.id.
+    vol_ids: HashMap<String, i64>,
+    /// Dir sizes in effect since the last key snapshot (path -> size), and that key's ts.
+    last_dirs: HashMap<String, i64>,
+    last_dir_key: Option<Ts>,
 }
 
 /// Lock file guarding the single-writer rule for `db`.
@@ -449,7 +516,9 @@ impl History {
             // Pre-release layouts are not migrated; start fresh.
             conn.execute_batch(
                 "DROP TABLE IF EXISTS system; DROP TABLE IF EXISTS changes; DROP TABLE IF EXISTS keyframes;
-                 DROP TABLE IF EXISTS proc_info; DROP TABLE IF EXISTS procs;",
+                 DROP TABLE IF EXISTS proc_info; DROP TABLE IF EXISTS procs;
+                 DROP TABLE IF EXISTS volume_ids; DROP TABLE IF EXISTS volumes;
+                 DROP TABLE IF EXISTS fs_snaps; DROP TABLE IF EXISTS fs_dirs;",
             )?;
         }
         conn.execute_batch(SCHEMA).context("creating history schema")?;
@@ -462,6 +531,10 @@ impl History {
             last_changes: HashMap::new(),
             known_info: HashMap::new(),
             writer: None,
+            last_vols: HashMap::new(),
+            vol_ids: HashMap::new(),
+            last_dirs: HashMap::new(),
+            last_dir_key: None,
         })
     }
 
@@ -499,6 +572,9 @@ impl History {
         self.last_rows.clear();
         self.last_changes.clear();
         self.known_info.clear();
+        self.last_vols.clear();
+        self.last_dirs.clear();
+        self.last_dir_key = None;
         self.writer = Some(f);
         true
     }
@@ -800,6 +876,16 @@ impl History {
                 SELECT max(c2.ts) FROM changes c2 WHERE c2.kind = changes.kind AND c2.ts <= ?1)",
             [cutoff],
         )?;
+        tx.execute("DELETE FROM volumes WHERE ts < ?1", [cutoff])?;
+        // Dir sizes: keep the key snapshot that newer deltas depend on.
+        let dkey: Option<Ts> = tx.query_row(
+            "SELECT max(ts) FROM fs_snaps WHERE key = 1 AND ts <= ?1",
+            [cutoff],
+            |r| r.get(0),
+        )?;
+        let deff = dkey.unwrap_or(cutoff).min(cutoff);
+        tx.execute("DELETE FROM fs_dirs WHERE ts < ?1", [deff])?;
+        tx.execute("DELETE FROM fs_snaps WHERE ts < ?1", [deff])?;
         tx.commit()?;
         if removed > 0 {
             // Return freed pages to the filesystem; harmless if auto_vacuum is off.
@@ -824,6 +910,264 @@ impl History {
     #[allow(dead_code)]
     pub fn sample_count(&self) -> anyhow::Result<u64> {
         Ok(self.conn.query_row("SELECT count(*) FROM system", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    // ---- storage (fs) -------------------------------------------------------------------------
+
+    /// Record mounted volumes (hidden ones are skipped). Change-point encoded: a volume gets a
+    /// row when used/avail moved by >= 1 MiB, its I/O rate changed notably, or
+    /// [`VOLUME_EVERY_MS`] passed. A no-op while another process holds the writer lease.
+    pub fn record_volumes(&mut self, ts: Ts, vols: &[crate::fs::Volume]) -> anyhow::Result<()> {
+        if !self.try_become_writer() {
+            return Ok(());
+        }
+        let mut wrote: Vec<(String, VolRow)> = Vec::new();
+        let mut new_ids: Vec<(String, i64)> = Vec::new();
+        let tx = self.conn.transaction()?;
+        {
+            let mut get_id = tx.prepare_cached(
+                "INSERT INTO volume_ids (mount) VALUES (?1)
+                 ON CONFLICT(mount) DO UPDATE SET mount = excluded.mount RETURNING id",
+            )?;
+            let mut ins = tx.prepare_cached(
+                "INSERT OR REPLACE INTO volumes (vid, ts, used, avail, total, read_bps, write_bps)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for v in vols.iter().filter(|v| !v.hidden) {
+                let cur = (ts, clamp_i64(v.used), clamp_i64(v.avail), clamp_i64(v.read_bps), clamp_i64(v.write_bps));
+                let due = match self.last_vols.get(&v.mount) {
+                    None => true,
+                    Some(&(lt, u, a, r, w)) => {
+                        ts < lt
+                            || ts - lt >= VOLUME_EVERY_MS
+                            || (cur.1 - u).abs() >= VOLUME_MIN_DELTA
+                            || (cur.2 - a).abs() >= VOLUME_MIN_DELTA
+                            || rel_changed(cur.3, r, 0.5, 256 * 1024)
+                            || rel_changed(cur.4, w, 0.5, 256 * 1024)
+                    }
+                };
+                if !due {
+                    continue;
+                }
+                let id = match self.vol_ids.get(&v.mount) {
+                    Some(&id) => id,
+                    None => {
+                        let id: i64 = get_id.query_row([&v.mount], |r| r.get(0))?;
+                        new_ids.push((v.mount.clone(), id));
+                        id
+                    }
+                };
+                ins.execute(params![id, ts, cur.1, cur.2, clamp_i64(v.total), cur.3, cur.4])?;
+                wrote.push((v.mount.clone(), cur));
+            }
+        }
+        tx.commit()?;
+        self.vol_ids.extend(new_ids);
+        self.last_vols.extend(wrote);
+        Ok(())
+    }
+
+    /// Recorded (ts, used, avail) of one volume in [from, to], oldest first. Rows are change
+    /// points; the value in effect at `from` (a row at most 2 x VOLUME_EVERY_MS earlier) is
+    /// included as a point at `from`.
+    pub fn volume_series(&self, mount: &str, from: Ts, to: Ts) -> anyhow::Result<Vec<(Ts, u64, u64)>> {
+        if to < from {
+            return Ok(vec![]);
+        }
+        let Some(vid): Option<i64> = self
+            .conn
+            .prepare_cached("SELECT id FROM volume_ids WHERE mount = ?1")?
+            .query_row([mount], |r| r.get(0))
+            .optional()?
+        else {
+            return Ok(vec![]);
+        };
+        let u = |v: i64| v.max(0) as u64;
+        let mut out: Vec<(Ts, u64, u64)> = Vec::new();
+        let carry: Option<(Ts, i64, i64)> = self
+            .conn
+            .prepare_cached("SELECT ts, used, avail FROM volumes WHERE vid = ?1 AND ts < ?2 ORDER BY ts DESC LIMIT 1")?
+            .query_row(params![vid, from], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT ts, used, avail FROM volumes WHERE vid = ?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts")?;
+        let rows = st
+            .query_map(params![vid, from, to], |r| Ok((r.get::<_, Ts>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some((t, us, av)) = carry
+            && from - t <= 2 * VOLUME_EVERY_MS
+            && rows.first().is_none_or(|r| r.0 > from)
+        {
+            out.push((from, u(us), u(av)));
+        }
+        out.extend(rows.into_iter().map(|(t, us, av)| (t, u(us), u(av))));
+        Ok(out)
+    }
+
+    /// Mounts that have recorded volume rows.
+    pub fn volume_mounts(&self) -> anyhow::Result<Vec<String>> {
+        let mut st = self.conn.prepare_cached("SELECT mount FROM volume_ids ORDER BY mount")?;
+        let v = st.query_map([], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+        Ok(v)
+    }
+
+    /// Record a directory-size snapshot: (path, allocated bytes, files). Delta encoded against
+    /// the last key snapshot (a full one every [`DIR_KEY_MS`]); at most [`DIR_MAX_ROWS`] paths
+    /// (largest kept). A no-op while another process holds the writer lease.
+    pub fn record_dir_sizes(&mut self, ts: Ts, dirs: &[(String, u64, u64)]) -> anyhow::Result<()> {
+        if !self.try_become_writer() {
+            return Ok(());
+        }
+        let mut dirs: Vec<&(String, u64, u64)> = dirs.iter().collect();
+        if dirs.len() > DIR_MAX_ROWS {
+            dirs.sort_by(|a, b| b.1.cmp(&a.1));
+            dirs.truncate(DIR_MAX_ROWS);
+        }
+        let is_key = match self.last_dir_key {
+            None => true,
+            Some(k) => ts < k || ts - k >= DIR_KEY_MS,
+        };
+        let mut state = if is_key { HashMap::new() } else { self.last_dirs.clone() };
+        let tx = self.conn.transaction()?;
+        {
+            tx.prepare_cached("INSERT OR REPLACE INTO fs_snaps (ts, key) VALUES (?1, ?2)")?
+                .execute(params![ts, is_key as i64])?;
+            let mut ins =
+                tx.prepare_cached("INSERT OR REPLACE INTO fs_dirs (path, ts, size, files) VALUES (?1, ?2, ?3, ?4)")?;
+            let mut present: HashSet<&str> = HashSet::with_capacity(dirs.len());
+            for (path, size, files) in dirs {
+                if !present.insert(path.as_str()) {
+                    continue;
+                }
+                let size = clamp_i64(*size);
+                let changed = match state.get(path) {
+                    Some(&prev) if prev >= 0 => (size - prev).abs() >= DIR_MIN_DELTA,
+                    _ => true,
+                };
+                if changed {
+                    ins.execute(params![path, ts, size, clamp_i64(*files)])?;
+                    state.insert(path.clone(), size);
+                }
+            }
+            let gone: Vec<String> = state
+                .iter()
+                .filter(|(p, s)| **s >= 0 && !present.contains(p.as_str()))
+                .map(|(p, _)| p.clone())
+                .collect();
+            for p in gone {
+                ins.execute(params![p, ts, -1i64, 0i64])?;
+                state.insert(p, -1);
+            }
+        }
+        tx.commit()?;
+        if is_key {
+            self.last_dir_key = Some(ts);
+        }
+        self.last_dirs = state;
+        Ok(())
+    }
+
+    /// Directory sizes from the nearest snapshot at or before `ts`, limited to `under` and
+    /// its descendants ("/" = all), sorted by size desc. Paths no longer tracked are omitted.
+    pub fn dir_sizes_near(&self, ts: Ts, under: &str) -> anyhow::Result<Option<DirSnapshot>> {
+        let snap: Option<Ts> =
+            self.conn.query_row("SELECT max(ts) FROM fs_snaps WHERE ts <= ?1", [ts], |r| r.get(0))?;
+        let Some(snap) = snap else { return Ok(None) };
+        let key: Option<Ts> = self.conn.query_row(
+            "SELECT max(ts) FROM fs_snaps WHERE key = 1 AND ts <= ?1",
+            [snap],
+            |r| r.get(0),
+        )?;
+        let key = key.unwrap_or(i64::MIN);
+        let under = if under.len() > 1 { under.trim_end_matches('/') } else { under };
+        // Prefix range: `under` itself plus everything in [under + "/", under + "0") ('0' = '/' + 1).
+        let (lo, hi) = if under == "/" || under.is_empty() {
+            (String::new(), char::MAX.to_string())
+        } else {
+            (format!("{under}/"), format!("{under}0"))
+        };
+        // Bare `size` comes from the row holding max(ts) (SQLite min/max semantics).
+        let mut st = self.conn.prepare_cached(
+            "SELECT path, size, max(ts) FROM fs_dirs
+             WHERE ts BETWEEN ?1 AND ?2 AND (path = ?3 OR (path >= ?4 AND path < ?5))
+             GROUP BY path",
+        )?;
+        let mut v: Vec<(String, u64)> = st
+            .query_map(params![key, snap, under, lo, hi], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .filter_map(|r| r.ok())
+            .filter(|(_, s)| *s >= 0)
+            .map(|(p, s)| (p, s as u64))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(Some((snap, v)))
+    }
+
+    /// Bytes written per recorded process in [from, to]: (pid, name, bytes), largest first.
+    /// Integrates the recorded per-process disk write rate over sample intervals (gaps longer
+    /// than 60 s, i.e. the recorder was off, are not integrated). Only processes the recorder
+    /// kept (top cpu/mem/power/disk writers ...) appear.
+    pub fn proc_writes(&self, from: Ts, to: Ts) -> anyhow::Result<Vec<(u32, String, u64)>> {
+        const MAX_GAP_MS: i64 = 60_000;
+        if to <= from {
+            return Ok(vec![]);
+        }
+        let prev_tick: Option<Ts> =
+            self.conn.query_row("SELECT max(ts) FROM system WHERE ts < ?1", [from], |r| r.get(0))?;
+        let ticks: Vec<Ts> = {
+            let mut st = self.conn.prepare_cached("SELECT ts FROM system WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts")?;
+            st.query_map(params![from, to], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?
+        };
+        let Some(&first) = ticks.first() else { return Ok(vec![]) };
+        let key: Option<Ts> = self
+            .conn
+            .query_row("SELECT max(ts) FROM keyframes WHERE ts <= ?1", [first], |r| r.get(0))?;
+        let mut blobs: Vec<(Ts, Vec<u8>)> = {
+            let mut st = self.conn.prepare_cached("SELECT ts, data FROM procs WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts")?;
+            st.query_map(params![key.unwrap_or(first).min(first), to], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        blobs.reverse(); // pop from the end in ts order
+        let mut state: HashMap<u32, (i64, i64)> = HashMap::new(); // pid -> (info, disk_w)
+        let mut bytes: HashMap<(u32, i64), f64> = HashMap::new();
+        let mut last = prev_tick;
+        for &t in &ticks {
+            while blobs.last().is_some_and(|b| b.0 <= t) {
+                let (_, data) = blobs.pop().unwrap_or_default();
+                for (pid, row) in decode_entries(&data) {
+                    if row.is_tombstone() {
+                        state.remove(&pid);
+                    } else {
+                        state.insert(pid, (row.info, row.disk_w));
+                    }
+                }
+            }
+            if let Some(l) = last {
+                // The rate recorded at `t` is the average over (l, t]; clip to the window.
+                let start = l.max(from);
+                if t - l <= MAX_GAP_MS && t > start {
+                    let dt = (t - start) as f64 / 1000.0;
+                    for (&pid, &(info, w)) in &state {
+                        if w > 0 {
+                            *bytes.entry((pid, info)).or_default() += w as f64 * dt;
+                        }
+                    }
+                }
+            }
+            last = Some(t);
+        }
+        let mut name_st = self.conn.prepare_cached("SELECT name FROM proc_info WHERE id = ?1")?;
+        let mut out: Vec<(u32, String, u64)> = Vec::with_capacity(bytes.len());
+        for ((pid, info), b) in bytes {
+            let b = b.round() as u64;
+            if b == 0 {
+                continue;
+            }
+            let name: Option<String> = name_st.query_row([info], |r| r.get(0)).optional()?.flatten();
+            out.push((pid, name.unwrap_or_default(), b));
+        }
+        out.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        Ok(out)
     }
 
     fn read_system(&self, ts: Ts) -> anyhow::Result<Option<System>> {
@@ -1033,6 +1377,11 @@ fn select_interesting<'a>(snap: &'a Snapshot, sticky: &HashSet<u32>, is_key: boo
         .take(TOP_POWER)
         .filter(|&&i| procs[i].power_mw >= ENTER_POWER_MW)
         .for_each(|&i| take(i, &mut chosen));
+    idx.sort_by(|&a, &b| procs[b].disk_write_bps.cmp(&procs[a].disk_write_bps));
+    idx.iter()
+        .take(TOP_DISK)
+        .filter(|&&i| procs[i].disk_write_bps >= ENTER_DISK_BPS)
+        .for_each(|&i| take(i, &mut chosen));
     idx.sort_by(|&a, &b| procs[b].mem.cmp(&procs[a].mem));
     idx.iter().take(TOP_MEM).for_each(|&i| take(i, &mut chosen));
     // Hysteresis: procs recorded last time stay while they are still somewhat
@@ -1164,6 +1513,114 @@ fn install_stop_handlers() {
     }
 }
 
+/// Directory-size snapshots are taken this often by the recorder.
+pub const DIR_SNAPSHOT_EVERY: Duration = Duration::from_secs(15 * 60);
+/// Deeper than [`DIR_SNAPSHOT_DEPTH`], a dir/file is recorded only when it holds at least
+/// 1/DIR_BIG_FRACTION of its volume's used space.
+const DIR_SNAPSHOT_DEPTH: usize = 3;
+const DIR_BIG_FRACTION: u64 = 100;
+const DIR_MAX_DEPTH: usize = 24;
+
+/// Storage side of the recorder: volumes every sample, directory sizes every
+/// [`DIR_SNAPSHOT_EVERY`] from the background scanner (only once a scan has completed).
+pub struct FsRecorder {
+    vols: crate::fs::volumes::Volumes,
+    scanner: Option<crate::fs::scan::Scanner>,
+    last_dirs: Option<Instant>,
+}
+
+impl FsRecorder {
+    /// `with_scanner` = also run the background scanner on "/" (low priority, TCC-safe) and
+    /// record directory sizes. `FAT_NO_FS_SCAN=1` turns it off.
+    pub fn new(with_scanner: bool) -> Self {
+        let scanner = (with_scanner && std::env::var_os("FAT_NO_FS_SCAN").is_none())
+            .then(|| {
+                // Guard: a scanner failure must never take the recorder down.
+                std::panic::catch_unwind(|| {
+                    let s = crate::fs::scan::Scanner::new();
+                    s.ensure("/", false);
+                    s
+                })
+                .ok()
+            })
+            .flatten();
+        FsRecorder { vols: crate::fs::volumes::Volumes::new(), scanner, last_dirs: None }
+    }
+
+    /// Seed fill-rate windows from recorded history so ETAs are available right after start.
+    pub fn seed_from(&mut self, hist: &History, now: Ts) {
+        for m in hist.volume_mounts().unwrap_or_default() {
+            if let Ok(s) = hist.volume_series(&m, now - crate::fs::volumes::FILL_WINDOW_MS, now) {
+                let pts: Vec<(Ts, u64)> = s.into_iter().map(|(t, u, _)| (t, u)).collect();
+                self.vols.seed(&m, &pts);
+            }
+        }
+    }
+
+    pub fn tick(&mut self, hist: &mut History, ts: Ts) -> anyhow::Result<()> {
+        let vols = self.vols.sample();
+        hist.record_volumes(ts, &vols)?;
+        if self.last_dirs.is_none_or(|t| t.elapsed() >= DIR_SNAPSHOT_EVERY)
+            && let Some(sc) = &self.scanner
+        {
+            let sc = sc.clone();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dir_snapshot(&sc, &vols))) {
+                Ok(Some(rows)) => {
+                    self.last_dirs = Some(Instant::now());
+                    if !rows.is_empty() {
+                        hist.record_dir_sizes(ts, &rows)?;
+                    }
+                }
+                Ok(None) => {} // no completed scan yet; try again next sample
+                Err(_) => self.scanner = None,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Directory sizes worth recording from the scanner: everything to depth 3 below each
+/// completed scan root, plus deeper entries holding >= 1% of their volume. None until some
+/// scan root has completed. Bounded by [`DIR_MAX_ROWS`].
+pub fn dir_snapshot(sc: &crate::fs::scan::Scanner, vols: &[crate::fs::Volume]) -> Option<Vec<(String, u64, u64)>> {
+    let roots: Vec<String> = sc.progress().into_iter().filter(|p| p.completed_at > 0).map(|p| p.root).collect();
+    if roots.is_empty() {
+        return None;
+    }
+    let mut out: Vec<(String, u64, u64)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue: std::collections::VecDeque<(String, usize)> = roots.into_iter().map(|r| (r, 0)).collect();
+    while let Some((path, depth)) = queue.pop_front() {
+        if out.len() >= DIR_MAX_ROWS {
+            break;
+        }
+        let Some(l) = sc.list(&path) else { continue };
+        if seen.insert(l.dir.path.clone()) && !l.dir.partial {
+            out.push((l.dir.path.clone(), l.dir.size, l.dir.files));
+        }
+        if depth >= DIR_MAX_DEPTH {
+            continue;
+        }
+        let big = crate::fs::volumes::volume_for(vols, &path).map_or(u64::MAX, |v| (v.used / DIR_BIG_FRACTION).max(1));
+        for c in l.children {
+            if c.partial || c.mount_point || seen.contains(&c.path) {
+                continue;
+            }
+            let shallow = depth < DIR_SNAPSHOT_DEPTH;
+            if !(shallow || c.size >= big) {
+                continue;
+            }
+            if c.is_dir {
+                queue.push_back((c.path, depth + 1));
+            } else if c.size >= big && seen.insert(c.path.clone()) {
+                out.push((c.path, c.size, c.files));
+            }
+        }
+    }
+    out.truncate(DIR_MAX_ROWS);
+    Some(out)
+}
+
 /// `fat record`: sample forever, writing to history. Blocks.
 pub fn record_forever(cfg: &crate::config::Config) -> anyhow::Result<()> {
     let interval = Duration::from_millis(cfg.interval_ms.max(1000));
@@ -1182,6 +1639,8 @@ pub fn record_forever(cfg: &crate::config::Config) -> anyhow::Result<()> {
     );
 
     let mut collector = crate::collect::Collector::new();
+    let mut fsrec = FsRecorder::new(true);
+    fsrec.seed_from(&hist, crate::model::now_ms());
     let mut last_prune = Instant::now();
     let mut recorded: u64 = 0;
     let mut errors: u64 = 0;
@@ -1206,6 +1665,12 @@ pub fn record_forever(cfg: &crate::config::Config) -> anyhow::Result<()> {
             eprintln!("fat record: recording");
         }
         let snap = collector.sample();
+        if let Err(e) = fsrec.tick(&mut hist, snap.ts) {
+            errors += 1;
+            if errors <= 5 || errors.is_multiple_of(100) {
+                eprintln!("fat record: storage write failed ({errors} total): {e:#}");
+            }
+        }
         match hist.record(&snap) {
             Ok(()) => recorded += 1,
             Err(e) => {
@@ -1435,6 +1900,12 @@ mod tests {
         assert_eq!(b.writer_pid(), Some(std::process::id()));
         drop(a);
         snap.ts += 1000;
+        // A process spawned concurrently by another test (lsof, ioreg, ...) briefly inherits
+        // a's lock fd until its exec, so the lease can stay taken for a moment after the drop.
+        let t = Instant::now();
+        while !b.try_become_writer() && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         b.record(&snap).unwrap();
         assert!(b.is_writer());
         assert_eq!(b.sample_count().unwrap(), 2);
@@ -1542,6 +2013,238 @@ mod tests {
         assert_eq!(s[0].ts, 20_000);
         // Baseline-only points before `from` aren't reported.
         assert!(detect_spikes(&pts, 30_000).is_empty());
+    }
+
+    fn fsvol(mount: &str, used: u64, w: u64) -> crate::fs::Volume {
+        crate::fs::Volume {
+            mount: mount.into(),
+            device: "/dev/disk3s5".into(),
+            fstype: "apfs".into(),
+            total: 1 << 40,
+            used,
+            avail: (1u64 << 40) - used,
+            write_bps: w,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn volumes_roundtrip_change_points_and_prune() {
+        let path = tmp_db("vols");
+        let mut h = History::open(Some(path.to_str().unwrap())).unwrap();
+        let hidden = crate::fs::Volume { hidden: true, ..fsvol("/System/Volumes/Preboot", 5, 0) };
+        // 2 s samples for 10 min, +768 KiB per sample (384 KiB/s): every other sample crosses
+        // the 1 MiB delta.
+        for i in 0..300i64 {
+            let used = (100u64 << 30) + i as u64 * 768 * 1024;
+            let vols = [fsvol("/data", used, 0), fsvol("/static", 7 << 30, 0), hidden.clone()];
+            h.record_volumes(T0 + i * 2000, &vols).unwrap();
+        }
+        let n = |m: &str| -> i64 {
+            h.conn
+                .query_row(
+                    "SELECT count(*) FROM volumes v JOIN volume_ids i ON i.id = v.vid WHERE i.mount = ?1",
+                    [m],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(n("/System/Volumes/Preboot"), 0, "hidden volumes not recorded");
+        // Unchanging volume: first row + one per VOLUME_EVERY_MS.
+        assert_eq!(n("/static"), 10);
+        assert!(n("/data") >= 145 && n("/data") <= 160, "{}", n("/data"));
+        let s = h.volume_series("/data", T0, T0 + 299 * 2000).unwrap();
+        assert_eq!(s.first().unwrap().0, T0);
+        assert!(s.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1));
+        // Fill rate from the recorded change points.
+        let pts: Vec<(Ts, u64)> = s.iter().map(|p| (p.0, p.1)).collect();
+        let f = crate::fs::volumes::fill_rate(&pts).unwrap();
+        assert!((f / 1024.0 - 384.0).abs() < 4.0, "fill {f}");
+        // Carry: a window starting between rows gets the value in effect at `from`.
+        let s = h.volume_series("/static", T0 + 61_000, T0 + 70_000).unwrap();
+        assert_eq!(s, vec![(T0 + 61_000, 7 << 30, (1u64 << 40) - (7 << 30))]);
+        // Far from any row: no carry.
+        assert!(h.volume_series("/static", T0 + 10_000_000, T0 + 10_001_000).unwrap().is_empty());
+        assert!(h.volume_series("/nope", T0, T0 + 1000).unwrap().is_empty());
+        assert_eq!(h.volume_mounts().unwrap(), vec!["/data".to_string(), "/static".to_string()]);
+        // Prune drops old volume rows.
+        h.prune_before(T0 + 300_000).unwrap();
+        assert!(h.volume_series("/data", T0, T0 + 299_999).unwrap().is_empty());
+        assert!(!h.volume_series("/data", T0 + 300_000, T0 + 600_000).unwrap().is_empty());
+        drop(h);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn dir_sizes_roundtrip_delta_and_prune() {
+        let path = tmp_db("dirs");
+        let mut h = History::open(Some(path.to_str().unwrap())).unwrap();
+        let mb = 1u64 << 20;
+        let snap = |users: u64, extra: bool| {
+            let mut v = vec![
+                ("/".to_string(), 500 * mb + users, 1000),
+                ("/Users".to_string(), 100 * mb + users, 500),
+                ("/Users/me".to_string(), 90 * mb + users, 400),
+                ("/Library".to_string(), 300 * mb, 300),
+                ("/Usersfoo".to_string(), 5 * mb, 1),
+            ];
+            if extra {
+                v.push(("/Users/me/big.iso".to_string(), 40 * mb, 1));
+            }
+            v
+        };
+        let q = 15 * 60_000;
+        h.record_dir_sizes(T0, &snap(0, false)).unwrap();
+        h.record_dir_sizes(T0 + q, &snap(mb / 2, true)).unwrap(); // sub-threshold change + new path
+        h.record_dir_sizes(T0 + 2 * q, &snap(10 * mb, false)).unwrap(); // big.iso gone
+        let rows: i64 = h.conn.query_row("SELECT count(*) FROM fs_dirs", [], |r| r.get(0)).unwrap();
+        // 5 key rows, +1 new, then 3 grown + 1 tombstone.
+        assert_eq!(rows, 10);
+        assert!(h.dir_sizes_near(T0 - 1, "/").unwrap().is_none());
+        let (ts, v) = h.dir_sizes_near(T0 + q + 5, "/Users").unwrap().unwrap();
+        assert_eq!(ts, T0 + q);
+        assert_eq!(
+            v,
+            vec![
+                ("/Users".to_string(), 100 * mb),
+                ("/Users/me".to_string(), 90 * mb),
+                ("/Users/me/big.iso".to_string(), 40 * mb)
+            ],
+            "sub-MiB changes are not rewritten; /Usersfoo is not under /Users"
+        );
+        let (_, v) = h.dir_sizes_near(T0 + 3 * q, "/Users/").unwrap().unwrap();
+        assert_eq!(v.len(), 2, "tombstoned path omitted: {v:?}");
+        assert_eq!(v[0].1, 110 * mb);
+        let (_, all) = h.dir_sizes_near(T0 + 3 * q, "/").unwrap().unwrap();
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].0, "/");
+        // Prune keeps the key snapshot later deltas need.
+        h.prune_before(T0 + q + 1).unwrap();
+        let (_, v) = h.dir_sizes_near(T0 + 3 * q, "/").unwrap().unwrap();
+        assert_eq!(v, all);
+        // A new writer (lease takeover) starts with a fresh key snapshot.
+        drop(h);
+        let mut h = History::open(Some(path.to_str().unwrap())).unwrap();
+        // (a concurrently spawned child may hold the old lock fd for a moment; see single_writer_lease)
+        let t = Instant::now();
+        while !h.try_become_writer() && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        h.record_dir_sizes(T0 + 3 * q, &snap(10 * mb, false)).unwrap();
+        let key: i64 = h.conn.query_row("SELECT key FROM fs_snaps WHERE ts = ?1", [T0 + 3 * q], |r| r.get(0)).unwrap();
+        assert_eq!(key, 1);
+        // Row cap.
+        let many: Vec<(String, u64, u64)> = (0..DIR_MAX_ROWS as u64 + 50).map(|i| (format!("/d{i}"), i * mb, 1)).collect();
+        h.record_dir_sizes(T0 + DIR_KEY_MS * 2, &many).unwrap();
+        let (_, v) = h.dir_sizes_near(T0 + DIR_KEY_MS * 2, "/").unwrap().unwrap();
+        assert_eq!(v.len(), DIR_MAX_ROWS);
+        assert_eq!(v.last().unwrap().0, "/d50", "smallest dropped");
+        drop(h);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn proc_writes_integrates_disk_write() {
+        let path = tmp_db("pwrites");
+        let mut h = History::open(Some(path.to_str().unwrap())).unwrap();
+        let mut rng = Rng(9);
+        let mb = 1u64 << 20;
+        for i in 0..150i64 {
+            let mut s = synth(T0 + i * 2000, 40, 10.0, 1000.0, 1 << 30, &mut rng);
+            // A low-cpu writer (would not be "interesting" without the disk-writer rule).
+            s.procs.push(Proc { pid: 4242, ppid: 1, name: "writer".into(), disk_write_bps: 4 * mb, status: "S".into(), start_time: 5, ..Default::default() });
+            // Writes only during the second half.
+            if i >= 75 {
+                s.procs.push(Proc { pid: 4343, ppid: 1, name: "late".into(), disk_write_bps: mb, status: "S".into(), start_time: 6, ..Default::default() });
+            }
+            h.record(&s).unwrap();
+        }
+        let w = h.proc_writes(T0 + 100_000, T0 + 200_000).unwrap();
+        let get = |pid: u32| w.iter().find(|e| e.0 == pid).cloned();
+        let (_, name, b) = get(4242).unwrap();
+        assert_eq!(name, "writer");
+        assert_eq!(b, 100 * 4 * mb, "4 MiB/s over 100 s");
+        let (_, _, late) = get(4343).unwrap();
+        // first sample of "late" is at T0+150s; its rate covers (148 s, 150 s].
+        assert_eq!(late, 52 * mb, "{late}");
+        assert_eq!(w[0].0, 4242);
+        // Gap (recorder off): no integration across it.
+        let mut s = synth(T0 + 1_000_000, 40, 10.0, 1000.0, 1 << 30, &mut rng);
+        s.procs.push(Proc { pid: 4242, ppid: 1, name: "writer".into(), disk_write_bps: 4 * mb, status: "S".into(), start_time: 5, ..Default::default() });
+        h.record(&s).unwrap();
+        let w = h.proc_writes(T0 + 298_000, T0 + 1_000_000).unwrap();
+        assert!(w.is_empty(), "{w:?}");
+        assert!(h.proc_writes(T0, T0).unwrap().is_empty());
+        drop(h);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn dir_snapshot_from_scanner_fixture() {
+        use crate::fs::scan::{Options, Scanner};
+        let root = std::env::current_exe().unwrap().parent().unwrap().join(format!("fs-hist-fixture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let deep = root.join("a/b/c/d/e");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(root.join("a/b/c/d/small")).unwrap();
+        std::fs::create_dir_all(root.join("x/y")).unwrap();
+        std::fs::write(deep.join("big.bin"), vec![1u8; 3 << 20]).unwrap();
+        std::fs::write(root.join("a/b/c/d/small/s.txt"), b"hi").unwrap();
+        std::fs::write(root.join("x/y/z.txt"), vec![2u8; 10_000]).unwrap();
+        let sc = Scanner::with_options(Options {
+            cache_path: None,
+            threads: 2,
+            background: false,
+            protect: false,
+            budget: 0.0,
+            battery_check: false,
+            keep_depth: u16::MAX,
+            big_file: 1 << 20,
+            ..Options::default()
+        });
+        let rp = root.to_str().unwrap().to_string();
+        let vols = vec![crate::fs::Volume { mount: "/".into(), used: 100 << 20, total: 1 << 30, ..Default::default() }];
+        assert!(dir_snapshot(&sc, &vols).is_none(), "nothing completed yet");
+        sc.ensure(&rp, true);
+        assert!(sc.scan_blocking(&rp, 20_000).is_some());
+        eprintln!("progress {:?}", sc.progress());
+        let rows = dir_snapshot(&sc, &vols).expect("completed scan");
+        let paths: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        let has = |p: &str| paths.contains(&format!("{rp}/{p}").as_str());
+        assert!(paths.contains(&rp.as_str()), "{paths:?}");
+        assert!(has("a") && has("a/b") && has("a/b/c") && has("x") && has("x/y"), "depth <= 3: {paths:?}");
+        assert!(has("a/b/c/d") && has("a/b/c/d/e"), ">= 1% of volume below depth 3: {paths:?}");
+        assert!(!has("a/b/c/d/small"), "small deep dir skipped: {paths:?}");
+        let rootrow = rows.iter().find(|r| r.0 == rp).unwrap();
+        assert!(rootrow.1 >= 3 << 20 && rootrow.2 >= 3, "{rootrow:?}");
+        // Round-trip into history.
+        let path = tmp_db("dirsnap");
+        let mut h = History::open(Some(path.to_str().unwrap())).unwrap();
+        h.record_dir_sizes(T0, &rows).unwrap();
+        let (_, back) = h.dir_sizes_near(T0, &format!("{rp}/a")).unwrap().unwrap();
+        assert_eq!(back[0].0, format!("{rp}/a"));
+        drop(h);
+        cleanup(&path);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fs_recorder_volumes_only() {
+        let path = tmp_db("fsrec");
+        let mut h = History::open(Some(path.to_str().unwrap())).unwrap();
+        let mut r = FsRecorder::new(false);
+        let t = Instant::now();
+        r.tick(&mut h, crate::model::now_ms()).unwrap();
+        let first = t.elapsed();
+        let t = Instant::now();
+        for i in 1..=20 {
+            r.tick(&mut h, crate::model::now_ms() + i).unwrap();
+        }
+        eprintln!("FsRecorder::tick first {first:?}, then avg {:?}", t.elapsed() / 20);
+        let mounts = h.volume_mounts().unwrap();
+        assert!(!mounts.is_empty());
+        drop(h);
+        cleanup(&path);
     }
 
     /// Real-machine size/latency check: `cargo test --bin fat history::tests::real_machine -- --ignored --nocapture`

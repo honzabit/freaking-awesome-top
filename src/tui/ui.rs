@@ -2,7 +2,8 @@
 //! terminal height, not the process count.
 
 use crate::model::{Container, Proc};
-use crate::tui::app::{App, AskState, Modal, SortKey, Tab, ZOOMS, ZOOM_NAMES};
+use crate::fs::Volume;
+use crate::tui::app::{App, AskState, FsMode, GrowthRow, Modal, SortKey, Tab, ZOOMS, ZOOM_NAMES};
 use crate::tui::widgets::*;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
@@ -40,6 +41,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.tab {
         Tab::Procs => draw_procs(f, app, main),
         Tab::Ports => draw_ports(f, app, main),
+        Tab::Fs => draw_fs(f, app, main),
         Tab::Fleet => draw_fleet(f, app, main),
         Tab::Timeline => draw_timeline(f, app, main),
         Tab::Doctor => draw_doctor(f, app, main),
@@ -247,6 +249,23 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
                     spans.push(Span::styled(format!(" {crit}"), Style::default().fg(Color::Red).bold()));
                 } else if warn > 0 {
                     spans.push(Span::styled(format!(" {warn}"), Style::default().fg(Color::Yellow)));
+                }
+            }
+            if *t == Tab::Fs {
+                let vols = &app.fs.volumes;
+                let hot = vols.iter().filter(|v| !v.read_only && !v.remote && !volume_hidden(v, vols));
+                let worst = hot.fold(None::<Color>, |acc, v| {
+                    let c = if volume_ratio(v) >= 0.97 || v.eta_full_s.is_some_and(|e| e < 2 * 3600) {
+                        Some(Color::Red)
+                    } else if volume_ratio(v) >= 0.90 || v.eta_full_s.is_some_and(|e| e < 86_400) {
+                        Some(Color::Yellow)
+                    } else {
+                        None
+                    };
+                    if acc == Some(Color::Red) { acc } else { c.or(acc) }
+                });
+                if let Some(c) = worst {
+                    spans.push(Span::styled(" ⚠", Style::default().fg(c).bold()));
                 }
             }
             if *t == Tab::Ports
@@ -523,6 +542,475 @@ fn draw_ports(f: &mut Frame, app: &mut App, area: Rect) {
     if len == 0 {
         let r = Rect { y: area.y + 2, height: 1, ..area };
         f.render_widget(Paragraph::new("nothing is listening (or port data unavailable)").style(dim()), r);
+    }
+}
+
+// ------------------------------------------------------------------- storage
+
+/// Volumes worth a line, primary first then biggest.
+fn strip_volumes(vols: &[Volume]) -> Vec<&Volume> {
+    let mut v: Vec<&Volume> = vols.iter().filter(|v| !volume_hidden(v, vols)).collect();
+    v.sort_by(|a, b| b.primary.cmp(&a.primary).then(b.total.cmp(&a.total)).then(a.mount.cmp(&b.mount)));
+    v
+}
+
+fn volume_line(app: &App, v: &Volume, mount_w: usize, width: u16) -> Line<'static> {
+    let wide = width >= 100;
+    let bw = if wide { 20 } else if width >= 70 { 12 } else { 6 };
+    let recorded = app.fs.past.as_ref().filter(|p| Some(p.ts) == app.cursor).and_then(|p| p.vols.iter().find(|(m, _)| *m == v.mount)).map(|(_, u)| *u);
+    let (used, past) = match recorded.or_else(|| app.cursor.and_then(|ts| app.fs.used_at(&v.mount, ts)).map(|(_, u)| u)) {
+        Some(u) if app.cursor.is_some() => (u, true),
+        _ => (v.used, false),
+    };
+    let ratio = if v.total == 0 { 0.0 } else if past { used as f64 / v.total as f64 } else { volume_ratio(v) };
+    let mut spans = vec![
+        Span::styled(format!(" {:<w$} ", clip(&v.mount, mount_w), w = mount_w), Style::default().bold()),
+        Span::styled(bar(ratio, bw), Style::default().fg(fill_color(ratio))),
+        Span::raw(format!(" {}/{}", fmt_bytes(used), fmt_bytes(v.total))),
+        Span::styled(format!(" {:>3.0}%", ratio * 100.0), Style::default().fg(fill_color(ratio))),
+    ];
+    if past {
+        spans.push(Span::styled(" ⏪", Style::default().fg(Color::Magenta).bold()));
+        return Line::from(spans);
+    }
+    // Most important first: narrow terminals cut the end of the line.
+    if let Some(eta) = v.eta_full_s {
+        spans.push(Span::styled(format!("  {}", fmt_eta(eta)), Style::default().fg(eta_color(eta)).bold()));
+    }
+    if let Some(fill) = fmt_fill(v.fill_bps, app.fs.window_ms()) {
+        let st = if v.fill_bps.is_some_and(|b| b > 0.0) { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::Green) };
+        spans.push(Span::styled(format!("  {fill}"), st));
+    }
+    spans.push(Span::styled(format!("  avail {}", fmt_bytes(v.avail)), dim()));
+    if v.read_bps + v.write_bps > 0 {
+        spans.push(Span::styled(format!("  r{}/s w{}/s", fmt_rate(v.read_bps), fmt_rate(v.write_bps)), dim()));
+    }
+    if let Some(p) = v.purgeable.filter(|p| *p > 0 && wide) {
+        spans.push(Span::styled(format!("  purgeable {}", fmt_bytes(p)), dim()));
+    }
+    let mut tags = Vec::new();
+    if v.remote {
+        tags.push("network");
+    }
+    if v.read_only {
+        tags.push("ro");
+    }
+    if !tags.is_empty() {
+        spans.push(Span::styled(format!("  [{}]", tags.join(",")), dim()));
+    }
+    Line::from(spans)
+}
+
+/// "scanning 43% · 1.2M files · as of 12m ago" and friends.
+fn scan_status(app: &App) -> Vec<Span<'static>> {
+    let fs = &app.fs;
+    if let Some(e) = &fs.error {
+        return vec![Span::styled(format!("storage engine unavailable: {}", clip(e, 80)), Style::default().fg(Color::Red))];
+    }
+    let Some(l) = fs.current() else {
+        return vec![Span::styled("measuring… (numbers appear as the background scan reaches this directory)", dim())];
+    };
+    let mut v = Vec::new();
+    let p = &l.progress;
+    if p.running || l.dir.partial {
+        let pct = p.fraction.map(|f| format!(" {:.0}%", (f * 100.0).clamp(0.0, 100.0))).unwrap_or_default();
+        v.push(Span::styled(format!("scanning{pct}"), Style::default().fg(Color::Yellow)));
+        v.push(Span::styled(format!(" · {} files", fmt_count(p.files_seen.max(l.dir.files))), dim()));
+        if l.dir.partial {
+            v.push(Span::styled(" · partial (lower bound)", dim()));
+        }
+    } else {
+        v.push(Span::styled(format!("{} files", fmt_count(l.dir.files)), dim()));
+    }
+    let at = if l.dir.scanned_at > 0 { l.dir.scanned_at } else { p.completed_at };
+    if at > 0 {
+        v.push(Span::styled(format!(" · as of {}", fmt_ago((app.now - at) / 1000)), dim()));
+    }
+    let locked = l.children.iter().filter(|c| c.denied > 0 && !c.mount_point).count();
+    if l.dir.denied > 0 && l.dir.size == 0 && l.children.is_empty() {
+        v.push(Span::styled("  🔒 not read (macOS privacy or permissions)", Style::default().fg(Color::Yellow)));
+    } else if locked > 0 {
+        let s = if locked == 1 { "" } else { "s" };
+        v.push(Span::styled(
+            format!("  🔒 {locked} subdir{s} with unread parts: ⏎ on one reads it (or grant Full Disk Access)"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    v
+}
+
+/// 1234567 -> "1.2M" (counts, not bytes).
+fn fmt_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 10_000 {
+        format!("{:.0}K", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
+}
+
+fn draw_fs(f: &mut Frame, app: &mut App, area: Rect) {
+    app.fs.ensure_rows();
+    let vols = strip_volumes(&app.fs.volumes);
+    let vol_h = if area.height < 10 { 0 } else { (vols.len() as u16).min(4).min(area.height / 4) };
+    let detail_h = if area.height >= 12 { 1 } else { 0 };
+    let [vol_area, crumb_area, table_area, detail_area] =
+        Layout::vertical([Constraint::Length(vol_h), Constraint::Length(1), Constraint::Min(2), Constraint::Length(detail_h)]).areas(area);
+    let body_h = table_area.height.saturating_sub(2) as usize;
+    let len = app.fs.len();
+    scroll_into_view(app.fs.sel, &mut app.fs.offset, body_h, len);
+    let app = &*app;
+
+    // volumes strip
+    if vol_h > 0 {
+        let mount_w = vols.iter().map(|v| v.mount.chars().count()).max().unwrap_or(1).clamp(1, 24);
+        let lines: Vec<Line> = vols.iter().take(vol_h as usize).map(|v| volume_line(app, v, mount_w, area.width)).collect();
+        f.render_widget(Paragraph::new(lines), vol_area);
+    }
+
+    // breadcrumb + status
+    let fs = &app.fs;
+    let mut crumb = vec![Span::styled(" ⛁ ", Style::default().fg(ACCENT))];
+    match fs.mode {
+        FsMode::Tree => crumb.push(Span::styled(fs.path.clone(), Style::default().fg(ACCENT).bold())),
+        FsMode::Growth => {
+            crumb.push(Span::styled("growth ", Style::default().fg(Color::Yellow).bold()));
+            crumb.push(Span::styled(format!("last {} · anywhere", fmt_window(fs.window_ms())), Style::default().bold()));
+        }
+        FsMode::Largest => {
+            crumb.push(Span::styled("largest below ", Style::default().fg(Color::Yellow).bold()));
+            crumb.push(Span::styled(fs.largest_path.clone(), Style::default().fg(ACCENT).bold()));
+        }
+    }
+    if fs.mode == FsMode::Tree {
+        let size = match fs.past_view() {
+            Some(p) => p.dir_size.or_else(|| Some(p.children.iter().map(|c| c.size).sum())),
+            None => fs.current().map(|l| l.dir.size),
+        };
+        if let Some(size) = size {
+            crumb.push(Span::styled(format!("  {}", fmt_bytes(size)), Style::default().bold()));
+        }
+    }
+    // Time travel first: it changes what every number below means.
+    if let Some(ts) = app.cursor {
+        let text = match fs.past_view() {
+            Some(p) => format!("  ⏪ as of {} (recorded {})", fmt_clock(ts), fmt_clock(p.at.unwrap_or(ts))),
+            None if app.history_ok && fs.past.as_ref().is_none_or(|p| p.ts != ts) => format!("  ⏪ as of {} · loading recorded sizes…", fmt_clock(ts)),
+            None => format!("  ⏪ as of {} · no directory sizes recorded then, showing the latest scan", fmt_clock(ts)),
+        };
+        crumb.push(Span::styled(text, Style::default().fg(Color::Magenta).bold()));
+    }
+    crumb.push(Span::raw("  "));
+    crumb.extend(scan_status(app));
+    if !fs.filter.is_empty() {
+        crumb.push(Span::styled(format!("  /{}", fs.filter), Style::default().fg(Color::Yellow)));
+    }
+    f.render_widget(Paragraph::new(Line::from(crumb)), crumb_area);
+
+    match fs.mode {
+        FsMode::Tree => draw_fs_tree(f, app, table_area, body_h),
+        FsMode::Growth => draw_fs_growth(f, app, table_area, body_h),
+        FsMode::Largest => draw_fs_largest(f, app, table_area, body_h),
+    }
+
+    if detail_h > 0 {
+        f.render_widget(Paragraph::new(fs_detail(app)), detail_area);
+    }
+}
+
+/// The detail line under the table: known-directory advice, or growth notes.
+fn fs_detail(app: &App) -> Line<'static> {
+    let fs = &app.fs;
+    if fs.mode == FsMode::Growth {
+        let notes = fs.growth.as_ref().map(|g| g.notes.join(" · ")).unwrap_or_default();
+        return Line::styled(format!(" {}", if notes.is_empty() { "⏎ on a writer: why it runs · on a path: open it".to_string() } else { notes }), dim());
+    }
+    let Some(e) = fs.selected_entry() else { return Line::raw("") };
+    let mut v = Vec::new();
+    if let Some(cg) = fs.selected_child_growth()
+        && let Some((pid, name, bps)) = &cg.top_writer
+    {
+        v.push(Span::styled(format!(" ✎ {name} ({pid}) {}/s", fmt_bytes(*bps)), Style::default().fg(Color::Yellow)));
+    }
+    match crate::blame::explain_path(&e.path) {
+        Some(t) => v.push(Span::styled(format!(" 💡 {t}"), Style::default().fg(Color::Green))),
+        None => {
+            let mut info = format!(" {}", e.path);
+            if e.apparent > 0 && e.apparent != e.size {
+                info.push_str(&format!(" · {} apparent", fmt_bytes(e.apparent)));
+            }
+            if e.denied > 0 {
+                info.push_str(&format!(" · {} unreadable subdirs", e.denied));
+            }
+            if e.mount_point {
+                info.push_str(" · another filesystem is mounted here (⏎ to read it)");
+            }
+            v.push(Span::styled(info, dim()));
+        }
+    }
+    Line::from(v)
+}
+
+fn fs_name_cell(e: &crate::fs::DirEntry) -> Cell<'static> {
+    let mut spans = Vec::with_capacity(3);
+    if e.mount_point {
+        spans.push(Span::styled("⛁ ", Style::default().fg(Color::LightBlue)));
+    } else if e.denied > 0 && e.size == 0 {
+        spans.push(Span::styled("🔒", Style::default().fg(Color::Yellow)));
+    }
+    let name = if e.is_dir { format!("{}/", e.name) } else { e.name.clone() };
+    spans.push(Span::styled(name, if e.is_dir { Style::default().bold() } else { Style::default() }));
+    if e.denied > 0 && e.size > 0 {
+        spans.push(Span::styled(" 🔒", Style::default().fg(Color::Yellow)));
+    }
+    if e.partial {
+        spans.push(Span::styled(" …", dim()));
+    }
+    Cell::from(Line::from(spans))
+}
+
+fn draw_fs_tree(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
+    let fs = &app.fs;
+    let wide = area.width >= 90;
+    let mid = area.width >= 64;
+    let win = fmt_window(fs.window_ms());
+    let sort = fs.sort;
+    let head = |t: String, key: Option<crate::tui::app::FsSort>, right: bool| {
+        let sorted = key == Some(sort);
+        let st = if sorted { Style::default().fg(ACCENT).bold() } else { Style::default().bold() };
+        let l = Line::styled(if sorted { format!("{t}▼") } else { t }, st);
+        Cell::from(if right { l.alignment(Alignment::Right) } else { l })
+    };
+    use crate::tui::app::FsSort as S;
+    let mut header = vec![head("SIZE".into(), Some(S::Size), true)];
+    let mut widths = vec![Constraint::Length(8)];
+    if mid {
+        header.push(head("".into(), None, false));
+        widths.push(Constraint::Length(if wide { 16 } else { 10 }));
+    }
+    header.push(head(format!("Δ{win}"), Some(S::Growth), true));
+    widths.push(Constraint::Length(8));
+    if wide {
+        header.push(head("WRITE/s".into(), Some(S::Io), true));
+        widths.push(Constraint::Length(8));
+        header.push(head("FILES".into(), Some(S::Files), true));
+        widths.push(Constraint::Length(7));
+    }
+    if mid {
+        header.push(head("NEWEST".into(), Some(S::Age), true));
+        widths.push(Constraint::Length(8));
+    }
+    header.push(head("NAME".into(), Some(S::Name), false));
+    widths.push(Constraint::Min(10));
+
+    let title = Line::from(vec![
+        Span::styled(" Storage ", Style::default().bold()),
+        Span::styled(format!("{} entries · sort {} ", fs.len(), fs.sort.label()), dim()),
+    ]);
+    let block = Block::default().borders(Borders::TOP).border_style(dim()).title(title);
+    let past = fs.past_view();
+    let children = fs.tree_children();
+    let (parent, dir_denied) = match (past, fs.current()) {
+        (Some(p), _) => (p.dir_size.unwrap_or_else(|| children.iter().map(|c| c.size).sum()), false),
+        (None, Some(l)) => (l.dir.size, l.dir.denied > 0),
+        (None, None) => (0, false),
+    };
+    if past.is_none() && fs.current().is_none() {
+        let msg = if fs.error.is_some() {
+            "The storage engine could not start; other views keep working.".to_string()
+        } else if !fs.opened {
+            String::new()
+        } else {
+            format!("Measuring {}… The first full scan of / takes a few minutes at background priority; \
+                     results appear as it goes and are cached for next time. fat only reads — it never deletes anything.", fs.path)
+        };
+        f.render_widget(Paragraph::new(msg).style(dim()).wrap(Wrap { trim: true }).block(block), area);
+        return;
+    }
+    let parent = parent.max(1);
+    let rows = fs.rows.iter().enumerate().skip(fs.offset).take(body_h).map(|(i, &ci)| {
+        let e = &children[ci];
+        let g = fs.child_growth.get(ci).cloned().unwrap_or_default();
+        let ratio = e.size as f64 / parent as f64;
+        let size_cell = if e.mount_point && e.size == 0 {
+            num("mount".into(), Style::default().fg(Color::LightBlue))
+        } else if e.denied > 0 && e.size == 0 {
+            num("?".into(), dim())
+        } else {
+            num(fmt_bytes(e.size), mem_style(e.size))
+        };
+        let mut cells = vec![size_cell];
+        if mid {
+            let bw = if wide { 10 } else { 5 };
+            cells.push(Cell::from(Line::from(vec![
+                Span::styled(bar(ratio, bw), Style::default().fg(ACCENT)),
+                Span::styled(format!("{:>4.0}%", ratio * 100.0), dim()),
+            ])));
+        }
+        cells.push(num(if g.delta == 0 { "-".into() } else { fmt_delta(g.delta) }, delta_style(g.delta)));
+        if wide {
+            cells.push(num(fmt_rate(g.write_bps), rate_style(g.write_bps)));
+            cells.push(num(fmt_count(e.files), dim()));
+        }
+        if mid {
+            cells.push(num(fmt_mtime_age(e.newest_mtime, app.now), dim()));
+        }
+        cells.push(fs_name_cell(e));
+        let mut row = Row::new(cells);
+        if i == fs.sel {
+            row = row.style(Style::default().bg(SEL_BG));
+        }
+        row
+    });
+    let table = Table::new(rows, widths).header(Row::new(header)).column_spacing(1).block(block);
+    f.render_widget(table, area);
+    if fs.rows.is_empty() {
+        let r = Rect { y: area.y + 2, height: 1, ..area };
+        let msg = if !fs.filter.is_empty() {
+            format!("nothing here matches '{}' — Esc clears the filter", fs.filter)
+        } else if past.is_none() && fs.current().is_some_and(|l| l.dir.files > 1) {
+            "expanding… this directory was summarized by the background scan; its entries appear in a moment".to_string()
+        } else if dir_denied {
+            "🔒 this directory could not be read (protected). ⏎ from its parent reads it once, or grant Full Disk Access.".to_string()
+        } else {
+            "empty (or not scanned yet)".to_string()
+        };
+        f.render_widget(Paragraph::new(msg).style(dim()), r);
+    }
+}
+
+fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
+    let fs = &app.fs;
+    let win = fmt_window(fs.window_ms());
+    let Some(g) = fs.growth.as_ref() else {
+        let block = Block::default().borders(Borders::TOP).border_style(dim()).title(" Growth ");
+        f.render_widget(Paragraph::new("collecting the growth report…").style(dim()).block(block), area);
+        return;
+    };
+    let total: i64 = g.volumes.iter().map(|(_, d)| *d).sum();
+    let title = Line::from(vec![
+        Span::styled(" What is eating space ", Style::default().bold()),
+        Span::styled(format!("last {win} · volumes {} ", fmt_delta(total)), delta_style(total)),
+        Span::styled(
+            format!(
+                "· {} growers · {} deleted-open · {} writers ",
+                fs.grows.iter().filter(|r| matches!(r, GrowthRow::Grower(_))).count(),
+                g.deleted_open.len(),
+                g.writers.len()
+            ),
+            dim(),
+        ),
+    ]);
+    let wide = area.width >= 90;
+    let header = Row::new(
+        ["KIND", "Δ / BYTES", "SIZE", "WRITE/s", "EVIDENCE", "PATH / PROCESS"]
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| wide || (*i != 2 && *i != 4))
+            .map(|(_, h)| Cell::from(Span::styled(h, Style::default().bold()))),
+    );
+    let rows = fs.grows.iter().enumerate().skip(fs.offset).take(body_h).map(|(i, r)| {
+        let (kind, kst, delta, dst, size, rate, ev, what): (&str, Style, String, Style, String, u64, String, Line) = match *r {
+            GrowthRow::Grower(j) => {
+                let x = &g.growers[j];
+                let rate: u64 = x.writers.iter().map(|w| w.2).sum();
+                let mut spans = vec![Span::styled(if x.is_dir { format!("{}/", x.path) } else { x.path.clone() }, Style::default().bold())];
+                if let Some(w) = x.writers.iter().max_by_key(|w| w.2) {
+                    spans.push(Span::styled(format!("  ← {} ({})", w.1, w.0), Style::default().fg(Color::Yellow)));
+                    if x.writers.len() > 1 {
+                        spans.push(Span::styled(format!(" +{}", x.writers.len() - 1), dim()));
+                    }
+                }
+                if x.files_touched > 0 {
+                    spans.push(Span::styled(format!("  {} files", fmt_count(x.files_touched)), dim()));
+                }
+                ("grow", Style::default(), fmt_delta(x.delta), delta_style(x.delta), fmt_bytes(x.size), rate, evidence_tags(&x.evidence), Line::from(spans))
+            }
+            GrowthRow::Deleted(j) => {
+                let (pid, name, path, bytes) = &g.deleted_open[j];
+                let line = Line::from(vec![
+                    Span::styled(format!("{path} (deleted)"), Style::default()),
+                    Span::styled(format!("  held by {name} ({pid}) · restart it to free the space"), Style::default().fg(Color::Yellow)),
+                ]);
+                ("deleted", Style::default().fg(Color::Magenta), fmt_bytes(*bytes), Style::default().fg(Color::Magenta), String::new(), 0, "open-files".into(), line)
+            }
+            GrowthRow::Writer(j) => {
+                let (pid, name, bytes) = &g.writers[j];
+                let rate = app.view().and_then(|s| s.proc(*pid)).map(|p| p.disk_write_bps).unwrap_or(0);
+                let line = Line::from(vec![
+                    Span::styled(name.clone(), Style::default().bold()),
+                    Span::styled(format!(" (pid {pid}) wrote {} in {win} · ⏎ why", fmt_bytes(*bytes)), dim()),
+                ]);
+                ("writer", Style::default().fg(ACCENT), fmt_bytes(*bytes), Style::default(), String::new(), rate, String::new(), line)
+            }
+        };
+        let mut cells = vec![Cell::from(Span::styled(kind, kst)), num(delta, dst)];
+        if wide {
+            cells.push(num(size, dim()));
+        }
+        cells.push(num(fmt_rate(rate), rate_style(rate)));
+        if wide {
+            cells.push(Cell::from(Span::styled(ev, dim())));
+        }
+        cells.push(Cell::from(what));
+        let mut row = Row::new(cells);
+        if i == fs.sel {
+            row = row.style(Style::default().bg(SEL_BG));
+        }
+        row
+    });
+    let widths: Vec<Constraint> = if wide {
+        vec![Constraint::Length(7), Constraint::Length(9), Constraint::Length(8), Constraint::Length(8), Constraint::Length(24), Constraint::Min(10)]
+    } else {
+        vec![Constraint::Length(7), Constraint::Length(9), Constraint::Length(8), Constraint::Min(10)]
+    };
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(1)
+        .block(Block::default().borders(Borders::TOP).border_style(dim()).title(title));
+    f.render_widget(table, area);
+    if fs.grows.is_empty() {
+        let r = Rect { y: area.y + 2, height: 1, ..area };
+        f.render_widget(Paragraph::new(format!("✓ nothing grew noticeably in the last {win}")).style(Style::default().fg(Color::Green)), r);
+    }
+}
+
+fn draw_fs_largest(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
+    let fs = &app.fs;
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(dim())
+        .title(Line::from(vec![Span::styled(" Largest ", Style::default().bold()), Span::styled("⏎ opens its directory ", dim())]));
+    let Some(list) = fs.largest.as_ref() else {
+        f.render_widget(Paragraph::new("finding the largest entries…").style(dim()).block(block), area);
+        return;
+    };
+    let base = fs.current().filter(|l| l.dir.path == fs.largest_path).map(|l| l.dir.size).unwrap_or(0).max(1);
+    let header = Row::new(["SIZE", "%", "FILES", "NEWEST", "PATH"].map(|h| Cell::from(Span::styled(h, Style::default().bold()))));
+    let rows = fs.rows.iter().enumerate().skip(fs.offset).take(body_h).map(|(i, &j)| {
+        let e = &list[j];
+        let shown = e.path.strip_prefix(fs.largest_path.trim_end_matches('/')).filter(|s| !s.is_empty()).unwrap_or(&e.path);
+        let mut row = Row::new(vec![
+            num(fmt_bytes(e.size), mem_style(e.size)),
+            num(format!("{:.0}%", e.size as f64 * 100.0 / base as f64), dim()),
+            num(fmt_count(e.files), dim()),
+            num(fmt_mtime_age(e.newest_mtime, app.now), dim()),
+            Cell::from(Span::styled(if e.is_dir { format!("{shown}/") } else { shown.to_string() }, Style::default().bold())),
+        ]);
+        if i == fs.sel {
+            row = row.style(Style::default().bg(SEL_BG));
+        }
+        row
+    });
+    let table = Table::new(rows, [Constraint::Length(8), Constraint::Length(5), Constraint::Length(7), Constraint::Length(8), Constraint::Min(10)])
+        .header(header)
+        .column_spacing(1)
+        .block(block);
+    f.render_widget(table, area);
+    if list.is_empty() {
+        let r = Rect { y: area.y + 2, height: 1, ..area };
+        f.render_widget(Paragraph::new("nothing measured below here yet").style(dim()), r);
     }
 }
 
@@ -982,7 +1470,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
 }
 
 const HELP: &[(&str, &str)] = &[
-    ("1-6 / Tab", "switch view: Procs Ports Fleet Timeline Doctor Log"),
+    ("1-7 / Tab", "switch view: Procs Ports Fs Fleet Timeline Doctor Log"),
     ("↑↓ PgUp PgDn g G", "move selection"),
     ("c m p n d i N", "sort by cpu mem power net disk pid name (again = reverse)"),
     ("t", "toggle process tree"),
@@ -994,6 +1482,9 @@ const HELP: &[(&str, &str)] = &[
     ("u", "undo last undoable action"),
     ("← → [ ] { }", "timeline: move through time (shift / braces = ×10)"),
     ("s  +/-", "timeline: jump to next spike · zoom window"),
+    ("Fs: ⏎ → l  ← ⌫", "storage: open directory · go up (⏎ on a 🔒 dir reads it once)"),
+    ("Fs: s g w", "sort size/growth/io/name/files/age · growth view · window 10m/1h/24h"),
+    ("Fs: b r", "biggest entries below here · rescan this directory (fat never deletes)"),
     ("L / Esc", "return to live"),
     ("?", "ask in plain language"),
     ("h", "this help"),
@@ -1024,7 +1515,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         let line = Line::from(vec![
             Span::styled(" / ", Style::default().fg(Color::Black).bg(Color::Yellow).bold()),
             Span::raw(" "),
-            Span::raw(app.filter.as_str()),
+            Span::raw(app.active_filter()),
             Span::styled("▏", Style::default().fg(ACCENT)),
             Span::styled("   Enter keep · Esc clear", dim()),
         ]);
@@ -1039,6 +1530,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints: &[(&str, &str)] = match app.tab {
         Tab::Procs => &[("⏎", "why"), ("␣", "pause"), ("r", "renice"), ("k", "term"), ("K", "tree"), ("u", "undo"), ("/", "filter"), ("t", "tree"), ("cmpnd", "sort"), ("?", "ask"), ("h", "help"), ("q", "quit")],
         Tab::Ports => &[("⏎", "why"), ("k", "kill tree"), ("␣", "pause"), ("u", "undo"), ("?", "ask"), ("h", "help"), ("q", "quit")],
+        Tab::Fs if app.fs.mode == FsMode::Growth => &[("⏎", "open / why"), ("w", "window"), ("g", "dirs"), ("/", "filter"), ("Esc", "back"), ("?", "ask"), ("h", "help"), ("q", "quit")],
+        Tab::Fs => &[("⏎", "open"), ("←", "up"), ("s", "sort"), ("g", "growth"), ("w", "window"), ("b", "biggest"), ("r", "rescan"), ("/", "filter"), ("?", "ask"), ("h", "help"), ("q", "quit")],
         Tab::Fleet => &[("↑↓", "move"), ("?", "ask"), ("h", "help"), ("q", "quit")],
         Tab::Timeline => &[("←→", "scrub"), ("s", "spike"), ("+/-", "zoom"), ("L", "live"), ("⏎", "why"), ("?", "ask"), ("h", "help"), ("q", "quit")],
         Tab::Doctor => &[("⏎", "run action"), ("w", "why"), ("?", "ask"), ("h", "help"), ("q", "quit")],
@@ -1404,5 +1897,119 @@ mod tests {
         eprintln!("render 800 procs @160x48: {per:?}/frame");
         // generous bound for debug builds on CI; release is far below 5ms
         assert!(per < std::time::Duration::from_millis(40), "render took {per:?}");
+    }
+
+    // ------------------------------------------------------------ Fs tab
+
+    fn fs_full_app() -> App {
+        use crate::fs::{DirEntry, Evidence, Grower, Growth, Listing, ScanProgress, Volume};
+        let mut a = full_app();
+        a.set_volumes(
+            a.now,
+            vec![
+                Volume { mount: "/".into(), read_only: true, total: 994 << 30, used: 11 << 30, avail: 300 << 30, ..Default::default() },
+                Volume {
+                    mount: "/System/Volumes/Data".into(),
+                    fstype: "apfs".into(),
+                    primary: true,
+                    total: 994 << 30,
+                    used: 630 << 30,
+                    avail: 300 << 30,
+                    fill_bps: Some(2.0 * 1024.0 * 1024.0),
+                    eta_full_s: Some(3 * 3600 + 60),
+                    write_bps: 5 << 20,
+                    purgeable: Some(12 << 30),
+                    ..Default::default()
+                },
+                Volume { mount: "/System/Volumes/Preboot".into(), total: 994 << 30, ..Default::default() },
+            ],
+        );
+        a.switch_tab(Tab::Fs);
+        let de = |p: &str, size: u64| DirEntry { path: p.into(), name: p.rsplit('/').next().unwrap().into(), is_dir: true, size, files: 1200, newest_mtime: a.now / 1000 - 120, ..Default::default() };
+        a.set_fs_listing(
+            "/",
+            Some(Listing {
+                dir: DirEntry { partial: true, ..de("/", 600 << 30) },
+                children: vec![
+                    de("/Users", 400 << 30),
+                    de("/Applications", 80 << 30),
+                    DirEntry { denied: 2, size: 0, ..de("/private", 0) },
+                    DirEntry { mount_point: true, size: 0, ..de("/Volumes", 0) },
+                ],
+                progress: ScanProgress { root: "/".into(), running: true, files_seen: 1_200_000, fraction: Some(0.43), ..Default::default() },
+            }),
+        );
+        a.set_fs_growth(Growth {
+            growers: vec![Grower { path: "/Users/me/Library/Caches/pip".into(), is_dir: true, delta: 1 << 30, size: 3 << 30, writers: vec![(200, "node".into(), 4 << 20)], evidence: vec![Evidence::Fsevents], ..Default::default() }],
+            writers: vec![(200, "node".into(), 1 << 30)],
+            deleted_open: vec![(400, "Chrome".into(), "/tmp/blob".into(), 2 << 30)],
+            notes: vec!["open-file attribution covers your own processes".into()],
+            ..Default::default()
+        });
+        a
+    }
+
+    #[test]
+    fn fs_tab_renders_tree_growth_and_largest() {
+        for (w, h) in SIZES {
+            let mut a = fs_full_app();
+            let out = render(&mut a, w, h);
+            if h >= 24 {
+                assert!(out.contains("Fs"), "{w}x{h}\n{out}");
+                assert!(out.contains("/System/Volumes/Data") && out.contains("full in 3h"), "volume strip {w}x{h}\n{out}");
+                assert!(!out.contains("Preboot"), "helper volumes hidden\n{out}");
+                assert!(out.contains("scanning 43%") && out.contains("1.2M files"), "{w}x{h}\n{out}");
+                assert!(out.contains("Users/") && out.contains("400.0G") && out.contains("+1.0G"), "{w}x{h}\n{out}");
+                assert!(out.contains("🔒") || out.contains("private/"), "{out}");
+            }
+            if w >= 100 {
+                assert!(out.contains("+1.2G/10m") && out.contains("purgeable 12.0G"), "{out}");
+                assert!(out.contains("2m ago") && out.contains("mount"), "{out}");
+            }
+            a.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+            let out = render(&mut a, w, h);
+            if h >= 24 {
+                assert!(out.contains("What is eating space") && out.contains("Library/Caches/pip") && out.contains("Chrome"), "{w}x{h}\n{out}");
+            }
+            a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            a.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+            let out = render(&mut a, w, h);
+            if h >= 24 {
+                assert!(out.contains("finding the largest"), "{out}");
+            }
+            a.set_fs_largest("/", vec![crate::fs::DirEntry { path: "/Users/me/vm.img".into(), name: "vm.img".into(), size: 40 << 30, ..Default::default() }]);
+            let out = render(&mut a, w, h);
+            if h >= 24 {
+                assert!(out.contains("Users/me/vm.img") && out.contains("40.0G"), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn fs_tab_detail_line_and_states() {
+        let mut a = fs_full_app();
+        let out = render(&mut a, 160, 48);
+        // Users is selected: the known-dir hint is not for it, but its top writer is
+        assert!(out.contains("✎ node (200)"), "{out}");
+        // empty / error states
+        let mut b = App::new(1000);
+        b.switch_tab(Tab::Fs);
+        assert!(render(&mut b, 80, 24).contains("Measuring /"));
+        b.set_fs_error("scanner unavailable (boom)".into());
+        let out = render(&mut b, 80, 24);
+        assert!(out.contains("storage engine unavailable"), "{out}");
+        // rewound without recorded sizes: clearly marked
+        let mut c = fs_full_app();
+        c.jump_to(c.now - 1000);
+        c.history_ok = false;
+        let out = render(&mut c, 160, 48);
+        assert!(out.contains("as of") && out.contains("no directory sizes recorded"), "{out}");
+        // rewound with recorded sizes
+        let ts = c.now - 1000;
+        c.history_ok = true;
+        c.set_fs_past(crate::tui::app::fs_past_from(ts, "/", Some(ts - 60_000), &[("/".into(), 500 << 30), ("/Users".into(), 300 << 30), ("/Users/me".into(), 1)], vec![("/System/Volumes/Data".into(), 600 << 30)]));
+        let out = render(&mut c, 160, 48);
+        assert!(out.contains("recorded") && out.contains("300.0G") && !out.contains("400.0G"), "{out}");
+        assert!(out.contains("600.0G/994.0G") && out.contains("⏪"), "{out}");
     }
 }

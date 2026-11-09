@@ -235,9 +235,184 @@ pub fn contains_ci(hay: &str, needle_lower: &str) -> bool {
     h.windows(n.len()).any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
 }
 
+// ------------------------------------------------------------------ storage formatting
+
+/// Signed byte change: "+1.2G", "-300.0M", "0".
+pub fn fmt_delta(d: i64) -> String {
+    match d.cmp(&0) {
+        std::cmp::Ordering::Equal => "0".to_string(),
+        std::cmp::Ordering::Greater => format!("+{}", fmt_bytes(d.unsigned_abs())),
+        std::cmp::Ordering::Less => format!("-{}", fmt_bytes(d.unsigned_abs())),
+    }
+}
+
+/// Compact duration with one unit: "45s", "12m", "3h", "2d".
+pub fn fmt_dur_short(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// Age of an event `secs` ago: "now", "42s ago", "2m ago", "3h ago". Negative (clock skew) = "now".
+pub fn fmt_ago(secs: i64) -> String {
+    if secs < 5 { "now".to_string() } else { format!("{} ago", fmt_dur_short(secs as u64)) }
+}
+
+/// Age of an epoch-seconds mtime relative to `now_ms`; "-" when unknown (0).
+pub fn fmt_mtime_age(mtime_s: i64, now_ms: Ts) -> String {
+    if mtime_s <= 0 { "-".to_string() } else { fmt_ago(now_ms / 1000 - mtime_s) }
+}
+
+/// Window length: "10m", "1h", "24h".
+pub fn fmt_window(ms: i64) -> String {
+    let s = (ms / 1000).max(0) as u64;
+    if s >= 3600 && s.is_multiple_of(3600) { format!("{}h", s / 3600) } else { format!("{}m", (s / 60).max(1)) }
+}
+
+/// Fill rate expressed over a window: "+1.2G/10m". None when not filling or unknown.
+pub fn fmt_fill(bps: Option<f64>, window_ms: i64) -> Option<String> {
+    let b = bps.filter(|b| b.is_finite() && b.abs() >= 1.0)?;
+    let d = (b * window_ms as f64 / 1000.0) as i64;
+    Some(format!("{}/{}", fmt_delta(d), fmt_window(window_ms)))
+}
+
+/// "full in 3h".
+pub fn fmt_eta(secs: u64) -> String {
+    format!("full in {}", fmt_dur_short(secs))
+}
+
+/// Red under 2h, yellow under a day.
+pub fn eta_color(secs: u64) -> Color {
+    if secs < 2 * 3600 {
+        Color::Red
+    } else if secs < 86_400 {
+        Color::Yellow
+    } else {
+        Color::Reset
+    }
+}
+
+/// Short tag for where a growth number came from.
+pub fn evidence_tag(e: crate::fs::Evidence) -> &'static str {
+    use crate::fs::Evidence::*;
+    match e {
+        Fsevents => "fsevents",
+        Watch => "watch",
+        OpenFiles => "open-files",
+        ScanDiff => "scan-diff",
+        Mtime => "mtime≤",
+    }
+}
+
+pub fn evidence_tags(ev: &[crate::fs::Evidence]) -> String {
+    ev.iter().map(|e| evidence_tag(*e)).collect::<Vec<_>>().join(",")
+}
+
+/// Growth coloring: big positive deltas are hot, shrinking is green.
+pub fn delta_style(d: i64) -> Style {
+    if d >= 1 << 30 {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if d >= 100 << 20 {
+        Style::default().fg(Color::Red)
+    } else if d >= 1 << 20 {
+        Style::default().fg(Color::Yellow)
+    } else if d < 0 {
+        Style::default().fg(Color::Green)
+    } else if d > 0 {
+        Style::default()
+    } else {
+        dim()
+    }
+}
+
+/// Volume fill (0..1) color: crit at 97%, warn at 90%.
+pub fn fill_color(ratio: f64) -> Color {
+    if ratio >= 0.97 {
+        Color::Red
+    } else if ratio >= 0.90 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+/// Share of a volume in use from the user's point of view: (total - avail) / total.
+pub fn volume_ratio(v: &crate::fs::Volume) -> f64 {
+    if v.total == 0 { 0.0 } else { v.total.saturating_sub(v.avail) as f64 / v.total as f64 }
+}
+
+/// Volumes not worth a line in the strip: macOS system helper volumes (Preboot, Update, xarts,
+/// ...: they share the Data volume's container), the sealed read-only system snapshot when the
+/// Data volume is listed, container bind-mounted files (/etc/hosts), and empty ones.
+pub fn volume_hidden(v: &crate::fs::Volume, all: &[crate::fs::Volume]) -> bool {
+    if v.total == 0 || v.hidden {
+        return true;
+    }
+    if v.primary {
+        return false;
+    }
+    let m = v.mount.as_str();
+    if m.starts_with("/System/Volumes/") && m != "/System/Volumes/Data" && m != "/System/Volumes/VM" {
+        return true;
+    }
+    if m == "/" && v.read_only && all.iter().any(|o| o.primary && o.mount != "/") {
+        return true;
+    }
+    m.starts_with("/etc/") || m.starts_with("/dev/") || m.starts_with("/proc") || m.starts_with("/sys/") || v.fstype == "squashfs"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_formatting() {
+        assert_eq!(fmt_delta(0), "0");
+        assert_eq!(fmt_delta(1536), "+1.5K");
+        assert_eq!(fmt_delta(-(300 << 20)), "-300.0M");
+        assert_eq!(fmt_delta(i64::MIN), "-8388608.0T");
+        assert_eq!(fmt_ago(2), "now");
+        assert_eq!(fmt_ago(42), "42s ago");
+        assert_eq!(fmt_ago(150), "2m ago");
+        assert_eq!(fmt_ago(3 * 3600 + 5), "3h ago");
+        assert_eq!(fmt_ago(-30), "now");
+        assert_eq!(fmt_mtime_age(0, 1_000_000), "-");
+        assert_eq!(fmt_mtime_age(1000 - 120, 1_000_000), "2m ago");
+        assert_eq!(fmt_window(600_000), "10m");
+        assert_eq!(fmt_window(3_600_000), "1h");
+        assert_eq!(fmt_window(86_400_000), "24h");
+        assert_eq!(fmt_fill(Some(2.0 * 1024.0 * 1024.0), 600_000).as_deref(), Some("+1.2G/10m"));
+        assert_eq!(fmt_fill(Some(-1024.0), 3_600_000).as_deref(), Some("-3.5M/1h"));
+        assert_eq!(fmt_fill(None, 600_000), None);
+        assert_eq!(fmt_fill(Some(0.2), 600_000), None);
+        assert_eq!(fmt_eta(3 * 3600 + 100), "full in 3h");
+        assert_eq!(eta_color(3600), Color::Red);
+        assert_eq!(eta_color(5 * 3600), Color::Yellow);
+        assert_eq!(eta_color(3 * 86_400), Color::Reset);
+        use crate::fs::Evidence;
+        assert_eq!(evidence_tags(&[Evidence::Fsevents, Evidence::OpenFiles]), "fsevents,open-files");
+        assert_eq!(fill_color(0.98), Color::Red);
+        assert_eq!(fill_color(0.91), Color::Yellow);
+    }
+
+    #[test]
+    fn hidden_volumes() {
+        use crate::fs::Volume;
+        let v = |m: &str, ro: bool, primary: bool| Volume { mount: m.into(), total: 100, read_only: ro, primary, ..Default::default() };
+        let mac = vec![v("/", true, false), v("/System/Volumes/Data", false, true), v("/System/Volumes/VM", false, false), v("/System/Volumes/Preboot", false, false), v("/Volumes/Install", true, false)];
+        let shown: Vec<&str> = mac.iter().filter(|x| !volume_hidden(x, &mac)).map(|x| x.mount.as_str()).collect();
+        assert_eq!(shown, vec!["/System/Volumes/Data", "/System/Volumes/VM", "/Volumes/Install"]);
+        let linux = vec![v("/", false, true), v("/etc/hosts", false, false), v("/home", false, false)];
+        let shown: Vec<&str> = linux.iter().filter(|x| !volume_hidden(x, &linux)).map(|x| x.mount.as_str()).collect();
+        assert_eq!(shown, vec!["/", "/home"]);
+        assert!((volume_ratio(&Volume { total: 100, avail: 25, ..Default::default() }) - 0.75).abs() < 1e-9);
+    }
 
     #[test]
     fn bytes_and_rates() {

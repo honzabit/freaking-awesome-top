@@ -3,6 +3,7 @@
 //! Everything here is pure logic over a [`Snapshot`] (plus optional flight-recorder
 //! [`History`]); no syscalls, no signals. History errors are swallowed: a missing or
 //! broken recorder only means fewer "how long has this been going on" details.
+use crate::fs::{Growth, Volume};
 use crate::history::History;
 use crate::model::{Explanation, Finding, Proc, Snapshot, Ts};
 use std::collections::HashMap;
@@ -244,6 +245,336 @@ pub fn diagnose(snap: &Snapshot, hist: Option<&History>) -> Vec<Finding> {
 
     out.sort_by_key(|f| std::cmp::Reverse(severity_rank(&f.severity)));
     out
+}
+
+// ======================================================================
+// Storage
+// ======================================================================
+
+/// Storage facts for the disk rules. The caller gathers them (volumes, growth report,
+/// deleted-but-open files); blame stays pure.
+#[derive(Debug, Clone, Default)]
+pub struct FsFacts {
+    pub volumes: Vec<Volume>,
+    pub growth: Option<Growth>,
+    pub deleted_open: Vec<(u32, String, String, u64)>,
+}
+
+/// [`diagnose`] plus the storage rules, ranked together.
+pub fn diagnose_with_fs(snap: &Snapshot, hist: Option<&History>, fs: &FsFacts) -> Vec<Finding> {
+    let mut out = diagnose(snap, hist);
+    out.extend(diagnose_fs(fs));
+    out.sort_by_key(|f| std::cmp::Reverse(severity_rank(&f.severity)));
+    out
+}
+
+/// Disk findings: volumes nearly full or filling fast, space held by deleted-but-open files,
+/// large swap files. Advice only: fat never deletes anything.
+pub fn diagnose_fs(fs: &FsFacts) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let watched = watched_volumes(&fs.volumes);
+    rule_volume_full(&watched, fs, &mut out);
+    rule_volume_filling(&watched, fs, &mut out);
+    rule_deleted_open(fs, &mut out);
+    rule_swapfiles(fs, &mut out);
+    out.sort_by_key(|f| std::cmp::Reverse(severity_rank(&f.severity)));
+    out
+}
+
+const FS_SKIP_TYPES: &[&str] = &["squashfs", "iso9660", "udf", "cd9660", "devtmpfs", "ramfs", "devfs", "autofs", "nullfs"];
+
+/// Local, writable, real volumes, one per underlying filesystem: APFS volumes of one container
+/// (and Linux bind mounts of one device) report the same space, so only the first is kept,
+/// preferring the primary (user data) volume.
+fn watched_volumes(vols: &[Volume]) -> Vec<&Volume> {
+    let mut v: Vec<&Volume> = vols
+        .iter()
+        .filter(|v| !v.read_only && !v.remote && v.total >= 2 * GB && !FS_SKIP_TYPES.contains(&v.fstype.as_str()))
+        .filter(|v| !(v.mount.starts_with("/System/Volumes/") && v.mount != "/System/Volumes/Data"))
+        .collect();
+    v.sort_by(|a, b| b.primary.cmp(&a.primary).then(a.mount.len().cmp(&b.mount.len())));
+    let mut out: Vec<&Volume> = Vec::new();
+    for x in v {
+        let same = |o: &&Volume| {
+            (!x.device.is_empty() && o.device == x.device && x.device.starts_with('/'))
+                || (o.total == x.total && o.avail / (256 * MB) == x.avail / (256 * MB))
+        };
+        if !out.iter().any(same) {
+            out.push(x);
+        }
+    }
+    out
+}
+
+fn fill_ratio(v: &Volume) -> f64 {
+    if v.total == 0 { 0.0 } else { v.total.saturating_sub(v.avail) as f64 / v.total as f64 }
+}
+
+/// The volume holding `path`: longest mount prefix; macOS firmlinks (/Users, /Applications,
+/// /private ... live on the Data volume) resolve to the primary volume instead of the sealed "/".
+fn volume_of<'a>(vols: &'a [Volume], path: &str) -> Option<&'a Volume> {
+    let v = vols
+        .iter()
+        .filter(|v| crate::tui::app::path_within(path, &v.mount))
+        .max_by_key(|v| v.mount.len())?;
+    if v.mount == "/" && v.read_only {
+        return vols.iter().find(|p| p.primary).or(Some(v));
+    }
+    Some(v)
+}
+
+/// Biggest positive growers on volume `v`: "~/Library/Caches +3.0G (node 200)".
+fn growers_on<'a>(fs: &'a FsFacts, v: &Volume, n: usize) -> Vec<&'a crate::fs::Grower> {
+    let Some(g) = &fs.growth else { return Vec::new() };
+    let mut out: Vec<&crate::fs::Grower> =
+        g.growers.iter().filter(|x| x.delta > 0 && volume_of(&fs.volumes, &x.path).is_none_or(|o| o.mount == v.mount)).collect();
+    out.sort_by_key(|x| std::cmp::Reverse(x.delta));
+    out.truncate(n);
+    out
+}
+
+fn grower_text(x: &crate::fs::Grower) -> String {
+    let mut t = format!("{} +{}", tilde(&x.path), human_bytes(x.delta.max(0) as u64));
+    if let Some((pid, name, _)) = x.writers.iter().max_by_key(|w| w.2) {
+        t.push_str(&format!(" ({name} {pid})"));
+    }
+    t
+}
+
+fn rule_volume_full(watched: &[&Volume], fs: &FsFacts, out: &mut Vec<Finding>) {
+    for v in watched {
+        let r = fill_ratio(v);
+        let sev = if r >= 0.97 {
+            "crit"
+        } else if r >= 0.90 {
+            "warn"
+        } else {
+            continue;
+        };
+        let mut detail = format!(
+            "{} of {} used on {} ({}), {} available.",
+            human_bytes(v.total.saturating_sub(v.avail)),
+            human_bytes(v.total),
+            if v.device.is_empty() { "?" } else { &v.device },
+            v.fstype,
+            human_bytes(v.avail)
+        );
+        if let Some(p) = v.purgeable.filter(|p| *p >= GB) {
+            detail.push_str(&format!(" macOS can reclaim about {} of purgeable space (caches, local snapshots) on demand.", human_bytes(p)));
+        }
+        let top = growers_on(fs, v, 3);
+        if !top.is_empty() {
+            detail.push_str(&format!(" Growing lately: {}.", top.iter().map(|x| grower_text(x)).collect::<Vec<_>>().join(", ")));
+        }
+        detail.push_str(&format!(" See what uses it: the Fs tab, or `fat fs {}`; `fat fs --growth` for recent growth.", v.mount));
+        let pids = top.iter().flat_map(|x| x.writers.iter().map(|w| w.0)).collect();
+        out.push(finding(sev, format!("Disk {} is {:.0}% full ({} left)", v.mount, r * 100.0, human_bytes(v.avail)), detail, pids, None));
+    }
+}
+
+fn rule_volume_filling(watched: &[&Volume], fs: &FsFacts, out: &mut Vec<Finding>) {
+    for v in watched {
+        let (Some(eta), Some(bps)) = (v.eta_full_s, v.fill_bps) else { continue };
+        if bps <= 0.0 {
+            continue;
+        }
+        let sev = if eta < 2 * 3600 {
+            "crit"
+        } else if eta < 24 * 3600 {
+            "warn"
+        } else {
+            continue;
+        };
+        let per10 = (bps * 600.0) as u64;
+        let top = growers_on(fs, v, 3);
+        let mut detail = format!("{} is filling at {}/10m ({} left).", v.mount, human_bytes(per10), human_bytes(v.avail));
+        if top.is_empty() {
+            detail.push_str(" Open the Fs tab and press g (or `fat fs --growth --since 10m`) to see what is growing.");
+        } else {
+            detail.push_str(&format!(" Growing: {}.", top.iter().map(|x| grower_text(x)).collect::<Vec<_>>().join(", ")));
+        }
+        let pids: Vec<u32> = top.iter().flat_map(|x| x.writers.iter().map(|w| w.0)).collect();
+        out.push(finding(sev, format!("{} will be full in {}", v.mount, human_dur_ms(eta as i64 * 1000)), detail, pids, None));
+    }
+}
+
+fn rule_deleted_open(fs: &FsFacts, out: &mut Vec<Finding>) {
+    let mut by_pid: Vec<(u32, String, u64, Vec<&str>)> = Vec::new();
+    for (pid, name, path, bytes) in &fs.deleted_open {
+        match by_pid.iter_mut().find(|e| e.0 == *pid) {
+            Some(e) => {
+                e.2 += bytes;
+                e.3.push(path);
+            }
+            None => by_pid.push((*pid, name.clone(), *bytes, vec![path])),
+        }
+    }
+    by_pid.sort_by_key(|e| std::cmp::Reverse(e.2));
+    for (pid, name, bytes, paths) in by_pid.into_iter().filter(|e| e.2 >= GB) {
+        let shown: Vec<String> = paths.iter().take(3).map(|p| tilde(p)).collect();
+        let more = if paths.len() > 3 { format!(" and {} more", paths.len() - 3) } else { String::new() };
+        out.push(finding(
+            "warn",
+            format!("{name} (pid {pid}) holds {} of deleted files", human_bytes(bytes)),
+            format!(
+                "These files were deleted but {name} still has them open, so their space is not freed until it closes them: {}{more}. \
+                 Restarting {name} (pid {pid}) releases the space; nothing needs to be deleted.",
+                shown.join(", ")
+            ),
+            vec![pid],
+            None,
+        ));
+    }
+}
+
+fn rule_swapfiles(fs: &FsFacts, out: &mut Vec<Finding>) {
+    let Some(vm) = fs.volumes.iter().find(|v| v.mount == "/System/Volumes/VM") else { return };
+    let sev = if vm.used >= 16 * GB {
+        "warn"
+    } else if vm.used >= 8 * GB {
+        "info"
+    } else {
+        return;
+    };
+    out.push(finding(
+        sev,
+        format!("Swap files use {} of disk", human_bytes(vm.used)),
+        "macOS writes swap files (and the sleep image) to /System/Volumes/VM when RAM runs short. They shrink again once \
+         memory pressure eases or after a reboot. Quit or pause the memory-heavy apps (see Procs sorted by mem); never \
+         delete swap files by hand."
+            .into(),
+        Vec::new(),
+        None,
+    ));
+}
+
+/// "/Users/me/x" -> "~/x" for the current user.
+fn tilde(p: &str) -> String {
+    if let Some(h) = dirs::home_dir().map(|h| h.display().to_string()).filter(|h| h.len() > 1)
+        && let Some(rest) = p.strip_prefix(&h)
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        return format!("~{rest}");
+    }
+    p.to_string()
+}
+
+/// How a known space hog is recognized.
+enum PathPat {
+    /// Relative to a home directory ("Library/Caches" = ~/Library/Caches).
+    Home(&'static str),
+    /// Absolute path.
+    Abs(&'static str),
+    /// Any directory with this name (node_modules, target).
+    Name(&'static str),
+    /// A directory whose name ends with this (".photoslibrary").
+    Suffix(&'static str),
+}
+
+/// Common space hogs with safe advice. Order matters: more specific first.
+static KNOWN_DIRS: &[(PathPat, &str)] = &[
+    // ---- macOS, per user ----
+    (PathPat::Home("Library/Caches/Homebrew"), "Homebrew downloads. `brew cleanup --prune=all` removes old ones."),
+    (PathPat::Home("Library/Caches"), "App caches: apps rebuild them, so they are safe to clear per app while it is closed. Big ones are usually browsers, Xcode, Homebrew (`brew cleanup`), pip and yarn."),
+    (PathPat::Home("Library/Developer/Xcode/DerivedData"), "Xcode build products and indexes, rebuilt automatically. Clear them from Xcode (Settings › Locations) or remove the folder while Xcode is closed."),
+    (PathPat::Home("Library/Developer/Xcode/Archives"), "Archived app builds (needed to symbolicate crashes of shipped versions). Prune old ones in Xcode's Organizer."),
+    (PathPat::Home("Library/Developer/Xcode/iOS DeviceSupport"), "Debug symbols copied for each iOS version you connected; old versions are safe to remove."),
+    (PathPat::Home("Library/Developer/CoreSimulator"), "iOS/watchOS simulators and their data. `xcrun simctl delete unavailable` removes simulators of runtimes you no longer have; `xcrun simctl runtime list` shows runtime sizes."),
+    (PathPat::Home("Library/Containers/com.docker.docker"), "Docker Desktop's VM disk: images, containers, volumes, build cache. `docker system df` shows usage, `docker system prune` frees it (add `--volumes` only if you don't need the data)."),
+    (PathPat::Home(".orbstack"), "OrbStack: Linux machines plus Docker images and volumes. `docker system df` / `docker system prune` for Docker data; `orb list` and `orb delete <machine>` for machines."),
+    (PathPat::Suffix(".dev.orbstack"), "OrbStack data (Linux machines, Docker images and volumes). `docker system df` / `docker system prune` for Docker data; `orb list` / `orb delete <machine>` for machines."),
+    (PathPat::Home("Library/Application Support/Google/Chrome"), "Chrome profiles: history, caches, service workers, extensions. Clear browsing data from Chrome itself instead of deleting files."),
+    (PathPat::Home("Library/Application Support/MobileSync/Backup"), "iPhone/iPad backups. Manage them in Finder (select the device › Manage Backups)."),
+    (PathPat::Home("Library/Mobile Documents"), "iCloud Drive. With 'Optimize Mac Storage' macOS evicts local copies itself; deleting here also deletes from iCloud."),
+    (PathPat::Home("Library/Mail"), "Mail messages and attachments."),
+    (PathPat::Home("Library/Messages"), "Messages history and attachments. Settings › General › Keep messages limits it."),
+    (PathPat::Suffix(".photoslibrary"), "A Photos library. Use iCloud Photos with 'Optimize Mac Storage' rather than touching files inside it."),
+    (PathPat::Home(".Trash"), "The Trash: deleted files keep using space until it is emptied."),
+    // ---- developer caches, any OS ----
+    (PathPat::Home(".cargo/registry"), "Downloaded crate sources and index for Cargo. Safe to clear (re-downloaded on the next build)."),
+    (PathPat::Home(".cargo/git"), "Git checkouts of Cargo dependencies. Safe to clear (re-fetched on the next build)."),
+    (PathPat::Home(".rustup/toolchains"), "Installed Rust toolchains. `rustup toolchain list` and `rustup toolchain uninstall <name>`."),
+    (PathPat::Home(".npm"), "npm's download cache. `npm cache clean --force` clears it (re-downloaded when needed)."),
+    (PathPat::Home(".cache/huggingface"), "Downloaded ML models (Hugging Face). `huggingface-cli scan-cache` shows them, `huggingface-cli delete-cache` prunes."),
+    (PathPat::Home(".cache"), "Per-user caches (pip, uv, go-build, yarn, Hugging Face models, …). Safe to clear per tool; each rebuilds its own."),
+    (PathPat::Home(".gradle/caches"), "Gradle dependency and build caches; safe to clear when no build runs (re-downloaded)."),
+    (PathPat::Home(".m2/repository"), "Maven's local repository; artifacts are re-downloaded as needed."),
+    (PathPat::Home("go/pkg/mod"), "Go module cache. `go clean -modcache` clears it."),
+    (PathPat::Home(".local/share/containers"), "Podman images and containers. `podman system df`, then `podman system prune`."),
+    (PathPat::Home(".local/share/Trash"), "The Trash: deleted files keep using space until it is emptied."),
+    (PathPat::Name("node_modules"), "npm/yarn/pnpm dependencies of one project, reinstalled by `npm install`. Old projects' node_modules are safe to remove (`npx npkill` finds them)."),
+    (PathPat::Name("target"), "Probably a Rust (Cargo) or Maven build directory: `cargo clean` (or `mvn clean`) in the project frees it; it is rebuilt on the next build."),
+    // ---- macOS, system ----
+    (PathPat::Abs("/private/var/vm"), "Swap files and the sleep image. They grow under memory pressure and shrink after it eases or on reboot; never delete them by hand."),
+    (PathPat::Abs("/System/Volumes/VM"), "Swap files and the sleep image. They grow under memory pressure and shrink after it eases or on reboot; never delete them by hand."),
+    (PathPat::Abs("/private/var/folders"), "Per-user temporary files and caches managed by macOS. Cleared automatically (mostly at reboot); don't delete by hand."),
+    (PathPat::Abs("/private/var/db/diagnostics"), "The unified system log. macOS caps and rotates it."),
+    (PathPat::Abs("/Library/Developer/CoreSimulator"), "Simulator runtimes. `xcrun simctl runtime list` shows them, `xcrun simctl runtime delete <id>` removes one."),
+    (PathPat::Abs("/System/Volumes/Data"), "The data volume behind /Users, /Applications, /Library … (firmlinks). Space that directories don't explain is often APFS local snapshots (`tmutil listlocalsnapshots /`, removed automatically when space runs low) or purgeable files."),
+    // ---- Linux ----
+    (PathPat::Abs("/var/log/journal"), "The systemd journal. `journalctl --disk-usage` shows its size; `sudo journalctl --vacuum-size=500M` trims it and SystemMaxUse= in journald.conf caps it."),
+    (PathPat::Abs("/var/log"), "System logs, rotated by logrotate. Look for one huge file from a noisy service."),
+    (PathPat::Abs("/var/lib/docker"), "Docker images, containers, volumes and build cache. `docker system df`, then `docker system prune` or `docker builder prune` (add `--volumes` only if you don't need the data)."),
+    (PathPat::Abs("/var/lib/containerd"), "containerd images and snapshots (Kubernetes, nerdctl). `crictl rmi --prune` or `nerdctl system prune`."),
+    (PathPat::Abs("/var/lib/containers"), "Podman images and containers. `podman system df`, then `podman system prune`."),
+    (PathPat::Abs("/var/cache/apt"), "Downloaded .deb packages. `sudo apt clean` removes them."),
+    (PathPat::Abs("/var/lib/snapd"), "Snap packages; snapd keeps old revisions. `snap list --all` shows disabled ones; `sudo snap set system refresh.retain=2` keeps fewer."),
+    (PathPat::Abs("/var/lib/flatpak"), "Flatpak runtimes and apps. `flatpak uninstall --unused` removes unused runtimes."),
+    (PathPat::Abs("/var/tmp"), "Temporary files kept across reboots; systemd-tmpfiles ages them out."),
+    (PathPat::Abs("/tmp"), "Temporary files; usually cleared at reboot."),
+    (PathPat::Abs("/"), "Space that directories don't explain may be filesystem snapshots (APFS: `tmutil listlocalsnapshots /`; btrfs/zfs snapshots), reserved blocks, or deleted files still held open (see doctor)."),
+];
+
+/// Safe advice for a known space hog at or above `path` ("inside ~/Library/Caches: …").
+/// Text only: fat never deletes anything.
+pub fn explain_path(path: &str) -> Option<String> {
+    explain_path_in(path, dirs::home_dir().map(|h| h.display().to_string()).as_deref())
+}
+
+fn explain_path_in(path: &str, home: Option<&str>) -> Option<String> {
+    // macOS firmlinks: /System/Volumes/Data/Users/x is /Users/x.
+    let norm = match path.strip_prefix("/System/Volumes/Data") {
+        Some(rest) if rest.starts_with('/') && rest.len() > 1 => rest,
+        _ => path,
+    };
+    let norm = if norm.len() > 1 { norm.trim_end_matches('/') } else { norm };
+    // Homes: ours, and whichever /Users/<u> or /home/<u> (or /root) the path is in.
+    let mut homes: Vec<String> = home.filter(|h| h.len() > 1).map(|h| vec![h.trim_end_matches('/').to_string()]).unwrap_or_default();
+    for base in ["/Users/", "/home/"] {
+        if let Some(rest) = norm.strip_prefix(base)
+            && let Some(user) = rest.split('/').next().filter(|u| !u.is_empty())
+        {
+            homes.push(format!("{base}{user}"));
+        }
+    }
+    if crate::tui::app::path_within(norm, "/root") {
+        homes.push("/root".into());
+    }
+    let mut cur = Some(norm.to_string());
+    while let Some(dir) = cur {
+        let name = dir.rsplit('/').next().unwrap_or("");
+        for (pat, text) in KNOWN_DIRS {
+            let hit = match pat {
+                PathPat::Abs(a) => dir == *a,
+                PathPat::Home(rel) => homes.iter().any(|h| dir == format!("{h}/{rel}")),
+                PathPat::Name(n) => name == *n,
+                PathPat::Suffix(suf) => name.len() > suf.len() && name.ends_with(suf),
+            };
+            if hit {
+                if dir == norm {
+                    return Some((*text).to_string());
+                }
+                // "/" only explains itself, not everything below it.
+                if dir == "/" {
+                    return None;
+                }
+                let shown = homes.first().and_then(|h| dir.strip_prefix(h.as_str()).map(|r| format!("~{r}"))).unwrap_or_else(|| dir.clone());
+                return Some(format!("inside {shown}: {text}"));
+            }
+        }
+        cur = crate::tui::app::parent_dir(&dir);
+    }
+    None
 }
 
 /// Human explanation for well-known system daemons (mds_stores, kernel_task, kswapd0, ...)
@@ -3204,5 +3535,132 @@ mod tests {
         assert!(u.detail.contains("hidepid") && u.detail.contains("sudo fat"), "{}", u.detail);
         let e = explain(&s, 1700, None);
         assert!(e.chain[0].contains("hidepid"), "{}", e.chain[0]);
+    }
+
+    // ------------------------------------------------------------ storage
+
+    fn vol(mount: &str, total: u64, avail: u64) -> Volume {
+        Volume {
+            mount: mount.into(),
+            device: format!("/dev/{}", mount.trim_start_matches('/').replace('/', "_")),
+            fstype: "apfs".into(),
+            total,
+            used: total - avail,
+            avail,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fs_full_volumes_warn_and_crit_once_per_container() {
+        let mut data = vol("/System/Volumes/Data", 1000 * GB, 50 * GB);
+        data.primary = true;
+        data.purgeable = Some(20 * GB);
+        // APFS siblings in the same container report the same space; only one finding.
+        let sealed = Volume { read_only: true, ..vol("/", 1000 * GB, 50 * GB) };
+        let vm = Volume { used: 2 * GB, ..vol("/System/Volumes/VM", 1000 * GB, 50 * GB) };
+        let ext = vol("/Volumes/T7", 500 * GB, 10 * GB);
+        let nfs = Volume { remote: true, ..vol("/Users/me/OrbStack", 100 * GB, GB) };
+        let tiny = vol("/Volumes/EFI", GB, 0);
+        let f = diagnose_fs(&FsFacts { volumes: vec![sealed, data, vm, ext, nfs, tiny], ..Default::default() });
+        let titles: Vec<&str> = f.iter().map(|x| x.title.as_str()).collect();
+        assert_eq!(titles, vec!["Disk /Volumes/T7 is 98% full (10.0G left)", "Disk /System/Volumes/Data is 95% full (50.0G left)"], "{f:#?}");
+        assert_eq!(f[0].severity, "crit");
+        assert_eq!(f[1].severity, "warn");
+        assert!(f[1].detail.contains("purgeable") && f[1].detail.contains("fat fs /System/Volumes/Data"));
+        // below 90%: nothing
+        assert!(diagnose_fs(&FsFacts { volumes: vec![vol("/", 100 * GB, 20 * GB)], ..Default::default() }).is_empty());
+    }
+
+    #[test]
+    fn fs_filling_volume_names_top_growers() {
+        let mut root = vol("/", 1000 * GB, 400 * GB);
+        root.primary = true;
+        root.fill_bps = Some(50.0 * MB as f64);
+        root.eta_full_s = Some(3600);
+        let mut home = vol("/home", 100 * GB, 60 * GB);
+        home.fill_bps = Some(1e6);
+        home.eta_full_s = Some(10 * 3600);
+        let mut slow = vol("/data", 100 * GB, 60 * GB);
+        slow.fill_bps = Some(10.0);
+        slow.eta_full_s = Some(30 * 86_400);
+        let growth = Growth {
+            growers: vec![
+                crate::fs::Grower { path: "/var/log/app".into(), delta: 30 * GB as i64, writers: vec![(321, "app".into(), 50 * MB)], ..Default::default() },
+                crate::fs::Grower { path: "/home/u/dl".into(), delta: GB as i64, ..Default::default() },
+                crate::fs::Grower { path: "/tmp/shrunk".into(), delta: -(GB as i64), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let f = diagnose_fs(&FsFacts { volumes: vec![root, home, slow], growth: Some(growth), ..Default::default() });
+        let crit = f.iter().find(|x| x.title == "/ will be full in 1h").expect("crit eta");
+        assert_eq!(crit.severity, "crit");
+        assert!(crit.detail.contains("/var/log/app +30.0G (app 321)"), "{}", crit.detail);
+        assert!(!crit.detail.contains("/home/u/dl"), "growers on other volumes are not blamed");
+        assert_eq!(crit.pids, vec![321]);
+        let warn = f.iter().find(|x| x.title.starts_with("/home will be full")).expect("warn eta");
+        assert_eq!(warn.severity, "warn");
+        assert!(warn.detail.contains("/home/u/dl"));
+        assert!(!f.iter().any(|x| x.title.starts_with("/data")), "a month away is not a finding");
+    }
+
+    #[test]
+    fn fs_deleted_open_and_swap() {
+        let facts = FsFacts {
+            volumes: vec![Volume { mount: "/System/Volumes/VM".into(), used: 20 * GB, total: 1000 * GB, avail: 500 * GB, ..Default::default() }],
+            deleted_open: vec![
+                (77, "java".into(), "/var/log/a.log".into(), 900 * MB),
+                (77, "java".into(), "/var/log/b.log".into(), 300 * MB),
+                (88, "vim".into(), "/tmp/.swp".into(), 10 * MB),
+            ],
+            ..Default::default()
+        };
+        let f = diagnose_fs(&facts);
+        let d = f.iter().find(|x| x.title.starts_with("java (pid 77) holds")).expect("deleted-open");
+        assert_eq!(d.title, "java (pid 77) holds 1.2G of deleted files");
+        assert_eq!(d.pids, vec![77]);
+        assert!(d.detail.contains("Restarting java (pid 77)") && d.detail.contains("/var/log/a.log"));
+        assert!(d.action.is_none(), "no automatic action for storage");
+        assert!(!f.iter().any(|x| x.title.contains("vim")), "small holders are not findings");
+        let s = f.iter().find(|x| x.title.starts_with("Swap files")).expect("swap");
+        assert_eq!(s.severity, "warn");
+        assert!(s.detail.contains("never") && s.detail.contains("delete"));
+        // merged into the full diagnosis, crit first
+        let all = diagnose_with_fs(&snap(base_procs()), None, &facts);
+        assert!(all.iter().any(|x| x.title.starts_with("java")));
+        assert!(all.windows(2).all(|w| severity_rank(&w[0].severity) >= severity_rank(&w[1].severity)));
+    }
+
+    #[test]
+    fn known_dirs_explained() {
+        let h = Some("/Users/me");
+        let e = |p: &str| explain_path_in(p, h);
+        assert!(e("/Users/me/Library/Caches").unwrap().starts_with("App caches"));
+        assert!(e("/Users/me/Library/Caches/Homebrew").unwrap().contains("brew cleanup"));
+        assert_eq!(e("/Users/me/Library/Caches/com.foo/x").unwrap().split(':').next(), Some("inside ~/Library/Caches"));
+        assert!(e("/System/Volumes/Data/Users/me/Library/Developer/Xcode/DerivedData").unwrap().contains("Xcode"), "firmlink alias");
+        assert!(e("/Users/me/Library/Developer/CoreSimulator/Devices").unwrap().contains("simctl"));
+        assert!(e("/Users/me/code/app/node_modules").unwrap().contains("npm"));
+        assert!(e("/Users/me/code/app/node_modules/react/dist").unwrap().starts_with("inside ~/code/app/node_modules"));
+        assert!(e("/Users/me/code/fat/target").unwrap().contains("cargo clean"));
+        assert!(e("/Users/me/.cargo/registry").unwrap().contains("Cargo"));
+        assert!(e("/Users/me/Library/Group Containers/HUAQ24HBR6.dev.orbstack").unwrap().contains("OrbStack"));
+        assert!(e("/private/var/vm").unwrap().contains("Swap"));
+        assert!(e("/private/var/folders").unwrap().contains("temporary"));
+        assert!(e("/").unwrap().contains("tmutil"));
+        // Another user's home is recognized too (e.g. running as root on Linux).
+        assert!(explain_path_in("/home/dev/.cache", Some("/root")).unwrap().contains("caches"));
+        assert!(explain_path_in("/root/.npm", Some("/root")).unwrap().contains("npm cache"));
+        assert!(e("/var/log/journal").unwrap().contains("journalctl --vacuum-size"));
+        assert!(e("/var/lib/docker/overlay2").unwrap().contains("docker system df"));
+        assert!(e("/var/cache/apt/archives").unwrap().contains("apt clean"));
+        assert!(e("/var/lib/snapd/snaps").unwrap().contains("refresh.retain"));
+        // unknown paths and "/" descendants without a match say nothing
+        assert_eq!(e("/Users/me/Projects"), None);
+        assert_eq!(e("/opt/thing"), None);
+        // advice only: nothing tells the user to rm
+        for (_, t) in KNOWN_DIRS {
+            assert!(!t.contains("rm -"), "{t}");
+        }
     }
 }
