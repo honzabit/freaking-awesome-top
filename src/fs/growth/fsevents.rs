@@ -546,7 +546,7 @@ mod tests {
             *by_top.entry(top).or_default() += e.count as u64;
         }
         let mut v: Vec<_> = by_top.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|x| std::cmp::Reverse(x.1));
         for (p, c) in v.iter().take(25) {
             eprintln!("{c:8} {p}");
         }
