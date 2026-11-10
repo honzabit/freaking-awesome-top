@@ -11,7 +11,7 @@
 //! enforces cpu (cpu.max) and memory (memory.max) itself; see [`cgroup`]. Polling stays on for
 //! reporting, the time and process-count budgets, and as the fallback.
 use crate::model::Budget;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, ExitStatus};
@@ -441,7 +441,8 @@ impl Tracker {
         signal_group(self.pgid, sig);
         let mut n = 0;
         for (pid, start) in self.escaped() {
-            let same = crate::actions::live_proc(pid).is_some_and(|l| l.start_time == 0 || l.start_time.abs_diff(start) <= 1);
+            let same =
+                crate::actions::live_proc(pid).is_some_and(|l| l.start_time == 0 || l.start_time.abs_diff(start) <= 1);
             if same {
                 // SAFETY: positive pid of a verified descendant of the child we spawned.
                 unsafe {
@@ -486,7 +487,12 @@ fn violations(b: &Budget, u: &Usage, elapsed: Duration, cpu_strikes: &mut u32) -
                 let why = if u.cpu > lim {
                     format!("cpu {:.0}% > budget {:.0}%", u.cpu, lim)
                 } else {
-                    format!("cpu demand > budget {:.0}% (held at {:.0}% by cpu.max, throttled in {:.0}% of periods)", lim, u.cpu, u.throttled * 100.0)
+                    format!(
+                        "cpu demand > budget {:.0}% (held at {:.0}% by cpu.max, throttled in {:.0}% of periods)",
+                        lim,
+                        u.cpu,
+                        u.throttled * 100.0
+                    )
                 };
                 v.push((Kind::Cpu, why));
             }
@@ -495,17 +501,20 @@ fn violations(b: &Budget, u: &Usage, elapsed: Duration, cpu_strikes: &mut u32) -
         }
     }
     if let Some(lim) = b.mem
-        && u.mem > lim {
-            v.push((Kind::Mem, format!("mem {} > budget {}", fmt_bytes(u.mem), fmt_bytes(lim))));
-        }
+        && u.mem > lim
+    {
+        v.push((Kind::Mem, format!("mem {} > budget {}", fmt_bytes(u.mem), fmt_bytes(lim))));
+    }
     if let Some(lim) = b.time
-        && elapsed.as_secs_f64() > lim as f64 {
-            v.push((Kind::Time, format!("wall time {} > budget {lim}s", fmt_secs(elapsed))));
-        }
+        && elapsed.as_secs_f64() > lim as f64
+    {
+        v.push((Kind::Time, format!("wall time {} > budget {lim}s", fmt_secs(elapsed))));
+    }
     if let Some(lim) = b.procs
-        && u.procs > lim {
-            v.push((Kind::Procs, format!("{} processes > budget {lim}", u.procs)));
-        }
+        && u.procs > lim
+    {
+        v.push((Kind::Procs, format!("{} processes > budget {lim}", u.procs)));
+    }
     v
 }
 
@@ -520,7 +529,8 @@ enum Wait {
 fn wait_leader(pid: u32) -> anyhow::Result<Wait> {
     let mut status: libc::c_int = 0;
     // SAFETY: waitpid on our own child with a valid status out-pointer.
-    let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED) };
+    let r =
+        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED) };
     if r == 0 {
         return Ok(Wait::Running);
     }
@@ -740,7 +750,9 @@ fn supervise(cmd: &[String], budget: &Budget, enforce: Mode) -> anyhow::Result<R
         let limits = kernel.effective(budget);
         if let Some(n) = oom {
             let lim = budget.mem.map(fmt_bytes).unwrap_or_default();
-            eprintln!("fat run: budget exceeded: mem > budget {lim}; the kernel OOM-killed inside the job ({n} oom_kill event(s), memory.max)");
+            eprintln!(
+                "fat run: budget exceeded: mem > budget {lim}; the kernel OOM-killed inside the job ({n} oom_kill event(s), memory.max)"
+            );
             if !fired.contains(&Kind::Mem) {
                 fired.push(Kind::Mem);
             }
@@ -785,7 +797,8 @@ fn supervise(cmd: &[String], budget: &Budget, enforce: Mode) -> anyhow::Result<R
                     if already {
                         continue; // a straggler was still running; it's frozen now too
                     }
-                    let also = if escaped > 0 { format!(" and {escaped} process(es) that left it") } else { String::new() };
+                    let also =
+                        if escaped > 0 { format!(" and {escaped} process(es) that left it") } else { String::new() };
                     eprintln!(
                         "fat run: budget exceeded: {why}; paused process group {pgid}{also}. Resume with `kill -CONT -{pgid}` or `fat resume {pid}`; stop it with Ctrl-C here or `kill {}`",
                         std::process::id()
@@ -827,7 +840,9 @@ fn supervise(cmd: &[String], budget: &Budget, enforce: Mode) -> anyhow::Result<R
     }
     if let Some(n) = kernel.sample(&mut Usage::default(), &[]) {
         let lim = budget.mem.map(fmt_bytes).unwrap_or_default();
-        eprintln!("fat run: budget exceeded: mem > budget {lim}; the kernel OOM-killed inside the job ({n} oom_kill event(s), memory.max)");
+        eprintln!(
+            "fat run: budget exceeded: mem > budget {lim}; the kernel OOM-killed inside the job ({n} oom_kill event(s), memory.max)"
+        );
         if !fired.contains(&Kind::Mem) {
             fired.push(Kind::Mem);
         }
@@ -997,13 +1012,22 @@ impl Kernel {
                 let mut kern = Vec::new();
                 let mut poll = Vec::new();
                 if let Some(c) = b.cpu {
-                    if j.cpu_enforced { kern.push(format!("cpu {} (cpu.max {})", pct(c), cgroup::cpu_max(c))) } else { poll.push("cpu") }
+                    if j.cpu_enforced {
+                        kern.push(format!("cpu {} (cpu.max {})", pct(c), cgroup::cpu_max(c)))
+                    } else {
+                        poll.push("cpu")
+                    }
                 }
                 if let Some(m) = b.mem {
                     match (j.mem_enforced, j.want.mem_soft) {
                         (true, true) => {
                             let (high, max) = cgroup::soft_mem(m);
-                            kern.push(format!("mem {} (memory.high {}, memory.max backstop {}; pause on breach)", fmt_bytes(m), fmt_bytes(high), fmt_bytes(max)))
+                            kern.push(format!(
+                                "mem {} (memory.high {}, memory.max backstop {}; pause on breach)",
+                                fmt_bytes(m),
+                                fmt_bytes(high),
+                                fmt_bytes(max)
+                            ))
                         }
                         (true, false) => kern.push(format!("mem {} (memory.max)", fmt_bytes(m))),
                         _ => poll.push("mem"),
@@ -1020,7 +1044,11 @@ impl Kernel {
                 }
                 let poll = if poll.is_empty() { String::new() } else { format!("; polling: {}", poll.join(", ")) };
                 if kern.is_empty() {
-                    let why = if j.want.limits { "the cpu/memory/pids controllers aren't delegated here" } else { "warn only, no kernel limits" };
+                    let why = if j.want.limits {
+                        "the cpu/memory/pids controllers aren't delegated here"
+                    } else {
+                        "warn only, no kernel limits"
+                    };
                     eprintln!("fat run: measuring via cgroup v2 ({}, {why}){poll}", j.describe());
                 } else {
                     eprintln!("fat run: enforcing via cgroup v2 (kernel, {}): {}{poll}", j.describe(), kern.join(", "));
@@ -1173,7 +1201,8 @@ mod cgroup {
         let mut b = [0u8; 6];
         let ok = fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_ok();
         if !ok {
-            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            let t =
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
             let x = t ^ ((std::process::id() as u128) << 64) ^ (SEQ.load(Ordering::Relaxed) as u128) << 32;
             b.copy_from_slice(&x.to_le_bytes()[..6]);
         }
@@ -1231,7 +1260,11 @@ mod cgroup {
         if r != pid as libc::pid_t {
             return None;
         }
-        Some(if libc::WIFEXITED(status) { format!("exit {}", libc::WEXITSTATUS(status)) } else { format!("signal {}", libc::WTERMSIG(status)) })
+        Some(if libc::WIFEXITED(status) {
+            format!("exit {}", libc::WEXITSTATUS(status))
+        } else {
+            format!("signal {}", libc::WTERMSIG(status))
+        })
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1299,7 +1332,9 @@ mod cgroup {
 
     /// The limit file holds a number, not "max" (and for cpu.max, the quota we asked for).
     pub fn limit_in_force(dir: &Path, file: &str) -> bool {
-        fs::read_to_string(dir.join(file)).map(|s| !s.trim().is_empty() && !s.trim().starts_with("max")).unwrap_or(false)
+        fs::read_to_string(dir.join(file))
+            .map(|s| !s.trim().is_empty() && !s.trim().starts_with("max"))
+            .unwrap_or(false)
     }
 
     /// Share of cpu.max periods that were throttled (0 when there were none).
@@ -1308,7 +1343,11 @@ mod cgroup {
     }
 
     fn procs_of(dir: &Path) -> Vec<u32> {
-        fs::read_to_string(dir.join("cgroup.procs")).unwrap_or_default().lines().filter_map(|l| l.trim().parse().ok()).collect()
+        fs::read_to_string(dir.join("cgroup.procs"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
     }
 
     /// Changes `create_dir` made outside its own run dir: undone when setup fails, so a failed
@@ -1397,7 +1436,11 @@ mod cgroup {
                 continue;
             }
             let p = e.path();
-            let old = fs::metadata(&p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a > GC_AGE);
+            let old = fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|a| a > GC_AGE);
             let empty = fs::read_to_string(p.join("cgroup.events")).ok().and_then(|t| kv(&t, "populated")) == Some(0);
             if old && empty {
                 let _ = fs::remove_dir(&p);
@@ -1414,7 +1457,11 @@ mod cgroup {
             // A cgroup made elsewhere must not let the job out of limits that bind fat itself.
             let own = own_cgroup().unwrap_or_default();
             if let Some(d) = limited_ancestor(root, &own) {
-                let what = if Path::new(&d).file_name().and_then(|n| n.to_str()).is_some_and(is_fat_job) { "another fat run job" } else { "a limited cgroup" };
+                let what = if Path::new(&d).file_name().and_then(|n| n.to_str()).is_some_and(is_fat_job) {
+                    "another fat run job"
+                } else {
+                    "a limited cgroup"
+                };
                 return Err(anyhow!(
                     "fat runs inside {what} ({d}); a new cgroup would escape its limits, so the job stays there under them"
                 ));
@@ -1436,17 +1483,25 @@ mod cgroup {
         pub fn create_dir(root: &Path, want: Want) -> Result<Job, String> {
             // SAFETY: access(2) on a NUL-terminated path we own.
             let writable = {
-                let p = std::ffi::CString::new(root.join("cgroup.subtree_control").as_os_str().as_encoded_bytes()).unwrap_or_default();
+                let p = std::ffi::CString::new(root.join("cgroup.subtree_control").as_os_str().as_encoded_bytes())
+                    .unwrap_or_default();
                 unsafe { libc::access(p.as_ptr(), libc::W_OK) == 0 }
             };
             if !writable {
-                return Err(if is_root() { format!("{} is read-only here", root.display()) } else { "not root".to_string() });
+                return Err(if is_root() {
+                    format!("{} is read-only here", root.display())
+                } else {
+                    "not root".to_string()
+                });
             }
             // A cgroup namespace root (a container's /sys/fs/cgroup) that holds processes can't
             // have domain controllers enabled for children (no-internal-process rule); touching
             // its subtree_control would only break cgroups others create there later.
             if root.join("cgroup.type").exists() && !procs_of(root).is_empty() {
-                return Err(format!("{} is a cgroup namespace root that holds processes (a container); not touching it", root.display()));
+                return Err(format!(
+                    "{} is a cgroup namespace root that holds processes (a container); not touching it",
+                    root.display()
+                ));
             }
             let mut ctrls: Vec<&str> = Vec::new();
             if want.cpu_pct.is_some() {
@@ -1527,7 +1582,8 @@ mod cgroup {
                     if job.want.mem_soft {
                         let (high, max) = soft_mem(m);
                         fs::write(dir.join("memory.max"), max.to_string()).map_err(|e| format!("memory.max: {e}"))?;
-                        fs::write(dir.join("memory.high"), high.to_string()).map_err(|e| format!("memory.high: {e}"))?;
+                        fs::write(dir.join("memory.high"), high.to_string())
+                            .map_err(|e| format!("memory.high: {e}"))?;
                     } else {
                         fs::write(dir.join("memory.max"), m.to_string()).map_err(|e| format!("memory.max: {e}"))?;
                     }
@@ -1568,10 +1624,13 @@ mod cgroup {
             }
             if user {
                 let rt = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-                let reachable = rt.as_ref().is_some_and(|d| d.join("bus").exists() || d.join("systemd/private").exists())
-                    || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some();
+                let reachable =
+                    rt.as_ref().is_some_and(|d| d.join("bus").exists() || d.join("systemd/private").exists())
+                        || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some();
                 if !reachable {
-                    return Err("no systemd --user session (no $XDG_RUNTIME_DIR/bus; try `loginctl enable-linger`)".into());
+                    return Err(
+                        "no systemd --user session (no $XDG_RUNTIME_DIR/bus; try `loginctl enable-linger`)".into()
+                    );
                 }
             } else if !Path::new("/run/systemd/system").exists() {
                 return Err("systemd is not the init system".into());
@@ -1583,7 +1642,11 @@ mod cgroup {
             if user {
                 probe.arg("--user");
             }
-            probe.args(["--scope", "--quiet", "--collect", "--", "true"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            probe
+                .args(["--scope", "--quiet", "--collect", "--", "true"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             let mut child = probe.spawn().map_err(|e| format!("systemd-run: {e}"))?;
             let deadline = Instant::now() + Duration::from_secs(3);
             let ok = loop {
@@ -1690,7 +1753,19 @@ mod cgroup {
                     if user {
                         c.arg("--user");
                     }
-                    c.args(["--scope", "--quiet", "--collect", "--unit", &self.unit, "-p", "CPUAccounting=yes", "-p", "MemoryAccounting=yes", "-p", "TasksAccounting=yes"]);
+                    c.args([
+                        "--scope",
+                        "--quiet",
+                        "--collect",
+                        "--unit",
+                        &self.unit,
+                        "-p",
+                        "CPUAccounting=yes",
+                        "-p",
+                        "MemoryAccounting=yes",
+                        "-p",
+                        "TasksAccounting=yes",
+                    ]);
                     if self.want.limits {
                         if let Some(p) = self.want.cpu_pct {
                             c.args(["-p", &format!("CPUQuota={}%", (p.max(1.0)).round() as u64)]);
@@ -1726,7 +1801,8 @@ mod cgroup {
                         if let Err(e) = fs::write(dir.join("cgroup.procs"), pid.to_string()) {
                             // A job that already finished (`true`) has left cgroup.procs: nothing
                             // to enforce, not a setup failure.
-                            let done = crate::actions::procfs::read_stat(Path::new("/proc"), pid).is_none_or(|s| s.state == 'Z');
+                            let done = crate::actions::procfs::read_stat(Path::new("/proc"), pid)
+                                .is_none_or(|s| s.state == 'Z');
                             if !done {
                                 return Err(format!("moving pid {pid}: {e}"));
                             }
@@ -1739,7 +1815,8 @@ mod cgroup {
                     let deadline = Instant::now() + Duration::from_secs(5);
                     let mut first: Option<String> = None;
                     loop {
-                        let cg = fs::read_to_string(format!("/proc/{pid}/cgroup")).map_err(|_| "the job exited before systemd placed it".to_string())?;
+                        let cg = fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                            .map_err(|_| "the job exited before systemd placed it".to_string())?;
                         let now_in = unified_path(&cg).unwrap_or("").to_string();
                         // Placed and already gone elsewhere (the job is itself `systemd-run
                         // --scope`): our scope is empty and systemd collects it; stop waiting.
@@ -1753,9 +1830,15 @@ mod cgroup {
                         if let Some(p) = unified_path(&cg).filter(|p| p.ends_with(&want)) {
                             let dir = Path::new(ROOT).join(p.trim_start_matches('/'));
                             if !dir.exists() {
-                                return Err(format!("scope cgroup {} not visible in this cgroup namespace", dir.display()));
+                                return Err(format!(
+                                    "scope cgroup {} not visible in this cgroup namespace",
+                                    dir.display()
+                                ));
                             }
-                            self.parent_oom_base = dir.parent().and_then(|p| fs::read_to_string(p.join("memory.events")).ok()).and_then(|t| kv(&t, "oom_kill"));
+                            self.parent_oom_base = dir
+                                .parent()
+                                .and_then(|p| fs::read_to_string(p.join("memory.events")).ok())
+                                .and_then(|t| kv(&t, "oom_kill"));
                             self.dir = Some(dir);
                             if self.want.limits && self.want.oom_group {
                                 let _ = fs::write(self.dir.as_ref().unwrap().join("memory.oom.group"), "1");
@@ -1763,7 +1846,8 @@ mod cgroup {
                             self.read_enforced();
                             return Ok(());
                         }
-                        let zombie = crate::actions::procfs::read_stat(Path::new("/proc"), pid).is_none_or(|s| s.state == 'Z');
+                        let zombie =
+                            crate::actions::procfs::read_stat(Path::new("/proc"), pid).is_none_or(|s| s.state == 'Z');
                         if zombie || Instant::now() > deadline {
                             return Err(format!("systemd did not place the job in {}.scope", self.unit));
                         }
@@ -1790,7 +1874,11 @@ mod cgroup {
 
         pub fn members(&self) -> Vec<u32> {
             let Some(d) = &self.dir else { return Vec::new() };
-            fs::read_to_string(d.join("cgroup.procs")).unwrap_or_default().lines().filter_map(|l| l.trim().parse().ok()).collect()
+            fs::read_to_string(d.join("cgroup.procs"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
         }
 
         fn read(&self, file: &str) -> String {
@@ -1813,7 +1901,12 @@ mod cgroup {
             if let Some(n) = kv(&self.read("memory.events"), "oom_kill") {
                 self.oom_total = self.oom_total.max(n);
             }
-            let cur = self.read("memory.peak").trim().parse::<u64>().ok().or_else(|| self.read("memory.current").trim().parse::<u64>().ok());
+            let cur = self
+                .read("memory.peak")
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .or_else(|| self.read("memory.current").trim().parse::<u64>().ok());
             self.mem_peak = self.mem_peak.max(cur.unwrap_or(0));
         }
 
@@ -1826,7 +1919,10 @@ mod cgroup {
                 return;
             }
             if let Some(base) = self.parent_oom_base
-                && let Some(now) = d.parent().and_then(|p| fs::read_to_string(p.join("memory.events")).ok()).and_then(|t| kv(&t, "oom_kill"))
+                && let Some(now) = d
+                    .parent()
+                    .and_then(|p| fs::read_to_string(p.join("memory.events")).ok())
+                    .and_then(|t| kv(&t, "oom_kill"))
             {
                 self.oom_total = now.saturating_sub(base).min(1);
             }
@@ -1931,7 +2027,8 @@ mod cgroup {
 
     impl Drop for Job {
         fn drop(&mut self) {
-            if self.via == Via::Root && !self.cleaned
+            if self.via == Via::Root
+                && !self.cleaned
                 && let Some(d) = &self.dir
             {
                 let _ = fs::remove_dir(d);
@@ -1982,7 +2079,8 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].0, Kind::Cpu);
         let big = Usage { cpu: 0.0, mem: 5000, procs: 3, ..Default::default() };
-        let kinds: Vec<Kind> = violations(&b, &big, Duration::from_secs(6), &mut strikes).into_iter().map(|x| x.0).collect();
+        let kinds: Vec<Kind> =
+            violations(&b, &big, Duration::from_secs(6), &mut strikes).into_iter().map(|x| x.0).collect();
         assert_eq!(kinds, vec![Kind::Mem, Kind::Time, Kind::Procs]);
         assert_eq!(strikes, 0);
     }
@@ -2024,7 +2122,12 @@ mod tests {
 
     /// perl-base (minimal Debian/Ubuntu) lacks Time::HiRes.
     fn have_perl_hires() -> bool {
-        Command::new("perl").args(["-MTime::HiRes", "-e1"]).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+        Command::new("perl")
+            .args(["-MTime::HiRes", "-e1"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     #[test]
@@ -2095,7 +2198,8 @@ mod tests {
         let b = Budget { mem: Some(parse_bytes("50M").unwrap()), on_violation: "kill".into(), ..Default::default() };
         let t = Instant::now();
         // ~200MB string held, then sleep.
-        let code = supervise(&sv(&["perl", "-e", "$x = 'a' x (200*1024*1024); sleep 30"]), &b, Mode::Poll).unwrap().code;
+        let code =
+            supervise(&sv(&["perl", "-e", "$x = 'a' x (200*1024*1024); sleep 30"]), &b, Mode::Poll).unwrap().code;
         assert_ne!(code, 0);
         assert!(t.elapsed() < Duration::from_secs(10));
     }
@@ -2116,9 +2220,27 @@ mod tests {
             std::fs::write(root.join(pid.to_string()).join("stat"), line).unwrap();
         };
         // sh (pid 50) that has reaped children worth 120+30 ticks; one live child; one zombie.
-        w(50, format!("50 (sh) S 1 50 50 0 -1 4194304 1 0 0 0 4 1 120 30 20 0 1 0 {} 2000000 300 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n", 10 * tck));
-        w(51, format!("51 (perl) R 50 50 50 0 -1 4194304 1 0 0 0 40 2 0 0 20 0 1 0 {} 9000000 1000 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n", 11 * tck));
-        w(52, format!("52 (perl) Z 50 50 50 0 -1 4227084 0 0 0 0 7 0 0 0 20 0 1 0 {} 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n", 11 * tck));
+        w(
+            50,
+            format!(
+                "50 (sh) S 1 50 50 0 -1 4194304 1 0 0 0 4 1 120 30 20 0 1 0 {} 2000000 300 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n",
+                10 * tck
+            ),
+        );
+        w(
+            51,
+            format!(
+                "51 (perl) R 50 50 50 0 -1 4194304 1 0 0 0 40 2 0 0 20 0 1 0 {} 9000000 1000 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n",
+                11 * tck
+            ),
+        );
+        w(
+            52,
+            format!(
+                "52 (perl) Z 50 50 50 0 -1 4227084 0 0 0 0 7 0 0 0 20 0 1 0 {} 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n",
+                11 * tck
+            ),
+        );
         std::fs::create_dir_all(root.join("self")).unwrap(); // non-numeric entries are skipped
         let t = table_at(&root);
         assert_eq!(t.len(), 3);
@@ -2166,7 +2288,10 @@ mod tests {
         assert_eq!(cgroup::kv(ev, "oom"), Some(3));
         assert_eq!(cgroup::kv("populated 1\nfrozen 0\n", "populated"), Some(1));
         let pc = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/fat-run-77-0.scope\n";
-        assert_eq!(cgroup::unified_path(pc), Some("/user.slice/user-1000.slice/user@1000.service/app.slice/fat-run-77-0.scope"));
+        assert_eq!(
+            cgroup::unified_path(pc),
+            Some("/user.slice/user-1000.slice/user@1000.service/app.slice/fat-run-77-0.scope")
+        );
         // A hybrid (v1 + v2) host lists v1 hierarchies first.
         assert_eq!(cgroup::unified_path("12:pids:/user.slice\n1:name=systemd:/x\n0::/x.scope\n"), Some("/x.scope"));
         assert_eq!(cgroup::unified_path("4:memory:/docker/abc\n"), None);
@@ -2197,7 +2322,10 @@ mod tests {
         assert!(v[0].1.contains("cpu.max"), "{}", v[0].1);
         // Occasionally throttled bursts, or throttled while far below the quota: not over.
         let mut strikes = 0;
-        for u in [Usage { cpu: 45.0, throttled: 0.2, ..Default::default() }, Usage { cpu: 10.0, throttled: 1.0, ..Default::default() }] {
+        for u in [
+            Usage { cpu: 45.0, throttled: 0.2, ..Default::default() },
+            Usage { cpu: 10.0, throttled: 1.0, ..Default::default() },
+        ] {
             assert!(violations(&b, &u, Duration::from_secs(1), &mut strikes).is_empty());
             assert!(violations(&b, &u, Duration::from_secs(1), &mut strikes).is_empty());
         }
@@ -2240,9 +2368,13 @@ mod tests {
                 std::fs::write(d.join(f), v).unwrap();
             }
         };
-        let open = [("cpu.max", "max 100000\n"), ("memory.max", "max\n"), ("memory.high", "max\n"), ("pids.max", "max\n")];
+        let open =
+            [("cpu.max", "max 100000\n"), ("memory.max", "max\n"), ("memory.high", "max\n"), ("pids.max", "max\n")];
         // systemd user slice: only TasksMax, which doesn't count.
-        mk("user.slice/user-1000.slice", &[("cpu.max", "max 100000\n"), ("memory.max", "max\n"), ("pids.max", "38019\n")]);
+        mk(
+            "user.slice/user-1000.slice",
+            &[("cpu.max", "max 100000\n"), ("memory.max", "max\n"), ("pids.max", "38019\n")],
+        );
         mk("user.slice/user-1000.slice/session-2.scope", &open);
         assert_eq!(cgroup::limited_ancestor(&root, "/user.slice/user-1000.slice/session-2.scope"), None);
         // docker run --memory 256m: memory.max on the container's cgroup.
@@ -2266,7 +2398,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("fat-cg-nsroot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        for (f, v) in [("cgroup.controllers", "cpuset cpu io memory pids\n"), ("cgroup.subtree_control", ""), ("cgroup.type", "domain\n"), ("cgroup.procs", "1\n57\n")] {
+        for (f, v) in [
+            ("cgroup.controllers", "cpuset cpu io memory pids\n"),
+            ("cgroup.subtree_control", ""),
+            ("cgroup.type", "domain\n"),
+            ("cgroup.procs", "1\n57\n"),
+        ] {
             std::fs::write(root.join(f), v).unwrap();
         }
         let want = cgroup::Want { cpu_pct: Some(50.0), limits: true, ..Default::default() };
@@ -2315,7 +2452,12 @@ mod tests {
         if !have_perl() {
             return;
         }
-        let b = Budget { mem: Some(parse_bytes("64M").unwrap()), time: Some(20), on_violation: "kill".into(), ..Default::default() };
+        let b = Budget {
+            mem: Some(parse_bytes("64M").unwrap()),
+            time: Some(20),
+            on_violation: "kill".into(),
+            ..Default::default()
+        };
         let t = Instant::now();
         let Some(r) = cgroup_run(&["perl", "-e", "$x = 'a' x (400*1024*1024); sleep 30"], &b) else { return };
         if !r.kernel.mem_enforced {
@@ -2335,7 +2477,12 @@ mod tests {
         if !have_perl() {
             return;
         }
-        let b = Budget { mem: Some(parse_bytes("64M").unwrap()), time: Some(4), on_violation: "pause".into(), ..Default::default() };
+        let b = Budget {
+            mem: Some(parse_bytes("64M").unwrap()),
+            time: Some(4),
+            on_violation: "pause".into(),
+            ..Default::default()
+        };
         // Touch 160MB, then idle: past the budget, under the backstop's reach only if unthrottled.
         let Some(r) = cgroup_run(&["perl", "-e", "$x = 'a' x (160*1024*1024); sleep 30"], &b) else { return };
         if !r.kernel.mem_enforced {
@@ -2353,7 +2500,10 @@ mod tests {
     #[test]
     fn cgroup_procs_backstop_and_poll() {
         let b = Budget { procs: Some(5), time: Some(10), on_violation: "kill".into(), ..Default::default() };
-        let Some(r) = cgroup_run(&["sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 30 & done; wait"], &b) else { return };
+        let Some(r) = cgroup_run(&["sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 30 & done; wait"], &b)
+        else {
+            return;
+        };
         assert!(r.fired.contains(&Kind::Procs), "{r:?}");
         if r.kernel.via == Some("cgroup") {
             assert!(r.kernel.removed, "{r:?}");

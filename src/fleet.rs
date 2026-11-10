@@ -71,7 +71,9 @@ fn collect_all() -> Vec<Container> {
     // A `docker` that is really podman (podman-docker shim) would list the same containers twice.
     let docker_is_podman = docker_bin.as_ref().is_some_and(is_podman_shim);
     let podman_bin = find_bin("podman").filter(|_| !docker_is_podman);
-    let docker = docker_bin.map(|b| std::thread::spawn(move || collect_runtime(&b, if docker_is_podman { Rt::Podman } else { Rt::Docker })));
+    let docker = docker_bin.map(|b| {
+        std::thread::spawn(move || collect_runtime(&b, if docker_is_podman { Rt::Podman } else { Rt::Docker }))
+    });
     let podman = podman_bin.map(|b| std::thread::spawn(move || collect_runtime(&b, Rt::Podman)));
     let mut out = Vec::new();
     for h in [docker, podman].into_iter().flatten() {
@@ -132,10 +134,14 @@ fn collect_runtime(bin: &Path, rt: Rt) -> Vec<Container> {
     if list.is_empty() {
         return list;
     }
-    if let Ok(o) = run_with_timeout(bin.to_str().unwrap_or("docker"), &["stats", "--no-stream", "--format", "{{json .}}"], CMD_TIMEOUT)
-        && o.success() {
-            merge_stats(&mut list, &parse_stats_lines(&o.stdout));
-        }
+    if let Ok(o) = run_with_timeout(
+        bin.to_str().unwrap_or("docker"),
+        &["stats", "--no-stream", "--format", "{{json .}}"],
+        CMD_TIMEOUT,
+    ) && o.success()
+    {
+        merge_stats(&mut list, &parse_stats_lines(&o.stdout));
+    }
     list
 }
 
@@ -171,7 +177,8 @@ fn runtime_from_context(ctx: &str) -> String {
 
 /// Locate an executable on PATH, plus common install dirs (GUI launches get a minimal PATH).
 fn find_bin(name: &str) -> Option<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let mut dirs: Vec<PathBuf> =
+        std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
     dirs.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from));
     if let Some(h) = dirs::home_dir() {
         dirs.push(h.join(".orbstack/bin"));
@@ -245,7 +252,9 @@ fn field<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a Value> {
 fn text(v: Option<&Value>) -> String {
     match v {
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(a)) => a.iter().map(|x| text(Some(x))).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", "),
+        Some(Value::Array(a)) => {
+            a.iter().map(|x| text(Some(x))).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ")
+        }
         Some(Value::Object(o)) => {
             // podman port mapping: {host_ip, container_port, host_port, protocol}
             let g = |k: &str| o.get(k).map(|v| v.to_string().trim_matches('"').to_string()).unwrap_or_default();
@@ -268,14 +277,14 @@ pub(crate) fn parse_ps_lines(out: &str, runtime: &str) -> Vec<Container> {
         .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
         .filter(|v| v.is_object())
         .map(|v| Container {
-                id: normalize_id(&text(field(&v, &["ID", "Id"]))),
-                name: text(field(&v, &["Names", "Name"])),
-                image: text(field(&v, &["Image"])),
-                runtime: runtime.to_string(),
-                status: text(field(&v, &["Status", "State"])),
-                cpu: 0.0,
-                mem: 0,
-                ports: text(field(&v, &["Ports"])),
+            id: normalize_id(&text(field(&v, &["ID", "Id"]))),
+            name: text(field(&v, &["Names", "Name"])),
+            image: text(field(&v, &["Image"])),
+            runtime: runtime.to_string(),
+            status: text(field(&v, &["Status", "State"])),
+            cpu: 0.0,
+            mem: 0,
+            ports: text(field(&v, &["Ports"])),
         })
         .collect()
 }
@@ -469,7 +478,11 @@ not json
         let cs = parse_ps_lines(line, "podman");
         assert_eq!(cs[0].id, "410892b21be2");
         assert_eq!(find_container(&cs, "410892b21be2").map(|c| c.name.as_str()), Some("fat-linux"));
-        assert_eq!(find_container(&cs, "410892b21be2ffda255ceb4e7e2077d968864674cefc8174a3843e6f01c860f7").map(|c| c.name.as_str()), Some("fat-linux"));
+        assert_eq!(
+            find_container(&cs, "410892b21be2ffda255ceb4e7e2077d968864674cefc8174a3843e6f01c860f7")
+                .map(|c| c.name.as_str()),
+            Some("fat-linux")
+        );
         assert!(find_container(&cs, "").is_none());
         assert!(find_container(&cs, "deadbeef0000").is_none());
         assert_eq!(container_label(&cs, "410892b21be2"), "fat-linux");
@@ -491,7 +504,11 @@ not json
         let dir = std::env::temp_dir().join(format!("fat-fleet-shim-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let shim = dir.join("docker");
-        std::fs::write(&shim, "#!/bin/sh\n[ -e /etc/containers/nodocker ] || echo emulate\nexec /usr/bin/podman \"$@\"\n").unwrap();
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\n[ -e /etc/containers/nodocker ] || echo emulate\nexec /usr/bin/podman \"$@\"\n",
+        )
+        .unwrap();
         assert!(is_podman_shim(&shim));
         let real = dir.join("docker-real");
         std::fs::write(&real, [0x7fu8, b'E', b'L', b'F', 0, 0]).unwrap();

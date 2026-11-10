@@ -108,30 +108,17 @@ pub fn parse_mounts(text: &str) -> Vec<(String, String)> {
 
 impl Watcher {
     pub fn start(exclude: Vec<String>, cap: usize, initial_dirs: Vec<String>) -> Watcher {
-        let state = Arc::new(Mutex::new(WState {
-            started: crate::model::now_ms(),
-            ino_fd: -1,
-            ..Default::default()
-        }));
+        let state = Arc::new(Mutex::new(WState { started: crate::model::now_ms(), ino_fd: -1, ..Default::default() }));
         let stop = Arc::new(AtomicBool::new(false));
-        let fan = if unsafe { libc::geteuid() } == 0 {
-            fanotify_setup(&state)
-        } else {
-            None
-        };
+        let fan = if unsafe { libc::geteuid() } == 0 { fanotify_setup(&state) } else { None };
         let fds = match fan {
             Some(fds) => fds,
             None => {
                 let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
                 let mut s = state.lock().unwrap();
                 if fd < 0 {
-                    s.errors
-                        .push(format!("inotify_init1: {}", std::io::Error::last_os_error()));
-                    return Watcher {
-                        state: state.clone(),
-                        stop,
-                        thread: None,
-                    };
+                    s.errors.push(format!("inotify_init1: {}", std::io::Error::last_os_error()));
+                    return Watcher { state: state.clone(), stop, thread: None };
                 }
                 s.mode = Mode::Inotify;
                 s.ino_fd = fd;
@@ -232,9 +219,7 @@ fn fanotify_setup(state: &Arc<Mutex<WState>>) -> Option<Vec<i32>> {
             s.errors.push(format!("fanotify_init: {e} (needs CAP_SYS_ADMIN)"));
             return None;
         }
-        s.errors.push(format!(
-            "fanotify_init(FAN_REPORT_DFID_NAME): {e} (needs kernel >= 5.9)"
-        ));
+        s.errors.push(format!("fanotify_init(FAN_REPORT_DFID_NAME): {e} (needs kernel >= 5.9)"));
     }
     let mut classic_fd = -1;
     let mask = libc::FAN_MODIFY | libc::FAN_CREATE | libc::FAN_DELETE | libc::FAN_MOVED_FROM | libc::FAN_MOVED_TO;
@@ -300,9 +285,7 @@ fn fanotify_setup(state: &Arc<Mutex<WState>>) -> Option<Vec<i32>> {
             ));
             continue;
         }
-        s.errors.push(format!(
-            "{mp} ({fstype}): filesystem mark refused ({fid_err}); mount mark, modifications only"
-        ));
+        s.errors.push(format!("{mp} ({fstype}): filesystem mark refused ({fid_err}); mount mark, modifications only"));
         s.partial = true;
         seen.push(fsid);
         s.marked.push(mp);
@@ -331,14 +314,8 @@ fn run(fds: Vec<i32>, state: Arc<Mutex<WState>>, stop: Arc<AtomicBool>, cap: usi
     // u64-aligned read buffer.
     let mut buf = vec![0u64; 8192];
     let mut dircache: HashMap<Vec<u8>, Option<String>> = HashMap::new();
-    let mut pfds: Vec<libc::pollfd> = fds
-        .iter()
-        .map(|&fd| libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        })
-        .collect();
+    let mut pfds: Vec<libc::pollfd> =
+        fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
     while !stop.load(Ordering::SeqCst) {
         for p in pfds.iter_mut() {
             p.revents = 0;
@@ -443,9 +420,7 @@ fn parse_fanotify(bytes: &[u8], cache: &mut HashMap<Vec<u8>, Option<String>>, me
         let pid = rd_u32(bytes, off + 20) as i32;
         // Classic-mode event: an open fd on the object instead of info records.
         let fd_path = if efd >= 0 {
-            let p = std::fs::read_link(format!("/proc/self/fd/{efd}"))
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned());
+            let p = std::fs::read_link(format!("/proc/self/fd/{efd}")).ok().map(|p| p.to_string_lossy().into_owned());
             unsafe { libc::close(efd) };
             p.filter(|p| p.starts_with('/') && !p.ends_with(" (deleted)"))
         } else {
@@ -457,11 +432,7 @@ fn parse_fanotify(bytes: &[u8], cache: &mut HashMap<Vec<u8>, Option<String>>, me
             if let Some(path) = fd_path
                 && pid != me
             {
-                out.push(Ev::Path {
-                    path,
-                    flags: fan_flags(mask),
-                    pid: pid.max(0) as u32,
-                });
+                out.push(Ev::Path { path, flags: fan_flags(mask), pid: pid.max(0) as u32 });
             }
         } else if pid != me {
             let mut io = off + md_len;
@@ -482,10 +453,8 @@ fn parse_fanotify(bytes: &[u8], cache: &mut HashMap<Vec<u8>, Option<String>>, me
                         let hb = u32::from_ne_bytes(rec[12..16].try_into().unwrap()) as usize;
                         if 20 + hb <= rec.len() {
                             let key = rec[4..20 + hb].to_vec();
-                            let dir = cache
-                                .entry(key)
-                                .or_insert_with(|| resolve_handle(fsid, &rec[12..20 + hb]))
-                                .clone();
+                            let dir =
+                                cache.entry(key).or_insert_with(|| resolve_handle(fsid, &rec[12..20 + hb])).clone();
                             if let Some(dir) = dir {
                                 let name = if ty == libc::FAN_EVENT_INFO_TYPE_DFID_NAME {
                                     let nb = &rec[20 + hb..];
@@ -501,11 +470,7 @@ fn parse_fanotify(bytes: &[u8], cache: &mut HashMap<Vec<u8>, Option<String>>, me
                                 } else {
                                     format!("{dir}/{name}")
                                 };
-                                out.push(Ev::Path {
-                                    path,
-                                    flags: fan_flags(mask),
-                                    pid: pid.max(0) as u32,
-                                });
+                                out.push(Ev::Path { path, flags: fan_flags(mask), pid: pid.max(0) as u32 });
                             }
                         }
                     }
@@ -526,11 +491,7 @@ fn resolve_handle(fsid: [i32; 2], fh: &[u8]) -> Option<String> {
     let mut h = vec![0u32; fh.len().div_ceil(4)];
     unsafe { std::ptr::copy_nonoverlapping(fh.as_ptr(), h.as_mut_ptr() as *mut u8, fh.len()) };
     let fd = unsafe {
-        libc::open_by_handle_at(
-            mfd,
-            h.as_mut_ptr() as *mut libc::file_handle,
-            libc::O_PATH | libc::O_CLOEXEC,
-        )
+        libc::open_by_handle_at(mfd, h.as_mut_ptr() as *mut libc::file_handle, libc::O_PATH | libc::O_CLOEXEC)
     };
     if fd < 0 {
         return None;
@@ -596,11 +557,7 @@ pub fn parse_inotify(bytes: &[u8], wds: &HashMap<i32, String>) -> Vec<Ev> {
         if f == 0 {
             continue;
         }
-        let path = if name.is_empty() {
-            dir.clone()
-        } else {
-            format!("{}/{name}", dir.trim_end_matches('/'))
-        };
+        let path = if name.is_empty() { dir.clone() } else { format!("{}/{name}", dir.trim_end_matches('/')) };
         out.push(Ev::Path { path, flags: f, pid: 0 });
     }
     out
@@ -622,10 +579,7 @@ mod tests {
                  28 22 0:42 / /run/user/1000/doc rw - fuse.portal portal rw\n";
         assert_eq!(
             parse_mounts(t),
-            vec![
-                ("ext4".to_string(), "/".to_string()),
-                ("xfs".to_string(), "/home".to_string())
-            ]
+            vec![("ext4".to_string(), "/".to_string()), ("xfs".to_string(), "/home".to_string())]
         );
     }
 
@@ -653,16 +607,8 @@ mod tests {
         assert_eq!(
             v,
             vec![
-                Ev::Path {
-                    path: "/var/log/a.log".into(),
-                    flags: F_CREATED,
-                    pid: 0
-                },
-                Ev::Path {
-                    path: "/var/log/a.log".into(),
-                    flags: F_MODIFIED,
-                    pid: 0
-                },
+                Ev::Path { path: "/var/log/a.log".into(), flags: F_CREATED, pid: 0 },
+                Ev::Path { path: "/var/log/a.log".into(), flags: F_MODIFIED, pid: 0 },
                 Ev::Ignored(2),
             ]
         );
@@ -671,13 +617,7 @@ mod tests {
     fn wait_for(w: &Watcher, path: &str, flag: u32) -> bool {
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(5) {
-            if w.state
-                .lock()
-                .unwrap()
-                .paths
-                .get(path)
-                .is_some_and(|e| e.flags & flag != 0)
-            {
+            if w.state.lock().unwrap().paths.get(path).is_some_and(|e| e.flags & flag != 0) {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -688,9 +628,8 @@ mod tests {
     /// Live: inotify (non-root) or fanotify (root) sees a write in a temp dir.
     #[test]
     fn live_watch_sees_write() {
-        let base = std::env::var("CARGO_TARGET_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir());
+        let base =
+            std::env::var("CARGO_TARGET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
         let d = base.join(format!("fat-gwatch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -736,10 +675,7 @@ mod tests {
         }
         if mode == Mode::Fanotify {
             let pids = w.state.lock().unwrap().paths[&fp].pids.clone();
-            assert!(
-                !pids.is_empty() && !pids.contains(&std::process::id()),
-                "writer pid recorded: {pids:?}"
-            );
+            assert!(!pids.is_empty() && !pids.contains(&std::process::id()), "writer pid recorded: {pids:?}");
         }
         drop(w);
         let _ = std::fs::remove_dir_all(&d);

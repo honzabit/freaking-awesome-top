@@ -75,7 +75,8 @@ pub fn parse_stat(s: &str) -> Option<Stat> {
         flags: u(6),
         cpu_ticks: u(11).saturating_add(u(12)),
         // cutime/cstime are signed in the kernel's printf but never negative in practice.
-        child_cpu_ticks: f[13].parse::<i64>().unwrap_or(0).max(0) as u64 + f[14].parse::<i64>().unwrap_or(0).max(0) as u64,
+        child_cpu_ticks: f[13].parse::<i64>().unwrap_or(0).max(0) as u64
+            + f[14].parse::<i64>().unwrap_or(0).max(0) as u64,
         nice: f[16].parse().unwrap_or(0),
         threads: f[17].parse().unwrap_or(0),
         start_ticks: u(19),
@@ -523,7 +524,10 @@ impl Rapl {
         let pick = |prefix: &str| -> Vec<Zone> {
             let mut v: Vec<&String> = names
                 .iter()
-                .filter(|n| n.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())))
+                .filter(|n| {
+                    n.strip_prefix(prefix)
+                        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+                })
                 .collect();
             v.sort();
             let (mut package, mut psys) = (Vec::new(), Vec::new());
@@ -552,7 +556,8 @@ impl Rapl {
         }
         let mut zones = Vec::new();
         let hw = root.join("sys/class/hwmon");
-        let mut dirs: Vec<PathBuf> = fs::read_dir(&hw).map(|rd| rd.filter_map(|e| Some(e.ok()?.path())).collect()).unwrap_or_default();
+        let mut dirs: Vec<PathBuf> =
+            fs::read_dir(&hw).map(|rd| rd.filter_map(|e| Some(e.ok()?.path())).collect()).unwrap_or_default();
         dirs.sort();
         for d in dirs {
             let mut files: Vec<String> = fs::read_dir(&d)
@@ -649,7 +654,9 @@ fn whole_disk(name: &str, blocks: Option<&HashSet<String>>) -> bool {
     // nvme0n1 / mmcblk0 are disks, nvme0n1p1 / mmcblk0p1 partitions; sda / vdb / xvda disks,
     // sda1 partitions.
     if name.starts_with("nvme") || name.starts_with("mmcblk") {
-        return !name.rsplit_once('p').is_some_and(|(head, tail)| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) && head.ends_with(|c: char| c.is_ascii_digit()));
+        return !name.rsplit_once('p').is_some_and(|(head, tail)| {
+            !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) && head.ends_with(|c: char| c.is_ascii_digit())
+        });
     }
     !name.ends_with(|c: char| c.is_ascii_digit())
 }
@@ -794,7 +801,10 @@ pub fn cgroup_view(cg_root: &Path, own: &str) -> CgView {
                 }
             }
             if first {
-                view.cpus = fs::read_to_string(dir.join("cpuset.cpus.effective")).ok().map(|t| parse_cpu_list(&t)).filter(|v| !v.is_empty());
+                view.cpus = fs::read_to_string(dir.join("cpuset.cpus.effective"))
+                    .ok()
+                    .map(|t| parse_cpu_list(&t))
+                    .filter(|v| !v.is_empty());
             }
         }
         first = false;
@@ -812,14 +822,19 @@ pub fn cg_mem_used(dir: &Path) -> Option<u64> {
     let cur: u64 = fs::read_to_string(dir.join("memory.current")).ok()?.trim().parse().ok()?;
     let inactive = fs::read_to_string(dir.join("memory.stat"))
         .ok()
-        .and_then(|t| t.lines().find_map(|l| l.strip_prefix("inactive_file ").and_then(|v| v.trim().parse::<u64>().ok())))
+        .and_then(|t| {
+            t.lines().find_map(|l| l.strip_prefix("inactive_file ").and_then(|v| v.trim().parse::<u64>().ok()))
+        })
         .unwrap_or(0);
     Some(cur.saturating_sub(inactive))
 }
 
 /// cgroup cpu.stat usage_usec.
 pub fn cg_usage_usec(dir: &Path) -> Option<u64> {
-    fs::read_to_string(dir.join("cpu.stat")).ok()?.lines().find_map(|l| l.strip_prefix("usage_usec ").and_then(|v| v.trim().parse().ok()))
+    fs::read_to_string(dir.join("cpu.stat"))
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("usage_usec ").and_then(|v| v.trim().parse().ok()))
 }
 
 /// The cgroup's own PSI ({cpu,memory,io}.pressure, same format as /proc/pressure/*).
@@ -932,7 +947,9 @@ mod tests {
         for path in [
             format!("0::/docker/{D}\n"),
             format!("0::/system.slice/docker-{D}.scope\n"),
-            format!("0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1a2b.slice/cri-containerd-{D}.scope\n"),
+            format!(
+                "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1a2b.slice/cri-containerd-{D}.scope\n"
+            ),
             format!("0::/kubepods/besteffort/pod0f1e2d3c-1111-2222-3333-444455556666/{D}\n"),
             format!("0::/machine.slice/libpod-{D}.scope/container\n"),
             format!("0::/kubepods.slice/kubepods-pod1.slice/crio-{D}.scope\n"),
@@ -969,11 +986,19 @@ mod tests {
         put(&root, "stat", b"cpu  1 2 3 4\nbtime 1700000000\nprocesses 5\n");
         put(&root, "meminfo", b"MemTotal: 1000 kB\nMemAvailable: 250 kB\n");
         // pid 100: user process in a docker container, 2s cpu, started 50s after boot.
-        put(&root, "100/stat", b"100 (python3 x) S 1 100 100 0 -1 4194560 0 0 0 0 150 50 10 0 20 5 3 0 5000 1048576 10 0\n");
+        put(
+            &root,
+            "100/stat",
+            b"100 (python3 x) S 1 100 100 0 -1 4194560 0 0 0 0 150 50 10 0 20 5 3 0 5000 1048576 10 0\n",
+        );
         put(&root, "100/status", b"Name:\tpython3\nUid:\t1000\t1000\t1000\t1000\nThreads:\t3\n");
         put(&root, "100/io", b"read_bytes: 100\nwrite_bytes: 200\n");
         put(&root, "100/cmdline", b"python3\0-m\0http.server\0");
-        put(&root, "100/cgroup", b"0::/system.slice/docker-1c5d10a36e643dfc79ca9514c31b8fb651d4c4b2741fb0bef58d591761db6384.scope\n");
+        put(
+            &root,
+            "100/cgroup",
+            b"0::/system.slice/docker-1c5d10a36e643dfc79ca9514c31b8fb651d4c4b2741fb0bef58d591761db6384.scope\n",
+        );
         // pid 2: kthreadd, no io file (as if denied), empty cmdline.
         put(&root, "2/stat", b"2 (kthreadd) S 0 0 0 0 -1 2129984 0 0 0 0 0 0 0 0 20 0 1 0 2 0 0 0\n");
         put(&root, "2/status", b"Uid:\t0\t0\t0\t0\nThreads:\t1\n");
@@ -1002,7 +1027,10 @@ mod tests {
         assert_eq!(p.counters.child_cpu_ns, 100_000_000);
         assert_eq!((p.counters.disk_read, p.counters.disk_write), (100, 200));
         assert!(p.io_ok);
-        assert_eq!(p.cgroup, "/system.slice/docker-1c5d10a36e643dfc79ca9514c31b8fb651d4c4b2741fb0bef58d591761db6384.scope");
+        assert_eq!(
+            p.cgroup,
+            "/system.slice/docker-1c5d10a36e643dfc79ca9514c31b8fb651d4c4b2741fb0bef58d591761db6384.scope"
+        );
         assert_eq!(p.container.as_deref(), Some("1c5d10a36e64"));
         assert_eq!(meminfo(&root).unwrap().used(), 750 * 1024);
 
@@ -1124,7 +1152,11 @@ mod tests {
     fn sysio_rates_from_fixture() {
         let root = fixture("sysio");
         put(&root, "sys/block/vda/size", b"1\n");
-        put(&root, "proc/diskstats", b" 254 0 vda 10 0 1000 0 10 0 2000 0 0 0 0\n 254 1 vda1 10 0 1000 0 10 0 2000 0 0 0 0\n");
+        put(
+            &root,
+            "proc/diskstats",
+            b" 254 0 vda 10 0 1000 0 10 0 2000 0 0 0 0\n 254 1 vda1 10 0 1000 0 10 0 2000 0 0 0 0\n",
+        );
         put(&root, "proc/net/dev", b"h|\nh|\n eth0: 100 0 0 0 0 0 0 0 50 0 0 0 0 0 0 0\n");
         let mut s = SysIo::default();
         assert_eq!(s.sample(&root), None);
@@ -1149,8 +1181,16 @@ mod tests {
         put(&root, "docker/abc/cpu.max", b"50000 100000\n");
         put(&root, "docker/abc/cpuset.cpus.effective", b"0-3,8\n");
         put(&root, "docker/abc/memory.current", b"262144000\n");
-        put(&root, "docker/abc/memory.stat", b"anon 200000000\nfile 60000000\nactive_file 10000000\ninactive_file 50000000\n");
-        put(&root, "docker/abc/memory.pressure", b"some avg10=12.50 avg60=3.00 avg300=1.00 total=1\nfull avg10=2.00 avg60=0.00 avg300=0.00 total=1\n");
+        put(
+            &root,
+            "docker/abc/memory.stat",
+            b"anon 200000000\nfile 60000000\nactive_file 10000000\ninactive_file 50000000\n",
+        );
+        put(
+            &root,
+            "docker/abc/memory.pressure",
+            b"some avg10=12.50 avg60=3.00 avg300=1.00 total=1\nfull avg10=2.00 avg60=0.00 avg300=0.00 total=1\n",
+        );
         let v = cgroup_view(&root, "/docker/abc");
         assert_eq!(v.mem_max, Some(268_435_456));
         assert_eq!(v.mem_dir, Some(root.join("docker/abc")));

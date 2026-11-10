@@ -119,7 +119,9 @@ pub fn allowed_actions(config_text: &str) -> Vec<String> {
         }
     };
     let names: Vec<String> = match v {
-        Some(toml::Value::String(s)) if s.eq_ignore_ascii_case("all") => ACTION_TOOLS.iter().map(|s| s.to_string()).collect(),
+        Some(toml::Value::String(s)) if s.eq_ignore_ascii_case("all") => {
+            ACTION_TOOLS.iter().map(|s| s.to_string()).collect()
+        }
         Some(toml::Value::String(s)) if s.eq_ignore_ascii_case("none") || s.is_empty() => vec![],
         Some(toml::Value::String(s)) => vec![s],
         Some(toml::Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
@@ -193,8 +195,22 @@ impl State {
         }
         let samples = u32::from(last.is_some());
         let allowed = std::fs::read_to_string(Config::path()).map(|t| allowed_actions(&t)).unwrap_or_default();
-        log(&if allowed.is_empty() { "side-effect tools disabled ([mcp] allow_actions not set)".to_string() } else { format!("side-effect tools enabled: {}", allowed.join(", ")) });
-        State { collector, history, actions, config, last, samples, fs: FsEngines::default(), allowed, kill_tokens: Vec::new() }
+        log(&if allowed.is_empty() {
+            "side-effect tools disabled ([mcp] allow_actions not set)".to_string()
+        } else {
+            format!("side-effect tools enabled: {}", allowed.join(", "))
+        });
+        State {
+            collector,
+            history,
+            actions,
+            config,
+            last,
+            samples,
+            fs: FsEngines::default(),
+            allowed,
+            kill_tokens: Vec::new(),
+        }
     }
 
     fn scanner(&mut self) -> Result<&crate::fs::scan::Scanner> {
@@ -207,7 +223,8 @@ impl State {
     /// Current volumes. A fresh `Volumes` takes two samples 1s apart so I/O rates are real.
     fn volumes(&mut self) -> Result<Vec<crate::fs::Volume>> {
         if self.fs.volumes.is_none() {
-            let mut v = guard(crate::fs::volumes::Volumes::new).ok_or_else(|| anyhow!("volume listing is unavailable"))?;
+            let mut v =
+                guard(crate::fs::volumes::Volumes::new).ok_or_else(|| anyhow!("volume listing is unavailable"))?;
             // Fill rates need minutes of samples: take them from the recorder's history.
             if let Some(h) = self.history.as_ref() {
                 let _ = guard(AssertUnwindSafe(|| h.seed_volumes(&mut v, crate::model::now_ms())));
@@ -516,7 +533,9 @@ pub fn tools_listed(allowed: &[String]) -> Vec<Value> {
         let name = t["name"].as_str().unwrap_or_default().to_string();
         if ACTION_TOOLS.contains(&name.as_str()) && !allowed.contains(&name) {
             let d = t["description"].as_str().unwrap_or_default().to_string();
-            t["description"] = json!(format!("DISABLED in this fat (enable with `[mcp] allow_actions = [\"{name}\"]` in fat's config.toml; calling it returns how). {d}"));
+            t["description"] = json!(format!(
+                "DISABLED in this fat (enable with `[mcp] allow_actions = [\"{name}\"]` in fat's config.toml; calling it returns how). {d}"
+            ));
         }
     }
     v
@@ -553,7 +572,10 @@ pub fn tools() -> Vec<Value> {
             "ports",
             "Listening ports",
             "All TCP listeners and bound UDP sockets with owning pid/process and a human note. `orphan: true` marks dev-server-like listeners whose launching terminal/agent is gone (re-parented to launchd, init or a systemd user manager) — prime candidates for cleanup.",
-            schema(json!({ "only_orphans": { "type": "boolean", "default": false, "description": "Return only orphaned listeners." } }), &[]),
+            schema(
+                json!({ "only_orphans": { "type": "boolean", "default": false, "description": "Return only orphaned listeners." } }),
+                &[],
+            ),
             false,
         ),
         tool(
@@ -588,7 +610,10 @@ pub fn tools() -> Vec<Value> {
             "find_port_owner",
             "Who owns a port",
             "Which process is listening on / bound to a port (tcp or udp), with its pid, command, orphan flag, and ancestor chain. Use when 'address already in use'.",
-            schema(json!({ "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Port number." } }), &["port"]),
+            schema(
+                json!({ "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Port number." } }),
+                &["port"],
+            ),
             false,
         ),
         tool(
@@ -635,7 +660,10 @@ pub fn tools() -> Vec<Value> {
             "undo",
             "Undo action",
             "Undo a previous pause or renice by its action id (resume / restore the nice value); without `id`, undoes the most recent undoable action. A kill can't be undone.",
-            schema(json!({ "id": { "type": "integer", "minimum": 0, "description": "Action id returned by a previous action." } }), &[]),
+            schema(
+                json!({ "id": { "type": "integer", "minimum": 0, "description": "Action id returned by a previous action." } }),
+                &[],
+            ),
             true,
         ),
         tool(
@@ -649,7 +677,10 @@ pub fn tools() -> Vec<Value> {
             "ask",
             "Ask in plain language",
             "Ask a plain-language question about this machine ('why is this machine slow?', 'what is using port 3000?', 'which container is eating memory?'). Answered from a fresh snapshot plus doctor findings.",
-            schema(json!({ "question": { "type": "string", "minLength": 1, "description": "The question." } }), &["question"]),
+            schema(
+                json!({ "question": { "type": "string", "minLength": 1, "description": "The question." } }),
+                &["question"],
+            ),
             false,
         ),
         tool(
@@ -933,7 +964,12 @@ fn top_procs_in<'a>(
 ) -> (usize, Vec<&'a Proc>) {
     let needle = filter.map(str::to_lowercase).filter(|s| !s.is_empty());
     let want = container.map(|c| c.trim().to_lowercase()).filter(|s| !s.is_empty());
-    let ctr_name = |p: &Proc| p.container.as_deref().and_then(|id| crate::fleet::find_container(containers, id)).map(|c| c.name.to_lowercase());
+    let ctr_name = |p: &Proc| {
+        p.container
+            .as_deref()
+            .and_then(|id| crate::fleet::find_container(containers, id))
+            .map(|c| c.name.to_lowercase())
+    };
     let mut v: Vec<&Proc> = procs
         .iter()
         .filter(|p| match &needle {
@@ -1003,7 +1039,14 @@ fn tool_snapshot(state: &mut State, args: &Value) -> Result<Value> {
 }
 
 /// The `snapshot` tool's result (pure, for tests).
-fn snapshot_value(snap: &Snapshot, containers: &[Container], sort: &str, limit: usize, filter: Option<&str>, container: Option<&str>) -> Value {
+fn snapshot_value(
+    snap: &Snapshot,
+    containers: &[Container],
+    sort: &str,
+    limit: usize,
+    filter: Option<&str>,
+    container: Option<&str>,
+) -> Value {
     let (matched, procs) = top_procs_in(&snap.procs, containers, sort, limit, filter, container);
     let procs: Vec<Value> = procs
         .into_iter()
@@ -1063,7 +1106,11 @@ fn tool_process(state: &mut State, args: &Value) -> Result<Value> {
     let children = snap.procs.iter().filter(|c| c.ppid == pid && c.pid != pid).count();
     let descendants = snap.descendants(pid).len();
     let ports: Vec<_> = snap.ports.iter().filter(|x| x.pid == pid).collect();
-    let containers = if p.container.is_some() && snap.containers.is_empty() { crate::fleet::containers() } else { snap.containers.clone() };
+    let containers = if p.container.is_some() && snap.containers.is_empty() {
+        crate::fleet::containers()
+    } else {
+        snap.containers.clone()
+    };
     let container = p.container.as_deref().and_then(|id| crate::fleet::find_container(&containers, id));
     let mut process = serde_json::to_value(p)?;
     process["cmd"] = json!(crate::ask::redact_cmd(&p.cmd));
@@ -1181,7 +1228,10 @@ fn hub_check(snap: &Snapshot, kind: ActionKind, pid: u32) -> (Option<String>, Op
     let verb = if kind == ActionKind::Pause { "freezes" } else { "ends" };
     match crate::blame::hub_gate(snap, pid) {
         Some(g) if g.hard => {
-            return (Some(format!("{}; {kind:?} {verb} everything it hosts. Not offered to agents: tell the user", g.note)), None);
+            return (
+                Some(format!("{}; {kind:?} {verb} everything it hosts. Not offered to agents: tell the user", g.note)),
+                None,
+            );
         }
         Some(g) => return (None, Some(g.note)),
         None => {}
@@ -1189,7 +1239,10 @@ fn hub_check(snap: &Snapshot, kind: ActionKind, pid: u32) -> (Option<String>, Op
     if kind == ActionKind::KillTree
         && let Some((d, g)) = crate::blame::hub_in_tree(snap, pid)
     {
-        return (Some(format!("its tree contains pid {d}: {}; end the specific job instead of the whole tree", g.note)), None);
+        return (
+            Some(format!("its tree contains pid {d}: {}; end the specific job instead of the whole tree", g.note)),
+            None,
+        );
     }
     (None, None)
 }
@@ -1200,7 +1253,11 @@ fn restrict_tree(snap: &Snapshot, pid: u32, tree: &[(u32, u64)]) -> (Snapshot, V
     let drop: std::collections::HashSet<u32> = snap
         .descendants(pid)
         .into_iter()
-        .filter(|d| !tree.iter().any(|&(tp, ts)| tp == d.pid && (ts == 0 || d.start_time == 0 || ts.abs_diff(d.start_time) <= 2)))
+        .filter(|d| {
+            !tree
+                .iter()
+                .any(|&(tp, ts)| tp == d.pid && (ts == 0 || d.start_time == 0 || ts.abs_diff(d.start_time) <= 2))
+        })
         .map(|d| d.pid)
         .collect();
     let mut out = snap.clone();
@@ -1227,7 +1284,9 @@ fn tool_renice(state: &mut State, args: &Value) -> Result<Value> {
 fn tool_kill(state: &mut State, args: &Value) -> Result<Value> {
     let pid = arg_pid(args)?;
     if arg_bool(args, "tree")? && arg_bool(args, "force")? {
-        bail!("`tree` and `force` can't be combined: a tree kill sends SIGTERM leaves-first. Kill the tree, then `force` any pid that survives");
+        bail!(
+            "`tree` and `force` can't be combined: a tree kill sends SIGTERM leaves-first. Kill the tree, then `force` any pid that survives"
+        );
     }
     let kind = if arg_bool(args, "tree")? {
         ActionKind::KillTree
@@ -1241,10 +1300,18 @@ fn tool_kill(state: &mut State, args: &Value) -> Result<Value> {
         None => kill_preview(state, kind, pid, args),
         Some(tok) => {
             // Single use: the token is consumed whatever happens next.
-            let i = state.kill_tokens.iter().position(|t| t.token == tok).context("unknown or expired confirm_token: call kill without it for a fresh preview")?;
+            let i = state
+                .kill_tokens
+                .iter()
+                .position(|t| t.token == tok)
+                .context("unknown or expired confirm_token: call kill without it for a fresh preview")?;
             let t = state.kill_tokens.remove(i);
             if t.pid != pid || t.kind != kind {
-                bail!("confirm_token was issued for {:?} of pid {}, not {kind:?} of pid {pid}: call kill without it for a fresh preview", t.kind, t.pid);
+                bail!(
+                    "confirm_token was issued for {:?} of pid {}, not {kind:?} of pid {pid}: call kill without it for a fresh preview",
+                    t.kind,
+                    t.pid
+                );
             }
             // The process must still be the one previewed (start time), plus any identity the caller passes.
             let mut expect = arg_expect(args)?.unwrap_or_default();
@@ -1258,14 +1325,16 @@ fn tool_kill(state: &mut State, args: &Value) -> Result<Value> {
                 bail!("no process with pid {pid}");
             }
             // Re-checked at execute: the tree may have grown a hub since the preview.
-            let (snap, unseen) = if kind == ActionKind::KillTree { restrict_tree(&snap, pid, &t.tree) } else { (snap, Vec::new()) };
+            let (snap, unseen) =
+                if kind == ActionKind::KillTree { restrict_tree(&snap, pid, &t.tree) } else { (snap, Vec::new()) };
             if let (Some(r), _) = hub_check(&snap, kind, pid) {
                 bail!("{kind:?} {pid} refused: {r}");
             }
             let mut r = state.actions()?.apply_expect(kind, pid, None, &snap, expect.as_ref());
             state.last = None;
             if !unseen.is_empty() {
-                r.message = format!("{}; left alone {} process(es) not in the preview: {unseen:?}", r.message, unseen.len());
+                r.message =
+                    format!("{}; left alone {} process(es) not in the preview: {unseen:?}", r.message, unseen.len());
             }
             action_result(r)
         }
@@ -1287,13 +1356,18 @@ fn kill_preview(state: &mut State, kind: ActionKind, pid: u32, args: &Value) -> 
         "undoable": false,
     });
     if kind == ActionKind::KillTree {
-        v["descendants"] = json!(pv.tree.iter().map(|(cpid, name, skip)| {
-            let mut d = json!({ "pid": cpid, "name": name });
-            if let Some(why) = skip {
-                d["skipped"] = json!(why);
-            }
-            d
-        }).collect::<Vec<_>>());
+        v["descendants"] = json!(
+            pv.tree
+                .iter()
+                .map(|(cpid, name, skip)| {
+                    let mut d = json!({ "pid": cpid, "name": name });
+                    if let Some(why) = skip {
+                        d["skipped"] = json!(why);
+                    }
+                    d
+                })
+                .collect::<Vec<_>>()
+        );
     }
     let (hub_refusal, hub_warning) = hub_check(&snap, kind, pid);
     let refusal = match (pv.refusal, hub_refusal) {
@@ -1315,14 +1389,24 @@ fn kill_preview(state: &mut State, kind: ActionKind, pid: u32, args: &Value) -> 
     } else {
         Vec::new()
     };
-    state.kill_tokens.push(KillToken { token: token.clone(), pid, start_time: pv.start_time.or((p.start_time != 0).then_some(p.start_time)), kind, issued: Instant::now(), tree });
+    state.kill_tokens.push(KillToken {
+        token: token.clone(),
+        pid,
+        start_time: pv.start_time.or((p.start_time != 0).then_some(p.start_time)),
+        kind,
+        issued: Instant::now(),
+        tree,
+    });
     v["confirm_token"] = json!(token);
     v["expires_in_s"] = json!(KILL_TOKEN_TTL.as_secs());
-    v["next"] = json!(format!("This cannot be undone. To proceed, call kill again with pid {pid}{} and confirm_token. Consider `pause` first.", match kind {
-        ActionKind::KillTree => ", tree: true",
-        ActionKind::Kill => ", force: true",
-        _ => "",
-    }));
+    v["next"] = json!(format!(
+        "This cannot be undone. To proceed, call kill again with pid {pid}{} and confirm_token. Consider `pause` first.",
+        match kind {
+            ActionKind::KillTree => ", tree: true",
+            ActionKind::Kill => ", force: true",
+            _ => "",
+        }
+    ));
     Ok(v)
 }
 
@@ -1414,12 +1498,20 @@ pub fn entry_json(e: &crate::fs::DirEntry) -> Value {
 
 /// A listing as JSON, recursing `depth - 1` more levels through `list` (cache lookups), at most
 /// `limit` children per directory; the rest are summarized as `more`.
-pub fn listing_json(l: &crate::fs::Listing, depth: usize, limit: usize, list: &mut dyn FnMut(&str) -> Option<crate::fs::Listing>) -> Value {
+pub fn listing_json(
+    l: &crate::fs::Listing,
+    depth: usize,
+    limit: usize,
+    list: &mut dyn FnMut(&str) -> Option<crate::fs::Listing>,
+) -> Value {
     let mut out = entry_json(&l.dir);
     let mut kids = Vec::new();
     for c in l.children.iter().take(limit) {
         let mut v = entry_json(c);
-        if depth > 1 && c.is_dir && !c.mount_point && c.size > 0
+        if depth > 1
+            && c.is_dir
+            && !c.mount_point
+            && c.size > 0
             && let Some(sub) = list(&c.path)
         {
             let s = listing_json(&sub, depth - 1, limit, list);
@@ -1564,13 +1656,19 @@ pub fn growth_json(g: &crate::fs::Growth, window_ms: i64) -> Value {
                 v["files_touched"] = json!(x.files_touched);
             }
             if !x.writers.is_empty() {
-                v["writers"] = json!(x.writers.iter().map(|(p, n, b)| json!({ "pid": p, "name": n, "write_bps": b })).collect::<Vec<_>>());
+                v["writers"] = json!(
+                    x.writers
+                        .iter()
+                        .map(|(p, n, b)| json!({ "pid": p, "name": n, "write_bps": b }))
+                        .collect::<Vec<_>>()
+                );
             }
             v
         })
         .collect();
     // Deleted-but-open files by the process holding them; files under 1 MB only counted.
-    let (groups, small, small_bytes) = crate::tui::widgets::group_deleted(&g.deleted_open, crate::tui::widgets::DELETED_MIN_BYTES);
+    let (groups, small, small_bytes) =
+        crate::tui::widgets::group_deleted(&g.deleted_open, crate::tui::widgets::DELETED_MIN_BYTES);
     let deleted = json!({
         "by_process": groups.iter().take(10).map(|d| json!({ "pid": d.pid, "name": d.name, "files": d.files, "bytes": d.bytes, "biggest": d.biggest })).collect::<Vec<_>>(),
         "small_files": small,
@@ -1593,7 +1691,9 @@ fn tool_services(state: &mut State, args: &Value) -> Result<Value> {
     use crate::server::services as svc;
     let failed = args.get("failed").and_then(Value::as_bool).unwrap_or(false);
     let kind = match arg_str(args, "kind")? {
-        Some(k) => Some(svc::parse_kind(k).ok_or_else(|| anyhow!("`kind` must be systemd, container, k8s-pod or cgroup"))?),
+        Some(k) => {
+            Some(svc::parse_kind(k).ok_or_else(|| anyhow!("`kind` must be systemd, container, k8s-pod or cgroup"))?)
+        }
         None => None,
     };
     let needle = arg_str(args, "filter")?.map(str::to_lowercase).filter(|s| !s.is_empty());
@@ -1608,11 +1708,17 @@ fn tool_services(state: &mut State, args: &Value) -> Result<Value> {
     let flapping_n = units.iter().filter(|u| u.flapping).count();
     let mut units = svc::filter(units, failed, kind);
     if let Some(n) = &needle {
-        units.retain(|u| u.name.to_lowercase().contains(n) || u.description.to_lowercase().contains(n) || u.cgroup.to_lowercase().contains(n));
+        units.retain(|u| {
+            u.name.to_lowercase().contains(n)
+                || u.description.to_lowercase().contains(n)
+                || u.cgroup.to_lowercase().contains(n)
+        });
     }
     let matched = units.len();
     units.truncate(limit);
-    Ok(json!({ "total": total, "failed": failed_n, "flapping": flapping_n, "matched": matched, "units": units, "events": events, "notes": notes }))
+    Ok(
+        json!({ "total": total, "failed": failed_n, "flapping": flapping_n, "matched": matched, "units": units, "events": events, "notes": notes }),
+    )
 }
 
 // --- server mode: doctor-incident ---
@@ -1622,7 +1728,10 @@ fn tool_events(state: &mut State, args: &Value) -> Result<Value> {
     let from = inc::parse_since(arg_str(args, "since")?.unwrap_or("2h"), now).map_err(|e| anyhow!("`since`: {e}"))?;
     let kinds: Vec<String> = match args.get("kinds") {
         None | Some(Value::Null) => vec![],
-        Some(Value::Array(a)) => a.iter().map(|k| k.as_str().map(str::to_string).ok_or_else(|| anyhow!("`kinds` must be an array of strings"))).collect::<Result<_>>()?,
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|k| k.as_str().map(str::to_string).ok_or_else(|| anyhow!("`kinds` must be an array of strings")))
+            .collect::<Result<_>>()?,
         Some(Value::String(k)) => vec![k.clone()],
         Some(_) => bail!("`kinds` must be an array of strings"),
     };
@@ -1633,7 +1742,11 @@ fn tool_events(state: &mut State, args: &Value) -> Result<Value> {
 }
 
 fn tool_what_happened(state: &mut State, args: &Value) -> Result<Value> {
-    let inc = crate::server::incident::what_happened_for(&state.config, arg_str(args, "at")?, arg_str(args, "window")?.unwrap_or("15m"))?;
+    let inc = crate::server::incident::what_happened_for(
+        &state.config,
+        arg_str(args, "at")?,
+        arg_str(args, "window")?.unwrap_or("15m"),
+    )?;
     let mut v = serde_json::to_value(&inc)?;
     v["text"] = json!(crate::server::incident::render(&inc));
     Ok(v)
@@ -1648,7 +1761,14 @@ fn tool_kernel(state: &mut State, args: &Value) -> Result<Value> {
     }
     let max = args.get("max_events").and_then(Value::as_u64).unwrap_or(50).min(1000) as usize;
     let procs = state.snapshot().map(|s| s.procs.clone()).unwrap_or_default();
-    let r = crate::server::kernel::report(&state.config.server, &procs, &[], std::time::Duration::from_secs(1), crate::model::now_ms() - secs as i64 * 1000, max);
+    let r = crate::server::kernel::report(
+        &state.config.server,
+        &procs,
+        &[],
+        std::time::Duration::from_secs(1),
+        crate::model::now_ms() - secs as i64 * 1000,
+        max,
+    );
     Ok(serde_json::to_value(r)?)
 }
 
@@ -1685,7 +1805,16 @@ mod tests {
     /// Secrets in command lines never reach the agent through snapshot results.
     #[test]
     fn snapshot_cmd_is_redacted() {
-        let snap = Snapshot { procs: vec![Proc { pid: 9, name: "psql".into(), cmd: "psql postgres://app:s3cretpw@db-01/app".into(), cpu: 5.0, ..Default::default() }], ..Default::default() };
+        let snap = Snapshot {
+            procs: vec![Proc {
+                pid: 9,
+                name: "psql".into(),
+                cmd: "psql postgres://app:s3cretpw@db-01/app".into(),
+                cpu: 5.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
         let v = snapshot_value(&snap, &[], "cpu", 10, None, None);
         let c = v["procs"][0]["cmd"].as_str().unwrap();
         assert!(!c.contains("s3cretpw") && c.contains("psql"), "{c}");
@@ -1696,7 +1825,9 @@ mod tests {
     }
 
     fn tool_call(state: &mut State, name: &str, args: Value) -> Value {
-        let line = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}).to_string();
+        let line =
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}})
+                .to_string();
         call(state, &line)["result"].clone()
     }
 
@@ -1704,7 +1835,10 @@ mod tests {
     fn allow_actions_config_parsing() {
         assert!(allowed_actions("").is_empty(), "default: no side effects");
         assert!(allowed_actions("interval_ms = 5\n").is_empty());
-        assert_eq!(allowed_actions("[mcp]\nallow_actions = [\"pause\", \"renice\", \"bogus\"]\n"), vec!["pause", "renice"]);
+        assert_eq!(
+            allowed_actions("[mcp]\nallow_actions = [\"pause\", \"renice\", \"bogus\"]\n"),
+            vec!["pause", "renice"]
+        );
         assert_eq!(allowed_actions("[mcp]\nallow_actions = \"all\"\n"), ACTION_TOOLS.to_vec());
         assert!(allowed_actions("[mcp]\nallow_actions = \"none\"\n").is_empty());
         assert_eq!(allowed_actions("[mcp]\nallow_actions = \"kill\"\n"), vec!["kill"]);
@@ -1791,7 +1925,14 @@ mod tests {
         assert_eq!(r["isError"], true);
 
         // 5. Expired tokens are dropped.
-        s.kill_tokens.push(KillToken { token: "old".into(), pid: 42, start_time: None, kind: ActionKind::Term, issued: Instant::now() - KILL_TOKEN_TTL - Duration::from_secs(1), tree: vec![] });
+        s.kill_tokens.push(KillToken {
+            token: "old".into(),
+            pid: 42,
+            start_time: None,
+            kind: ActionKind::Term,
+            issued: Instant::now() - KILL_TOKEN_TTL - Duration::from_secs(1),
+            tree: vec![],
+        });
         let r = tool_call(&mut s, "kill", json!({"pid": 42, "confirm_token": "old"}));
         assert!(r["structuredContent"]["error"].as_str().unwrap().contains("expired"));
         let _ = std::fs::remove_file(&journal);
@@ -1815,11 +1956,17 @@ mod tests {
     fn initialize_echoes_supported_version() {
         let mut s = State::empty();
         for v in SUPPORTED_PROTOCOLS {
-            let r = call(&mut s, &format!(r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{v}"}}}}"#));
+            let r = call(
+                &mut s,
+                &format!(r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{v}"}}}}"#),
+            );
             assert_eq!(r["result"]["protocolVersion"], *v);
             assert_eq!(r["id"], 1);
         }
-        let r = call(&mut s, r#"{"jsonrpc":"2.0","id":"a","method":"initialize","params":{"protocolVersion":"1999-01-01"}}"#);
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":"a","method":"initialize","params":{"protocolVersion":"1999-01-01"}}"#,
+        );
         assert_eq!(r["result"]["protocolVersion"], DEFAULT_PROTOCOL);
         assert_eq!(r["result"]["serverInfo"]["name"], "fat");
         assert_eq!(r["result"]["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
@@ -1875,8 +2022,27 @@ mod tests {
         let tools = r["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         for n in [
-            "snapshot", "process", "ports", "why", "doctor", "history", "find_port_owner", "pause", "resume", "renice", "kill",
-            "undo", "containers", "ask", "fs_volumes", "fs_list", "fs_largest", "fs_growth", "kernel", "events", "what_happened",
+            "snapshot",
+            "process",
+            "ports",
+            "why",
+            "doctor",
+            "history",
+            "find_port_owner",
+            "pause",
+            "resume",
+            "renice",
+            "kill",
+            "undo",
+            "containers",
+            "ask",
+            "fs_volumes",
+            "fs_list",
+            "fs_largest",
+            "fs_growth",
+            "kernel",
+            "events",
+            "what_happened",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
             assert!(handler_for(n).is_some(), "no handler for {n}");
@@ -1914,17 +2080,29 @@ mod tests {
         let r = call(&mut s, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#);
         assert_eq!(r["error"]["code"], INVALID_PARAMS);
         // No collector attached at startup: it is created lazily on first use.
-        let r = call(&mut s, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"snapshot","arguments":{}}}"#);
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"snapshot","arguments":{}}}"#,
+        );
         assert!(r["result"]["isError"].is_null() || r["result"]["isError"] == false, "{r}");
         assert_eq!(r["result"]["content"][0]["type"], "text");
         // An unknown pid is a tool failure (isError), not a protocol error or crash.
-        let r = call(&mut s, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"why","arguments":{"pid":4294967000}}}"#);
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"why","arguments":{"pid":4294967000}}}"#,
+        );
         assert_eq!(r["result"]["isError"], true, "{r}");
         assert!(r["result"]["structuredContent"]["error"].is_string());
         // Bad argument types are reported as tool errors.
-        let r = call(&mut s, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"process","arguments":{"pid":"x"}}}"#);
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"process","arguments":{"pid":"x"}}}"#,
+        );
         assert_eq!(r["result"]["isError"], true);
-        let r = call(&mut s, r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"history","arguments":{}}}"#);
+        let r = call(
+            &mut s,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"history","arguments":{}}}"#,
+        );
         assert_eq!(r["result"]["isError"], true);
         assert!(r["result"]["structuredContent"]["error"].as_str().unwrap().contains("fat record"));
     }
@@ -1965,7 +2143,12 @@ mod tests {
     #[test]
     fn top_procs_sorts_filters_and_limits() {
         let mk = |pid, name: &str, cpu, mem| Proc { pid, name: name.into(), cpu, mem, ..Default::default() };
-        let procs = vec![mk(1, "launchd", 0.1, 10), mk(2, "node", 50.0, 5), mk(3, "Chrome", 20.0, 900), mk(4, "nodemon", 5.0, 1)];
+        let procs = vec![
+            mk(1, "launchd", 0.1, 10),
+            mk(2, "node", 50.0, 5),
+            mk(3, "Chrome", 20.0, 900),
+            mk(4, "nodemon", 5.0, 1),
+        ];
         let (n, v) = top_procs(&procs, "cpu", 2, None);
         assert_eq!(n, 4);
         assert_eq!(v.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![2, 3]);
@@ -1990,7 +2173,13 @@ mod tests {
         };
         Snapshot {
             system: crate::model::System {
-                psi: Some(crate::model::Psi { cpu_some: 4.5, mem_some: 0.0, mem_full: 0.0, io_some: 12.0, io_full: 3.0 }),
+                psi: Some(crate::model::Psi {
+                    cpu_some: 4.5,
+                    mem_some: 0.0,
+                    mem_full: 0.0,
+                    io_some: 12.0,
+                    io_full: 3.0,
+                }),
                 temp_c: Some(64.0),
                 power_source: "rapl".into(),
                 ..Default::default()
@@ -2009,7 +2198,13 @@ mod tests {
     #[test]
     fn snapshot_filters_by_container_and_reports_linux_fields() {
         let snap = linuxish();
-        let cs = vec![Container { id: "410892b21be2".into(), name: "db-1".into(), image: "postgres:16".into(), runtime: "docker".into(), ..Default::default() }];
+        let cs = vec![Container {
+            id: "410892b21be2".into(),
+            name: "db-1".into(),
+            image: "postgres:16".into(),
+            runtime: "docker".into(),
+            ..Default::default()
+        }];
         let v = snapshot_value(&snap, &cs, "cpu", 30, None, Some("DB-1"));
         assert_eq!(v["matched_procs"], 2);
         assert_eq!(v["procs"][0]["pid"], 10);
@@ -2059,7 +2254,12 @@ mod tests {
         }
         let mut s = State::empty();
         let err = |s: &mut State, name: &str, args: &str| -> String {
-            let r = call(s, &format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#));
+            let r = call(
+                s,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+                ),
+            );
             assert_eq!(r["result"]["isError"], true, "{name} {args}: {r}");
             r["result"]["structuredContent"]["error"].as_str().unwrap().to_string()
         };
@@ -2081,13 +2281,30 @@ mod tests {
     #[test]
     fn fs_json_is_compact_and_recursive() {
         use crate::fs::{DirEntry, Listing};
-        let de = |p: &str, size: u64, dir: bool| DirEntry { path: p.into(), name: p.rsplit('/').next().unwrap().into(), is_dir: dir, size, files: 1, ..Default::default() };
-        let root = Listing {
-            dir: de("/w", 600, true),
-            children: vec![de("/w/a", 400, true), DirEntry { denied: 2, ..de("/w/node_modules", 150, true) }, de("/w/f", 50, false)],
+        let de = |p: &str, size: u64, dir: bool| DirEntry {
+            path: p.into(),
+            name: p.rsplit('/').next().unwrap().into(),
+            is_dir: dir,
+            size,
+            files: 1,
             ..Default::default()
         };
-        let mut lookup = |p: &str| (p == "/w/a").then(|| Listing { dir: de("/w/a", 400, true), children: vec![de("/w/a/x", 300, false), de("/w/a/y", 100, false)], ..Default::default() });
+        let root = Listing {
+            dir: de("/w", 600, true),
+            children: vec![
+                de("/w/a", 400, true),
+                DirEntry { denied: 2, ..de("/w/node_modules", 150, true) },
+                de("/w/f", 50, false),
+            ],
+            ..Default::default()
+        };
+        let mut lookup = |p: &str| {
+            (p == "/w/a").then(|| Listing {
+                dir: de("/w/a", 400, true),
+                children: vec![de("/w/a/x", 300, false), de("/w/a/y", 100, false)],
+                ..Default::default()
+            })
+        };
         let v = listing_json(&root, 2, 2, &mut lookup);
         assert_eq!(v["size"], 600);
         assert_eq!(v["children"].as_array().unwrap().len(), 2);
@@ -2097,7 +2314,14 @@ mod tests {
         assert!(v["children"][1]["known"].as_str().unwrap().contains("npm"));
         assert!(v["children"][0].get("partial").is_none(), "false flags left out");
         let g = crate::fs::Growth {
-            growers: vec![crate::fs::Grower { path: "/w/a".into(), is_dir: true, delta: 5, writers: vec![(9, "cc".into(), 7)], evidence: vec![crate::fs::Evidence::OpenFiles], ..Default::default() }],
+            growers: vec![crate::fs::Grower {
+                path: "/w/a".into(),
+                is_dir: true,
+                delta: 5,
+                writers: vec![(9, "cc".into(), 7)],
+                evidence: vec![crate::fs::Evidence::OpenFiles],
+                ..Default::default()
+            }],
             deleted_open: vec![(3, "x".into(), "/tmp/z".into(), 1 << 30)],
             ..Default::default()
         };
@@ -2110,20 +2334,35 @@ mod tests {
     }
 
     fn hp(pid: u32, ppid: u32, name: &str, exe: &str) -> Proc {
-        Proc { pid, ppid, name: name.into(), cmd: exe.into(), exe: exe.into(), user: "me".into(), start_time: 1_700_000_000 + pid as u64, ..Default::default() }
+        Proc {
+            pid,
+            ppid,
+            name: name.into(),
+            cmd: exe.into(),
+            exe: exe.into(),
+            user: "me".into(),
+            start_time: 1_700_000_000 + pid as u64,
+            ..Default::default()
+        }
     }
 
     fn hub_snap() -> Snapshot {
         let mut s = Snapshot::default();
         s.system.os = "macOS 15.6".into();
-        let helper = "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper";
+        let helper =
+            "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper";
         let mut l = hp(1, 0, "launchd", "/sbin/launchd");
         l.user = "root".into();
         s.procs = vec![
             l,
             hp(13792, 1, "OrbStack Helper", helper),
             hp(1686, 1, "Brave Browser", "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
-            hp(1700, 1686, "Brave Browser Helper (Renderer)", "/Applications/Brave Browser.app/Contents/Frameworks/Brave Browser Helper (Renderer).app/Contents/MacOS/Brave Browser Helper (Renderer)"),
+            hp(
+                1700,
+                1686,
+                "Brave Browser Helper (Renderer)",
+                "/Applications/Brave Browser.app/Contents/Frameworks/Brave Browser Helper (Renderer).app/Contents/MacOS/Brave Browser Helper (Renderer)",
+            ),
             hp(900, 1, "node", "/usr/local/bin/node"),
             hp(901, 900, "node", "/usr/local/bin/node"),
             hp(902, 901, "esbuild", "/usr/local/bin/esbuild"),
@@ -2138,7 +2377,10 @@ mod tests {
             let (r, _) = hub_check(&s, kind, 13792);
             let r = r.unwrap_or_else(|| panic!("{kind:?} of the VM host must be refused"));
             assert!(r.contains("OrbStack VM") && r.contains("tell the user"), "{r}");
-            assert!(hub_check(&s, kind, 1686).0.is_some_and(|r| r.contains("Brave's main process")), "{kind:?} browser main");
+            assert!(
+                hub_check(&s, kind, 1686).0.is_some_and(|r| r.contains("Brave's main process")),
+                "{kind:?} browser main"
+            );
             assert_eq!(hub_check(&s, kind, 900), (None, None), "{kind:?} a plain process");
         }
         // Renice and resume are not gated (renice of a VM host is blame's call, not a freeze).

@@ -61,7 +61,10 @@ impl Resolver {
         Resolver {
             cache: HashMap::new(),
             docker_root: Some(docker_root),
-            run_roots: vec![PathBuf::from("/run/containerd/io.containerd.runtime.v2.task"), PathBuf::from("/run/containers/storage/overlay-containers")],
+            run_roots: vec![
+                PathBuf::from("/run/containerd/io.containerd.runtime.v2.task"),
+                PathBuf::from("/run/containers/storage/overlay-containers"),
+            ],
             podman_index,
         }
     }
@@ -90,7 +93,9 @@ impl Resolver {
         // Names from the TUI's cache may arrive later; adopt them when ours is only the id.
         let e = self.cache.get_mut(&short).expect("present");
         if e.meta.name == short
-            && let Some(c) = crate::fleet::cached_containers().and_then(|l| l.into_iter().find(|c| !c.id.is_empty() && (c.id.starts_with(&short) || short.starts_with(&c.id))))
+            && let Some(c) = crate::fleet::cached_containers().and_then(|l| {
+                l.into_iter().find(|c| !c.id.is_empty() && (c.id.starts_with(&short) || short.starts_with(&c.id)))
+            })
         {
             merge_cli(&mut e.meta, &mut e.state, &c);
         }
@@ -103,12 +108,24 @@ impl Resolver {
     }
 
     fn lookup(&self, full_id: &str, short: &str, runtime: &str) -> Entry {
-        let mut e = Entry { meta: ContainerMeta { id: short.to_string(), name: short.to_string(), runtime: runtime.to_string(), ..Default::default() }, ..Default::default() };
+        let mut e = Entry {
+            meta: ContainerMeta {
+                id: short.to_string(),
+                name: short.to_string(),
+                runtime: runtime.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         if full_id.len() == 64 {
             if let Some(root) = &self.docker_root {
                 let f = root.join("containers").join(full_id).join("config.v2.json");
                 if let Some((m, s)) = read_docker(&f) {
-                    let rt = if e.meta.runtime.is_empty() || e.meta.runtime == "cri" { "docker".to_string() } else { e.meta.runtime.clone() };
+                    let rt = if e.meta.runtime.is_empty() || e.meta.runtime == "cri" {
+                        "docker".to_string()
+                    } else {
+                        e.meta.runtime.clone()
+                    };
                     e.meta = ContainerMeta { runtime: rt, ..m };
                     e.state = s;
                     e.docker_file = Some(f);
@@ -132,7 +149,9 @@ impl Resolver {
                 }
             }
         }
-        if let Some(c) = crate::fleet::cached_containers().and_then(|l| l.into_iter().find(|c| !c.id.is_empty() && (c.id.starts_with(short) || short.starts_with(&c.id)))) {
+        if let Some(c) = crate::fleet::cached_containers().and_then(|l| {
+            l.into_iter().find(|c| !c.id.is_empty() && (c.id.starts_with(short) || short.starts_with(&c.id)))
+        }) {
             merge_cli(&mut e.meta, &mut e.state, &c);
         }
         e
@@ -157,7 +176,10 @@ fn merge_cli(meta: &mut ContainerMeta, state: &mut RtState, c: &crate::model::Co
     }
     let st = c.status.to_ascii_lowercase();
     if meta.health.is_none() {
-        meta.health = ["unhealthy", "healthy", "starting"].into_iter().find(|h| st.contains(&format!("({h}"))).map(str::to_string);
+        meta.health = ["unhealthy", "healthy", "starting"]
+            .into_iter()
+            .find(|h| st.contains(&format!("({h}")))
+            .map(str::to_string);
     }
     if state.state.is_none() && !st.is_empty() {
         let (s, sub) = if st.starts_with("up") && st.contains("paused") {
@@ -197,7 +219,8 @@ pub fn parse_docker_config(v: &Value) -> (ContainerMeta, RtState) {
     let h = s("/State/Health/Status");
     meta.health = (!h.is_empty()).then_some(h);
     if let Some(labels) = v.pointer("/Config/Labels").and_then(Value::as_object) {
-        let m: HashMap<String, String> = labels.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect();
+        let m: HashMap<String, String> =
+            labels.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect();
         apply_annotations(&mut meta, &m);
     }
     let exit = v.pointer("/State/ExitCode").and_then(Value::as_i64).map(|x| x as i32);
@@ -212,7 +235,10 @@ pub fn parse_docker_config(v: &Value) -> (ContainerMeta, RtState) {
     } else {
         ("inactive", "exited")
     };
-    let started = chrono::DateTime::parse_from_rfc3339(&s("/State/StartedAt")).ok().map(|t| t.timestamp_millis()).filter(|&t| t > 0);
+    let started = chrono::DateTime::parse_from_rfc3339(&s("/State/StartedAt"))
+        .ok()
+        .map(|t| t.timestamp_millis())
+        .filter(|&t| t > 0);
     let st = RtState {
         state: Some(state.into()),
         sub_state: sub.into(),
@@ -238,7 +264,10 @@ fn read_oci(f: &Path) -> Option<HashMap<String, String>> {
 }
 
 pub fn oci_annotations(v: &Value) -> HashMap<String, String> {
-    v.get("annotations").and_then(Value::as_object).map(|a| a.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect()).unwrap_or_default()
+    v.get("annotations")
+        .and_then(Value::as_object)
+        .map(|a| a.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+        .unwrap_or_default()
 }
 
 /// Kubernetes identity from CRI annotations / docker labels (containerd, CRI-O, cri-dockerd).
@@ -249,7 +278,8 @@ pub fn apply_annotations(meta: &mut ContainerMeta, a: &HashMap<String, String>) 
     let uid = get(&["io.kubernetes.cri.sandbox-uid", "io.kubernetes.pod.uid"]);
     let cname = get(&["io.kubernetes.cri.container-name", "io.kubernetes.container.name"]);
     let image = get(&["io.kubernetes.cri.image-name", "io.kubernetes.cri-o.ImageName"]);
-    let sandbox = get(&["io.kubernetes.cri.container-type", "io.kubernetes.cri-o.ContainerType"]).is_some_and(|t| t == "sandbox")
+    let sandbox = get(&["io.kubernetes.cri.container-type", "io.kubernetes.cri-o.ContainerType"])
+        .is_some_and(|t| t == "sandbox")
         || get(&["io.kubernetes.docker.type"]).is_some_and(|t| t == "podsandbox");
     if pod.is_some() {
         meta.pod = pod.clone();
@@ -277,7 +307,14 @@ pub fn apply_annotations(meta: &mut ContainerMeta, a: &HashMap<String, String>) 
 /// Name for `id` in podman's containers.json (`[{"id": ..., "names": [...]}]`).
 fn podman_name(index: &Path, id: &str) -> Option<String> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(index).ok()?).ok()?;
-    v.as_array()?.iter().find(|c| c.get("id").and_then(Value::as_str) == Some(id))?.get("names")?.as_array()?.first()?.as_str().map(str::to_string)
+    v.as_array()?
+        .iter()
+        .find(|c| c.get("id").and_then(Value::as_str) == Some(id))?
+        .get("names")?
+        .as_array()?
+        .first()?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Runtime implied by a container cgroup segment.
@@ -307,9 +344,18 @@ mod tests {
         let v = json!({"ID": "abcdef0123456789", "Name": "/web", "Config": {"Image": "nginx:1", "Labels": {}}, "RestartCount": 4,
             "State": {"Running": false, "Restarting": true, "ExitCode": 1, "StartedAt": "2026-11-10T09:12:33.5Z", "Health": {"Status": "unhealthy"}}});
         let (m, s) = parse_docker_config(&v);
-        assert_eq!((m.id.as_str(), m.name.as_str(), m.image.as_str(), m.health.as_deref()), ("abcdef012345", "web", "nginx:1", Some("unhealthy")));
-        assert_eq!((s.state.as_deref(), s.sub_state.as_str(), s.exit_code, s.restarts), (Some("activating"), "restarting", Some(1), Some(4)));
-        assert_eq!(s.started, Some(chrono::DateTime::parse_from_rfc3339("2026-11-10T09:12:33.5Z").unwrap().timestamp_millis()));
+        assert_eq!(
+            (m.id.as_str(), m.name.as_str(), m.image.as_str(), m.health.as_deref()),
+            ("abcdef012345", "web", "nginx:1", Some("unhealthy"))
+        );
+        assert_eq!(
+            (s.state.as_deref(), s.sub_state.as_str(), s.exit_code, s.restarts),
+            (Some("activating"), "restarting", Some(1), Some(4))
+        );
+        assert_eq!(
+            s.started,
+            Some(chrono::DateTime::parse_from_rfc3339("2026-11-10T09:12:33.5Z").unwrap().timestamp_millis())
+        );
         let (_, s) = parse_docker_config(&json!({"State": {"Running": false, "ExitCode": 137}}));
         assert_eq!(s.state.as_deref(), Some("failed"));
         let (_, s) = parse_docker_config(&json!({"State": {"Running": false, "ExitCode": 0}}));
@@ -331,7 +377,10 @@ mod tests {
         .collect();
         apply_annotations(&mut m, &a);
         assert_eq!(m.name, "shop/api-7d9f/app");
-        assert_eq!((m.pod.as_deref(), m.namespace.as_deref(), m.pod_uid.as_deref(), m.image.as_str()), (Some("api-7d9f"), Some("shop"), Some("1234-ab"), "example.com/app:2"));
+        assert_eq!(
+            (m.pod.as_deref(), m.namespace.as_deref(), m.pod_uid.as_deref(), m.image.as_str()),
+            (Some("api-7d9f"), Some("shop"), Some("1234-ab"), "example.com/app:2")
+        );
     }
 
     #[test]
@@ -341,7 +390,11 @@ mod tests {
         let id = "a".repeat(64);
         let id2 = "b".repeat(64);
         std::fs::create_dir_all(d.join("docker/containers").join(&id)).unwrap();
-        std::fs::write(d.join("docker/containers").join(&id).join("config.v2.json"), r#"{"ID":"x","Name":"/db","Config":{"Image":"pg"},"State":{"Running":true}}"#).unwrap();
+        std::fs::write(
+            d.join("docker/containers").join(&id).join("config.v2.json"),
+            r#"{"ID":"x","Name":"/db","Config":{"Image":"pg"},"State":{"Running":true}}"#,
+        )
+        .unwrap();
         std::fs::create_dir_all(d.join("run/k8s.io").join(&id2)).unwrap();
         std::fs::write(d.join("run/k8s.io").join(&id2).join("config.json"), r#"{"annotations":{"io.kubernetes.cri.sandbox-name":"p","io.kubernetes.cri.sandbox-namespace":"n","io.kubernetes.cri.container-name":"c"}}"#).unwrap();
         let mut r = Resolver::with_roots(&d.join("docker"), vec![d.join("run")], vec![]);

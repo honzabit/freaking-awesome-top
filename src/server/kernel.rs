@@ -21,7 +21,10 @@
 //! Events are edge-triggered (fire when a condition starts, re-arm when it clears to half the
 //! threshold) and identical kernel-log events within one sample are collapsed with a `repeats`
 //! count, so a flood of I/O errors costs one row, not thousands.
-use super::{DStateProc, DiskStat, Event, EventKind, FsErrorStat, Kernel, MdArray, NumaNode, OomInfo, Pressure, ServerCfg, Severity, Unit};
+use super::{
+    DStateProc, DiskStat, Event, EventKind, FsErrorStat, Kernel, MdArray, NumaNode, OomInfo, Pressure, ServerCfg,
+    Severity, Unit,
+};
 use crate::model::{Proc, Ts, now_ms};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -75,8 +78,17 @@ struct VmCounters {
 enum KernelLog {
     /// Not opened yet.
     Init,
-    Kmsg { file: fs::File, last_seq: Option<u64>, asm: OomAssembler },
-    Journal { cursor: Option<String>, since_s: i64, last_run: Option<Instant>, asm: OomAssembler },
+    Kmsg {
+        file: fs::File,
+        last_seq: Option<u64>,
+        asm: OomAssembler,
+    },
+    Journal {
+        cursor: Option<String>,
+        since_s: i64,
+        last_run: Option<Instant>,
+        asm: OomAssembler,
+    },
     Off(String),
 }
 
@@ -108,7 +120,11 @@ impl KernelSampler {
             md_degraded: HashSet::new(),
             active: HashSet::new(),
             eph_cache: None,
-            log: if live && cfg.kmsg { KernelLog::Init } else { KernelLog::Off("kernel log disabled ([server] kmsg = false)".into()) },
+            log: if live && cfg.kmsg {
+                KernelLog::Init
+            } else {
+                KernelLog::Off("kernel log disabled ([server] kmsg = false)".into())
+            },
             unit_cgroups: Vec::new(),
         }
     }
@@ -161,7 +177,12 @@ impl KernelSampler {
         // The kernel log prints memcgs from the root cgroup namespace, so inside a container or
         // VM with its own namespace the unit's path is a suffix ("/<outer>/system.slice/x.scope").
         let hit = self.unit_cgroups.iter().find(|(c, _)| {
-            !c.is_empty() && c != "/" && (cg == c || cg.starts_with(&format!("{c}/")) || cg.ends_with(c.as_str()) || cg.contains(&format!("{c}/")))
+            !c.is_empty()
+                && c != "/"
+                && (cg == c
+                    || cg.starts_with(&format!("{c}/"))
+                    || cg.ends_with(c.as_str())
+                    || cg.contains(&format!("{c}/")))
         });
         hit.map(|(_, n)| n.clone()).or_else(|| super::unit_of_cgroup(cg).map(|u| u.key))
     }
@@ -196,7 +217,10 @@ impl KernelSampler {
         // Pressure (some + full).
         k.pressure = self.read_pressure();
         if k.pressure.is_none() {
-            k.notes.push("no PSI: /proc/pressure unreadable (kernel < 4.20, CONFIG_PSI off, psi=0, or hidden in this container)".into());
+            k.notes.push(
+                "no PSI: /proc/pressure unreadable (kernel < 4.20, CONFIG_PSI off, psi=0, or hidden in this container)"
+                    .into(),
+            );
         }
 
         if let Some(m) = self.read("proc/meminfo") {
@@ -261,8 +285,16 @@ impl KernelSampler {
                 // W (warning), D (oops), L (soft lockup), M (machine check), B (bad page).
                 let serious = new_bits & ((1 << 9) | (1 << 7) | (1 << 14) | (1 << 4) | (1 << 5));
                 if serious != 0 {
-                    let sev = if new_bits & ((1 << 7) | (1 << 4) | (1 << 5)) != 0 { Severity::Crit } else { Severity::Warn };
-                    let mut e = event(now, EventKind::KernelWarn, sev, "kernel", format!("kernel taint gained {} (now {})", decode_taint(new_bits), k.taint_flags), "procfs");
+                    let sev =
+                        if new_bits & ((1 << 7) | (1 << 4) | (1 << 5)) != 0 { Severity::Crit } else { Severity::Warn };
+                    let mut e = event(
+                        now,
+                        EventKind::KernelWarn,
+                        sev,
+                        "kernel",
+                        format!("kernel taint gained {} (now {})", decode_taint(new_bits), k.taint_flags),
+                        "procfs",
+                    );
                     e.value = Some(t as f64);
                     self.pending.push(e);
                 }
@@ -273,7 +305,14 @@ impl KernelSampler {
         k.ntp_synced = if self.live { clock_synced() } else { self.read("ntp_synced").map(|s| s.trim() == "1") };
         if let Some(s) = k.ntp_synced {
             if !s && self.ntp_synced != Some(false) {
-                self.pending.push(event(now, EventKind::ClockUnsynced, Severity::Warn, "host", "system clock is not synchronised (kernel max error >= 16 s)".into(), "procfs"));
+                self.pending.push(event(
+                    now,
+                    EventKind::ClockUnsynced,
+                    Severity::Warn,
+                    "host",
+                    "system clock is not synchronised (kernel max error >= 16 s)".into(),
+                    "procfs",
+                ));
             }
             self.ntp_synced = Some(s);
         }
@@ -282,7 +321,14 @@ impl KernelSampler {
             k.mdraid = parse_mdstat(&s);
             for a in &k.mdraid {
                 if a.degraded && self.md_degraded.insert(a.name.clone()) {
-                    let mut e = event(now, EventKind::DiskError, Severity::Crit, &format!("disk:{}", a.name), format!("md array {} ({}) is degraded: {}", a.name, a.level, a.state), "procfs");
+                    let mut e = event(
+                        now,
+                        EventKind::DiskError,
+                        Severity::Crit,
+                        &format!("disk:{}", a.name),
+                        format!("md array {} ({}) is degraded: {}", a.name, a.level, a.state),
+                        "procfs",
+                    );
                     e.value = a.sync_pct.map(f64::from);
                     self.pending.push(e);
                 } else if !a.degraded {
@@ -329,8 +375,16 @@ impl KernelSampler {
                 let node: u32 = e.file_name().to_string_lossy().strip_prefix("node")?.parse().ok()?;
                 let s = fs::read_to_string(e.path().join("meminfo")).ok()?;
                 // "Node 0 MemTotal:  8000000 kB"
-                let kb = |key: &str| s.lines().find_map(|l| l.split_once(key).and_then(|(_, r)| r.trim().trim_end_matches("kB").trim().parse::<u64>().ok()));
-                Some(NumaNode { node, mem_total: kb("MemTotal:").unwrap_or(0) * 1024, mem_free: kb("MemFree:").unwrap_or(0) * 1024 })
+                let kb = |key: &str| {
+                    s.lines().find_map(|l| {
+                        l.split_once(key).and_then(|(_, r)| r.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                    })
+                };
+                Some(NumaNode {
+                    node,
+                    mem_total: kb("MemTotal:").unwrap_or(0) * 1024,
+                    mem_free: kb("MemFree:").unwrap_or(0) * 1024,
+                })
             })
             .collect();
         v.sort_by_key(|n| n.node);
@@ -341,7 +395,10 @@ impl KernelSampler {
         let Some(text) = self.read("proc/diskstats") else { return Vec::new() };
         let sysblock = self.p("sys/class/block");
         let have_sys = sysblock.is_dir();
-        let cur: Vec<DiskCounters> = parse_diskstats(&text).into_iter().filter(|d| !(have_sys && sysblock.join(&d.name).join("partition").exists())).collect();
+        let cur: Vec<DiskCounters> = parse_diskstats(&text)
+            .into_iter()
+            .filter(|d| !(have_sys && sysblock.join(&d.name).join("partition").exists()))
+            .collect();
         let mut out = Vec::with_capacity(cur.len());
         for d in &cur {
             let mut s = DiskStat { name: d.name.clone(), ..Default::default() };
@@ -373,7 +430,8 @@ impl KernelSampler {
     fn ephemeral(&mut self, range: (u16, u16)) -> Option<(u64, String)> {
         let span = (range.1 as u64).saturating_sub(range.0 as u64) + 1;
         if let Some((at, prev)) = &self.eph_cache {
-            let near = prev.as_ref().is_some_and(|(u, _)| *u as f64 >= span as f64 * self.cfg.exhaustion_warn as f64 / 2.0);
+            let near =
+                prev.as_ref().is_some_and(|(u, _)| *u as f64 >= span as f64 * self.cfg.exhaustion_warn as f64 / 2.0);
             if !near && at.elapsed().as_secs() < self.cfg.unit_refresh_s {
                 return prev.clone();
             }
@@ -399,7 +457,12 @@ impl KernelSampler {
         let mut wchan_hidden = false;
         // One task (main thread or worker thread) confirmed in D: track its episode by
         // (tid, starttime) so a recycled tid starts a new one; report it under its process.
-        let mut task = |this: &mut Self, p: &Proc, dir: &str, start: u64, out: &mut Vec<DStateProc>, new_long: &mut Vec<DStateProc>| {
+        let mut task = |this: &mut Self,
+                        p: &Proc,
+                        dir: &str,
+                        start: u64,
+                        out: &mut Vec<DStateProc>,
+                        new_long: &mut Vec<DStateProc>| {
             let tid: u32 = dir.rsplit('/').next().and_then(|t| t.parse().ok()).unwrap_or(p.pid);
             let key = (tid, start);
             seen.insert(key);
@@ -415,7 +478,13 @@ impl KernelSampler {
             } else {
                 wchan
             };
-            let d = DStateProc { pid: p.pid, name: p.name.clone(), wchan, seconds: secs, unit: this.unit_for_cgroup(&p.cgroup) };
+            let d = DStateProc {
+                pid: p.pid,
+                name: p.name.clone(),
+                wchan,
+                seconds: secs,
+                unit: this.unit_for_cgroup(&p.cgroup),
+            };
             // A process with several blocked threads is one row (its longest-blocked thread)
             // and one event.
             let fresh = this.dstate_reported.insert(key);
@@ -472,7 +541,10 @@ impl KernelSampler {
                 }
             }
             if reads >= max && found < blocked {
-                notes.push(format!("{} blocked tasks, {found} found: thread scan stopped at server.dstate_max_thread_reads ({max})", blocked));
+                notes.push(format!(
+                    "{} blocked tasks, {found} found: thread scan stopped at server.dstate_max_thread_reads ({max})",
+                    blocked
+                ));
             }
         }
         self.dstate_first.retain(|k, _| seen.contains(k));
@@ -487,7 +559,13 @@ impl KernelSampler {
                 EventKind::HungTask,
                 Severity::Warn,
                 &format!("pid:{}", d.pid),
-                format!("{} (pid {}) blocked in D state for {}s{}", d.name, d.pid, d.seconds, if d.wchan.is_empty() { String::new() } else { format!(" in {}", d.wchan) }),
+                format!(
+                    "{} (pid {}) blocked in D state for {}s{}",
+                    d.name,
+                    d.pid,
+                    d.seconds,
+                    if d.wchan.is_empty() { String::new() } else { format!(" in {}", d.wchan) }
+                ),
                 "procfs",
             );
             e.pid = Some(d.pid);
@@ -514,7 +592,13 @@ impl KernelSampler {
                     .dev_names
                     .entry(m.source.clone())
                     .or_insert_with(|| {
-                        let real = if live { fs::canonicalize(&m.source).ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned())) } else { None };
+                        let real = if live {
+                            fs::canonicalize(&m.source)
+                                .ok()
+                                .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+                        } else {
+                            None
+                        };
                         real.unwrap_or_else(|| dev.rsplit('/').next().unwrap_or(dev).to_string())
                     })
                     .clone();
@@ -533,7 +617,14 @@ impl KernelSampler {
                     if !self.ro_remounts.contains(&mp) {
                         self.ro_remounts.push(mp.clone());
                     }
-                    let mut e = event(now, EventKind::RoRemount, Severity::Crit, &format!("mount:{mp}"), format!("{mp} ({}, {}) went read-only", m.source, m.fstype), "procfs");
+                    let mut e = event(
+                        now,
+                        EventKind::RoRemount,
+                        Severity::Crit,
+                        &format!("mount:{mp}"),
+                        format!("{mp} ({}, {}) went read-only", m.source, m.fstype),
+                        "procfs",
+                    );
                     e.extra.insert("device".into(), m.source.clone());
                     self.pending.push(e);
                 }
@@ -550,11 +641,27 @@ impl KernelSampler {
         if let Ok(rd) = fs::read_dir(self.p("sys/fs/ext4")) {
             for e in rd.flatten() {
                 let dev = e.file_name().to_string_lossy().into_owned();
-                let Some(n) = fs::read_to_string(e.path().join("errors_count")).ok().and_then(|s| s.trim().parse::<u64>().ok()) else { continue };
+                let Some(n) =
+                    fs::read_to_string(e.path().join("errors_count")).ok().and_then(|s| s.trim().parse::<u64>().ok())
+                else {
+                    continue;
+                };
                 let (mount, ro) = dev_mount.get(&dev).cloned().map_or((None, false), |(m, r)| (Some(m), r));
                 let prev = self.ext4_errors.insert(dev.clone(), n);
                 if prev.is_some_and(|p| n > p) {
-                    let mut ev = event(now, EventKind::DiskError, Severity::Crit, &format!("disk:{dev}"), format!("ext4 on {dev}{} recorded {} new error(s) ({} total)", mount.as_deref().map(|m| format!(" ({m})")).unwrap_or_default(), n - prev.unwrap_or(0), n), "procfs");
+                    let mut ev = event(
+                        now,
+                        EventKind::DiskError,
+                        Severity::Crit,
+                        &format!("disk:{dev}"),
+                        format!(
+                            "ext4 on {dev}{} recorded {} new error(s) ({} total)",
+                            mount.as_deref().map(|m| format!(" ({m})")).unwrap_or_default(),
+                            n - prev.unwrap_or(0),
+                            n
+                        ),
+                        "procfs",
+                    );
                     ev.value = Some(n as f64);
                     self.pending.push(ev);
                 }
@@ -572,7 +679,12 @@ impl KernelSampler {
         let checks: [(&str, Option<u64>, Option<u64>, &str); 3] = [
             ("fd", k.fd_used, k.fd_max, "file handles"),
             ("conntrack", k.conntrack_used, k.conntrack_max, "conntrack entries"),
-            ("ephemeral", k.ephemeral_used, k.ephemeral_range.map(|(a, b)| (b as u64).saturating_sub(a as u64) + 1), "ephemeral ports"),
+            (
+                "ephemeral",
+                k.ephemeral_used,
+                k.ephemeral_range.map(|(a, b)| (b as u64).saturating_sub(a as u64) + 1),
+                "ephemeral ports",
+            ),
         ];
         for (key, used, max, what) in checks {
             let (Some(u), Some(m)) = (used, max) else { continue };
@@ -605,7 +717,15 @@ impl KernelSampler {
                     EventKind::DiskLatencySpike,
                     sev,
                     &format!("disk:{}", d.name),
-                    format!("{} await r {:.0} ms / w {:.0} ms (util {:.0}%, queue {:.1}, {:.0} iops)", d.name, d.r_await_ms, d.w_await_ms, d.util_pct, d.queue_depth, d.r_iops + d.w_iops),
+                    format!(
+                        "{} await r {:.0} ms / w {:.0} ms (util {:.0}%, queue {:.1}, {:.0} iops)",
+                        d.name,
+                        d.r_await_ms,
+                        d.w_await_ms,
+                        d.util_pct,
+                        d.queue_depth,
+                        d.r_iops + d.w_iops
+                    ),
                     "procfs",
                 );
                 e.value = Some(a as f64);
@@ -617,7 +737,16 @@ impl KernelSampler {
             for (res, full) in [("cpu", p.cpu_full), ("memory", p.mem_full), ("io", p.io_full)] {
                 if self.rise(&format!("psi:{res}"), full >= lim, full < lim / 2.0) {
                     let sev = if full >= lim * 4.0 { Severity::Crit } else { Severity::Warn };
-                    let mut e = event(now, EventKind::PressureSpike, sev, "host", format!("{res} pressure: all non-idle tasks stalled {full:.1}% of the last 10s (PSI full avg10)"), "procfs");
+                    let mut e = event(
+                        now,
+                        EventKind::PressureSpike,
+                        sev,
+                        "host",
+                        format!(
+                            "{res} pressure: all non-idle tasks stalled {full:.1}% of the last 10s (PSI full avg10)"
+                        ),
+                        "procfs",
+                    );
                     e.value = Some(full as f64);
                     e.extra.insert("resource".into(), res.into());
                     self.pending.push(e);
@@ -647,7 +776,14 @@ impl KernelSampler {
                     raw.extend(asm.feed(rec, boot));
                 });
                 if lost > 0 {
-                    raw.push(event(now, EventKind::Other, Severity::Info, "kernel", format!("{lost} kernel log records were overwritten before fat read them"), "kmsg"));
+                    raw.push(event(
+                        now,
+                        EventKind::Other,
+                        Severity::Info,
+                        "kernel",
+                        format!("{lost} kernel log records were overwritten before fat read them"),
+                        "kmsg",
+                    ));
                 }
             }
             KernelLog::Journal { cursor, since_s, last_run, asm } => {
@@ -698,7 +834,14 @@ impl KernelSampler {
         if let (Some(p), Some(cur)) = (prev_vm.and_then(|p| p.oom_kill), vm.oom_kill) {
             let d = cur.saturating_sub(p);
             if d > 0 && !log_on && kmsg_ooms == 0 {
-                let mut e = event(now, EventKind::OomKill, Severity::Crit, "host", format!("{d} process(es) OOM-killed (victim unknown: kernel log needs root)"), "procfs");
+                let mut e = event(
+                    now,
+                    EventKind::OomKill,
+                    Severity::Crit,
+                    "host",
+                    format!("{d} process(es) OOM-killed (victim unknown: kernel log needs root)"),
+                    "procfs",
+                );
                 e.value = Some(d as f64);
                 self.pending.push(e);
             }
@@ -708,8 +851,33 @@ impl KernelSampler {
 
 /// Filesystems whose read-only state is not news.
 const VIRTUAL_FS: &[&str] = &[
-    "proc", "sysfs", "cgroup", "cgroup2", "devpts", "mqueue", "debugfs", "tracefs", "securityfs", "pstore", "bpf", "configfs", "fusectl", "hugetlbfs",
-    "autofs", "binfmt_misc", "rpc_pipefs", "nsfs", "efivarfs", "devtmpfs", "squashfs", "iso9660", "ramfs", "tmpfs", "overlay", "erofs", "nfsd",
+    "proc",
+    "sysfs",
+    "cgroup",
+    "cgroup2",
+    "devpts",
+    "mqueue",
+    "debugfs",
+    "tracefs",
+    "securityfs",
+    "pstore",
+    "bpf",
+    "configfs",
+    "fusectl",
+    "hugetlbfs",
+    "autofs",
+    "binfmt_misc",
+    "rpc_pipefs",
+    "nsfs",
+    "efivarfs",
+    "devtmpfs",
+    "squashfs",
+    "iso9660",
+    "ramfs",
+    "tmpfs",
+    "overlay",
+    "erofs",
+    "nfsd",
 ];
 
 fn event(ts: Ts, kind: EventKind, severity: Severity, subject: &str, detail: String, source: &str) -> Event {
@@ -760,7 +928,9 @@ fn open_kernel_log(now: Ts) -> KernelLog {
             let _ = f.seek(std::io::SeekFrom::End(0));
             KernelLog::Kmsg { file: f, last_seq: None, asm: OomAssembler::default() }
         }
-        Err(_) if which("journalctl") => KernelLog::Journal { cursor: None, since_s: now / 1000, last_run: None, asm: OomAssembler::default() },
+        Err(_) if which("journalctl") => {
+            KernelLog::Journal { cursor: None, since_s: now / 1000, last_run: None, asm: OomAssembler::default() }
+        }
         Err(e) => KernelLog::Off(kmsg_error(&e)),
     }
 }
@@ -768,7 +938,9 @@ fn open_kernel_log(now: Ts) -> KernelLog {
 /// Why /dev/kmsg could not be opened, in operator terms.
 fn kmsg_error(e: &std::io::Error) -> String {
     match e.kind() {
-        std::io::ErrorKind::NotFound => "kernel log unavailable: no /dev/kmsg here (typical in containers) and no readable journal".into(),
+        std::io::ErrorKind::NotFound => {
+            "kernel log unavailable: no /dev/kmsg here (typical in containers) and no readable journal".into()
+        }
         _ => format!("{NEEDS_ROOT} ({e})"),
     }
 }
@@ -903,7 +1075,9 @@ fn apply_oom(e: &mut Event, o: &OomInfo) {
     let rss = (o.anon_rss_kb + o.file_rss_kb + o.shmem_rss_kb) * 1024;
     e.value = Some(rss as f64);
     let scope = match o.constraint.as_str() {
-        "CONSTRAINT_MEMCG" => format!("cgroup {} hit its memory limit", if o.memcg.is_empty() { "?" } else { &o.memcg }),
+        "CONSTRAINT_MEMCG" => {
+            format!("cgroup {} hit its memory limit", if o.memcg.is_empty() { "?" } else { &o.memcg })
+        }
         "CONSTRAINT_NONE" | "" => "host out of memory".to_string(),
         c => format!("{} ({c})", if o.memcg.is_empty() { "constrained OOM" } else { &o.memcg }),
     };
@@ -982,7 +1156,8 @@ fn journal_records(cursor: Option<&str>, since_s: i64) -> Result<JournalBatch, S
         Some(c) => cmd.arg(format!("--after-cursor={c}")),
         None => cmd.arg(format!("--since=@{since_s}")),
     };
-    let out = run_with_timeout(cmd, std::time::Duration::from_secs(5)).map_err(|e| format!("kernel log via journalctl failed: {e}"))?;
+    let out = run_with_timeout(cmd, std::time::Duration::from_secs(5))
+        .map_err(|e| format!("kernel log via journalctl failed: {e}"))?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if stderr.contains("insufficient permissions") || stderr.contains("No journal files were") {
         return Err(NEEDS_ROOT.into());
@@ -1004,7 +1179,10 @@ fn journal_records(cursor: Option<&str>, since_s: i64) -> Result<JournalBatch, S
 }
 
 /// Run a command we spawn, killing it (our own child) if it outlives `limit`.
-fn run_with_timeout(mut cmd: std::process::Command, limit: std::time::Duration) -> std::io::Result<std::process::Output> {
+fn run_with_timeout(
+    mut cmd: std::process::Command,
+    limit: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
     use std::process::Stdio;
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let (mut so, mut se) = (child.stdout.take(), child.stderr.take());
@@ -1034,7 +1212,11 @@ fn run_with_timeout(mut cmd: std::process::Command, limit: std::time::Duration) 
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    Ok(std::process::Output { status, stdout: t_out.join().unwrap_or_default(), stderr: t_err.join().unwrap_or_default() })
+    Ok(std::process::Output {
+        status,
+        stdout: t_out.join().unwrap_or_default(),
+        stderr: t_err.join().unwrap_or_default(),
+    })
 }
 
 /// One /dev/kmsg record ("6,1234,5678901,-;message") -> event, if it is one we classify.
@@ -1069,7 +1251,9 @@ fn bracket_name_pid(s: &str) -> Option<(String, u32)> {
 
 /// Device named in "(device sda1)" / "XFS (sdb1)" / "dev sda," / "[sdb]".
 fn device_in(msg: &str) -> Option<String> {
-    let pick = |s: &str| s.trim_matches(|c: char| c == ',' || c == ')' || c == '(' || c == ':' || c == '[' || c == ']').to_string();
+    let pick = |s: &str| {
+        s.trim_matches(|c: char| c == ',' || c == ')' || c == '(' || c == ':' || c == '[' || c == ']').to_string()
+    };
     if let Some(d) = kv_after(msg, "(device ") {
         return Some(pick(d));
     }
@@ -1096,7 +1280,9 @@ fn device_in(msg: &str) -> Option<String> {
             return Some(pick(d));
         }
     }
-    if let (Some(a), Some(b)) = (msg.find("] ["), msg.find("] [").and_then(|i| msg[i + 3..].find(']').map(|j| i + 3 + j))) {
+    if let (Some(a), Some(b)) =
+        (msg.find("] ["), msg.find("] [").and_then(|i| msg[i + 3..].find(']').map(|j| i + 3 + j)))
+    {
         return Some(msg[a + 3..b].to_string());
     }
     None
@@ -1127,9 +1313,18 @@ fn classify(level: u8, msg: &str, ts: Ts) -> Option<Event> {
     if let Some(rest) = msg.split_once("INFO: task ").map(|(_, r)| r)
         && let Some((who, tail)) = rest.split_once(" blocked for more than ")
     {
-        let (name, pid) = who.rsplit_once(':').map_or((who.to_string(), None), |(n, p)| (n.to_string(), p.parse::<u32>().ok()));
+        let (name, pid) =
+            who.rsplit_once(':').map_or((who.to_string(), None), |(n, p)| (n.to_string(), p.parse::<u32>().ok()));
         let secs: f64 = tail.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-        let mut e = ev(EventKind::HungTask, Severity::Warn, &pid.map_or("kernel".into(), |p| format!("pid:{p}")), format!("{name} (pid {}) blocked in D state for more than {secs:.0}s (kernel hung task detector)", pid.map_or("?".into(), |p| p.to_string())));
+        let mut e = ev(
+            EventKind::HungTask,
+            Severity::Warn,
+            &pid.map_or("kernel".into(), |p| format!("pid:{p}")),
+            format!(
+                "{name} (pid {}) blocked in D state for more than {secs:.0}s (kernel hung task detector)",
+                pid.map_or("?".into(), |p| p.to_string())
+            ),
+        );
         e.pid = pid;
         e.value = Some(secs);
         return Some(e);
@@ -1137,16 +1332,26 @@ fn classify(level: u8, msg: &str, ts: Ts) -> Option<Event> {
     // Lockups and oopses.
     if msg.contains("soft lockup") || msg.contains("hard LOCKUP") {
         let mut e = ev(EventKind::KernelWarn, Severity::Crit, "kernel", short);
-        if let Some((name, pid)) = msg.rfind('[').and_then(|i| msg[i + 1..].trim_end_matches(']').rsplit_once(':').map(|(n, p)| (n.to_string(), p.parse::<u32>().ok()))) {
+        if let Some((name, pid)) = msg.rfind('[').and_then(|i| {
+            msg[i + 1..].trim_end_matches(']').rsplit_once(':').map(|(n, p)| (n.to_string(), p.parse::<u32>().ok()))
+        }) {
             e.pid = pid;
             e.extra.insert("task".into(), name);
         }
         return Some(e);
     }
-    if msg.contains("rcu_sched self-detected stall") || msg.contains("rcu_preempt self-detected stall") || msg.contains("detected stalls on CPUs") {
+    if msg.contains("rcu_sched self-detected stall")
+        || msg.contains("rcu_preempt self-detected stall")
+        || msg.contains("detected stalls on CPUs")
+    {
         return Some(ev(EventKind::KernelWarn, Severity::Warn, "kernel", short));
     }
-    if msg.starts_with("BUG: ") || msg.starts_with("kernel BUG at") || msg.starts_with("Oops:") || msg.contains("Kernel panic") || msg.starts_with("general protection fault:") {
+    if msg.starts_with("BUG: ")
+        || msg.starts_with("kernel BUG at")
+        || msg.starts_with("Oops:")
+        || msg.contains("Kernel panic")
+        || msg.starts_with("general protection fault:")
+    {
         return Some(ev(EventKind::KernelWarn, Severity::Crit, "kernel", short));
     }
     if msg.starts_with("WARNING: CPU:") || msg.starts_with("WARNING: at ") {
@@ -1165,7 +1370,11 @@ fn classify(level: u8, msg: &str, ts: Ts) -> Option<Event> {
         return Some(ev(EventKind::KernelWarn, Severity::Warn, "kernel", short));
     }
     // Process crashes: "nginx[1234]: segfault at 0 ip ..." / "traps: x[12] general protection ..."
-    if msg.contains(": segfault at ") || msg.starts_with("traps: ") || msg.contains(" trap invalid opcode ") || msg.contains(" trap divide error ") {
+    if msg.contains(": segfault at ")
+        || msg.starts_with("traps: ")
+        || msg.contains(" trap invalid opcode ")
+        || msg.contains(" trap divide error ")
+    {
         let body = msg.strip_prefix("traps: ").unwrap_or(msg);
         let mut e = ev(EventKind::KernelWarn, Severity::Warn, "kernel", short.clone());
         if let Some((name, pid)) = bracket_name_pid(body) {
@@ -1178,13 +1387,30 @@ fn classify(level: u8, msg: &str, ts: Ts) -> Option<Event> {
         return Some(e);
     }
     // Filesystems.
-    if msg.contains("Remounting filesystem read-only") || msg.contains("forced readonly") || msg.contains("switching to read-only") {
+    if msg.contains("Remounting filesystem read-only")
+        || msg.contains("forced readonly")
+        || msg.contains("switching to read-only")
+    {
         let dev = device_in(msg).unwrap_or_default();
-        let mut e = ev(EventKind::RoRemount, Severity::Crit, &if dev.is_empty() { "kernel".into() } else { format!("disk:{dev}") }, short);
+        let mut e = ev(
+            EventKind::RoRemount,
+            Severity::Crit,
+            &if dev.is_empty() { "kernel".into() } else { format!("disk:{dev}") },
+            short,
+        );
         e.extra.insert("device".into(), dev);
         return Some(e);
     }
-    if msg.starts_with("EXT4-fs error") || msg.starts_with("EXT3-fs error") || msg.starts_with("BTRFS error") || msg.starts_with("BTRFS critical") || msg.starts_with("XFS (") && (msg.contains("error") || msg.contains("Corruption") || msg.contains("shut down") || msg.contains("force_shutdown")) {
+    if msg.starts_with("EXT4-fs error")
+        || msg.starts_with("EXT3-fs error")
+        || msg.starts_with("BTRFS error")
+        || msg.starts_with("BTRFS critical")
+        || msg.starts_with("XFS (")
+            && (msg.contains("error")
+                || msg.contains("Corruption")
+                || msg.contains("shut down")
+                || msg.contains("force_shutdown"))
+    {
         let dev = device_in(msg).unwrap_or_default();
         return Some(ev(EventKind::DiskError, Severity::Crit, &format!("disk:{dev}"), short));
     }
@@ -1198,13 +1424,18 @@ fn classify(level: u8, msg: &str, ts: Ts) -> Option<Event> {
         let subj = if dev.is_empty() { "kernel".to_string() } else { format!("disk:{dev}") };
         return Some(ev(EventKind::DiskError, Severity::Crit, &subj, short));
     }
-    if (msg.starts_with("nvme ") && (msg.contains("timeout") || msg.contains("controller is down") || msg.contains("resetting controller")))
-        || (msg.starts_with("ata") && (msg.contains("failed command") || msg.contains("hard resetting link") || msg.contains("exception Emask")))
+    if (msg.starts_with("nvme ")
+        && (msg.contains("timeout") || msg.contains("controller is down") || msg.contains("resetting controller")))
+        || (msg.starts_with("ata")
+            && (msg.contains("failed command")
+                || msg.contains("hard resetting link")
+                || msg.contains("exception Emask")))
         || (msg.starts_with("sd ") && msg.contains("FAILED Result"))
     {
         let dev = msg.split_whitespace().nth(1).map(|s| s.trim_end_matches(':').to_string());
         let dev = device_in(msg).filter(|d| !d.contains(':')).or(dev).unwrap_or_default();
-        let dev = if msg.starts_with("ata") { msg.split([':', ' ', '.']).next().unwrap_or("").to_string() } else { dev };
+        let dev =
+            if msg.starts_with("ata") { msg.split([':', ' ', '.']).next().unwrap_or("").to_string() } else { dev };
         return Some(ev(EventKind::DiskError, Severity::Warn, &format!("disk:{dev}"), short));
     }
     // Resource exhaustion reported by the kernel itself.
@@ -1242,7 +1473,12 @@ fn classify(level: u8, msg: &str, ts: Ts) -> Option<Event> {
         return Some(e);
     }
     // NIC link state: "e1000e: eth0 NIC Link is Down", "mlx5_core ...: Link down".
-    if msg.contains("NIC Link is Down") || msg.contains("Link is Down") || msg.ends_with(": Link down") || msg.contains("NIC Link is Up") || msg.contains("Link is Up") {
+    if msg.contains("NIC Link is Down")
+        || msg.contains("Link is Down")
+        || msg.ends_with(": Link down")
+        || msg.contains("NIC Link is Up")
+        || msg.contains("Link is Up")
+    {
         let up = msg.contains("Up");
         let iface = msg
             .split_whitespace()
@@ -1251,7 +1487,12 @@ fn classify(level: u8, msg: &str, ts: Ts) -> Option<Event> {
             .last()
             .unwrap_or("")
             .to_string();
-        let mut e = ev(EventKind::Other, if up { Severity::Info } else { Severity::Warn }, "host", format!("network link {} {}", if iface.is_empty() { "?" } else { &iface }, if up { "up" } else { "down" }));
+        let mut e = ev(
+            EventKind::Other,
+            if up { Severity::Info } else { Severity::Warn },
+            "host",
+            format!("network link {} {}", if iface.is_empty() { "?" } else { &iface }, if up { "up" } else { "down" }),
+        );
         e.extra.insert("iface".into(), iface);
         e.extra.insert("raw".into(), short);
         return Some(e);
@@ -1346,7 +1587,9 @@ fn fold_oom_line(o: &mut OomInfo, l: &str) -> bool {
     o.anon_rss_kb = kb("anon-rss:").unwrap_or(0);
     o.file_rss_kb = kb("file-rss:").unwrap_or(0);
     o.shmem_rss_kb = kb("shmem-rss:").unwrap_or(0);
-    if let Some(adj) = l.split("oom_score_adj:").nth(1).and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse().ok()) {
+    if let Some(adj) =
+        l.split("oom_score_adj:").nth(1).and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse().ok())
+    {
         o.oom_score_adj = adj;
     }
     true
@@ -1442,8 +1685,12 @@ fn ephemeral_usage(texts: &[&str], range: (u16, u16)) -> (u64, String) {
     for t in texts {
         for l in t.lines().skip(1) {
             let mut it = l.split_whitespace();
-            let (Some(_), Some(local), Some(remote), Some(state)) = (it.next(), it.next(), it.next(), it.next()) else { continue };
-            let Some(port) = local.rsplit_once(':').and_then(|(_, p)| u16::from_str_radix(p, 16).ok()) else { continue };
+            let (Some(_), Some(local), Some(remote), Some(state)) = (it.next(), it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            let Some(port) = local.rsplit_once(':').and_then(|(_, p)| u16::from_str_radix(p, 16).ok()) else {
+                continue;
+            };
             if port < range.0 || port > range.1 || state == "0A" {
                 continue;
             }
@@ -1600,7 +1847,8 @@ pub fn parse_diskstats(text: &str) -> Vec<DiskCounters> {
             if is_partition_name(&d.name) {
                 return None;
             }
-            let idle_virtual = ["loop", "ram", "zram", "nbd", "sr", "fd"].iter().any(|p| d.name.starts_with(p)) && d.reads + d.writes == 0;
+            let idle_virtual = ["loop", "ram", "zram", "nbd", "sr", "fd"].iter().any(|p| d.name.starts_with(p))
+                && d.reads + d.writes == 0;
             (!idle_virtual).then_some(d)
         })
         .collect()
@@ -1632,16 +1880,30 @@ pub fn parse_mdstat(text: &str) -> Vec<MdArray> {
             }
             let words: Vec<&str> = rest.split_whitespace().collect();
             let active = words.first() == Some(&"active");
-            let level = words.iter().skip(1).find(|w| !w.starts_with('(')).filter(|w| w.starts_with("raid") || **w == "linear" || **w == "multipath").map_or(String::new(), |w| w.to_string());
+            let level = words
+                .iter()
+                .skip(1)
+                .find(|w| !w.starts_with('('))
+                .filter(|w| w.starts_with("raid") || **w == "linear" || **w == "multipath")
+                .map_or(String::new(), |w| w.to_string());
             let failed = words.iter().any(|w| w.ends_with("(F)"));
-            out.push(MdArray { name: name.trim().into(), level, state: if active { "active".into() } else { words.first().unwrap_or(&"").to_string() }, degraded: failed, sync_pct: None });
+            out.push(MdArray {
+                name: name.trim().into(),
+                level,
+                state: if active { "active".into() } else { words.first().unwrap_or(&"").to_string() },
+                degraded: failed,
+                sync_pct: None,
+            });
             continue;
         }
         let Some(a) = out.last_mut() else { continue };
         // "[2/1] [U_]"
         if let Some(i) = t.rfind('[') {
             let tail = &t[i + 1..];
-            if tail.ends_with(']') && tail.trim_end_matches(']').bytes().all(|b| b == b'U' || b == b'_') && tail.len() > 1 {
+            if tail.ends_with(']')
+                && tail.trim_end_matches(']').bytes().all(|b| b == b'U' || b == b'_')
+                && tail.len() > 1
+            {
                 if tail.contains('_') {
                     a.degraded = true;
                 }
@@ -1654,7 +1916,9 @@ pub fn parse_mdstat(text: &str) -> Vec<MdArray> {
                 }
             }
         }
-        for (op, st) in [("recovery", "recovering"), ("resync", "resyncing"), ("reshape", "reshaping"), ("check", "checking")] {
+        for (op, st) in
+            [("recovery", "recovering"), ("resync", "resyncing"), ("reshape", "reshaping"), ("check", "checking")]
+        {
             if let Some(rest) = t.split_once(&format!("{op} =")).map(|(_, r)| r) {
                 a.sync_pct = rest.trim().split('%').next().and_then(|p| p.trim().parse().ok());
                 a.state = st.into();
@@ -1706,7 +1970,14 @@ pub struct KernelReport {
 
 /// Two kernel samples `interval` apart (rates need an interval) plus kernel log events since
 /// `since`. `procs`/`units` come from the caller's snapshot.
-pub fn report(cfg: &ServerCfg, procs: &[Proc], units: &[Unit], interval: std::time::Duration, since: Ts, max_events: usize) -> KernelReport {
+pub fn report(
+    cfg: &ServerCfg,
+    procs: &[Proc],
+    units: &[Unit],
+    interval: std::time::Duration,
+    since: Ts,
+    max_events: usize,
+) -> KernelReport {
     let mut r = KernelReport { ts: now_ms(), ..Default::default() };
     if !cfg!(target_os = "linux") {
         r.notes.push("kernel health is Linux only".into());
@@ -1719,10 +1990,21 @@ pub fn report(cfg: &ServerCfg, procs: &[Proc], units: &[Unit], interval: std::ti
     std::thread::sleep(interval);
     r.kernel = ks.sample(procs, units);
     for p in procs.iter().filter(|p| p.status == "U") {
-        let Some((state, _)) = fs::read_to_string(format!("/proc/{}/stat", p.pid)).ok().as_deref().and_then(stat_state_start) else { continue };
+        let Some((state, _)) =
+            fs::read_to_string(format!("/proc/{}/stat", p.pid)).ok().as_deref().and_then(stat_state_start)
+        else {
+            continue;
+        };
         if state == 'D' {
-            let wchan = fs::read_to_string(format!("/proc/{}/wchan", p.pid)).map(|s| s.trim().to_string()).unwrap_or_default();
-            r.d_state_now.push(DStateProc { pid: p.pid, name: p.name.clone(), wchan: if wchan == "0" { String::new() } else { wchan }, seconds: 0, unit: ks.unit_for_cgroup(&p.cgroup) });
+            let wchan =
+                fs::read_to_string(format!("/proc/{}/wchan", p.pid)).map(|s| s.trim().to_string()).unwrap_or_default();
+            r.d_state_now.push(DStateProc {
+                pid: p.pid,
+                name: p.name.clone(),
+                wchan: if wchan == "0" { String::new() } else { wchan },
+                seconds: 0,
+                unit: ks.unit_for_cgroup(&p.cgroup),
+            });
         }
     }
     let mut ev = ks.drain_events();
@@ -1788,7 +2070,9 @@ fn watch_events(cfg: &crate::config::Config, json: bool) -> anyhow::Result<()> {
 }
 
 fn event_line(e: &Event) -> String {
-    let t = chrono::DateTime::from_timestamp_millis(e.ts).map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string()).unwrap_or_default();
+    let t = chrono::DateTime::from_timestamp_millis(e.ts)
+        .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default();
     let rep = e.extra.get("repeats").map(|n| format!(" (x{n})")).unwrap_or_default();
     let unit = e.unit.as_deref().map(|u| format!(" [{u}]")).unwrap_or_default();
     format!("{t}  {:<4} {:<18} {}{unit}{rep}", e.severity.as_str(), e.kind.as_str(), e.detail)
@@ -1804,11 +2088,26 @@ pub fn render(r: &KernelReport) -> String {
         }
         return s;
     };
-    let _ = writeln!(s, "CPU      steal {:.1}%  iowait {:.1}%  irq {:.1}%  softirq {:.1}%   running {}  blocked (D) {}", k.steal_pct, k.iowait_pct, k.irq_pct, k.softirq_pct, k.procs_running, k.procs_blocked);
+    let _ = writeln!(
+        s,
+        "CPU      steal {:.1}%  iowait {:.1}%  irq {:.1}%  softirq {:.1}%   running {}  blocked (D) {}",
+        k.steal_pct, k.iowait_pct, k.irq_pct, k.softirq_pct, k.procs_running, k.procs_blocked
+    );
     if let Some(p) = k.pressure {
-        let _ = writeln!(s, "PSI      cpu {:.1}/{:.1}  mem {:.1}/{:.1}  io {:.1}/{:.1}   (some/full avg10 %)", p.cpu_some, p.cpu_full, p.mem_some, p.mem_full, p.io_some, p.io_full);
+        let _ = writeln!(
+            s,
+            "PSI      cpu {:.1}/{:.1}  mem {:.1}/{:.1}  io {:.1}/{:.1}   (some/full avg10 %)",
+            p.cpu_some, p.cpu_full, p.mem_some, p.mem_full, p.io_some, p.io_full
+        );
     }
-    let _ = writeln!(s, "Memory   available {}  swap in/out {:.0}/{:.0} pages/s  OOM kills since boot {}", human(k.mem_available), k.swap_in_ps, k.swap_out_ps, k.oom_kills_total);
+    let _ = writeln!(
+        s,
+        "Memory   available {}  swap in/out {:.0}/{:.0} pages/s  OOM kills since boot {}",
+        human(k.mem_available),
+        k.swap_in_ps,
+        k.swap_out_ps,
+        k.oom_kills_total
+    );
     for n in &k.numa {
         let _ = writeln!(s, "  node{}  {} free of {}", n.node, human(n.mem_free), human(n.mem_total));
     }
@@ -1818,10 +2117,24 @@ pub fn render(r: &KernelReport) -> String {
         _ => "n/a".into(),
     };
     let eph_max = k.ephemeral_range.map(|(a, b)| (b as u64).saturating_sub(a as u64) + 1);
-    let _ = writeln!(s, "Limits   fds {}  conntrack {}  ephemeral ports {}", lim(k.fd_used, k.fd_max), lim(k.conntrack_used, k.conntrack_max), lim(k.ephemeral_used, eph_max));
-    let _ = writeln!(s, "TCP      retrans {:.1}/s  listen overflows {:.1}/s  drops {:.1}/s", k.tcp_retrans_ps, k.listen_overflows_ps, k.listen_drops_ps);
+    let _ = writeln!(
+        s,
+        "Limits   fds {}  conntrack {}  ephemeral ports {}",
+        lim(k.fd_used, k.fd_max),
+        lim(k.conntrack_used, k.conntrack_max),
+        lim(k.ephemeral_used, eph_max)
+    );
+    let _ = writeln!(
+        s,
+        "TCP      retrans {:.1}/s  listen overflows {:.1}/s  drops {:.1}/s",
+        k.tcp_retrans_ps, k.listen_overflows_ps, k.listen_drops_ps
+    );
     if !k.disks.is_empty() {
-        let _ = writeln!(s, "Disks    {:<10} {:>6} {:>8} {:>8} {:>6} {:>8} {:>8} {:>10} {:>10}", "device", "util%", "r_await", "w_await", "queue", "r_iops", "w_iops", "read/s", "write/s");
+        let _ = writeln!(
+            s,
+            "Disks    {:<10} {:>6} {:>8} {:>8} {:>6} {:>8} {:>8} {:>10} {:>10}",
+            "device", "util%", "r_await", "w_await", "queue", "r_iops", "w_iops", "read/s", "write/s"
+        );
         for d in &k.disks {
             let _ = writeln!(
                 s,
@@ -1842,14 +2155,29 @@ pub fn render(r: &KernelReport) -> String {
     if !r.d_state_now.is_empty() {
         let _ = writeln!(s, "D state  {} process(es) now:", r.d_state_now.len());
         for d in r.d_state_now.iter().take(15) {
-            let _ = writeln!(s, "         {:>7} {:<20} {:<24} {}", d.pid, d.name, d.wchan, d.unit.as_deref().unwrap_or(""));
+            let _ =
+                writeln!(s, "         {:>7} {:<20} {:<24} {}", d.pid, d.name, d.wchan, d.unit.as_deref().unwrap_or(""));
         }
     }
     for m in &k.mdraid {
-        let _ = writeln!(s, "RAID     {} {} {}{}", m.name, m.level, m.state, m.sync_pct.map(|p| format!(" {p:.1}%")).unwrap_or_default());
+        let _ = writeln!(
+            s,
+            "RAID     {} {} {}{}",
+            m.name,
+            m.level,
+            m.state,
+            m.sync_pct.map(|p| format!(" {p:.1}%")).unwrap_or_default()
+        );
     }
     for f in &k.fs_errors {
-        let _ = writeln!(s, "FS       {} {} errors {}{}", f.device, f.mount.as_deref().unwrap_or(""), f.errors, if f.read_only { " (read-only)" } else { "" });
+        let _ = writeln!(
+            s,
+            "FS       {} {} errors {}{}",
+            f.device,
+            f.mount.as_deref().unwrap_or(""),
+            f.errors,
+            if f.read_only { " (read-only)" } else { "" }
+        );
     }
     for m in &k.ro_remounts {
         let _ = writeln!(s, "RO       {m} went read-only");

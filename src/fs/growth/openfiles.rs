@@ -110,7 +110,8 @@ impl OpenFiles {
                 // only (macOS gets creations from FSEvents, and a stat there could touch a
                 // TCC-protected path).
                 if cfg!(target_os = "linux")
-                    && super::paths::lstat(p).is_some_and(|st| st.is_file && st.nlink <= 1 && st.birth_ms.is_some_and(|b| b >= from))
+                    && super::paths::lstat(p)
+                        .is_some_and(|st| st.is_file && st.nlink <= 1 && st.birth_ms.is_some_and(|b| b >= from))
                 {
                     o.delta = Some(cur as i64);
                 }
@@ -146,9 +147,7 @@ pub fn baseline(s: &[(Ts, u64)], from: Ts) -> Option<u64> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// Parse the octal `flags:` line of /proc/<pid>/fdinfo/<fd>.
 pub fn parse_fdinfo_flags(text: &str) -> Option<u32> {
-    text.lines()
-        .find_map(|l| l.strip_prefix("flags:"))
-        .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
+    text.lines().find_map(|l| l.strip_prefix("flags:")).and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -222,11 +221,7 @@ mod tests {
         let mut of = OpenFiles::default();
         let w = (42u32, "dd".to_string(), 1000u64);
         of.ingest(1_000, vec![(w.clone(), vec![("/v/log".into(), 100)])], &[]);
-        of.ingest(
-            10_000,
-            vec![(w.clone(), vec![("/v/log".into(), 400), ("/v/new".into(), 7)])],
-            &["/v/own".into()],
-        );
+        of.ingest(10_000, vec![(w.clone(), vec![("/v/log".into(), 400), ("/v/new".into(), 7)])], &["/v/own".into()]);
         of.ingest(
             20_000,
             vec![(w.clone(), vec![("/v/log".into(), 1000), ("/v/own/db".into(), 5)])],
@@ -236,11 +231,7 @@ mod tests {
         o.sort_by(|a, b| a.path.cmp(&b.path));
         assert_eq!(o.len(), 2);
         assert_eq!(o[0].path, "/v/log");
-        assert_eq!(
-            o[0].delta,
-            Some(900),
-            "baseline is the newest sample <= from (100 @ 1s)"
-        );
+        assert_eq!(o[0].delta, Some(900), "baseline is the newest sample <= from (100 @ 1s)");
         assert_eq!(o[0].writers, vec![w.clone()]);
         assert_eq!(o[1].delta, None, "single sample: unknown");
         let o = of.obs(15_000);
@@ -275,10 +266,7 @@ mod tests {
         let ro = std::fs::File::open(&p).unwrap();
         let files = writable_files(std::process::id());
         let canon = std::fs::canonicalize(&p).unwrap().to_string_lossy().into_owned();
-        let hits: Vec<_> = files
-            .iter()
-            .filter(|(fp, _)| *fp == canon || fp.ends_with("/w.bin"))
-            .collect();
+        let hits: Vec<_> = files.iter().filter(|(fp, _)| *fp == canon || fp.ends_with("/w.bin")).collect();
         assert_eq!(hits.len(), 1, "write fd listed once (read-only fd ignored): {files:?}");
         assert!(hits[0].1 >= 128 * 1024, "{hits:?}");
         drop((f, ro));

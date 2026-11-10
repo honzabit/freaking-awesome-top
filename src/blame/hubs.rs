@@ -62,7 +62,9 @@ pub(super) enum Block {
     Critical,
     Gui(App),
     /// Container process the user doesn't own: stop the container instead.
-    Container { id: String },
+    Container {
+        id: String,
+    },
     /// Owned by root / a system account and not started from a user's session.
     Service,
 }
@@ -117,17 +119,72 @@ pub(super) struct Ctx<'a> {
     inits: HashMap<String, u32>,
 }
 
-const SHELL_HOSTS: &[Launcher] = &[Launcher::Shell, Launcher::Terminal, Launcher::Remote, Launcher::Agent, Launcher::Ide];
+const SHELL_HOSTS: &[Launcher] =
+    &[Launcher::Shell, Launcher::Terminal, Launcher::Remote, Launcher::Agent, Launcher::Ide];
 
 /// Root and the system accounts of macOS (`_*`) and common Linux distros.
 pub(super) fn system_account(u: &str) -> bool {
     const SYS: &[&str] = &[
-        "root", "daemon", "bin", "sys", "nobody", "messagebus", "syslog", "www-data", "avahi", "polkitd", "rtkit",
-        "colord", "sshd", "dbus", "uuidd", "tss", "cups", "lp", "mail", "man", "proxy", "backup", "dnsmasq", "chrony",
-        "ntp", "geoclue", "gdm", "lightdm", "sddm", "pulse", "saned", "kernoops", "whoopsie", "usbmux", "postgres",
-        "mysql", "redis", "nginx", "statd", "unbound", "fwupd-refresh", "landscape", "pollinate", "lxd", "Debian-gdm",
-        "speech-dispatcher", "hplip", "nm-openvpn", "dhcpcd", "_apt", "rpc", "rpcuser", "apache", "httpd", "named",
-        "prometheus", "grafana", "elasticsearch", "docker", "containerd",
+        "root",
+        "daemon",
+        "bin",
+        "sys",
+        "nobody",
+        "messagebus",
+        "syslog",
+        "www-data",
+        "avahi",
+        "polkitd",
+        "rtkit",
+        "colord",
+        "sshd",
+        "dbus",
+        "uuidd",
+        "tss",
+        "cups",
+        "lp",
+        "mail",
+        "man",
+        "proxy",
+        "backup",
+        "dnsmasq",
+        "chrony",
+        "ntp",
+        "geoclue",
+        "gdm",
+        "lightdm",
+        "sddm",
+        "pulse",
+        "saned",
+        "kernoops",
+        "whoopsie",
+        "usbmux",
+        "postgres",
+        "mysql",
+        "redis",
+        "nginx",
+        "statd",
+        "unbound",
+        "fwupd-refresh",
+        "landscape",
+        "pollinate",
+        "lxd",
+        "Debian-gdm",
+        "speech-dispatcher",
+        "hplip",
+        "nm-openvpn",
+        "dhcpcd",
+        "_apt",
+        "rpc",
+        "rpcuser",
+        "apache",
+        "httpd",
+        "named",
+        "prometheus",
+        "grafana",
+        "elasticsearch",
+        "docker",
+        "containerd",
     ];
     u.starts_with('_') || u.starts_with("systemd-") || SYS.contains(&u)
 }
@@ -152,8 +209,26 @@ pub(super) fn bundle_of(path: &str) -> Option<(&str, bool)> {
 }
 
 const BROWSERS: &[&str] = &[
-    "Google Chrome", "Chromium", "Brave Browser", "Microsoft Edge", "Arc", "Vivaldi", "Opera", "Firefox", "Zen",
-    "Safari", "Orion", "Dia", "Comet", "Thorium", "LibreWolf", "Waterfox", "Floorp", "Tor Browser", "Chrome", "Brave",
+    "Google Chrome",
+    "Chromium",
+    "Brave Browser",
+    "Microsoft Edge",
+    "Arc",
+    "Vivaldi",
+    "Opera",
+    "Firefox",
+    "Zen",
+    "Safari",
+    "Orion",
+    "Dia",
+    "Comet",
+    "Thorium",
+    "LibreWolf",
+    "Waterfox",
+    "Floorp",
+    "Tor Browser",
+    "Chrome",
+    "Brave",
     "Edge",
 ];
 
@@ -212,7 +287,8 @@ fn linux_family(lname: &str) -> Option<(&'static str, bool)> {
 }
 
 /// Firefox's generic helper names: only Firefox's when a parent is Firefox.
-const FIREFOX_HELPERS: &[&str] = &["rdd process", "socket process", "utility process", "privileged cont", "gpu process", "forkserver"];
+const FIREFOX_HELPERS: &[&str] =
+    &["rdd process", "socket process", "utility process", "privileged cont", "gpu process", "forkserver"];
 
 fn is_vm_name_mac_only(l: &str) -> bool {
     l.starts_with("orbstack")
@@ -260,19 +336,35 @@ impl<'a> Ctx<'a> {
     pub fn app(&self, p: &Proc) -> Option<App> {
         let path = if p.exe.is_empty() { p.cmd.as_str() } else { p.exe.as_str() };
         if let Some((bundle, main)) = bundle_of(path) {
-            return Some(App { name: display_name(bundle), browser: is_browser(bundle), main: main && !p.cmd.contains("--type=") });
+            return Some(App {
+                name: display_name(bundle),
+                browser: is_browser(bundle),
+                main: main && !p.cmd.contains("--type="),
+            });
         }
         let lname = p.name.to_ascii_lowercase();
         if lname.starts_with("com.apple.webkit.") {
             let safari = self.snap.procs.iter().any(|q| q.name == "Safari");
-            return Some(App { name: if safari { "Safari".into() } else { "WebKit".into() }, browser: safari, main: false });
+            return Some(App {
+                name: if safari { "Safari".into() } else { "WebKit".into() },
+                browser: safari,
+                main: false,
+            });
         }
         if let Some((name, browser)) = linux_family(&lname) {
-            let parent_same = self.snap.proc(p.ppid).is_some_and(|q| linux_family(&q.name.to_ascii_lowercase()).is_some_and(|f| f.0 == name));
+            let parent_same = self
+                .snap
+                .proc(p.ppid)
+                .is_some_and(|q| linux_family(&q.name.to_ascii_lowercase()).is_some_and(|f| f.0 == name));
             return Some(App { name: name.into(), browser, main: !parent_same && !p.cmd.contains("--type=") });
         }
         if FIREFOX_HELPERS.contains(&lname.as_str())
-            && self.snap.ancestors(p.pid).iter().take(3).any(|q| linux_family(&q.name.to_ascii_lowercase()).is_some_and(|f| f.0 == "Firefox"))
+            && self
+                .snap
+                .ancestors(p.pid)
+                .iter()
+                .take(3)
+                .any(|q| linux_family(&q.name.to_ascii_lowercase()).is_some_and(|f| f.0 == "Firefox"))
         {
             return Some(App { name: "Firefox".into(), browser: true, main: false });
         }
@@ -376,7 +468,10 @@ impl<'a> Ctx<'a> {
     /// Classify `p` as a hub, if it is one.
     pub fn hub(&self, p: &Proc) -> Option<Hub> {
         let l = p.name.to_ascii_lowercase();
-        if p.name == "kernel_task" || (p.pid == 0 && self.os == Os::Mac) || (self.os == Os::Linux && is_kernel_thread(p)) {
+        if p.name == "kernel_task"
+            || (p.pid == 0 && self.os == Os::Mac)
+            || (self.os == Os::Linux && is_kernel_thread(p))
+        {
             return Some(Hub::Kernel);
         }
         if p.pid == 1 || matches!(l.as_str(), "launchd" | "systemd" | "init") {
@@ -394,7 +489,18 @@ impl<'a> Ctx<'a> {
         if l.starts_with("containerd-shim")
             || matches!(
                 l.as_str(),
-                "dockerd" | "containerd" | "podman" | "conmon" | "crun" | "runc" | "crio" | "cri-dockerd" | "kubelet" | "k3s" | "k3s-server" | "k3s-agent"
+                "dockerd"
+                    | "containerd"
+                    | "podman"
+                    | "conmon"
+                    | "crun"
+                    | "runc"
+                    | "crio"
+                    | "cri-dockerd"
+                    | "kubelet"
+                    | "k3s"
+                    | "k3s-server"
+                    | "k3s-agent"
             )
         {
             return Some(Hub::Runtime);
@@ -402,13 +508,24 @@ impl<'a> Ctx<'a> {
         if let Some(what) = super::protected_service(p, self.os) {
             return Some(Hub::Service { what });
         }
-        if matches!(l.as_str(), "windowserver" | "xorg" | "xwayland" | "gnome-shell" | "plasmashell" | "mutter" | "sway" | "hyprland" | "weston")
-            || l.starts_with("kwin_")
+        if matches!(
+            l.as_str(),
+            "windowserver"
+                | "xorg"
+                | "xwayland"
+                | "gnome-shell"
+                | "plasmashell"
+                | "mutter"
+                | "sway"
+                | "hyprland"
+                | "weston"
+        ) || l.starts_with("kwin_")
         {
             return Some(Hub::Display);
         }
         if let Some(app) = self.app(p).filter(|a| a.main) {
-            let multi = self.snap.procs.iter().any(|q| q.ppid == p.pid && self.app(q).is_some_and(|a| a.name == app.name));
+            let multi =
+                self.snap.procs.iter().any(|q| q.ppid == p.pid && self.app(q).is_some_and(|a| a.name == app.name));
             if app.browser {
                 return Some(Hub::Browser { app: app.name });
             }
@@ -517,12 +634,18 @@ impl<'a> Ctx<'a> {
     }
 
     fn quit_hint(&self, app: &str) -> String {
-        if self.os == Os::Mac { format!("quit {app} normally ({app} menu > Quit, or Cmd-Q)") } else { format!("close {app} normally") }
+        if self.os == Os::Mac {
+            format!("quit {app} normally ({app} menu > Quit, or Cmd-Q)")
+        } else {
+            format!("close {app} normally")
+        }
     }
 
     fn tab_hint(app: &str) -> String {
         match app {
-            "Firefox" | "Zen" | "LibreWolf" | "Waterfox" | "Floorp" | "Tor Browser" => "open about:processes to see which tab".into(),
+            "Firefox" | "Zen" | "LibreWolf" | "Waterfox" | "Floorp" | "Tor Browser" => {
+                "open about:processes to see which tab".into()
+            }
             "Safari" | "WebKit" | "Orion" => "Activity Monitor names each tab's WebContent process".into(),
             _ => format!("Shift+Esc in {app} opens its task manager"),
         }
@@ -534,19 +657,31 @@ impl<'a> Ctx<'a> {
             Block::Hub(h) => self.hub_note(p, h),
             Block::Critical => format!("{} is part of the OS; don't pause or kill it", p.name),
             Block::Gui(a) if a.browser => {
-                format!("it is a {} tab/helper: close heavy tabs ({}), or {}", a.name, Self::tab_hint(&a.name), self.quit_hint(&a.name))
+                format!(
+                    "it is a {} tab/helper: close heavy tabs ({}), or {}",
+                    a.name,
+                    Self::tab_hint(&a.name),
+                    self.quit_hint(&a.name)
+                )
             }
-            Block::Gui(a) => format!("it is part of {}: {} rather than killing its processes", a.name, self.quit_hint(&a.name)),
+            Block::Gui(a) => {
+                format!("it is part of {}: {} rather than killing its processes", a.name, self.quit_hint(&a.name))
+            }
             Block::Container { id } => {
                 let ct = find_container(self.snap, id);
                 let label = container_label(self.snap, id);
                 let cli = container_cli(ct.map(|c| c.runtime.as_str()).or_else(|| container_of(p).and_then(|x| x.1)));
-                format!("it runs in container {label}: end it from where it was started (e.g. its `{cli} exec` shell), or `{cli} stop {label}` stops the whole container")
+                format!(
+                    "it runs in container {label}: end it from where it was started (e.g. its `{cli} exec` shell), or `{cli} stop {label}` stops the whole container"
+                )
             }
             Block::Service => {
                 let who = if p.user.is_empty() { "another user".to_string() } else { p.user.clone() };
                 let mgr = if self.os == Os::Linux { "systemctl" } else { "launchctl" };
-                format!("{} runs as {who}, a system service: restart it through its service manager ({mgr}) rather than killing it", p.name)
+                format!(
+                    "{} runs as {who}, a system service: restart it through its service manager ({mgr}) rather than killing it",
+                    p.name
+                )
             }
         }
     }
@@ -563,7 +698,10 @@ impl<'a> Ctx<'a> {
                         vm_cli(product),
                         c.name
                     ),
-                    None => format!("{} is the {product} VM; its cost is whatever runs inside it (`fat fleet` lists the containers)", p.name),
+                    None => format!(
+                        "{} is the {product} VM; its cost is whatever runs inside it (`fat fleet` lists the containers)",
+                        p.name
+                    ),
                 };
                 s.push_str(&format!("; to cap it, {}", vm_limit_hint(product)));
                 s
@@ -571,28 +709,50 @@ impl<'a> Ctx<'a> {
             Hub::Runtime if self.shim_container(p).is_some() => {
                 let id = self.shim_container(p).unwrap_or_default();
                 let label = container_label(self.snap, &id);
-                format!("{} is the shim of container {label}: its cost is that container; `docker stop {label}` stops it cleanly", p.name)
+                format!(
+                    "{} is the shim of container {label}: its cost is that container; `docker stop {label}` stops it cleanly",
+                    p.name
+                )
             }
             Hub::Runtime => {
-                format!("{} is a container runtime; its load is its containers': stop the busy container (`docker stop <name>`), not the runtime", p.name)
+                format!(
+                    "{} is a container runtime; its load is its containers': stop the busy container (`docker stop <name>`), not the runtime",
+                    p.name
+                )
             }
             Hub::ContainerInit { id } => {
                 let label = container_label(self.snap, id);
-                format!("{} is pid 1 of container {label}: killing it stops the container; use `docker restart {label}` or `docker stop {label}`", p.name)
+                format!(
+                    "{} is pid 1 of container {label}: killing it stops the container; use `docker restart {label}` or `docker stop {label}`",
+                    p.name
+                )
             }
             Hub::Init => format!("{} is init; it hosts every service and app", p.name),
             Hub::Browser { app } => {
                 let heavy = self.app_heaviest(app, 2);
-                let list = if heavy.is_empty() { String::new() } else { format!(" (heaviest: {})", Self::proc_list(&heavy)) };
-                format!("{} is {app}'s main process{list}: close heavy tabs ({}), or {}", p.name, Self::tab_hint(app), self.quit_hint(app))
+                let list =
+                    if heavy.is_empty() { String::new() } else { format!(" (heaviest: {})", Self::proc_list(&heavy)) };
+                format!(
+                    "{} is {app}'s main process{list}: close heavy tabs ({}), or {}",
+                    p.name,
+                    Self::tab_hint(app),
+                    self.quit_hint(app)
+                )
             }
-            Hub::AppMain { app } => format!("{} is {app}'s main process: {} rather than killing it", p.name, self.quit_hint(app)),
+            Hub::AppMain { app } => {
+                format!("{} is {app}'s main process: {} rather than killing it", p.name, self.quit_hint(app))
+            }
             Hub::Session { what } => {
                 let jobs = self.heaviest_jobs(p, 2);
                 if jobs.is_empty() {
                     format!("{} is your {what}; ending it ends everything running in it", p.name)
                 } else {
-                    format!("{} is your {what}; its cost is its jobs ({}): see `fat why {}`", p.name, Self::proc_list(&jobs), jobs[0].pid)
+                    format!(
+                        "{} is your {what}; its cost is its jobs ({}): see `fat why {}`",
+                        p.name,
+                        Self::proc_list(&jobs),
+                        jobs[0].pid
+                    )
                 }
             }
             Hub::Display => format!("{} draws every window; the cause is an app redrawing a lot", p.name),
@@ -602,7 +762,10 @@ impl<'a> Ctx<'a> {
                 p.name
             ),
             Hub::Service { what } => {
-                format!("{} is the {what}; other services depend on it: inspect or restart it through its service manager, don't pause or kill it", p.name)
+                format!(
+                    "{} is the {what}; other services depend on it: inspect or restart it through its service manager, don't pause or kill it",
+                    p.name
+                )
             }
         }
     }
@@ -621,7 +784,8 @@ impl<'a> Ctx<'a> {
             "Podman" => &["podman"],
             _ => &[],
         };
-        let mut v: Vec<&Container> = self.snap.containers.iter().filter(|c| rts.contains(&c.runtime.as_str())).collect();
+        let mut v: Vec<&Container> =
+            self.snap.containers.iter().filter(|c| rts.contains(&c.runtime.as_str())).collect();
         if v.is_empty() && self.os == Os::Mac {
             let mut products: Vec<&'static str> = self.snap.procs.iter().filter_map(|q| self.vm_product(q)).collect();
             products.sort_unstable();
@@ -635,7 +799,8 @@ impl<'a> Ctx<'a> {
     }
 
     fn container_list(cts: &[&Container], n: usize) -> String {
-        let mut s = cts.iter().take(n).map(|c| format!("{} {}", c.name, human_bytes(c.mem))).collect::<Vec<_>>().join(", ");
+        let mut s =
+            cts.iter().take(n).map(|c| format!("{} {}", c.name, human_bytes(c.mem))).collect::<Vec<_>>().join(", ");
         if cts.len() > n {
             s.push_str(&format!(", +{} more", cts.len() - n));
         }
@@ -657,7 +822,8 @@ impl<'a> Ctx<'a> {
 
     /// Heaviest descendants of a session hub that are not hubs themselves (by CPU, then memory).
     fn heaviest_jobs(&self, p: &Proc, n: usize) -> Vec<&'a Proc> {
-        let mut v: Vec<&Proc> = self.snap.descendants(p.pid).into_iter().filter(|d| self.hub(d).is_none() && !is_zombie(d)).collect();
+        let mut v: Vec<&Proc> =
+            self.snap.descendants(p.pid).into_iter().filter(|d| self.hub(d).is_none() && !is_zombie(d)).collect();
         v.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.mem.cmp(&a.mem)));
         v.retain(|d| d.cpu >= 1.0 || d.mem >= 64 * super::MB);
         v.truncate(n);
@@ -689,12 +855,9 @@ impl<'a> Ctx<'a> {
         for c in &mut v {
             c.members.sort_by(|a, b| b.mem.cmp(&a.mem).then(a.pid.cmp(&b.pid)));
             c.lead = match &c.kind {
-                CKind::App { .. } => c
-                    .members
-                    .iter()
-                    .find(|q| self.app(q).is_some_and(|a| a.main))
-                    .copied()
-                    .unwrap_or(c.members[0]),
+                CKind::App { .. } => {
+                    c.members.iter().find(|q| self.app(q).is_some_and(|a| a.main)).copied().unwrap_or(c.members[0])
+                }
                 CKind::Container { .. } => c
                     .members
                     .iter()
@@ -721,7 +884,11 @@ impl<'a> Ctx<'a> {
                     "{} {} across {n} processes ({what}: {})",
                     c.name,
                     human_bytes(c.mem),
-                    heavy.iter().map(|q| format!("pid {} {}", q.pid, human_bytes(q.mem))).collect::<Vec<_>>().join(", ")
+                    heavy
+                        .iter()
+                        .map(|q| format!("pid {} {}", q.pid, human_bytes(q.mem)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )
             }
             CKind::Vm { product } => {
@@ -743,17 +910,32 @@ impl<'a> Ctx<'a> {
             CKind::Proc => self.advise(c.lead, Want::End),
             CKind::App { browser: true } => Advice {
                 action: None,
-                note: Some(format!("close heavy tabs in {} ({}), or {}", c.name, Self::tab_hint(&c.name), self.quit_hint(&c.name))),
+                note: Some(format!(
+                    "close heavy tabs in {} ({}), or {}",
+                    c.name,
+                    Self::tab_hint(&c.name),
+                    self.quit_hint(&c.name)
+                )),
             },
-            CKind::App { .. } => Advice { action: None, note: Some(format!("{} and reopen it", self.quit_hint(&c.name))) },
+            CKind::App { .. } => {
+                Advice { action: None, note: Some(format!("{} and reopen it", self.quit_hint(&c.name))) }
+            }
             CKind::Vm { product } => {
                 let cts = self.vm_containers(product);
-                let first = cts.first().map(|x| format!("`{} stop {}` (its biggest container), or ", vm_cli(product), x.name)).unwrap_or_default();
+                let first = cts
+                    .first()
+                    .map(|x| format!("`{} stop {}` (its biggest container), or ", vm_cli(product), x.name))
+                    .unwrap_or_default();
                 Advice { action: None, note: Some(format!("{product}: {first}{}", vm_limit_hint(product))) }
             }
             CKind::Container { id } => {
-                let rt = find_container(self.snap, id).map(|x| x.runtime.as_str()).or_else(|| container_of(c.lead).and_then(|x| x.1));
-                Advice { action: None, note: Some(format!("`{} stop {}` stops that container", container_cli(rt), c.name)) }
+                let rt = find_container(self.snap, id)
+                    .map(|x| x.runtime.as_str())
+                    .or_else(|| container_of(c.lead).and_then(|x| x.1));
+                Advice {
+                    action: None,
+                    note: Some(format!("`{} stop {}` stops that container", container_cli(rt), c.name)),
+                }
             }
         }
     }
@@ -790,12 +972,19 @@ impl<'a> Ctx<'a> {
                 }
                 sugg.push(vm_limit_hint(product));
                 sugg.push("inspect what runs inside: fat fleet (or docker stats)".into());
-                sugg.push(format!("don't pause or kill {}: that freezes or kills every container and VM inside it", p.name));
+                sugg.push(format!(
+                    "don't pause or kill {}: that freezes or kills every container and VM inside it",
+                    p.name
+                ));
             }
             Hub::Runtime if self.shim_container(p).is_some() => {
                 let id = self.shim_container(p).unwrap_or_default();
                 let label = container_label(self.snap, &id);
-                let cli = container_cli(find_container(self.snap, &id).map(|c| c.runtime.as_str()).or_else(|| container_of(p).and_then(|x| x.1)));
+                let cli = container_cli(
+                    find_container(self.snap, &id)
+                        .map(|c| c.runtime.as_str())
+                        .or_else(|| container_of(p).and_then(|x| x.1)),
+                );
                 sugg.push(format!("stop or restart its container instead: {cli} stop {label} / {cli} restart {label}"));
                 sugg.push(format!("don't kill {}: it is container {label}'s shim, the container dies with it", p.name));
             }
@@ -811,12 +1000,17 @@ impl<'a> Ctx<'a> {
             }
             Hub::ContainerInit { id } => {
                 let label = container_label(self.snap, id);
-                steps.push(format!("it is pid 1 (the entrypoint) of container {label}: the container lives exactly as long as it does"));
-                sugg.push(format!("restart or stop the container instead: docker restart {label} / docker stop {label}"));
+                steps.push(format!(
+                    "it is pid 1 (the entrypoint) of container {label}: the container lives exactly as long as it does"
+                ));
+                sugg.push(format!(
+                    "restart or stop the container instead: docker restart {label} / docker stop {label}"
+                ));
             }
             Hub::Init => {}
             Hub::Browser { app } | Hub::AppMain { app } => {
-                let members: Vec<&Proc> = self.snap.procs.iter().filter(|q| self.app(q).is_some_and(|a| &a.name == app)).collect();
+                let members: Vec<&Proc> =
+                    self.snap.procs.iter().filter(|q| self.app(q).is_some_and(|a| &a.name == app)).collect();
                 let total: u64 = members.iter().map(|q| q.mem).sum();
                 let cpu: f32 = members.iter().map(|q| q.cpu).sum();
                 steps.push(format!(
@@ -826,7 +1020,8 @@ impl<'a> Ctx<'a> {
                 ));
                 let heavy = self.app_heaviest(app, 3);
                 if !heavy.is_empty() {
-                    let what = if matches!(h, Hub::Browser { .. }) { "heaviest tabs/helpers" } else { "heaviest helpers" };
+                    let what =
+                        if matches!(h, Hub::Browser { .. }) { "heaviest tabs/helpers" } else { "heaviest helpers" };
                     steps.push(format!("{what}: {}", Self::proc_list(&heavy)));
                 }
                 if p.cpu >= 50.0 {
@@ -837,9 +1032,15 @@ impl<'a> Ctx<'a> {
                 }
                 if matches!(h, Hub::Browser { .. }) {
                     sugg.push(format!("find the heavy tab: {}; close or reload it", Self::tab_hint(app)));
-                    sugg.push(format!("or {} to free all of it (most browsers reopen tabs on relaunch)", self.quit_hint(app)));
+                    sugg.push(format!(
+                        "or {} to free all of it (most browsers reopen tabs on relaunch)",
+                        self.quit_hint(app)
+                    ));
                 } else {
-                    sugg.push(format!("{} and reopen it; a heavy renderer is usually one window or workspace", self.quit_hint(app)));
+                    sugg.push(format!(
+                        "{} and reopen it; a heavy renderer is usually one window or workspace",
+                        self.quit_hint(app)
+                    ));
                 }
                 if let Some(h) = heavy.first() {
                     sugg.push(format!("drill down: fat why {}", h.pid));
@@ -847,7 +1048,9 @@ impl<'a> Ctx<'a> {
             }
             Hub::Session { what } => {
                 let jobs = self.heaviest_jobs(p, 3);
-                steps.push(format!("it is an interactive {what}: its cost is the jobs started from it, not the {what} itself"));
+                steps.push(format!(
+                    "it is an interactive {what}: its cost is the jobs started from it, not the {what} itself"
+                ));
                 if let Some(j) = jobs.first() {
                     steps.push(format!("heaviest jobs: {}", Self::proc_list(&jobs)));
                     sugg.push(format!("drill down: fat why {}", j.pid));
@@ -861,8 +1064,14 @@ impl<'a> Ctx<'a> {
             Hub::Service { what: "database" } => {
                 steps.push(format!("it is a database server: its CPU, memory and I/O are the work its clients send it, not {} misbehaving on its own", p.name));
                 sugg.push("investigate the workload: its slow-query/activity views (e.g. pg_stat_activity, SHOW PROCESSLIST, SLOWLOG, system.processes), connection count, and any backup, vacuum or compaction running".into());
-                sugg.push(format!("check its own log and the service log: journalctl _PID={} -n 100 --no-pager", p.pid));
-                sugg.push(format!("don't pause or kill {}: every client loses its connection and recovery can take long", p.name));
+                sugg.push(format!(
+                    "check its own log and the service log: journalctl _PID={} -n 100 --no-pager",
+                    p.pid
+                ));
+                sugg.push(format!(
+                    "don't pause or kill {}: every client loses its connection and recovery can take long",
+                    p.name
+                ));
             }
             Hub::Service { what } => {
                 steps.push(format!("it is the {what}: other services depend on it"));
@@ -953,7 +1162,14 @@ mod tests {
     }
 
     fn ct(name: &str, runtime: &str, mem: u64) -> Container {
-        Container { id: format!("{:0<12}", name.len()), name: name.into(), image: "img:1".into(), runtime: runtime.into(), mem, ..Default::default() }
+        Container {
+            id: format!("{:0<12}", name.len()),
+            name: name.into(),
+            image: "img:1".into(),
+            runtime: runtime.into(),
+            mem,
+            ..Default::default()
+        }
     }
 
     /// Pause/Term/Kill/KillTree targets of every finding's runnable action.
@@ -961,14 +1177,18 @@ mod tests {
         f.iter()
             .filter_map(|x| x.action.as_deref())
             .filter_map(|a| parse_action(a).map(|(k, pid, _)| (k, pid, a.to_string())))
-            .filter(|(k, _, _)| matches!(k, ActionKind::Pause | ActionKind::Term | ActionKind::Kill | ActionKind::KillTree))
+            .filter(|(k, _, _)| {
+                matches!(k, ActionKind::Pause | ActionKind::Term | ActionKind::Kill | ActionKind::KillTree)
+            })
             .map(|(_, pid, a)| (pid, a))
             .collect()
     }
 
     fn says_stop(e: &Explanation, pid: u32) -> bool {
         e.suggestions.iter().any(|s| {
-            s.contains(&format!("fat kill {pid}")) || s.contains(&format!("fat pause {pid}")) || s.contains(&format!("kill {pid} --tree"))
+            s.contains(&format!("fat kill {pid}"))
+                || s.contains(&format!("fat pause {pid}"))
+                || s.contains(&format!("kill {pid} --tree"))
         })
     }
 
@@ -976,13 +1196,19 @@ mod tests {
     fn orbstack_helper_is_its_containers_never_killed() {
         let mut ps = mac_base();
         ps.push(mp(11043, 1, "OrbStack", "/Applications/OrbStack.app/Contents/MacOS/OrbStack", 0.0, 31 * MB));
-        let helper = "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper";
+        let helper =
+            "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper";
         ps.push(mp(13792, 1, "OrbStack Helper", helper, 300.0, 2800 * MB));
         let mut s = mac(ps);
-        s.containers = vec![ct("toposcope-clickhouse-1", "orbstack", 328 * MB), ct("toposcope-app-1", "orbstack", 55 * MB)];
+        s.containers =
+            vec![ct("toposcope-clickhouse-1", "orbstack", 328 * MB), ct("toposcope-app-1", "orbstack", 55 * MB)];
         let f = diagnose(&s, None);
         let m = f.iter().find(|x| x.title.starts_with("Memory pressure")).expect("memory finding");
-        assert!(m.detail.contains("OrbStack 2.8G (VM: containers toposcope-clickhouse-1 328M, toposcope-app-1 55M"), "{}", m.detail);
+        assert!(
+            m.detail.contains("OrbStack 2.8G (VM: containers toposcope-clickhouse-1 328M, toposcope-app-1 55M"),
+            "{}",
+            m.detail
+        );
         assert!(m.detail.contains("`docker stop toposcope-clickhouse-1`"), "{}", m.detail);
         assert!(m.detail.contains("memory limit"), "{}", m.detail);
         assert!(m.detail.contains("swap 6.7G of 8.0G in use"), "{}", m.detail);
@@ -995,7 +1221,11 @@ mod tests {
         let e = explain(&s, 13792, None);
         assert!(!says_stop(&e, 13792), "{:?}", e.suggestions);
         assert!(!e.suggestions.iter().any(|x| x.contains("renice 13792")), "{:?}", e.suggestions);
-        assert!(e.suggestions.iter().any(|x| x == "stop the biggest container: docker stop toposcope-clickhouse-1"), "{:?}", e.suggestions);
+        assert!(
+            e.suggestions.iter().any(|x| x == "stop the biggest container: docker stop toposcope-clickhouse-1"),
+            "{:?}",
+            e.suggestions
+        );
         assert!(e.chain.iter().any(|c| c.contains("OrbStack VM host")), "{:?}", e.chain);
         assert!(!e.chain.iter().any(|c| c.contains("pure CPU spin")));
     }
@@ -1003,7 +1233,14 @@ mod tests {
     #[test]
     fn docker_desktop_vm_is_attributed_to_docker() {
         let mut ps = mac_base();
-        ps.push(mp(2236, 1, "com.docker.backend", "/Applications/Docker.app/Contents/MacOS/com.docker.backend", 1.0, 100 * MB));
+        ps.push(mp(
+            2236,
+            1,
+            "com.docker.backend",
+            "/Applications/Docker.app/Contents/MacOS/com.docker.backend",
+            1.0,
+            100 * MB,
+        ));
         ps.push(mp(
             5745,
             2236,
@@ -1049,7 +1286,12 @@ mod tests {
         let s = mac(ps);
         let f = diagnose(&s, None);
         let m = f.iter().find(|x| x.title.starts_with("Memory pressure")).unwrap();
-        assert!(m.detail.contains("Biggest workloads: Brave 4.3G across 23 processes (heaviest tabs/helpers: pid 52510 650M"), "{}", m.detail);
+        assert!(
+            m.detail
+                .contains("Biggest workloads: Brave 4.3G across 23 processes (heaviest tabs/helpers: pid 52510 650M"),
+            "{}",
+            m.detail
+        );
         assert!(m.detail.contains("close heavy tabs in Brave"), "{}", m.detail);
         assert_eq!(m.pids[0], 1686);
         // The first safe action among the top workloads is the user's own CLI process.
@@ -1079,7 +1321,14 @@ mod tests {
         ps.push(mp(44401, 1, "Slack", "/Applications/Slack.app/Contents/MacOS/Slack", 1.0, 109 * MB));
         let h = "/Applications/Slack.app/Contents/Frameworks/Slack Helper (Renderer).app/Contents/MacOS/Slack Helper (Renderer)";
         ps.push(mp(46079, 44401, "Slack Helper (Renderer)", h, 180.0, 1536 * MB));
-        ps.push(mp(46080, 44401, "Slack Helper", "/Applications/Slack.app/Contents/Frameworks/Slack Helper.app/Contents/MacOS/Slack Helper", 0.0, 30 * MB));
+        ps.push(mp(
+            46080,
+            44401,
+            "Slack Helper",
+            "/Applications/Slack.app/Contents/Frameworks/Slack Helper.app/Contents/MacOS/Slack Helper",
+            0.0,
+            30 * MB,
+        ));
         let s = mac(ps);
         let f = diagnose(&s, None);
         let m = f.iter().find(|x| x.title.starts_with("Memory pressure")).unwrap();
@@ -1151,9 +1400,15 @@ mod tests {
         assert_eq!(cx.hub(&p("tmux", "tmux new -s x", 1)), Some(Hub::Session { what: "terminal" }));
         assert_eq!(cx.hub(&p("claude", "claude", 102)), Some(Hub::Session { what: "agent session" }));
         assert_eq!(cx.hub(&p("dockerd", "dockerd", 1)), Some(Hub::Runtime));
-        assert_eq!(cx.hub(&p("qemu-system-aarch64", "qemu-system-aarch64 -m 4096 lima", 1)), Some(Hub::Vm { product: "Lima" }));
+        assert_eq!(
+            cx.hub(&p("qemu-system-aarch64", "qemu-system-aarch64 -m 4096 lima", 1)),
+            Some(Hub::Vm { product: "Lima" })
+        );
         assert_eq!(bundle_of("/Applications/OrbStack.app/Contents/MacOS/bin/orb"), None, "CLI inside a bundle");
-        assert_eq!(bundle_of("/Users/me/Library/Application Support/Claude/claude-code/1/claude.app/Contents/MacOS/claude"), None);
+        assert_eq!(
+            bundle_of("/Users/me/Library/Application Support/Claude/claude-code/1/claude.app/Contents/MacOS/claude"),
+            None
+        );
         assert_eq!(bundle_of("/Applications/Slack.app/Contents/MacOS/Slack"), Some(("Slack", true)));
         // A kill --tree never reaches a hosted session/app.
         let mut ps = mac_base();
@@ -1171,24 +1426,106 @@ mod tests {
     fn linux_container_pid1_and_runtime_are_hubs() {
         let cid = "410892b21be2";
         let mut procs = vec![
-            Proc { pid: 1, ppid: 0, name: "systemd".into(), user: "root".into(), status: "S".into(), cgroup: "/init.scope".into(), ..Default::default() },
-            Proc { pid: 40, ppid: 1, name: "containerd".into(), user: "root".into(), status: "S".into(), mem: 60 * MB, cpu: 30.0, ..Default::default() },
-            Proc { pid: 50, ppid: 1, name: "containerd-shim-runc-v2".into(), user: "root".into(), status: "S".into(), mem: 10 * MB, ..Default::default() },
-            Proc { pid: 60, ppid: 50, name: "sleep".into(), user: "root".into(), status: "S".into(), mem: MB, container: Some(cid.into()), start_time: 1000, ..Default::default() },
+            Proc {
+                pid: 1,
+                ppid: 0,
+                name: "systemd".into(),
+                user: "root".into(),
+                status: "S".into(),
+                cgroup: "/init.scope".into(),
+                ..Default::default()
+            },
+            Proc {
+                pid: 40,
+                ppid: 1,
+                name: "containerd".into(),
+                user: "root".into(),
+                status: "S".into(),
+                mem: 60 * MB,
+                cpu: 30.0,
+                ..Default::default()
+            },
+            Proc {
+                pid: 50,
+                ppid: 1,
+                name: "containerd-shim-runc-v2".into(),
+                user: "root".into(),
+                status: "S".into(),
+                mem: 10 * MB,
+                ..Default::default()
+            },
+            Proc {
+                pid: 60,
+                ppid: 50,
+                name: "sleep".into(),
+                user: "root".into(),
+                status: "S".into(),
+                mem: MB,
+                container: Some(cid.into()),
+                start_time: 1000,
+                ..Default::default()
+            },
             // `docker exec` session: same shim parent, started later. A job, not the init.
-            Proc { pid: 62, ppid: 50, name: "bash".into(), cmd: "bash -c ./write-test.sh".into(), user: "root".into(), status: "R".into(), mem: MB, disk_write_bps: 700 * MB, container: Some(cid.into()), start_time: 5000, ..Default::default() },
-            Proc { pid: 61, ppid: 60, name: "python3".into(), user: "root".into(), status: "R".into(), cpu: 390.0, mem: 6 * GB, container: Some(cid.into()), ..Default::default() },
+            Proc {
+                pid: 62,
+                ppid: 50,
+                name: "bash".into(),
+                cmd: "bash -c ./write-test.sh".into(),
+                user: "root".into(),
+                status: "R".into(),
+                mem: MB,
+                disk_write_bps: 700 * MB,
+                container: Some(cid.into()),
+                start_time: 5000,
+                ..Default::default()
+            },
+            Proc {
+                pid: 61,
+                ppid: 60,
+                name: "python3".into(),
+                user: "root".into(),
+                status: "R".into(),
+                cpu: 390.0,
+                mem: 6 * GB,
+                container: Some(cid.into()),
+                ..Default::default()
+            },
         ];
         for i in 0..25 {
-            procs.push(Proc { pid: 100 + i, ppid: 60, name: "yes".into(), status: "Z".into(), container: Some(cid.into()), ..Default::default() });
+            procs.push(Proc {
+                pid: 100 + i,
+                ppid: 60,
+                name: "yes".into(),
+                status: "Z".into(),
+                container: Some(cid.into()),
+                ..Default::default()
+            });
         }
         let mut s = Snapshot { ts: NOW, procs, ..Default::default() };
-        s.system = System { os: "Debian GNU/Linux 12".into(), cores: 4, mem_total: 8 * GB, mem_used: 7900 * MB, mem_pressure: "unknown".into(), load: [9.0, 9.0, 9.0], ..Default::default() };
-        s.containers = vec![Container { id: cid.into(), name: "worker".into(), runtime: "docker".into(), mem: 6 * GB, ..Default::default() }];
+        s.system = System {
+            os: "Debian GNU/Linux 12".into(),
+            cores: 4,
+            mem_total: 8 * GB,
+            mem_used: 7900 * MB,
+            mem_pressure: "unknown".into(),
+            load: [9.0, 9.0, 9.0],
+            ..Default::default()
+        };
+        s.containers = vec![Container {
+            id: cid.into(),
+            name: "worker".into(),
+            runtime: "docker".into(),
+            mem: 6 * GB,
+            ..Default::default()
+        }];
         let f = diagnose(&s, None);
         assert!(harmful_targets(&f).is_empty(), "{:?}", harmful_targets(&f));
         let m = f.iter().find(|x| x.title.starts_with("Memory pressure")).unwrap();
-        assert!(m.detail.contains("container worker 6.0G (27 processes)") || m.detail.contains("container worker 6.0G"), "{}", m.detail);
+        assert!(
+            m.detail.contains("container worker 6.0G (27 processes)") || m.detail.contains("container worker 6.0G"),
+            "{}",
+            m.detail
+        );
         assert!(m.detail.contains("`docker stop worker`"), "{}", m.detail);
         assert_eq!(m.pids[0], 60, "lead is the container's init");
         let cpu = f.iter().find(|x| x.pids == vec![61]).unwrap();
@@ -1221,10 +1558,24 @@ mod tests {
             p.disk_write_bps = 300 * MB;
         };
         let mut hubs = vec![
-            mp(13792, 1, "OrbStack Helper", "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper", 0.0, 0),
+            mp(
+                13792,
+                1,
+                "OrbStack Helper",
+                "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper",
+                0.0,
+                0,
+            ),
             mp(44401, 1, "Slack", "/Applications/Slack.app/Contents/MacOS/Slack", 0.0, 0),
             mp(0, 0, "kernel_task", "", 0.0, 0),
-            mp(392, 1, "WindowServer", "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer", 0.0, 0),
+            mp(
+                392,
+                1,
+                "WindowServer",
+                "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+                0.0,
+                0,
+            ),
             mp(700, 1, "tmux", "/opt/homebrew/bin/tmux", 0.0, 0),
             mp(701, 700, "-zsh", "/bin/zsh", 0.0, 0),
             mp(800, 102, "claude", "/Users/me/.local/bin/claude", 0.0, 0),
@@ -1253,9 +1604,19 @@ mod tests {
         s.system.battery_pct = Some(5.0);
         s.system.power_mw = 90_000.0;
         s.system.disk_write_bps = 900 * MB;
-        s.ports.push(Port { proto: Proto::Tcp, addr: "*".into(), port: 3000, pid: 13792, process: "OrbStack Helper".into(), state: "LISTEN".into(), orphan: true, note: String::new() });
+        s.ports.push(Port {
+            proto: Proto::Tcp,
+            addr: "*".into(),
+            port: 3000,
+            pid: 13792,
+            process: "OrbStack Helper".into(),
+            state: "LISTEN".into(),
+            orphan: true,
+            note: String::new(),
+        });
         s.containers = vec![ct("web", "orbstack", GB)];
-        let hub_pids: Vec<u32> = s.procs.iter().filter(|p| Ctx::new(&s, Os::Mac).block(p).is_some()).map(|p| p.pid).collect();
+        let hub_pids: Vec<u32> =
+            s.procs.iter().filter(|p| Ctx::new(&s, Os::Mac).block(p).is_some()).map(|p| p.pid).collect();
         for want in [13792, 44401, 0, 392, 700, 701, 800, 801, 802, 1686, 52510, 45000, 1, 100, 102] {
             assert!(hub_pids.contains(&want), "{want} should be blocked");
         }
@@ -1282,7 +1643,8 @@ mod tests {
     #[test]
     fn hub_gate_covers_vm_host_browser_main_and_container_init() {
         let mut ps = mac_base();
-        let helper = "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper";
+        let helper =
+            "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper";
         ps.push(mp(13792, 1, "OrbStack Helper", helper, 300.0, 2800 * MB));
         brave(&mut ps);
         ps.push(mp(900, 102, "java", "/usr/bin/java", 5.0, GB));
@@ -1322,7 +1684,14 @@ mod tests {
     #[test]
     fn why_never_calls_renice_reversible_and_skips_it_for_os_daemons() {
         let mut ps = mac_base();
-        let mut mds = mp(75606, 1, "mds_stores", "/System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Support/mds_stores", 90.0, 200 * MB);
+        let mut mds = mp(
+            75606,
+            1,
+            "mds_stores",
+            "/System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Support/mds_stores",
+            90.0,
+            200 * MB,
+        );
         mds.user = "root".into();
         ps.push(mds);
         ps.push(mp(900, 102, "java", "/usr/bin/java", 95.0, GB));

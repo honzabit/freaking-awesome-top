@@ -107,7 +107,9 @@ impl Drop for Cf {
 /// A new CFString with the contents of `s`.
 pub fn string(s: &str) -> Option<Cf> {
     // SAFETY: bytes/len describe a valid UTF-8 buffer; the result is owned (Create rule).
-    unsafe { Cf::owned(CFStringCreateWithBytes(std::ptr::null(), s.as_ptr(), s.len() as CFIndex, kCFStringEncodingUTF8, 0)) }
+    unsafe {
+        Cf::owned(CFStringCreateWithBytes(std::ptr::null(), s.as_ptr(), s.len() as CFIndex, kCFStringEncodingUTF8, 0))
+    }
 }
 
 /// # Safety
@@ -267,7 +269,14 @@ pub fn number(n: i64) -> Option<Cf> {
 #[cfg(test)]
 pub fn array(items: &[CFTypeRef]) -> Option<Cf> {
     // SAFETY: items are valid CF objects, retained by the array via the CFType callbacks.
-    unsafe { Cf::owned(CFArrayCreate(std::ptr::null(), items.as_ptr(), items.len() as CFIndex, &raw const kCFTypeArrayCallBacks)) }
+    unsafe {
+        Cf::owned(CFArrayCreate(
+            std::ptr::null(),
+            items.as_ptr(),
+            items.len() as CFIndex,
+            &raw const kCFTypeArrayCallBacks,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -285,7 +294,12 @@ mod tests {
         let s = string("Apple M3 Max — GPU").unwrap();
         let n = number(1_596_080_128).unwrap();
         let inner = dictionary(&[("Device Utilization %", number(37).unwrap().as_ptr())]).unwrap();
-        let d = dictionary(&[("model", s.as_ptr()), ("In use system memory", n.as_ptr()), ("PerformanceStatistics", inner.as_ptr())]).unwrap();
+        let d = dictionary(&[
+            ("model", s.as_ptr()),
+            ("In use system memory", n.as_ptr()),
+            ("PerformanceStatistics", inner.as_ptr()),
+        ])
+        .unwrap();
         unsafe {
             assert_eq!(dict_string(d.as_ptr(), "model").as_deref(), Some("Apple M3 Max — GPU"));
             assert_eq!(dict_i64(d.as_ptr(), "In use system memory"), Some(1_596_080_128));

@@ -140,11 +140,18 @@ pub struct FleetPoll {
 }
 
 /// Poll `targets` and summarize. `progress` gets (done, total) as hosts finish.
-pub fn poll_summary(targets: &[Target], fc: &FleetCfg, tr: &dyn Transport, progress: &(dyn Fn(usize, usize) + Sync)) -> FleetPoll {
+pub fn poll_summary(
+    targets: &[Target],
+    fc: &FleetCfg,
+    tr: &dyn Transport,
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> FleetPoll {
     let t0 = Instant::now();
     let done = AtomicUsize::new(0);
     let total = targets.len();
-    let polled: Vec<Polled> = fanout::poll_detailed(targets, fc, tr, false, &|_h: &FleetHost| progress(done.fetch_add(1, Ordering::Relaxed) + 1, total));
+    let polled: Vec<Polled> = fanout::poll_detailed(targets, fc, tr, false, &|_h: &FleetHost| {
+        progress(done.fetch_add(1, Ordering::Relaxed) + 1, total)
+    });
     let mut rows = Vec::with_capacity(polled.len());
     let mut findings = Vec::with_capacity(polled.len());
     for p in polled {
@@ -175,18 +182,27 @@ pub fn run(a: FleetArgs, cfg: &Config) -> anyhow::Result<()> {
     let all = inventory::inventory(cfg)?;
     if all.is_empty() {
         if a.json {
-            return print_json(&json!({ "hosts": [], "containers": super::containers(), "note": "no hosts configured" }));
+            return print_json(
+                &json!({ "hosts": [], "containers": super::containers(), "note": "no hosts configured" }),
+            );
         }
         println!("No fleet hosts configured. Add any of these to {}:", Config::path().display());
-        println!("  [[hosts]]\n  name = \"web-01\"            # ssh destination defaults to the name\n  groups = [\"web\"]\n");
-        println!("  [fleet]\n  hosts_file = \"~/fleet.txt\"   # lines: web-01 [ssh=user@web-01.example.com] [groups=web] [tags=prod]");
+        println!(
+            "  [[hosts]]\n  name = \"web-01\"            # ssh destination defaults to the name\n  groups = [\"web\"]\n"
+        );
+        println!(
+            "  [fleet]\n  hosts_file = \"~/fleet.txt\"   # lines: web-01 [ssh=user@web-01.example.com] [groups=web] [tags=prod]"
+        );
         println!("  ssh_config_hosts = true       # or use the Host aliases of ~/.ssh/config");
         println!("\nThis machine's containers:");
         return containers(false);
     }
     let ts = inventory::select(&all, &selector(&a), cfg);
     if ts.is_empty() {
-        anyhow::bail!("no host matches the selection ({} hosts in the inventory; `fat fleet hosts` lists them)", all.len());
+        anyhow::bail!(
+            "no host matches the selection ({} hosts in the inventory; `fat fleet hosts` lists them)",
+            all.len()
+        );
     }
     let tr = transport(&fc);
     match cmd {
@@ -208,7 +224,9 @@ pub fn run(a: FleetArgs, cfg: &Config) -> anyhow::Result<()> {
             clear_progress(a.json);
             if a.json {
                 let per: Vec<Value> = p.findings.iter().map(|(h, f)| json!({ "host": h, "findings": f })).collect();
-                return print_json(&json!({ "summary": p.summary.findings, "hosts": per, "unreachable": p.summary.hosts.iter().filter(|h| !h.ok).map(|h| json!({"host": h.name, "error": h.error})).collect::<Vec<_>>() }));
+                return print_json(
+                    &json!({ "summary": p.summary.findings, "hosts": per, "unreachable": p.summary.hosts.iter().filter(|h| !h.ok).map(|h| json!({"host": h.name, "error": h.error})).collect::<Vec<_>>() }),
+                );
             }
             print!("{}", render_doctor(&p));
             Ok(())
@@ -216,12 +234,17 @@ pub fn run(a: FleetArgs, cfg: &Config) -> anyhow::Result<()> {
         FleetCmd::Events { since, kinds } => {
             for k in &kinds {
                 if EventKind::parse(k).is_none() {
-                    anyhow::bail!("unknown event kind {k:?} (one of: {})", EventKind::ALL.map(|k| k.as_str()).join(", "));
+                    anyhow::bail!(
+                        "unknown event kind {k:?} (one of: {})",
+                        EventKind::ALL.map(|k| k.as_str()).join(", ")
+                    );
                 }
             }
             let (events, errors) = fleet_events(&ts, &fc, tr.as_ref(), &since, &kinds);
             if a.json {
-                return print_json(&json!({ "events": events.iter().map(|(h, e)| { let mut v = serde_json::to_value(e).unwrap_or_default(); v["host"] = json!(h); v }).collect::<Vec<_>>(), "errors": errors }));
+                return print_json(
+                    &json!({ "events": events.iter().map(|(h, e)| { let mut v = serde_json::to_value(e).unwrap_or_default(); v["host"] = json!(h); v }).collect::<Vec<_>>(), "errors": errors }),
+                );
             }
             print!("{}", render_events(&events, &errors));
             Ok(())
@@ -242,9 +265,14 @@ pub fn run(a: FleetArgs, cfg: &Config) -> anyhow::Result<()> {
         FleetCmd::ExecReadonly { args } => {
             let sub = args.first().cloned().unwrap_or_default();
             if !fanout::READ_ONLY_REMOTE.contains(&sub.as_str()) {
-                anyhow::bail!("refusing `{sub}`: fleet runs only read-only fat commands ({})", fanout::READ_ONLY_REMOTE.join(", "));
+                anyhow::bail!(
+                    "refusing `{sub}`: fleet runs only read-only fat commands ({})",
+                    fanout::READ_ONLY_REMOTE.join(", ")
+                );
             }
-            let res = fanout::fan_out(&ts, fc.concurrency, |t| (t.name.clone(), fanout::remote_read_only(t, &args, &fc, tr.as_ref())));
+            let res = fanout::fan_out(&ts, fc.concurrency, |t| {
+                (t.name.clone(), fanout::remote_read_only(t, &args, &fc, tr.as_ref()))
+            });
             if a.json {
                 let v: Vec<Value> = res
                     .iter()
@@ -272,7 +300,10 @@ pub fn run(a: FleetArgs, cfg: &Config) -> anyhow::Result<()> {
             let (pid, name) = if action == "undo" {
                 (0, String::new())
             } else {
-                (pid.ok_or_else(|| anyhow::anyhow!("{action} needs a pid"))?, name.ok_or_else(|| anyhow::anyhow!("{action} needs --name (the process you expect at that pid)"))?)
+                (
+                    pid.ok_or_else(|| anyhow::anyhow!("{action} needs a pid"))?,
+                    name.ok_or_else(|| anyhow::anyhow!("{action} needs --name (the process you expect at that pid)"))?,
+                )
             };
             if action == "renice" && nice.is_none() {
                 anyhow::bail!("renice needs --nice N");
@@ -298,7 +329,12 @@ fn one_host(ts: &[Target], a: &FleetArgs) -> anyhow::Result<Target> {
     match ts {
         [t] => Ok(t.clone()),
         [] => anyhow::bail!("no host selected"),
-        many => anyhow::bail!("this needs exactly one host; the selection {:?} matches {} (e.g. {})", a.hosts, many.len(), many.iter().take(3).map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")),
+        many => anyhow::bail!(
+            "this needs exactly one host; the selection {:?} matches {} (e.g. {})",
+            a.hosts,
+            many.len(),
+            many.iter().take(3).map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+        ),
     }
 }
 
@@ -330,7 +366,14 @@ fn hosts(ts: &[Target], json: bool) -> anyhow::Result<()> {
     }
     println!("{:<24} {:<32} {:<20} {:<20} FAT", "HOST", "SSH", "GROUPS", "TAGS");
     for t in ts {
-        println!("{:<24} {:<32} {:<20} {:<20} {}", t.name, t.dest, t.groups.join(","), t.tags.join(","), t.fat_path.as_deref().unwrap_or("(probe)"));
+        println!(
+            "{:<24} {:<32} {:<20} {:<20} {}",
+            t.name,
+            t.dest,
+            t.groups.join(","),
+            t.tags.join(","),
+            t.fat_path.as_deref().unwrap_or("(probe)")
+        );
     }
     println!("{} hosts", ts.len());
     Ok(())
@@ -423,7 +466,13 @@ fn worst_note(f: &crate::server::FleetFinding) -> String {
     if f.worst.is_empty() { String::new() } else { format!(" (worst: {})", f.worst) }
 }
 
-pub fn render_summary(s: &FleetSummary, outliers: &[FleetOutlier], sort: &str, top: usize, concurrency: usize) -> String {
+pub fn render_summary(
+    s: &FleetSummary,
+    outliers: &[FleetOutlier],
+    sort: &str,
+    top: usize,
+    concurrency: usize,
+) -> String {
     let mut o = String::new();
     o.push_str(&format!(
         "fleet: {} hosts · {} ok · {} not polled · {:.1}s (concurrency {})\n",
@@ -436,13 +485,24 @@ pub fn render_summary(s: &FleetSummary, outliers: &[FleetOutlier], sort: &str, t
     if !s.findings.is_empty() {
         o.push_str("\nfindings across hosts:\n");
         for f in &s.findings {
-            o.push_str(&format!("  {:<4}  {}: {} host{} [{}]{}\n", sev_word(f.severity), f.title, f.count, if f.count == 1 { "" } else { "s" }, host_list(&f.hosts, f.count), worst_note(f)));
+            o.push_str(&format!(
+                "  {:<4}  {}: {} host{} [{}]{}\n",
+                sev_word(f.severity),
+                f.title,
+                f.count,
+                if f.count == 1 { "" } else { "s" },
+                host_list(&f.hosts, f.count),
+                worst_note(f)
+            ));
         }
     }
     if !outliers.is_empty() {
         o.push_str("\noutliers (far from their group's median):\n");
         for x in outliers {
-            o.push_str(&format!("  {:<20} {:<18} {:>6.0}  (group {} median {:.0}, z {:.1})\n", x.host, x.metric, x.value, x.group, x.median, x.z));
+            o.push_str(&format!(
+                "  {:<20} {:<18} {:>6.0}  (group {} median {:.0}, z {:.1})\n",
+                x.host, x.metric, x.value, x.group, x.median, x.z
+            ));
         }
     }
     let mut rows: Vec<&FleetHost> = s.hosts.iter().collect();
@@ -454,7 +514,13 @@ pub fn render_summary(s: &FleetSummary, outliers: &[FleetOutlier], sort: &str, t
     ));
     for h in rows.iter().take(shown) {
         if !h.ok {
-            o.push_str(&format!("{:<22} {:>6} {:>67}  {}\n", h.name, "-", "", h.error.as_deref().unwrap_or("not polled")));
+            o.push_str(&format!(
+                "{:<22} {:>6} {:>67}  {}\n",
+                h.name,
+                "-",
+                "",
+                h.error.as_deref().unwrap_or("not polled")
+            ));
             continue;
         }
         o.push_str(&format!(
@@ -482,12 +548,26 @@ pub fn render_summary(s: &FleetSummary, outliers: &[FleetOutlier], sort: &str, t
 fn render_doctor(p: &FleetPoll) -> String {
     let mut o = String::new();
     let s = &p.summary;
-    o.push_str(&format!("fleet doctor: {} hosts · {} ok · {} not polled · {:.1}s\n", s.total, s.ok, s.unreachable, s.elapsed_ms as f64 / 1000.0));
+    o.push_str(&format!(
+        "fleet doctor: {} hosts · {} ok · {} not polled · {:.1}s\n",
+        s.total,
+        s.ok,
+        s.unreachable,
+        s.elapsed_ms as f64 / 1000.0
+    ));
     for f in &s.findings {
-        o.push_str(&format!("  {:<4}  {}: {} [{}]{}\n", sev_word(f.severity), f.title, f.count, host_list(&f.hosts, f.count), worst_note(f)));
+        o.push_str(&format!(
+            "  {:<4}  {}: {} [{}]{}\n",
+            sev_word(f.severity),
+            f.title,
+            f.count,
+            host_list(&f.hosts, f.count),
+            worst_note(f)
+        ));
     }
     let health: std::collections::HashMap<&str, u8> = s.hosts.iter().map(|h| (h.name.as_str(), h.health)).collect();
-    let mut per: Vec<&(String, Vec<Finding>)> = p.findings.iter().filter(|(_, f)| f.iter().any(|x| x.severity != "info")).collect();
+    let mut per: Vec<&(String, Vec<Finding>)> =
+        p.findings.iter().filter(|(_, f)| f.iter().any(|x| x.severity != "info")).collect();
     per.sort_by_key(|(h, _)| health.get(h.as_str()).copied().unwrap_or(100));
     for (h, fs) in per {
         o.push_str(&format!("\n{h} (health {}):\n", health.get(h.as_str()).copied().unwrap_or(0)));
@@ -502,13 +582,21 @@ fn render_doctor(p: &FleetPoll) -> String {
 pub type HostEvent = (String, Event);
 
 /// Run `fat events --since S --json` on every host; merged oldest first, plus per-host errors.
-pub fn fleet_events(ts: &[Target], fc: &FleetCfg, tr: &dyn Transport, since: &str, kinds: &[String]) -> (Vec<HostEvent>, Vec<(String, String)>) {
+pub fn fleet_events(
+    ts: &[Target],
+    fc: &FleetCfg,
+    tr: &dyn Transport,
+    since: &str,
+    kinds: &[String],
+) -> (Vec<HostEvent>, Vec<(String, String)>) {
     let mut args = vec!["events".to_string(), "--since".into(), since.to_string(), "--json".into()];
     for k in kinds {
         args.push("--kind".into());
         args.push(k.clone());
     }
-    let res = fanout::fan_out(ts, fc.concurrency, |t| (t.name.clone(), fanout::remote_read_only(t, &args, fc, tr).and_then(|o| parse_events(&o))));
+    let res = fanout::fan_out(ts, fc.concurrency, |t| {
+        (t.name.clone(), fanout::remote_read_only(t, &args, fc, tr).and_then(|o| parse_events(&o)))
+    });
     let mut events = Vec::new();
     let mut errors = Vec::new();
     for (h, r) in res {
@@ -532,8 +620,17 @@ fn parse_events(out: &str) -> anyhow::Result<Vec<Event>> {
 fn render_events(events: &[(String, Event)], errors: &[(String, String)]) -> String {
     let mut o = String::new();
     for (h, e) in events {
-        let t = chrono::DateTime::from_timestamp_millis(e.ts).map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string()).unwrap_or_default();
-        o.push_str(&format!("{t}  {:<18} {:<4} {:<20} {:<28} {}\n", h, sev_word(e.severity), e.kind.as_str(), e.subject, e.detail));
+        let t = chrono::DateTime::from_timestamp_millis(e.ts)
+            .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+        o.push_str(&format!(
+            "{t}  {:<18} {:<4} {:<20} {:<28} {}\n",
+            h,
+            sev_word(e.severity),
+            e.kind.as_str(),
+            e.subject,
+            e.detail
+        ));
     }
     if events.is_empty() {
         o.push_str("no events in that window\n");
@@ -559,7 +656,12 @@ const OOM_EVENTS_MAX: usize = 100;
 pub fn fast_snapshot(cfg: &Config) -> Snapshot {
     let now = now_ms();
     let hist = crate::history::History::open_read_only(cfg.history_path.as_deref()).ok();
-    let recorded = hist.as_ref().and_then(|h| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.latest(cfg.fleet.fast_max_age_ms))).ok()?.ok().flatten());
+    let recorded = hist.as_ref().and_then(|h| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.latest(cfg.fleet.fast_max_age_ms)))
+            .ok()?
+            .ok()
+            .flatten()
+    });
     let mut s = match recorded {
         Some(s) => s,
         None => live_server_snapshot(cfg),
@@ -580,7 +682,12 @@ pub fn fast_snapshot(cfg: &Config) -> Snapshot {
     // The last day's OOM kills (victims, cgroups) ride along: they are what an operator asks
     // about first, and a fleet poll should not need a second call for them. Bounded.
     if let Some(h) = &hist {
-        let ooms = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.events(now - 86_400_000, now, &[EventKind::OomKill], OOM_EVENTS_MAX))).ok().and_then(|r| r.ok()).unwrap_or_default();
+        let ooms = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            h.events(now - 86_400_000, now, &[EventKind::OomKill], OOM_EVENTS_MAX)
+        }))
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
         for e in ooms {
             if !s.events.iter().any(|x| x.ts == e.ts && x.kind == e.kind && x.subject == e.subject) {
                 s.events.push(e);
@@ -639,7 +746,10 @@ fn cached_poll(cfg: &Config, sel: &Selector, refresh: bool) -> anyhow::Result<(A
     }
     let all = inventory::inventory(cfg)?;
     if all.is_empty() {
-        anyhow::bail!("no fleet hosts configured: add [[hosts]], fleet.hosts_file or fleet.ssh_config_hosts to {}", Config::path().display());
+        anyhow::bail!(
+            "no fleet hosts configured: add [[hosts]], fleet.hosts_file or fleet.ssh_config_hosts to {}",
+            Config::path().display()
+        );
     }
     let ts = inventory::select(&all, sel, cfg);
     if ts.is_empty() {
@@ -687,15 +797,25 @@ pub fn mcp_fleet_doctor(cfg: &Config, args: &Value) -> anyhow::Result<Value> {
         .take(limit)
         .map(|(h, f)| json!({ "host": h, "findings": f }))
         .collect();
-    Ok(json!({ "cache_age_ms": age, "fleet_findings": p.summary.findings, "outliers": p.outliers, "hosts": hosts, "unreachable": p.summary.hosts.iter().filter(|h| !h.ok).map(|h| json!({"host": h.name, "error": h.error})).collect::<Vec<_>>() }))
+    Ok(
+        json!({ "cache_age_ms": age, "fleet_findings": p.summary.findings, "outliers": p.outliers, "hosts": hosts, "unreachable": p.summary.hosts.iter().filter(|h| !h.ok).map(|h| json!({"host": h.name, "error": h.error})).collect::<Vec<_>>() }),
+    )
 }
 
 fn exact_host(cfg: &Config, args: &Value) -> anyhow::Result<Target> {
-    let name = args.get("host").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| anyhow::anyhow!("`host` is required"))?;
+    let name = args
+        .get("host")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("`host` is required"))?;
     if inventory::is_glob(name) {
         anyhow::bail!("`host` must be one exact inventory name");
     }
-    inventory::inventory(cfg)?.into_iter().find(|t| t.name == name).ok_or_else(|| anyhow::anyhow!("{name} is not in the fleet inventory"))
+    inventory::inventory(cfg)?
+        .into_iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| anyhow::anyhow!("{name} is not in the fleet inventory"))
 }
 
 /// MCP `host_snapshot`: one host's state, trimmed for an agent (top processes, failed units,
@@ -766,7 +886,12 @@ mod tests {
     /// Remote command lines reach an agent only redacted.
     #[test]
     fn host_snapshot_procs_are_redacted() {
-        let p = crate::model::Proc { pid: 7, name: "mysql".into(), cmd: "mysql --password=hunter2 -h db-01".into(), ..Default::default() };
+        let p = crate::model::Proc {
+            pid: 7,
+            name: "mysql".into(),
+            cmd: "mysql --password=hunter2 -h db-01".into(),
+            ..Default::default()
+        };
         let v = slim_proc(&p);
         let c = v["cmd"].as_str().unwrap();
         assert!(!c.contains("hunter2") && c.contains("mysql"), "{c}");
@@ -791,25 +916,43 @@ mod tests {
         let a = parse(&["doctor", "--group", "web", "-g", "db", "--tag", "prod", "--json"]).unwrap();
         assert!(matches!(a.cmd, Some(FleetCmd::Doctor)) && a.groups == ["web", "db"] && a.json);
         let a = parse(&["--host", "db-01", "what-happened", "--at", "03:12"]).unwrap();
-        assert!(matches!(a.cmd, Some(FleetCmd::WhatHappened { at: Some(ref t), ref window }) if t == "03:12" && window == "15m"));
+        assert!(
+            matches!(a.cmd, Some(FleetCmd::WhatHappened { at: Some(ref t), ref window }) if t == "03:12" && window == "15m")
+        );
         let a = parse(&["events", "--since", "2h", "--kind", "oom-kill", "--kind", "unit_failed"]).unwrap();
         assert!(matches!(a.cmd, Some(FleetCmd::Events { ref since, ref kinds }) if since == "2h" && kinds.len() == 2));
         let a = parse(&["exec-readonly", "kernel", "--json"]).unwrap();
         assert!(matches!(a.cmd, Some(FleetCmd::ExecReadonly { ref args }) if args == &["kernel", "--json"]));
         assert!(parse(&["--sort", "bogus"]).is_err());
         assert!(parse(&["act", "kill", "1"]).is_err(), "no remote kill");
-        let a = parse(&["act", "--allow-actions", "--host", "web-01", "renice", "42", "--name", "make", "--nice", "-5"]).unwrap();
-        assert!(matches!(a.cmd, Some(FleetCmd::Act { allow_actions: true, ref action, pid: Some(42), nice: Some(-5), .. }) if action == "renice"));
+        let a =
+            parse(&["act", "--allow-actions", "--host", "web-01", "renice", "42", "--name", "make", "--nice", "-5"])
+                .unwrap();
+        assert!(
+            matches!(a.cmd, Some(FleetCmd::Act { allow_actions: true, ref action, pid: Some(42), nice: Some(-5), .. }) if action == "renice")
+        );
     }
 
     #[test]
     fn act_guards() {
-        let cfg = Config { hosts: vec![crate::config::HostCfg { name: "web-01".into(), ..Default::default() }, crate::config::HostCfg { name: "web-02".into(), ..Default::default() }], ..Default::default() };
+        let cfg = Config {
+            hosts: vec![
+                crate::config::HostCfg { name: "web-01".into(), ..Default::default() },
+                crate::config::HostCfg { name: "web-02".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
         let err = |v: &[&str]| run(parse(v).unwrap(), &cfg).unwrap_err().to_string();
         assert!(err(&["--host", "web-01", "act", "pause", "1", "--name", "x"]).contains("--allow-actions"));
-        assert!(err(&["--host", "web-*", "act", "--allow-actions", "pause", "1", "--name", "x"]).contains("exactly one --host"));
+        assert!(
+            err(&["--host", "web-*", "act", "--allow-actions", "pause", "1", "--name", "x"])
+                .contains("exactly one --host")
+        );
         assert!(err(&["act", "--allow-actions", "pause", "1", "--name", "x"]).contains("exactly one --host"));
-        assert!(err(&["--group", "g", "--host", "web-01", "act", "--allow-actions", "pause", "1"]).contains("exactly one --host"));
+        assert!(
+            err(&["--group", "g", "--host", "web-01", "act", "--allow-actions", "pause", "1"])
+                .contains("exactly one --host")
+        );
         assert!(err(&["--host", "web-01", "act", "--allow-actions", "pause", "1"]).contains("--name"));
         assert!(err(&["exec-readonly", "kill", "1"]).contains("read-only"));
         assert!(err(&["--host", "nope", "summary"]).contains("no host matches"));
@@ -827,13 +970,24 @@ mod tests {
 
     #[test]
     fn summary_rendering() {
-        let h = |n: &str, health: u8, cpu: f32| FleetHost { name: n.into(), ok: true, health, cpu, ..Default::default() };
+        let h =
+            |n: &str, health: u8, cpu: f32| FleetHost { name: n.into(), ok: true, health, cpu, ..Default::default() };
         let s = FleetSummary {
             total: 3,
             ok: 2,
             unreachable: 1,
-            hosts: vec![h("web-01", 50, 10.0), h("web-02", 90, 80.0), FleetHost { name: "db-01".into(), error: Some("auth: denied".into()), ..Default::default() }],
-            findings: vec![crate::server::FleetFinding { title: "Disk / is #% full".into(), severity: Severity::Warn, count: 12, hosts: vec!["web-01".into(), "web-02".into()], ..Default::default() }],
+            hosts: vec![
+                h("web-01", 50, 10.0),
+                h("web-02", 90, 80.0),
+                FleetHost { name: "db-01".into(), error: Some("auth: denied".into()), ..Default::default() },
+            ],
+            findings: vec![crate::server::FleetFinding {
+                title: "Disk / is #% full".into(),
+                severity: Severity::Warn,
+                count: 12,
+                hosts: vec!["web-01".into(), "web-02".into()],
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let out = render_summary(&s, &[], "cpu", 0, 64);

@@ -209,7 +209,10 @@ enum Cmd {
 /// from each subcommand's own about text; `help_groups_cover_every_subcommand` keeps it whole).
 const HELP_GROUPS: &[(&str, &[&str])] = &[
     ("Everyday", &["snapshot", "ports", "fs", "why", "doctor", "ask"]),
-    ("Actions (pause/resume can be undone, renice as root; kill cannot)", &["pause", "resume", "renice", "kill", "undo", "log"]),
+    (
+        "Actions (pause/resume can be undone, renice as root; kill cannot)",
+        &["pause", "resume", "renice", "kill", "undo", "log"],
+    ),
     ("Flight recorder", &["record", "history"]),
     ("Advanced", &["run", "mcp"]),
     ("Server", &["services", "kernel", "events", "what-happened", "fleet"]),
@@ -229,7 +232,9 @@ fn cli_command() -> clap::Command {
         }
     }
     groups.push_str("  help      Print help for a command (fat help <command>)\n");
-    cmd.help_template(format!("{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{groups}\nOptions:\n{{options}}{{after-help}}"))
+    cmd.help_template(format!(
+        "{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{groups}\nOptions:\n{{options}}{{after-help}}"
+    ))
 }
 
 fn parse_cli() -> Cli {
@@ -335,7 +340,9 @@ struct FsArgs {
 fn abs_path(p: Option<&str>) -> String {
     let p = p.map(str::trim).filter(|p| !p.is_empty()).unwrap_or("/");
     let expanded = match p.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => dirs::home_dir().map(|h| format!("{}{rest}", h.display())).unwrap_or_else(|| p.to_string()),
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            dirs::home_dir().map(|h| format!("{}{rest}", h.display())).unwrap_or_else(|| p.to_string())
+        }
         _ => p.to_string(),
     };
     let abs = std::path::absolute(&expanded).map(|a| a.display().to_string()).unwrap_or(expanded);
@@ -357,7 +364,13 @@ fn hb(b: u64) -> String {
 }
 
 /// Aligned table of a listing's children (recursing through `list` up to `depth`).
-fn fmt_listing(l: &fs::Listing, depth: u8, top: usize, now: model::Ts, list: &mut dyn FnMut(&str) -> Option<fs::Listing>) -> String {
+fn fmt_listing(
+    l: &fs::Listing,
+    depth: u8,
+    top: usize,
+    now: model::Ts,
+    list: &mut dyn FnMut(&str) -> Option<fs::Listing>,
+) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let p = &l.progress;
@@ -408,7 +421,10 @@ fn fmt_children(
         let ratio = c.size as f64 / parent as f64;
         let mut name = format!("{indent}{}{}", c.name, if c.is_dir { "/" } else { "" });
         if c.mount_point {
-            let alias = c.path.strip_prefix("/System/Volumes/Data").filter(|r| cfg!(target_os = "macos") && fs::volumes::firmlinks().iter().any(|f| f == r));
+            let alias = c
+                .path
+                .strip_prefix("/System/Volumes/Data")
+                .filter(|r| cfg!(target_os = "macos") && fs::volumes::firmlinks().iter().any(|f| f == r));
             match alias.map(|r| r.trim_start_matches('/')) {
                 // macOS firmlink: the same directory as /<name>, counted there.
                 Some(r) => name.push_str(&format!("  ↪ = /{r} (firmlink, counted there)")),
@@ -438,7 +454,10 @@ fn fmt_children(
         if let Some(k) = blame::explain_path(&c.path).filter(|k| !k.starts_with("inside ")) {
             notes.push((c.name.clone(), k));
         }
-        if depth > 1 && c.is_dir && !c.mount_point && c.size > 0
+        if depth > 1
+            && c.is_dir
+            && !c.mount_point
+            && c.size > 0
             && let Some(sub) = list(&c.path)
         {
             fmt_children(out, &sub, depth - 1, top, level + 1, now, list, notes);
@@ -446,7 +465,16 @@ fn fmt_children(
     }
     if l.children.len() > top {
         let rest = &l.children[top..];
-        let _ = writeln!(out, "{:>8} {:>4}  {:<12} {:>7} {:>8}  {indent}… {} more", hb(rest.iter().map(|c| c.size).sum()), "", "", "", "", rest.len());
+        let _ = writeln!(
+            out,
+            "{:>8} {:>4}  {:<12} {:>7} {:>8}  {indent}… {} more",
+            hb(rest.iter().map(|c| c.size).sum()),
+            "",
+            "",
+            "",
+            "",
+            rest.len()
+        );
     }
     let (files, bytes) = mcp::unlisted(l);
     if !l.dir.partial && files > 0 && bytes > 0 {
@@ -517,15 +545,22 @@ fn fmt_growth(g: &fs::Growth, window_ms: i64, now: model::Ts) -> String {
         let _ = writeln!(out, "Deleted but still open (space returns when the holder closes them or restarts):");
         const SHOW: usize = 8;
         for d in groups.iter().take(SHOW) {
-            let what = if d.files == 1 { d.biggest.clone() } else { format!("{} files, biggest {}", d.files, d.biggest) };
+            let what =
+                if d.files == 1 { d.biggest.clone() } else { format!("{} files, biggest {}", d.files, d.biggest) };
             let _ = writeln!(out, "{:>9}  {} ({}) holds {what}", hb(d.bytes), d.name, d.pid);
         }
         if groups.len() > SHOW {
             let rest = &groups[SHOW..];
-            let _ = writeln!(out, "{:>9}  … {} more processes (--json lists them)", hb(rest.iter().map(|d| d.bytes).sum()), rest.len());
+            let _ = writeln!(
+                out,
+                "{:>9}  … {} more processes (--json lists them)",
+                hb(rest.iter().map(|d| d.bytes).sum()),
+                rest.len()
+            );
         }
         if small > 0 {
-            let _ = writeln!(out, "{:>9}  … {small} small files under 1M not shown (--json lists them)", hb(small_bytes));
+            let _ =
+                writeln!(out, "{:>9}  … {small} small files under 1M not shown (--json lists them)", hb(small_bytes));
         }
     }
     if !g.writers.is_empty() {
@@ -538,7 +573,12 @@ fn fmt_growth(g: &fs::Growth, window_ms: i64, now: model::Ts) -> String {
         let _ = writeln!(out, "note: {n}");
     }
     if g.to > 0 && now > 0 {
-        let _ = writeln!(out, "(window {} → {}, evidence: fsevents/watch exact · open-files attributed · scan-diff coarse · mtime≤ upper bound)", fmt_hms(g.from), fmt_hms(g.to));
+        let _ = writeln!(
+            out,
+            "(window {} → {}, evidence: fsevents/watch exact · open-files attributed · scan-diff coarse · mtime≤ upper bound)",
+            fmt_hms(g.from),
+            fmt_hms(g.to)
+        );
     }
     out
 }
@@ -552,10 +592,18 @@ fn fmt_volumes(vols: &[fs::Volume]) -> String {
     use tui::widgets::{fmt_eta, fmt_fill, volume_ratio};
     let mut out = String::new();
     let w = vols.iter().map(|v| v.mount.chars().count()).max().unwrap_or(5).clamp(5, 40);
-    let _ = writeln!(out, "{:<w$} {:>17} {:>4}  {:<12} {:>8} {:>12}  {:<12} {:<22} TYPE", "MOUNT", "USED/TOTAL", "USE", "", "AVAIL", "FILL/10m", "ETA", "IO r/w");
+    let _ = writeln!(
+        out,
+        "{:<w$} {:>17} {:>4}  {:<12} {:>8} {:>12}  {:<12} {:<22} TYPE",
+        "MOUNT", "USED/TOTAL", "USE", "", "AVAIL", "FILL/10m", "ETA", "IO r/w"
+    );
     for v in vols {
         let r = volume_ratio(v);
-        let io = if v.read_bps + v.write_bps > 0 { format!("{}/s {}/s", hb(v.read_bps), hb(v.write_bps)) } else { "-".into() };
+        let io = if v.read_bps + v.write_bps > 0 {
+            format!("{}/s {}/s", hb(v.read_bps), hb(v.write_bps))
+        } else {
+            "-".into()
+        };
         let mut ty = v.fstype.clone();
         if v.read_only {
             ty.push_str(" ro");
@@ -707,7 +755,9 @@ fn main() -> Result<()> {
     }
     // Fleet polls set a self-deadline (see fleet::fanout::DEADLINE_ENV): a remote fat whose
     // ssh client gave up must not keep running on the host. SIGALRM's default action ends it.
-    if let Some(s) = std::env::var(fleet::fanout::DEADLINE_ENV).ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|&s| s > 0) {
+    if let Some(s) =
+        std::env::var(fleet::fanout::DEADLINE_ENV).ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|&s| s > 0)
+    {
         // SAFETY: alarm() has no preconditions; SIGALRM keeps its default disposition.
         unsafe {
             libc::alarm(s);
@@ -916,7 +966,13 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Kill { pid, tree, force }) => {
             let s = sample();
-            let kind = if tree { ActionKind::KillTree } else if force { ActionKind::Kill } else { ActionKind::Term };
+            let kind = if tree {
+                ActionKind::KillTree
+            } else if force {
+                ActionKind::Kill
+            } else {
+                ActionKind::Term
+            };
             print_action(&actions::Actions::open().apply(kind, pid, None, &s));
         }
         Some(Cmd::Undo { id }) => {
@@ -936,7 +992,12 @@ fn main() -> Result<()> {
             } else {
                 for r in &l {
                     let undone = if r.undone { " (undone)" } else { "" };
-                    print!("{}  ", chrono::DateTime::from_timestamp_millis(r.ts).map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string()).unwrap_or_default());
+                    print!(
+                        "{}  ",
+                        chrono::DateTime::from_timestamp_millis(r.ts)
+                            .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string())
+                            .unwrap_or_default()
+                    );
                     print_action(r);
                     if !undone.is_empty() {
                         println!("    {undone}");
@@ -949,12 +1010,16 @@ fn main() -> Result<()> {
         Some(Cmd::Mcp) => mcp::serve()?,
         // === server mode dispatch: one arm per variant, each under its owner's marker. ===
         // --- services ---
-        Some(Cmd::Services { failed, kind, json }) => server::services::cli(&cfg.server, failed, kind.as_deref(), json)?,
+        Some(Cmd::Services { failed, kind, json }) => {
+            server::services::cli(&cfg.server, failed, kind.as_deref(), json)?
+        }
         // --- kernel ---
         Some(Cmd::Kernel { since, json, watch }) => server::kernel::run_cli(&cfg, &since, json, watch)?,
         // --- doctor-incident ---
         Some(Cmd::Events { since, kind, json }) => server::incident::cli_events(&cfg, &since, &kind, json)?,
-        Some(Cmd::WhatHappened { at, window, json }) => server::incident::cli_what_happened(&cfg, at.as_deref(), &window, json)?,
+        Some(Cmd::WhatHappened { at, window, json }) => {
+            server::incident::cli_what_happened(&cfg, at.as_deref(), &window, json)?
+        }
         Some(Cmd::Fs(a)) => run_fs(a, &cfg)?,
     }
     Ok(())
@@ -978,8 +1043,14 @@ mod tests {
         // A tree kill sends TERM; --force used to be dropped silently and the result said "[ok]".
         let e = Cli::try_parse_from(["fat", "kill", "123", "--tree", "--force"]).err().expect("rejected");
         assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict, "{e}");
-        assert!(matches!(Cli::try_parse_from(["fat", "kill", "123", "--tree"]).unwrap().cmd, Some(Cmd::Kill { tree: true, force: false, .. })));
-        assert!(matches!(Cli::try_parse_from(["fat", "kill", "123", "--force"]).unwrap().cmd, Some(Cmd::Kill { tree: false, force: true, .. })));
+        assert!(matches!(
+            Cli::try_parse_from(["fat", "kill", "123", "--tree"]).unwrap().cmd,
+            Some(Cmd::Kill { tree: true, force: false, .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["fat", "kill", "123", "--force"]).unwrap().cmd,
+            Some(Cmd::Kill { tree: false, force: true, .. })
+        ));
     }
 
     #[test]
@@ -999,12 +1070,25 @@ mod tests {
         }
         assert!(help.find("Everyday:").unwrap() < help.find("Advanced:").unwrap());
         // Every existing command still parses (no renames).
-        for args in [&["fat", "snapshot"][..], &["fat", "log"], &["fat", "undo"], &["fat", "kill", "5", "--tree"], &["fat", "ask", "--dry-run", "why", "hot"], &["fat", "mcp"], &["fat", "fleet"], &["fat", "record"], &["fat", "history", "--spikes"], &["fat", "run", "--", "true"]] {
+        for args in [
+            &["fat", "snapshot"][..],
+            &["fat", "log"],
+            &["fat", "undo"],
+            &["fat", "kill", "5", "--tree"],
+            &["fat", "ask", "--dry-run", "why", "hot"],
+            &["fat", "mcp"],
+            &["fat", "fleet"],
+            &["fat", "record"],
+            &["fat", "history", "--spikes"],
+            &["fat", "run", "--", "true"],
+        ] {
             let m = cli_command().try_get_matches_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
             <Cli as clap::FromArgMatches>::from_arg_matches(&m).unwrap();
         }
         let m = cli_command().try_get_matches_from(["fat", "ask", "--dry-run", "why", "hot"]).unwrap();
-        assert!(matches!(<Cli as clap::FromArgMatches>::from_arg_matches(&m).unwrap().cmd, Some(Cmd::Ask { dry_run: true, ref question }) if question == &["why", "hot"]));
+        assert!(
+            matches!(<Cli as clap::FromArgMatches>::from_arg_matches(&m).unwrap().cmd, Some(Cmd::Ask { dry_run: true, ref question }) if question == &["why", "hot"])
+        );
     }
 
     #[test]
@@ -1046,40 +1130,97 @@ mod tests {
 
     #[test]
     fn fs_human_output() {
-        let de = |p: &str, size: u64, dir: bool| fs::DirEntry { path: p.into(), name: p.rsplit('/').next().unwrap().into(), is_dir: dir, size, files: 3, newest_mtime: 1000, ..Default::default() };
+        let de = |p: &str, size: u64, dir: bool| fs::DirEntry {
+            path: p.into(),
+            name: p.rsplit('/').next().unwrap().into(),
+            is_dir: dir,
+            size,
+            files: 3,
+            newest_mtime: 1000,
+            ..Default::default()
+        };
         let l = fs::Listing {
             dir: fs::DirEntry { files: 9, scanned_at: 1_000_000, partial: true, ..de("/w", 1000, true) },
-            children: vec![de("/w/node_modules", 600, true), fs::DirEntry { denied: 1, ..de("/w/secret", 0, true) }, de("/w/b", 300, false), de("/w/c", 100, false)],
+            children: vec![
+                de("/w/node_modules", 600, true),
+                fs::DirEntry { denied: 1, ..de("/w/secret", 0, true) },
+                de("/w/b", 300, false),
+                de("/w/c", 100, false),
+            ],
             progress: fs::ScanProgress { running: true, fraction: Some(0.43), ..Default::default() },
         };
-        let mut sub = |p: &str| (p == "/w/node_modules").then(|| fs::Listing { dir: de(p, 600, true), children: vec![de("/w/node_modules/react", 500, true)], ..Default::default() });
+        let mut sub = |p: &str| {
+            (p == "/w/node_modules").then(|| fs::Listing {
+                dir: de(p, 600, true),
+                children: vec![de("/w/node_modules/react", 500, true)],
+                ..Default::default()
+            })
+        };
         let out = fmt_listing(&l, 2, 3, 1_120_000, &mut sub);
-        assert!(out.starts_with("/w  1000B  (9 files · still scanning 43%: sizes are lower bounds · as of 2m ago)"), "{out}");
+        assert!(
+            out.starts_with("/w  1000B  (9 files · still scanning 43%: sizes are lower bounds · as of 2m ago)"),
+            "{out}"
+        );
         assert!(out.contains("    600B  60%  ███████▎····       3   2m ago  node_modules/"), "{out}");
-        assert!(out.contains("    500B  83%  ██████████··       3   2m ago    react/"), "depth 2 nests children\n{out}");
+        assert!(
+            out.contains("    500B  83%  ██████████··       3   2m ago    react/"),
+            "depth 2 nests children\n{out}"
+        );
         assert!(out.contains("?   0%") && out.contains("secret/ 🔒") && out.contains(locked_legend()), "{out}");
         assert_eq!(out.contains("Full Disk Access"), cfg!(target_os = "macos"), "{out}");
         assert!(!out.contains("not listed by name"), "partial listings have no remainder row\n{out}");
         // A complete listing whose loose files are not all listed gets a remainder row.
-        let done = fs::Listing { dir: fs::DirEntry { files: 9, ..de("/w", 1000, true) }, children: vec![de("/w/a", 600, true)], ..Default::default() };
+        let done = fs::Listing {
+            dir: fs::DirEntry { files: 9, ..de("/w", 1000, true) },
+            children: vec![de("/w/a", 600, true)],
+            ..Default::default()
+        };
         let rest = fmt_listing(&done, 1, 3, 1_120_000, &mut |_| None);
         assert!(rest.contains("    400B  40%") && rest.contains("(6 other files not listed by name)"), "{rest}");
         assert!(out.contains("… 1 more"), "{out}");
         assert!(out.contains("💡 node_modules: npm"), "{out}");
         let g = fs::Growth {
-            from: 1, to: 2,
+            from: 1,
+            to: 2,
             volumes: vec![("/".into(), 3 << 30)],
-            growers: vec![fs::Grower { path: "/w/logs".into(), is_dir: true, delta: 2 << 30, size: 5 << 30, writers: vec![(42, "node".into(), 1 << 20), (7, "x".into(), 1)], evidence: vec![fs::Evidence::Fsevents, fs::Evidence::OpenFiles], ..Default::default() }],
+            growers: vec![fs::Grower {
+                path: "/w/logs".into(),
+                is_dir: true,
+                delta: 2 << 30,
+                size: 5 << 30,
+                writers: vec![(42, "node".into(), 1 << 20), (7, "x".into(), 1)],
+                evidence: vec![fs::Evidence::Fsevents, fs::Evidence::OpenFiles],
+                ..Default::default()
+            }],
             writers: vec![(42, "node".into(), 2 << 30)],
             deleted_open: vec![(9, "java".into(), "/tmp/old.log".into(), 3 << 30)],
             notes: vec!["fanotify needs root".into()],
         };
         let out = fmt_growth(&g, 600_000, 5);
         assert!(out.contains("last 10m") && out.contains("volume /: +3.0G"), "{out}");
-        assert!(out.contains("    +2.0G     5.0G    1.0M/s  fsevents,open-files      /w/logs/  ← node (42) +1"), "{out}");
-        assert!(out.contains("java (9) holds /tmp/old.log") && out.contains("fat why 42") && out.contains("note: fanotify"), "{out}");
-        let vols = vec![fs::Volume { mount: "/".into(), fstype: "apfs".into(), total: 100 << 30, used: 95 << 30, avail: 5 << 30, primary: true, fill_bps: Some(1e6), eta_full_s: Some(5000), ..Default::default() }];
+        assert!(
+            out.contains("    +2.0G     5.0G    1.0M/s  fsevents,open-files      /w/logs/  ← node (42) +1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("java (9) holds /tmp/old.log") && out.contains("fat why 42") && out.contains("note: fanotify"),
+            "{out}"
+        );
+        let vols = vec![fs::Volume {
+            mount: "/".into(),
+            fstype: "apfs".into(),
+            total: 100 << 30,
+            used: 95 << 30,
+            avail: 5 << 30,
+            primary: true,
+            fill_bps: Some(1e6),
+            eta_full_s: Some(5000),
+            ..Default::default()
+        }];
         let out = fmt_volumes(&vols);
-        assert!(out.contains("95.0G/100.0G  95%") && out.contains("full in 1h") && out.contains("apfs primary"), "{out}");
+        assert!(
+            out.contains("95.0G/100.0G  95%") && out.contains("full in 1h") && out.contains("apfs primary"),
+            "{out}"
+        );
     }
 }

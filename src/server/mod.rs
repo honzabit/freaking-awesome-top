@@ -602,7 +602,8 @@ fn pod_uid_of(seg: &str) -> Option<String> {
         return None;
     }
     let uid = &s[i + 3..];
-    (uid.len() >= 32 && uid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_' || b == b'-')).then(|| uid.replace('_', "-"))
+    (uid.len() >= 32 && uid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_' || b == b'-'))
+        .then(|| uid.replace('_', "-"))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1177,7 +1178,8 @@ pub fn top_procs<'a>(procs: &'a [Proc], units: &[Unit], n: usize) -> Vec<&'a Pro
     take(&|p| p.mem as f64, &mut keep);
     take(&|p| (p.disk_read_bps + p.disk_write_bps) as f64, &mut keep);
     let mains: std::collections::HashSet<u32> = units.iter().filter_map(|u| u.main_pid).collect();
-    let mut out: Vec<&Proc> = procs.iter().enumerate().filter(|(i, p)| keep.contains(i) || mains.contains(&p.pid)).map(|(_, p)| p).collect();
+    let mut out: Vec<&Proc> =
+        procs.iter().enumerate().filter(|(i, p)| keep.contains(i) || mains.contains(&p.pid)).map(|(_, p)| p).collect();
     out.sort_by_key(|p| p.pid);
     out
 }
@@ -1206,25 +1208,60 @@ mod tests {
     #[test]
     fn oom_sources_dedup() {
         let mut d = OomDedup::new(120);
-        let k = oom_ev(1000, "pid:42", "kmsg", &[("task_memcg", "/outer/ns/system.slice/x.service")], Some(1e6), "OOM killer killed python3");
-        let mut units = vec![oom_ev(5000, "unit:x.service", "cgroup", &[("cgroup", "/system.slice/x.service")], Some(1.0), "1 process(es) OOM-killed in x.service")];
+        let k = oom_ev(
+            1000,
+            "pid:42",
+            "kmsg",
+            &[("task_memcg", "/outer/ns/system.slice/x.service")],
+            Some(1e6),
+            "OOM killer killed python3",
+        );
+        let mut units = vec![oom_ev(
+            5000,
+            "unit:x.service",
+            "cgroup",
+            &[("cgroup", "/system.slice/x.service")],
+            Some(1.0),
+            "1 process(es) OOM-killed in x.service",
+        )];
         d.dedup(std::slice::from_ref(&k), &mut units);
         assert!(units.is_empty(), "cgroup report of the logged kill dropped");
         // systemd's later Result=oom-kill for the same unit: the kill was already consumed, so it
         // is kept only if no kernel kill remains; here the services layer suppresses it itself.
-        let mut units = vec![oom_ev(7000, "unit:y.service", "systemd", &[("cgroup", "/system.slice/y.service")], None, "y was OOM-killed")];
+        let mut units = vec![oom_ev(
+            7000,
+            "unit:y.service",
+            "systemd",
+            &[("cgroup", "/system.slice/y.service")],
+            None,
+            "y was OOM-killed",
+        )];
         d.dedup(&[], &mut units);
         assert_eq!(units.len(), 1, "no kernel kill for y: kept");
         // Three kills in the cgroup, one logged: two remain.
         let k = oom_ev(10_000, "pid:7", "kmsg", &[("memcg", "/system.slice/z.service")], None, "");
-        let mut units = vec![oom_ev(11_000, "unit:z.service", "cgroup", &[("cgroup", "/system.slice/z.service")], Some(3.0), "3 process(es) OOM-killed in z.service")];
+        let mut units = vec![oom_ev(
+            11_000,
+            "unit:z.service",
+            "cgroup",
+            &[("cgroup", "/system.slice/z.service")],
+            Some(3.0),
+            "3 process(es) OOM-killed in z.service",
+        )];
         d.dedup(&[k], &mut units);
         assert_eq!(units[0].value, Some(2.0));
         assert!(units[0].detail.starts_with("2 process(es)"), "{}", units[0].detail);
         // Outside the window: a different kill.
         let k = oom_ev(20_000, "pid:8", "kmsg", &[("memcg", "/system.slice/w.service")], None, "");
         d.dedup(&[k], &mut vec![]);
-        let mut units = vec![oom_ev(20_000 + 121_000, "unit:w.service", "cgroup", &[("cgroup", "/system.slice/w.service")], Some(1.0), "")];
+        let mut units = vec![oom_ev(
+            20_000 + 121_000,
+            "unit:w.service",
+            "cgroup",
+            &[("cgroup", "/system.slice/w.service")],
+            Some(1.0),
+            "",
+        )];
         d.dedup(&[], &mut units);
         assert_eq!(units.len(), 1);
         assert!(cg_within("/a/system.slice/x.service", "/system.slice/x.service"));
@@ -1245,15 +1282,28 @@ mod tests {
     #[test]
     fn cgroup_to_unit() {
         let r = |p: &str| unit_of_cgroup(p);
-        assert_eq!(r("/system.slice/nginx.service"), Some(UnitRef { kind: UnitKind::Systemd, key: "nginx.service".into() }));
+        assert_eq!(
+            r("/system.slice/nginx.service"),
+            Some(UnitRef { kind: UnitKind::Systemd, key: "nginx.service".into() })
+        );
         let hex = "410892b21be2ffda255ceb4e7e2077d968864674cefc8174a3843e6f01c860f7";
-        assert_eq!(r(&format!("/system.slice/docker-{hex}.scope")).unwrap(), UnitRef { kind: UnitKind::Container, key: "410892b21be2".into() });
+        assert_eq!(
+            r(&format!("/system.slice/docker-{hex}.scope")).unwrap(),
+            UnitRef { kind: UnitKind::Container, key: "410892b21be2".into() }
+        );
         assert_eq!(r(&format!("/machine.slice/libpod-{hex}.scope/container")).unwrap().kind, UnitKind::Container);
         assert_eq!(r(&format!("/machine.slice/libpod-conmon-{hex}.scope")).unwrap().kind, UnitKind::Systemd);
-        let pod = "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1234abcd_5678_90ef_1234_567890abcdef.slice";
-        assert_eq!(r(pod).unwrap(), UnitRef { kind: UnitKind::Pod, key: "1234abcd-5678-90ef-1234-567890abcdef".into() });
+        let pod =
+            "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1234abcd_5678_90ef_1234_567890abcdef.slice";
+        assert_eq!(
+            r(pod).unwrap(),
+            UnitRef { kind: UnitKind::Pod, key: "1234abcd-5678-90ef-1234-567890abcdef".into() }
+        );
         assert_eq!(r(&format!("{pod}/cri-containerd-{hex}.scope")).unwrap().kind, UnitKind::Container);
-        assert_eq!(r(&format!("/kubepods/besteffort/pod1234abcd-5678-90ef-1234-567890abcdef/{hex}")).unwrap().kind, UnitKind::Container);
+        assert_eq!(
+            r(&format!("/kubepods/besteffort/pod1234abcd-5678-90ef-1234-567890abcdef/{hex}")).unwrap().kind,
+            UnitKind::Container
+        );
         assert_eq!(r("/user.slice/user-1000.slice/session-3.scope").unwrap().key, "session-3.scope");
         assert_eq!(r("/"), None);
         assert_eq!(r("/system.slice"), None);
@@ -1279,10 +1329,13 @@ mod tests {
 
     #[test]
     fn top_procs_is_bounded() {
-        let procs: Vec<Proc> = (1..=500).map(|i| Proc { pid: i, cpu: i as f32, mem: (501 - i) as u64, ..Default::default() }).collect();
+        let procs: Vec<Proc> =
+            (1..=500).map(|i| Proc { pid: i, cpu: i as f32, mem: (501 - i) as u64, ..Default::default() }).collect();
         let units = vec![Unit { main_pid: Some(250), ..Default::default() }];
         let kept = top_procs(&procs, &units, 10);
         assert!(kept.len() <= 31);
-        assert!(kept.iter().any(|p| p.pid == 500) && kept.iter().any(|p| p.pid == 1) && kept.iter().any(|p| p.pid == 250));
+        assert!(
+            kept.iter().any(|p| p.pid == 500) && kept.iter().any(|p| p.pid == 1) && kept.iter().any(|p| p.pid == 250)
+        );
     }
 }

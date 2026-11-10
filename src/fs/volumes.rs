@@ -406,11 +406,38 @@ pub fn totals(vols: &[Volume]) -> (u64, u64, u64) {
 pub fn is_pseudo(fstype: &str) -> bool {
     matches!(
         fstype,
-        "proc" | "sysfs" | "devfs" | "devtmpfs" | "devpts" | "cgroup" | "cgroup2" | "autofs"
-            | "securityfs" | "debugfs" | "tracefs" | "bpf" | "fusectl" | "mqueue" | "hugetlbfs"
-            | "configfs" | "pstore" | "binfmt_misc" | "nsfs" | "efivarfs" | "rpc_pipefs"
-            | "selinuxfs" | "nfsd" | "ramfs" | "rootfs" | "kernfs" | "fdesc" | "fuse.lxcfs"
-            | "fuse.portal" | "fuse.gvfsd-fuse" | "nullfs" | "fusefs.portal"
+        "proc"
+            | "sysfs"
+            | "devfs"
+            | "devtmpfs"
+            | "devpts"
+            | "cgroup"
+            | "cgroup2"
+            | "autofs"
+            | "securityfs"
+            | "debugfs"
+            | "tracefs"
+            | "bpf"
+            | "fusectl"
+            | "mqueue"
+            | "hugetlbfs"
+            | "configfs"
+            | "pstore"
+            | "binfmt_misc"
+            | "nsfs"
+            | "efivarfs"
+            | "rpc_pipefs"
+            | "selinuxfs"
+            | "nfsd"
+            | "ramfs"
+            | "rootfs"
+            | "kernfs"
+            | "fdesc"
+            | "fuse.lxcfs"
+            | "fuse.portal"
+            | "fuse.gvfsd-fuse"
+            | "nullfs"
+            | "fusefs.portal"
     )
 }
 
@@ -418,9 +445,28 @@ pub fn is_pseudo(fstype: &str) -> bool {
 pub fn is_remote_fstype(fstype: &str) -> bool {
     matches!(
         fstype,
-        "nfs" | "nfs4" | "cifs" | "smb3" | "smbfs" | "afpfs" | "webdav" | "davfs" | "9p" | "virtiofs"
-            | "ceph" | "glusterfs" | "lustre" | "fuse" | "fuseblk" | "osxfuse" | "macfuse" | "sshfs"
-            | "ftp" | "afs" | "gpfs" | "beegfs"
+        "nfs"
+            | "nfs4"
+            | "cifs"
+            | "smb3"
+            | "smbfs"
+            | "afpfs"
+            | "webdav"
+            | "davfs"
+            | "9p"
+            | "virtiofs"
+            | "ceph"
+            | "glusterfs"
+            | "lustre"
+            | "fuse"
+            | "fuseblk"
+            | "osxfuse"
+            | "macfuse"
+            | "sshfs"
+            | "ftp"
+            | "afs"
+            | "gpfs"
+            | "beegfs"
     ) || fstype.starts_with("fuse.")
         || fstype.starts_with("fusefs")
         || fstype.starts_with("macfuse")
@@ -476,10 +522,7 @@ pub fn unescape_mount(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'\\'
-            && i + 3 < b.len()
-            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
-        {
+        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)) {
             let v = (b[i + 1] - b'0') as u32 * 64 + (b[i + 2] - b'0') as u32 * 8 + (b[i + 3] - b'0') as u32;
             out.push(v as u8);
             i += 4;
@@ -503,10 +546,7 @@ pub fn parse_mountinfo(text: &str) -> Vec<RawMount> {
         if f.len() < 6 || g.len() < 2 {
             continue;
         }
-        let majmin = f[2]
-            .split_once(':')
-            .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
-            .unwrap_or((0, 0));
+        let majmin = f[2].split_once(':').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))).unwrap_or((0, 0));
         let opts = f[5];
         let super_opts = g.get(2).copied().unwrap_or("");
         let ro = opts.split(',').any(|o| o == "ro") || super_opts.split(',').any(|o| o == "ro");
@@ -532,8 +572,15 @@ fn under(path: &str, dir: &str) -> bool {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn classify_linux(raws: &[RawMount]) -> Vec<(RawMount, Visibility)> {
     const NOISE: [&str; 9] = [
-        "/proc", "/sys", "/dev", "/var/lib/docker", "/run/docker", "/var/lib/containers",
-        "/run/containerd", "/var/lib/kubelet", "/snap",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/var/lib/docker",
+        "/run/docker",
+        "/var/lib/containers",
+        "/run/containerd",
+        "/var/lib/kubelet",
+        "/snap",
     ];
     let kept: Vec<&RawMount> = raws.iter().filter(|r| !is_pseudo(&r.fstype)).collect();
     // Later mounts on the same mount point shadow earlier ones.
@@ -618,8 +665,16 @@ pub fn firmlinks() -> &'static [String] {
 }
 
 const DEFAULT_FIRMLINKS: [&str; 10] = [
-    "/Applications", "/Library", "/Users", "/Volumes", "/cores", "/opt", "/private", "/usr/local",
-    "/System/Library/Caches", "/AppleInternal",
+    "/Applications",
+    "/Library",
+    "/Users",
+    "/Volumes",
+    "/cores",
+    "/opt",
+    "/private",
+    "/usr/local",
+    "/System/Library/Caches",
+    "/AppleInternal",
 ];
 
 /// The volume containing `path` (longest mount prefix).
@@ -770,7 +825,8 @@ pub fn deleted_open_uncached() -> Vec<(u32, String, String, u64)> {
             let Ok(link) = std::fs::read_link(fd.path()) else { continue };
             let link = link.to_string_lossy();
             let Some(path) = link.strip_suffix(" (deleted)") else { continue };
-            if !path.starts_with('/') || path.starts_with("/memfd:") || path.starts_with("/SYSV") || under(path, "/dev") {
+            if !path.starts_with('/') || path.starts_with("/memfd:") || path.starts_with("/SYSV") || under(path, "/dev")
+            {
                 continue;
             }
             let Ok(md) = std::fs::metadata(fd.path()) else { continue };
@@ -1040,8 +1096,18 @@ mod mac {
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         static kCFURLVolumeAvailableCapacityForImportantUsageKey: CFTypeRef;
-        fn CFURLCreateFromFileSystemRepresentation(alloc: CFTypeRef, buf: *const u8, len: isize, is_dir: u8) -> CFTypeRef;
-        fn CFURLCopyResourcePropertyForKey(url: CFTypeRef, key: CFTypeRef, value: *mut CFTypeRef, err: *mut CFTypeRef) -> u8;
+        fn CFURLCreateFromFileSystemRepresentation(
+            alloc: CFTypeRef,
+            buf: *const u8,
+            len: isize,
+            is_dir: u8,
+        ) -> CFTypeRef;
+        fn CFURLCopyResourcePropertyForKey(
+            url: CFTypeRef,
+            key: CFTypeRef,
+            value: *mut CFTypeRef,
+            err: *mut CFTypeRef,
+        ) -> u8;
         fn CFNumberGetValue(n: CFTypeRef, ty: isize, out: *mut std::ffi::c_void) -> u8;
         fn CFGetTypeID(cf: CFTypeRef) -> usize;
         fn CFNumberGetTypeID() -> usize;
@@ -1053,7 +1119,8 @@ mod mac {
         // SAFETY: standard CF create/copy/release pattern; every object we own is released,
         // the key is a framework constant, and type ids are checked before CFNumberGetValue.
         unsafe {
-            let url = CFURLCreateFromFileSystemRepresentation(std::ptr::null(), mount.as_ptr(), mount.len() as isize, 1);
+            let url =
+                CFURLCreateFromFileSystemRepresentation(std::ptr::null(), mount.as_ptr(), mount.len() as isize, 1);
             if url.is_null() {
                 return None;
             }
@@ -1147,7 +1214,9 @@ mod mac {
                 last_io = Some(Instant::now());
                 let stats = driver_stats();
                 let unknown = stats.iter().any(|(id, _, _)| !map.values().any(|(i, _)| i == id));
-                if last_map.is_none_or(|t| t.elapsed() >= MAP_EVERY) || (unknown && last_map.is_none_or(|t| t.elapsed() >= IO_EVERY)) {
+                if last_map.is_none_or(|t| t.elapsed() >= MAP_EVERY)
+                    || (unknown && last_map.is_none_or(|t| t.elapsed() >= IO_EVERY))
+                {
                     last_map = Some(Instant::now());
                     if let Some(m) = bsd_map() {
                         map = m;
@@ -1158,7 +1227,10 @@ mod mac {
                 for (id, r, w) in stats {
                     if let Some((t, pr, pw)) = prev.get(&id) {
                         let dt = now.duration_since(*t).as_secs_f64().max(0.001);
-                        per_id.insert(id.clone(), ((r.saturating_sub(*pr) as f64 / dt) as u64, (w.saturating_sub(*pw) as f64 / dt) as u64));
+                        per_id.insert(
+                            id.clone(),
+                            ((r.saturating_sub(*pr) as f64 / dt) as u64, (w.saturating_sub(*pw) as f64 / dt) as u64),
+                        );
                     }
                     prev.insert(id, (now, r, w));
                 }
@@ -1441,24 +1513,36 @@ garbage line without separator
         let vols = vec![mk("/", "/dev/disk3s1s1", 10), mk("/System/Volumes/Data", "/dev/disk3s5", 600), x];
         assert_eq!(totals(&vols), (615, 200, 1500));
         // Linux: overlay root and a btrfs bind of the same pool count once.
-        let lin = |m: &str, d: &str, f: &str| Volume { mount: m.into(), device: d.into(), fstype: f.into(), used: 300, avail: 700, total: 1000, ..Default::default() };
-        let v = vec![lin("/", "overlay", "overlay"), lin("/target", "/dev/vdb1", "btrfs"), lin("/home", "/dev/sda2", "ext4")];
+        let lin = |m: &str, d: &str, f: &str| Volume {
+            mount: m.into(),
+            device: d.into(),
+            fstype: f.into(),
+            used: 300,
+            avail: 700,
+            total: 1000,
+            ..Default::default()
+        };
+        let v = vec![
+            lin("/", "overlay", "overlay"),
+            lin("/target", "/dev/vdb1", "btrfs"),
+            lin("/home", "/dev/sda2", "ext4"),
+        ];
         let v = [v, vec![Volume { avail: 1500, total: 2000, ..lin("/data", "/dev/sdb1", "ext4") }]].concat();
         assert_eq!(totals(&v[..2]), (300, 700, 1000));
         assert_eq!(totals(&v[..1]), (300, 700, 1000));
         assert_eq!(totals(&[v[0].clone(), v[3].clone()]), (600, 2200, 3000));
-        assert_eq!(totals(&v), (600, 2200, 3000), "same-size /home with near-equal free is merged (documented heuristic)");
+        assert_eq!(
+            totals(&v),
+            (600, 2200, 3000),
+            "same-size /home with near-equal free is merged (documented heuristic)"
+        );
     }
 
     /// Scratch dir inside the cargo target dir (next to the test binary), so it sits on a real
     /// local filesystem even when the source tree is a virtiofs/NFS share.
     fn scratch(tag: &str) -> std::path::PathBuf {
         let exe = std::env::current_exe().unwrap();
-        let d = exe
-            .parent()
-            .unwrap()
-            .join("fs-volumes-test")
-            .join(format!("{tag}-{}", std::process::id()));
+        let d = exe.parent().unwrap().join("fs-volumes-test").join(format!("{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -1475,8 +1559,13 @@ garbage line without separator
         let st = iokit::block_storage_stats().unwrap();
         let dn = t.elapsed();
         let t = Instant::now();
-        let m2 = parse_ioreg_bsd_map(&run_timeout("ioreg", &["-c", "IOBlockStorageDriver", "-r", "-l", "-w0"], Duration::from_secs(5)).unwrap());
-        let st2 = parse_ioreg_stats(&run_timeout("ioreg", &["-c", "IOBlockStorageDriver", "-r", "-d", "1", "-w0"], Duration::from_secs(5)).unwrap());
+        let m2 = parse_ioreg_bsd_map(
+            &run_timeout("ioreg", &["-c", "IOBlockStorageDriver", "-r", "-l", "-w0"], Duration::from_secs(5)).unwrap(),
+        );
+        let st2 = parse_ioreg_stats(
+            &run_timeout("ioreg", &["-c", "IOBlockStorageDriver", "-r", "-d", "1", "-w0"], Duration::from_secs(5))
+                .unwrap(),
+        );
         let ds = t.elapsed();
         println!("disk map+stats: iokit {dn:?}, ioreg {ds:?}; {} bsd nodes, {} drivers", m.len(), st.len());
         assert_eq!(m, m2);
@@ -1495,11 +1584,17 @@ garbage line without separator
         let dn = t.elapsed();
         let t = Instant::now();
         let uid = euid.to_string();
-        let out = run_timeout("lsof", &["+c", "0", "-nP", "-w", "+L1", "-a", "-u", &uid, "-F", "pcftsiDn"], Duration::from_secs(10)).unwrap();
+        let out = run_timeout(
+            "lsof",
+            &["+c", "0", "-nP", "-w", "+L1", "-a", "-u", &uid, "-F", "pcftsiDn"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
         let d2 = finish_deleted(parse_lsof_deleted(&out));
         let ds = t.elapsed();
         println!("deleted-open: libproc {} files in {dn:?}, lsof {} in {ds:?}", d.len(), d2.len());
-        let k = |v: &[DeletedFile]| v.iter().map(|e| (e.0, e.2.clone(), e.3)).collect::<std::collections::BTreeSet<_>>();
+        let k =
+            |v: &[DeletedFile]| v.iter().map(|e| (e.0, e.2.clone(), e.3)).collect::<std::collections::BTreeSet<_>>();
         let (kd, kd2) = (k(&d), k(&d2));
         for x in kd.difference(&kd2) {
             println!("only libproc: {x:?}");
@@ -1527,7 +1622,12 @@ garbage line without separator
         let me = std::process::id();
         let found = deleted_open_uncached();
         let hit = found.iter().find(|(pid, _, path, _)| *pid == me && path.ends_with("held-open.bin"));
-        assert!(hit.is_some(), "not found among {} entries: {:?}", found.len(), found.iter().filter(|e| e.0 == me).collect::<Vec<_>>());
+        assert!(
+            hit.is_some(),
+            "not found among {} entries: {:?}",
+            found.len(),
+            found.iter().filter(|e| e.0 == me).collect::<Vec<_>>()
+        );
         assert!(hit.unwrap().3 >= 1 << 20, "{hit:?}");
         // Sorted by bytes desc.
         assert!(found.windows(2).all(|w| w[0].3 >= w[1].3));
@@ -1550,9 +1650,24 @@ garbage line without separator
         for x in &vols {
             eprintln!(
                 "{:<40} {:<22} {:<8} used {:>8.2}G avail {:>8.2}G tot {:>8.2}G purg {:?} ino {}/{} ro={} remote={} primary={} hidden={} r={} w={} fill={:?} eta={:?} {}",
-                x.mount, x.device, x.fstype, x.used as f64 / 1e9, x.avail as f64 / 1e9, x.total as f64 / 1e9,
-                x.purgeable.map(|p| p as f64 / 1e9), x.inodes_used, x.inodes_total, x.read_only, x.remote, x.primary,
-                x.hidden, x.read_bps, x.write_bps, x.fill_bps, x.eta_full_s, x.note
+                x.mount,
+                x.device,
+                x.fstype,
+                x.used as f64 / 1e9,
+                x.avail as f64 / 1e9,
+                x.total as f64 / 1e9,
+                x.purgeable.map(|p| p as f64 / 1e9),
+                x.inodes_used,
+                x.inodes_total,
+                x.read_only,
+                x.remote,
+                x.primary,
+                x.hidden,
+                x.read_bps,
+                x.write_bps,
+                x.fill_bps,
+                x.eta_full_s,
+                x.note
             );
         }
         eprintln!("totals {:?}", totals(&vols));

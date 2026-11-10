@@ -12,7 +12,7 @@
 use super::inventory::Target;
 use crate::blame::FsFacts;
 use crate::model::{Finding, Snapshot};
-use crate::server::{FleetCfg, FleetFinding, FleetHost, FleetOutlier, FleetSummary, Profile, Severity, SevCounts};
+use crate::server::{FleetCfg, FleetFinding, FleetHost, FleetOutlier, FleetSummary, Profile, SevCounts, Severity};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -21,7 +21,8 @@ use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 /// Remote fat subcommands the fleet may run.
-pub const READ_ONLY_REMOTE: &[&str] = &["snapshot", "doctor", "why", "ports", "services", "kernel", "events", "what-happened", "history", "fs"];
+pub const READ_ONLY_REMOTE: &[&str] =
+    &["snapshot", "doctor", "why", "ports", "services", "kernel", "events", "what-happened", "history", "fs"];
 
 /// Actions `fat fleet act` may forward to ONE host's `fat mcp` (which applies its own
 /// `[mcp] allow_actions` gate and pid-reuse checks). Kill is deliberately absent: it cannot be
@@ -150,7 +151,10 @@ impl Transport for LocalTransport {
 /// disables connection sharing (None) rather than failing every connection.
 fn control_dir() -> Option<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    let base = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()).map(std::path::PathBuf::from).or_else(|| dirs::home_dir().map(|h| h.join(".cache")))?;
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))?;
     let dir = base.join("fat").join("ssh");
     if dir.as_os_str().len() + 42 > 100 {
         return None;
@@ -212,7 +216,9 @@ fn run_capped(mut cmd: Command, input: Option<&str>, timeout: Duration, max: usi
     let start = Instant::now();
     let deadline = start + timeout;
     let prog = cmd.get_program().to_string_lossy().into_owned();
-    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("{}: cannot run {prog}: {e}", Kind::Local.as_str()))?;
     let pid = child.id() as libc::pid_t;
     if let (Some(text), Some(mut w)) = (input, child.stdin.take()) {
@@ -285,14 +291,28 @@ fn run_capped(mut cmd: Command, input: Option<&str>, timeout: Duration, max: usi
             Err(_) => {
                 if status.is_none() {
                     kill();
-                    anyhow::bail!("{}: no answer within {:.0}s (fleet.command_timeout_s)", Kind::Timeout.as_str(), timeout.as_secs_f32());
+                    anyhow::bail!(
+                        "{}: no answer within {:.0}s (fleet.command_timeout_s)",
+                        Kind::Timeout.as_str(),
+                        timeout.as_secs_f32()
+                    );
                 }
-                anyhow::bail!("{}: exited but its output stayed open for {:.0}s", Kind::Timeout.as_str(), timeout.as_secs_f32());
+                anyhow::bail!(
+                    "{}: exited but its output stayed open for {:.0}s",
+                    Kind::Timeout.as_str(),
+                    timeout.as_secs_f32()
+                );
             }
         }
     }
     let (Some(status), Some(stdout)) = (status, stdout) else { unreachable!("loop exits only with both") };
-    Ok(RemoteOut { ok: status.success(), code: status.code(), stdout: String::from_utf8_lossy(&stdout).into_owned(), stderr: stderr.unwrap_or_default(), latency_ms: start.elapsed().as_millis() as u64 })
+    Ok(RemoteOut {
+        ok: status.success(),
+        code: status.code(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: stderr.unwrap_or_default(),
+        latency_ms: start.elapsed().as_millis() as u64,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -378,13 +398,30 @@ fn classify(out: &RemoteOut) -> Kind {
             Kind::Remote
         };
     }
-    if has("host key verification failed") || has("remote host identification has changed") || has("no matching host key") {
+    if has("host key verification failed")
+        || has("remote host identification has changed")
+        || has("no matching host key")
+    {
         Kind::HostKey
-    } else if has("permission denied") || has("too many authentication failures") || has("no supported authentication") {
+    } else if has("permission denied") || has("too many authentication failures") || has("no supported authentication")
+    {
         Kind::Auth
-    } else if has("could not resolve hostname") || has("connection refused") || has("no route to host") || has("connection timed out") || has("operation timed out") || has("network is unreachable") || has("connection closed by") || has("connection reset") || has("kex_exchange_identification") {
+    } else if has("could not resolve hostname")
+        || has("connection refused")
+        || has("no route to host")
+        || has("connection timed out")
+        || has("operation timed out")
+        || has("network is unreachable")
+        || has("connection closed by")
+        || has("connection reset")
+        || has("kex_exchange_identification")
+    {
         Kind::Unreachable
-    } else if has("fat: command not found") || has("fat: not found") || (has("no such file") && has("fat")) || has("command not found") {
+    } else if has("fat: command not found")
+        || has("fat: not found")
+        || (has("no such file") && has("fat"))
+        || has("command not found")
+    {
         Kind::FatMissing
     } else if is_unknown_arg(&e) {
         Kind::Version
@@ -394,7 +431,10 @@ fn classify(out: &RemoteOut) -> Kind {
 }
 
 fn is_unknown_arg(stderr_lower: &str) -> bool {
-    stderr_lower.contains("unexpected argument") || stderr_lower.contains("unrecognized subcommand") || stderr_lower.contains("found argument") || stderr_lower.contains("wasn't expected")
+    stderr_lower.contains("unexpected argument")
+        || stderr_lower.contains("unrecognized subcommand")
+        || stderr_lower.contains("found argument")
+        || stderr_lower.contains("wasn't expected")
 }
 
 fn err_text(kind: Kind, out: &RemoteOut) -> String {
@@ -450,13 +490,24 @@ pub struct Polled {
 /// Poll every target with `fat snapshot --json --fast` (falling back to `snapshot --json` for
 /// older remotes). `on_result` is called as each host finishes (progress / streaming UI).
 #[cfg_attr(not(test), allow(dead_code))] // the TUI's Fleet tab is the caller
-pub fn poll(targets: &[Target], cfg: &FleetCfg, tr: &dyn Transport, on_result: &(dyn Fn(&FleetHost) + Sync)) -> Vec<(FleetHost, Option<Snapshot>)> {
+pub fn poll(
+    targets: &[Target],
+    cfg: &FleetCfg,
+    tr: &dyn Transport,
+    on_result: &(dyn Fn(&FleetHost) + Sync),
+) -> Vec<(FleetHost, Option<Snapshot>)> {
     poll_detailed(targets, cfg, tr, true, on_result).into_iter().map(|p| (p.host, p.snap)).collect()
 }
 
 /// [`poll`] that also returns each host's findings, and keeps snapshots only when `keep_snaps`
 /// (summaries over large fleets do not need them; dropping them bounds memory).
-pub fn poll_detailed(targets: &[Target], cfg: &FleetCfg, tr: &dyn Transport, keep_snaps: bool, on_result: &(dyn Fn(&FleetHost) + Sync)) -> Vec<Polled> {
+pub fn poll_detailed(
+    targets: &[Target],
+    cfg: &FleetCfg,
+    tr: &dyn Transport,
+    keep_snaps: bool,
+    on_result: &(dyn Fn(&FleetHost) + Sync),
+) -> Vec<Polled> {
     let timeout = Duration::from_secs(cfg.command_timeout_s.max(1));
     let backoff = Duration::from_secs(cfg.timeout_backoff_s);
     fan_out(targets, cfg.concurrency, |t| {
@@ -512,7 +563,8 @@ fn sargs(a: &[&str]) -> Vec<String> {
 
 fn poll_one(t: &Target, tr: &dyn Transport, timeout: Duration, keep: bool) -> Polled {
     let start = Instant::now();
-    let fail = |e: String| Polled { host: host_row(t, Err(&e), start.elapsed().as_millis() as u64), ..Default::default() };
+    let fail =
+        |e: String| Polled { host: host_row(t, Err(&e), start.elapsed().as_millis() as u64), ..Default::default() };
     let mut out = match tr.run(t, &sargs(&["snapshot", "--json", "--fast"]), timeout) {
         Ok(o) => o,
         Err(e) => return fail(e.to_string()),
@@ -562,7 +614,8 @@ fn poll_one(t: &Target, tr: &dyn Transport, timeout: Duration, keep: bool) -> Po
 /// data yields no findings rather than a failed poll.
 pub fn findings_of(snap: &Snapshot) -> Vec<Finding> {
     let facts = FsFacts { volumes: snap.volumes.clone(), ..Default::default() };
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::blame::diagnose_with_fs(snap, None, &facts))).unwrap_or_default()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::blame::diagnose_with_fs(snap, None, &facts)))
+        .unwrap_or_default()
 }
 
 /// Build a fleet row from one poll result (findings computed locally from the snapshot with
@@ -656,7 +709,9 @@ pub fn health_score(snap: &Snapshot, findings: &[Finding]) -> u8 {
             0
         };
     }
-    if let Some(pr) = snap.kernel.as_ref().and_then(|k| k.pressure) && (pr.mem_full >= 10.0 || pr.io_full >= 10.0) {
+    if let Some(pr) = snap.kernel.as_ref().and_then(|k| k.pressure)
+        && (pr.mem_full >= 10.0 || pr.io_full >= 10.0)
+    {
         p += 10;
     }
     100u32.saturating_sub(p) as u8
@@ -699,7 +754,11 @@ pub fn title_key(title: &str) -> String {
 /// host has the identical title) with host lists capped at
 /// `max_hosts_per_finding` (counts exact). Unreachable hosts are grouped by error kind, and a
 /// remote fat version different from this one is reported as one info finding.
-pub fn summarize(rows: Vec<FleetHost>, findings: &[(String, Vec<Finding>)], max_hosts_per_finding: usize) -> FleetSummary {
+pub fn summarize(
+    rows: Vec<FleetHost>,
+    findings: &[(String, Vec<Finding>)],
+    max_hosts_per_finding: usize,
+) -> FleetSummary {
     let health: BTreeMap<&str, u8> = rows.iter().map(|r| (r.name.as_str(), r.health)).collect();
     // key -> (severity, hosts with their own severity)
     // key -> (severity, hosts with their own severity, the original title while all agree)
@@ -741,23 +800,49 @@ pub fn summarize(rows: Vec<FleetHost>, findings: &[(String, Vec<Finding>)], max_
         .map(|(key, (severity, mut hosts, same))| {
             // Identical titles everywhere are shown verbatim; differing numbers become "#".
             let title = same.clone().unwrap_or(key);
-            hosts.sort_by(|a, b| b.0.cmp(&a.0).then(health.get(a.1.as_str()).cmp(&health.get(b.1.as_str()))).then(a.1.cmp(&b.1)));
+            hosts.sort_by(|a, b| {
+                b.0.cmp(&a.0).then(health.get(a.1.as_str()).cmp(&health.get(b.1.as_str()))).then(a.1.cmp(&b.1))
+            });
             let count = hosts.len();
-            let worst = if same.is_none() { hosts.first().map(|h| format!("{}: {}", h.1, h.2)).unwrap_or_default() } else { String::new() };
+            let worst = if same.is_none() {
+                hosts.first().map(|h| format!("{}: {}", h.1, h.2)).unwrap_or_default()
+            } else {
+                String::new()
+            };
             FleetFinding { title, severity, count, hosts: cap(hosts.into_iter().map(|h| h.1).collect()), worst }
         })
         .collect();
     for (kind, hosts) in errs {
-        out.push(FleetFinding { title: format!("not polled: {kind}"), severity: Severity::Warn, count: hosts.len(), hosts: cap(hosts), ..Default::default() });
+        out.push(FleetFinding {
+            title: format!("not polled: {kind}"),
+            severity: Severity::Warn,
+            count: hosts.len(),
+            hosts: cap(hosts),
+            ..Default::default()
+        });
     }
     if !skew.is_empty() {
-        out.push(FleetFinding { title: format!("fat version differs from this one ({mine})"), severity: Severity::Info, count: skew.len(), hosts: cap(skew), ..Default::default() });
+        out.push(FleetFinding {
+            title: format!("fat version differs from this one ({mine})"),
+            severity: Severity::Info,
+            count: skew.len(),
+            hosts: cap(skew),
+            ..Default::default()
+        });
     }
     out.sort_by(|a, b| b.severity.cmp(&a.severity).then(b.count.cmp(&a.count)).then(a.title.cmp(&b.title)));
     let mut hosts = rows;
     hosts.sort_by(|a, b| a.health.cmp(&b.health).then(a.name.cmp(&b.name)));
     let ok = hosts.iter().filter(|h| h.ok).count();
-    FleetSummary { ts: crate::model::now_ms(), elapsed_ms: 0, total: hosts.len(), ok, unreachable: hosts.len() - ok, hosts, findings: out }
+    FleetSummary {
+        ts: crate::model::now_ms(),
+        elapsed_ms: 0,
+        total: hosts.len(),
+        ok,
+        unreachable: hosts.len() - ok,
+        hosts,
+        findings: out,
+    }
 }
 
 fn median(v: &mut [f32]) -> f32 {
@@ -809,7 +894,14 @@ pub fn outliers(rows: &[FleetHost], cfg: &FleetCfg) -> Vec<FleetOutlier> {
                 let v = f(h);
                 let z = 0.6745 * (v - med) / mad;
                 if z.abs() >= cfg.outlier_z && (v - med).abs() >= cfg.outlier_min_delta {
-                    out.push(FleetOutlier { host: h.name.clone(), group: g.clone(), metric: name.into(), value: v, median: med, z });
+                    out.push(FleetOutlier {
+                        host: h.name.clone(),
+                        group: g.clone(),
+                        metric: name.into(),
+                        value: v,
+                        median: med,
+                        z,
+                    });
                 }
             }
         }
@@ -824,7 +916,10 @@ pub fn outliers(rows: &[FleetHost], cfg: &FleetCfg) -> Vec<FleetOutlier> {
 pub fn remote_read_only(t: &Target, args: &[String], cfg: &FleetCfg, tr: &dyn Transport) -> anyhow::Result<String> {
     let sub = args.first().map(String::as_str).unwrap_or("");
     if !READ_ONLY_REMOTE.contains(&sub) {
-        anyhow::bail!("refusing remote `fat {sub}`: only read-only commands are allowed ({})", READ_ONLY_REMOTE.join(", "));
+        anyhow::bail!(
+            "refusing remote `fat {sub}`: only read-only commands are allowed ({})",
+            READ_ONLY_REMOTE.join(", ")
+        );
     }
     let out = tr.run(t, args, Duration::from_secs(cfg.command_timeout_s.max(1)))?;
     if !out.ok {
@@ -851,10 +946,16 @@ pub struct ActionReq {
 /// `expect_name` / `start_time` (pid reuse). When `start_time` is None it is read from the
 /// remote `process` tool in the same session, just before the action. Returns the remote
 /// tool result (JSON). Callers enforce `--allow-actions` and an exact host name.
-pub fn remote_action(t: &Target, req: &ActionReq, cfg: &FleetCfg, tr: &dyn Transport) -> anyhow::Result<serde_json::Value> {
+pub fn remote_action(
+    t: &Target,
+    req: &ActionReq,
+    cfg: &FleetCfg,
+    tr: &dyn Transport,
+) -> anyhow::Result<serde_json::Value> {
     use serde_json::{Value, json};
     let ActionReq { action, pid, nice, expect_name, start_time } = req;
-    let (action, pid, nice, expect_name, start_time) = (action.as_str(), *pid, *nice, expect_name.as_str(), *start_time);
+    let (action, pid, nice, expect_name, start_time) =
+        (action.as_str(), *pid, *nice, expect_name.as_str(), *start_time);
     if !REMOTE_ACTIONS.contains(&action) {
         anyhow::bail!("`{action}` cannot be sent to a remote host (allowed: {})", REMOTE_ACTIONS.join(", "));
     }
@@ -862,8 +963,14 @@ pub fn remote_action(t: &Target, req: &ActionReq, cfg: &FleetCfg, tr: &dyn Trans
         anyhow::bail!("actions need one exact host name");
     }
     let timeout = Duration::from_secs(cfg.command_timeout_s.max(1));
-    let rpc = |id: u64, method: &str, params: Value| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    let init = rpc(1, "initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fat-fleet", "version": env!("CARGO_PKG_VERSION")}}));
+    let rpc = |id: u64, method: &str, params: Value| {
+        json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
+    };
+    let init = rpc(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fat-fleet", "version": env!("CARGO_PKG_VERSION")}}),
+    );
     let session = |lines: &[String]| -> anyhow::Result<Vec<Value>> {
         let out = tr.run_input(t, &sargs(&["mcp"]), &(lines.join("\n") + "\n"), timeout)?;
         let replies: Vec<Value> = out.stdout.lines().filter_map(|l| serde_json::from_str(l.trim()).ok()).collect();
@@ -880,7 +987,8 @@ pub fn remote_action(t: &Target, req: &ActionReq, cfg: &FleetCfg, tr: &dyn Trans
         (Some(st), _) => Some(st),
         (None, "undo") => None,
         (None, _) => {
-            let r = session(&[init.clone(), rpc(2, "tools/call", json!({"name": "process", "arguments": {"pid": pid}}))])?;
+            let r =
+                session(&[init.clone(), rpc(2, "tools/call", json!({"name": "process", "arguments": {"pid": pid}}))])?;
             let p = result_of(&r, 2).unwrap_or_default();
             let live = p["process"]["name"].as_str().or_else(|| p["name"].as_str()).unwrap_or("").to_string();
             if !live.eq_ignore_ascii_case(expect_name) {
@@ -932,13 +1040,25 @@ mod tests {
 
     #[test]
     fn ssh_argv_respects_operator_options() {
-        let mut cfg = FleetCfg { ssh_options: vec!["ConnectTimeout=2".into(), "-o Port=2222".into()], ..Default::default() };
+        let mut cfg =
+            FleetCfg { ssh_options: vec!["ConnectTimeout=2".into(), "-o Port=2222".into()], ..Default::default() };
         let tr = SshTransport { cfg: cfg.clone() };
         let cm = std::path::Path::new("/run/user/1000/fat/ssh");
-        let v = tr.argv_with(&Target { fat_path: Some("/opt/fat".into()), ..target("web-01") }, &sargs(&["snapshot", "--json"]), Some(cm)).unwrap();
-        assert!(v.contains(&"ControlPath=/run/user/1000/fat/ssh/%C".into()) && v.contains(&"ControlMaster=auto".into()));
+        let v = tr
+            .argv_with(
+                &Target { fat_path: Some("/opt/fat".into()), ..target("web-01") },
+                &sargs(&["snapshot", "--json"]),
+                Some(cm),
+            )
+            .unwrap();
+        assert!(
+            v.contains(&"ControlPath=/run/user/1000/fat/ssh/%C".into()) && v.contains(&"ControlMaster=auto".into())
+        );
         let ct = v.iter().position(|a| a == "ConnectTimeout=2").unwrap();
-        assert!(ct < v.iter().position(|a| a == "ConnectTimeout=5").unwrap(), "operator options first: ssh keeps the first value");
+        assert!(
+            ct < v.iter().position(|a| a == "ConnectTimeout=5").unwrap(),
+            "operator options first: ssh keeps the first value"
+        );
         assert!(v.contains(&"Port=2222".into()) && v.contains(&"BatchMode=yes".into()) && v.contains(&"-C".into()));
         assert!(!v.iter().any(|a| a.contains("ProxyJump") || a.contains("ProxyCommand")));
         let dd = v.iter().position(|a| a == "--").unwrap();
@@ -959,7 +1079,10 @@ mod tests {
 
     #[test]
     fn local_transport_and_capped_runner() {
-        let tr = LocalTransport { program: "sh".into(), prefix: vec!["-c".into(), "echo host={host} \"$@\"; echo warn >&2".into(), "x".into()] };
+        let tr = LocalTransport {
+            program: "sh".into(),
+            prefix: vec!["-c".into(), "echo host={host} \"$@\"; echo warn >&2".into(), "x".into()],
+        };
         let o = tr.run(&target("web-01"), &sargs(&["a", "b"]), Duration::from_secs(5)).unwrap();
         assert!(o.ok);
         assert_eq!(o.stdout.trim(), "host=web-01 a b");
@@ -1033,7 +1156,13 @@ mod tests {
         let c = remote_command_with_deadline(None, &sargs(&["doctor"]), Some(20));
         assert!(c.starts_with("env FAT_DEADLINE_S=20 sh -c "), "{c}");
         let ssh = SshTransport { cfg: FleetCfg { command_timeout_s: 7, ..Default::default() } };
-        assert!(ssh.argv(&target("web-01"), &sargs(&["doctor"])).unwrap().last().unwrap().starts_with("env FAT_DEADLINE_S=7 "));
+        assert!(
+            ssh.argv(&target("web-01"), &sargs(&["doctor"]))
+                .unwrap()
+                .last()
+                .unwrap()
+                .starts_with("env FAT_DEADLINE_S=7 ")
+        );
     }
 
     #[test]
@@ -1059,7 +1188,8 @@ mod tests {
         s.system.cores = 4;
         s.system.mem_total = 100;
         s.system.mem_used = 50;
-        s.meta = Some(SnapMeta { version: version.into(), source: "recorder".into(), age_ms: 1200, ..Default::default() });
+        s.meta =
+            Some(SnapMeta { version: version.into(), source: "recorder".into(), age_ms: 1200, ..Default::default() });
         serde_json::to_string(&s).unwrap()
     }
 
@@ -1120,12 +1250,38 @@ esac"#,
         let s = Snapshot::default();
         assert_eq!(health_score(&s, &[]), 100);
         assert_eq!(health_score(&s, &[f("crit", "a"), f("warn", "b")]), 67);
-        assert_eq!(health_score(&s, &[f("crit", "a"), f("crit", "b"), f("crit", "c"), f("warn", "x"), f("warn", "y"), f("warn", "z"), f("warn", "w")]), 10);
-        let s = Snapshot { units: vec![Unit { state: "failed".into(), ..Default::default() }; 2], ..Default::default() };
+        assert_eq!(
+            health_score(
+                &s,
+                &[
+                    f("crit", "a"),
+                    f("crit", "b"),
+                    f("crit", "c"),
+                    f("warn", "x"),
+                    f("warn", "y"),
+                    f("warn", "z"),
+                    f("warn", "w")
+                ]
+            ),
+            10
+        );
+        let s =
+            Snapshot { units: vec![Unit { state: "failed".into(), ..Default::default() }; 2], ..Default::default() };
         assert_eq!(health_score(&s, &[]), 90);
 
-        let row = |n: &str, h: u8| FleetHost { name: n.into(), ok: true, health: h, version: env!("CARGO_PKG_VERSION").into(), ..Default::default() };
-        let rows = vec![row("web-01", 60), row("web-02", 40), row("db-01", 90), FleetHost { name: "x".into(), error: Some("auth: no".into()), ..Default::default() }];
+        let row = |n: &str, h: u8| FleetHost {
+            name: n.into(),
+            ok: true,
+            health: h,
+            version: env!("CARGO_PKG_VERSION").into(),
+            ..Default::default()
+        };
+        let rows = vec![
+            row("web-01", 60),
+            row("web-02", 40),
+            row("db-01", 90),
+            FleetHost { name: "x".into(), error: Some("auth: no".into()), ..Default::default() },
+        ];
         let fs = vec![
             ("web-01".to_string(), vec![f("warn", "Disk / is 91% full"), f("warn", "Disk / is 91% full")]),
             ("web-02".to_string(), vec![f("crit", "Disk / is 98% full")]),
@@ -1136,9 +1292,17 @@ esac"#,
         assert_eq!(sum.findings[0].severity, Severity::Crit);
         assert_eq!(sum.findings[0].count, 2, "a host counts once per title");
         assert_eq!(sum.findings[0].hosts, vec!["web-02", "web-01"], "worst host first");
-        assert!(sum.findings.iter().any(|f| f.title == "postgres is a big network user"), "identical titles stay verbatim");
+        assert!(
+            sum.findings.iter().any(|f| f.title == "postgres is a big network user"),
+            "identical titles stay verbatim"
+        );
         assert!(sum.findings.iter().any(|f| f.title == "not polled: auth"));
-        assert_eq!(summarize(vec![], &[("a".into(), vec![f("warn", "t")]), ("b".into(), vec![f("warn", "t")])], 1).findings[0].hosts.len(), 1);
+        assert_eq!(
+            summarize(vec![], &[("a".into(), vec![f("warn", "t")]), ("b".into(), vec![f("warn", "t")])], 1).findings[0]
+                .hosts
+                .len(),
+            1
+        );
         assert_eq!(title_key("node on :3000 uses 1,234.5 MB"), "node on :# uses # MB");
         assert_eq!(sum.findings[0].worst, "web-02: Disk / is 98% full", "the merged line keeps the worst value");
         // Names with digits stay apart; values merge.
@@ -1150,7 +1314,10 @@ esac"#,
         assert_eq!(title_key("Disk writes at 120M/s"), "Disk writes at #M/s");
         let d = summarize(
             vec![],
-            &[("a".into(), vec![f("crit", "Disk /data1 is 97% full")]), ("b".into(), vec![f("warn", "Disk /data2 is 91% full")])],
+            &[
+                ("a".into(), vec![f("crit", "Disk /data1 is 97% full")]),
+                ("b".into(), vec![f("warn", "Disk /data2 is 91% full")]),
+            ],
             10,
         );
         assert_eq!(d.findings.len(), 2, "{:?}", d.findings);
@@ -1160,7 +1327,17 @@ esac"#,
     #[test]
     fn group_outliers() {
         let cfg = FleetCfg::default();
-        let mut rows: Vec<FleetHost> = (0..10).map(|i| FleetHost { name: format!("web-{i:02}"), ok: true, groups: vec!["web".into()], cores: 4, mem_pct: 40.0 + i as f32, disk_worst_pct: 50.0, ..Default::default() }).collect();
+        let mut rows: Vec<FleetHost> = (0..10)
+            .map(|i| FleetHost {
+                name: format!("web-{i:02}"),
+                ok: true,
+                groups: vec!["web".into()],
+                cores: 4,
+                mem_pct: 40.0 + i as f32,
+                disk_worst_pct: 50.0,
+                ..Default::default()
+            })
+            .collect();
         rows[3].mem_pct = 95.0;
         rows[7].disk_worst_pct = 52.0; // small difference: not an outlier
         let o = outliers(&rows, &cfg);
@@ -1176,7 +1353,10 @@ esac"#,
         assert!(remote_read_only(&target("a"), &sargs(&["kill", "1"]), &cfg, &tr).is_err());
         assert!(remote_read_only(&target("a"), &sargs(&["mcp"]), &cfg, &tr).is_err());
         assert!(remote_read_only(&target("a"), &[], &cfg, &tr).is_err());
-        assert_eq!(remote_read_only(&target("a"), &sargs(&["kernel", "--json"]), &cfg, &tr).unwrap().trim(), "kernel --json");
+        assert_eq!(
+            remote_read_only(&target("a"), &sargs(&["kernel", "--json"]), &cfg, &tr).unwrap().trim(),
+            "kernel --json"
+        );
         let req = |a: &str| ActionReq { action: a.into(), pid: 1, expect_name: "x".into(), ..Default::default() };
         assert!(remote_action(&target("a"), &req("kill"), &cfg, &tr).is_err());
         assert!(remote_action(&target("web-*"), &req("pause"), &cfg, &tr).is_err());

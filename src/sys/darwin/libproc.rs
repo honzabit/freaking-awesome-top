@@ -333,7 +333,9 @@ pub fn mapped_files(pid: i32) -> Vec<RegionWithPathInfo> {
         }
         addr = next;
         let st = &r.prp_vip.vip_vi.vi_stat;
-        if out.last().is_some_and(|l| l.prp_vip.vip_vi.vi_stat.vst_dev == st.vst_dev && l.prp_vip.vip_vi.vi_stat.vst_ino == st.vst_ino) {
+        if out.last().is_some_and(|l| {
+            l.prp_vip.vip_vi.vi_stat.vst_dev == st.vst_dev && l.prp_vip.vip_vi.vi_stat.vst_ino == st.vst_ino
+        }) {
             continue;
         }
         out.push(r);
@@ -500,7 +502,8 @@ pub fn writable_files(pid: i32) -> Vec<(String, u64)> {
         .filter(|vi| vi.writable() && vi.is_regular())
         .filter_map(|vi| {
             let p = vi.path()?;
-            (p.starts_with('/') && !p.starts_with("/dev/")).then(|| (p, vi.pvip.vip_vi.vi_stat.vst_blocks.max(0) as u64 * 512))
+            (p.starts_with('/') && !p.starts_with("/dev/"))
+                .then(|| (p, vi.pvip.vip_vi.vi_stat.vst_blocks.max(0) as u64 * 512))
         })
         .collect()
 }
@@ -621,7 +624,8 @@ mod tests {
         f.write_all(&[9u8; 3 * 16384]).unwrap();
         f.sync_all().unwrap();
         // SAFETY: mapping a regular file we own, read-only, unmapped below.
-        let m = unsafe { libc::mmap(std::ptr::null_mut(), 3 * 16384, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0) };
+        let m =
+            unsafe { libc::mmap(std::ptr::null_mut(), 3 * 16384, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0) };
         assert_ne!(m, libc::MAP_FAILED);
         drop(f);
         std::fs::remove_file(&p).unwrap();
@@ -643,7 +647,8 @@ mod tests {
         f.sync_all().unwrap();
         let ro = std::fs::File::open(&p).unwrap();
         let w = writable_files(std::process::id() as i32);
-        let hits: Vec<_> = w.iter().filter(|x| x.0.ends_with(&format!("fat-libproc-w-{}", std::process::id()))).collect();
+        let hits: Vec<_> =
+            w.iter().filter(|x| x.0.ends_with(&format!("fat-libproc-w-{}", std::process::id()))).collect();
         assert_eq!(hits.len(), 1, "{w:?}");
         assert!(hits[0].1 >= 64 * 1024);
         drop((f, ro));

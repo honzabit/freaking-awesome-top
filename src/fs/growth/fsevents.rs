@@ -132,12 +132,7 @@ impl Journal {
         if thread.is_none() {
             state.lock().unwrap().error = Some("could not spawn FSEvents thread".into());
         }
-        Journal {
-            state,
-            since_id,
-            stop,
-            thread,
-        }
+        Journal { state, since_id, stop, thread }
     }
 
     /// Block until history replay finished (or `timeout`). True when done.
@@ -175,25 +170,14 @@ fn run(
     cap: usize,
     exclude: Vec<String>,
 ) {
-    let ctx = Box::into_raw(Box::new(Ctx {
-        state: state.clone(),
-        cap,
-        exclude,
-    }));
+    let ctx = Box::into_raw(Box::new(Ctx { state: state.clone(), cap, exclude }));
     let c_roots: Vec<CString> = roots.iter().filter_map(|r| CString::new(r.as_str()).ok()).collect();
     // SAFETY: CoreFoundation objects are created, used and released on this thread only;
     // `ctx` outlives the stream (freed after FSEventStreamRelease).
     unsafe {
-        let cf_strs: Vec<CFRef> = c_roots
-            .iter()
-            .map(|c| CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), UTF8))
-            .collect();
-        let arr = CFArrayCreate(
-            std::ptr::null(),
-            cf_strs.as_ptr(),
-            cf_strs.len() as isize,
-            &kCFTypeArrayCallBacks,
-        );
+        let cf_strs: Vec<CFRef> =
+            c_roots.iter().map(|c| CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), UTF8)).collect();
+        let arr = CFArrayCreate(std::ptr::null(), cf_strs.as_ptr(), cf_strs.len() as isize, &kCFTypeArrayCallBacks);
         for s in &cf_strs {
             CFRelease(*s);
         }
@@ -321,11 +305,7 @@ impl IdClock {
                 }
             }
         }
-        let mut c = IdClock {
-            anchors: vec![],
-            file,
-            last_persist: 0,
-        };
+        let mut c = IdClock { anchors: vec![], file, last_persist: 0 };
         for (t, id) in anchors {
             c.push(t, id);
         }
@@ -467,9 +447,7 @@ mod tests {
     /// the time->id lookup is fat's own clock; replay from an explicit id works unprivileged.)
     #[test]
     fn replay_sees_recent_write() {
-        let dev = std::fs::metadata("/")
-            .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
-            .unwrap();
+        let dev = std::fs::metadata("/").map(|m| std::os::unix::fs::MetadataExt::dev(&m)).unwrap();
         eprintln!(
             "FSEventsGetLastEventIdForDeviceBeforeTime(now-60s) = {}",
             id_before(dev, crate::model::now_ms() - 60_000)

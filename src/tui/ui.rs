@@ -1,9 +1,9 @@
 //! Rendering. Only visible rows are materialized, so cost scales with the
 //! terminal height, not the process count.
 
-use crate::model::{Container, Proc};
 use crate::fs::Volume;
-use crate::tui::app::{App, AskState, FsMode, GrowthRow, Modal, SortKey, Tab, ZOOMS, ZOOM_NAMES};
+use crate::model::{Container, Proc};
+use crate::tui::app::{App, AskState, FsMode, GrowthRow, Modal, SortKey, Tab, ZOOM_NAMES, ZOOMS};
 use crate::tui::server_ui;
 use crate::tui::widgets::*;
 use ratatui::Frame;
@@ -25,9 +25,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.ensure_server_rows();
     let area = f.area();
     let header_h = if area.height < 16 { 2 } else { 4 };
-    let [header, tabs, main, footer] =
-        Layout::vertical([Constraint::Length(header_h), Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
-            .areas(area);
+    let [header, tabs, main, footer] = Layout::vertical([
+        Constraint::Length(header_h),
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(area);
 
     draw_header(f, app, header);
     draw_tabs(f, app, tabs);
@@ -91,7 +95,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         l1.push(Span::styled(format!(" collector unavailable: {err}"), Style::default().fg(Color::Red)));
     } else if let Some(s) = snap {
         let sys = &s.system;
-        l1.push(Span::styled(format!(" {} ", if sys.hostname.is_empty() { &s.host } else { &sys.hostname }), Style::default().bold()));
+        l1.push(Span::styled(
+            format!(" {} ", if sys.hostname.is_empty() { &s.host } else { &sys.hostname }),
+            Style::default().bold(),
+        ));
         l1.push(Span::styled(format!(" up {}", fmt_dur(sys.uptime)), dim()));
         l1.push(Span::raw(format!("  load {:.2} {:.2} {:.2}", sys.load[0], sys.load[1], sys.load[2])));
         if app.server() {
@@ -133,7 +140,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let mut l2 = vec![
         Span::styled("CPU ", Style::default().fg(ACCENT).bold()),
         Span::styled(format!("{:>4.0}% ", sys.cpu), Style::default().fg(pct_color(sys.cpu)).bold()),
-        Span::styled(sparkline(app.ring_points.iter().map(|p| p.cpu), spark_w), Style::default().fg(pct_color(sys.cpu))),
+        Span::styled(
+            sparkline(app.ring_points.iter().map(|p| p.cpu), spark_w),
+            Style::default().fg(pct_color(sys.cpu)),
+        ),
     ];
     if cores_w > 0 {
         l2.push(Span::raw(" "));
@@ -153,7 +163,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("MEM ", Style::default().fg(ACCENT).bold()),
             Span::styled(bar(ratio, bw), Style::default().fg(pc)),
             Span::raw(format!(" {}/{} ", fmt_bytes(sys.mem_used), fmt_bytes(sys.mem_total))),
-            Span::styled(if sys.mem_pressure.is_empty() { "unknown" } else { sys.mem_pressure.as_str() }, Style::default().fg(pc)),
+            Span::styled(
+                if sys.mem_pressure.is_empty() { "unknown" } else { sys.mem_pressure.as_str() },
+                Style::default().fg(pc),
+            ),
         ];
         if let Some(psi) = &sys.psi {
             l3.extend(psi_spans(psi));
@@ -261,7 +274,10 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let titles: Vec<Line> = tabs
         .iter()
         .map(|t| {
-            let mut spans = vec![Span::styled(format!("{}", app.tab_number(*t)), Style::default().fg(Color::Yellow)), Span::raw(t.title())];
+            let mut spans = vec![
+                Span::styled(format!("{}", app.tab_number(*t)), Style::default().fg(Color::Yellow)),
+                Span::raw(t.title()),
+            ];
             if let Some(b) = server_ui::tab_badge(app, *t) {
                 spans.push(b);
             }
@@ -292,9 +308,10 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
                 }
             }
             if *t == Tab::Ports
-                && let Some(n) = app.view().map(|s| s.ports.iter().filter(|p| p.orphan).count()).filter(|n| *n > 0) {
-                    spans.push(Span::styled(format!(" ⚠{n}"), Style::default().fg(Color::Yellow)));
-                }
+                && let Some(n) = app.view().map(|s| s.ports.iter().filter(|p| p.orphan).count()).filter(|n| *n > 0)
+            {
+                spans.push(Span::styled(format!(" ⚠{n}"), Style::default().fg(Color::Yellow)));
+            }
             Line::from(spans)
         })
         .collect();
@@ -468,11 +485,18 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
 
     let Some(snap) = app.view() else {
         let msg = if app.rewound() {
-            if app.past_loading { "loading snapshot from the recorder…" } else { "no process snapshot recorded at this moment" }
+            if app.past_loading {
+                "loading snapshot from the recorder…"
+            } else {
+                "no process snapshot recorded at this moment"
+            }
         } else {
             "waiting for the first sample…"
         };
-        f.render_widget(Paragraph::new(msg).style(dim()).block(Block::default().borders(Borders::TOP).title(" Procs ")), area);
+        f.render_widget(
+            Paragraph::new(msg).style(dim()).block(Block::default().borders(Borders::TOP).title(" Procs ")),
+            area,
+        );
         return;
     };
 
@@ -510,7 +534,10 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
 
     if len == 0 && !app.filter.is_empty() {
         let r = Rect { y: area.y + 2, height: 1, ..area };
-        f.render_widget(Paragraph::new(format!("no process matches '{}' — Esc clears the filter", app.filter)).style(dim()), r);
+        f.render_widget(
+            Paragraph::new(format!("no process matches '{}' — Esc clears the filter", app.filter)).style(dim()),
+            r,
+        );
     }
 }
 
@@ -522,15 +549,21 @@ fn draw_ports(f: &mut Frame, app: &mut App, area: Rect) {
     scroll_into_view(app.port_sel, &mut app.port_offset, body_h, len);
     let app = &*app;
     let Some(snap) = app.view() else {
-        f.render_widget(Paragraph::new("no snapshot").style(dim()).block(Block::default().borders(Borders::TOP).title(" Ports ")), area);
+        f.render_widget(
+            Paragraph::new("no snapshot").style(dim()).block(Block::default().borders(Borders::TOP).title(" Ports ")),
+            area,
+        );
         return;
     };
     let orphans = snap.ports.iter().filter(|p| p.orphan).count();
-    let mut title = vec![Span::styled(" Ports ", Style::default().bold()), Span::styled(format!("{} listening ", len), dim())];
+    let mut title =
+        vec![Span::styled(" Ports ", Style::default().bold()), Span::styled(format!("{} listening ", len), dim())];
     if orphans > 0 {
         title.push(Span::styled(format!("· ⚠ {orphans} orphaned "), Style::default().fg(Color::Yellow).bold()));
     }
-    let header = Row::new(["PROTO", "ADDRESS", "PID", "PROCESS", "NOTE"].map(|h| Cell::from(Span::styled(h, Style::default().bold()))));
+    let header = Row::new(
+        ["PROTO", "ADDRESS", "PID", "PROCESS", "NOTE"].map(|h| Cell::from(Span::styled(h, Style::default().bold()))),
+    );
     let rows = app.port_rows.iter().enumerate().skip(app.port_offset).take(body_h).map(|(i, &pi)| {
         let p = &snap.ports[pi];
         let proto = match p.proto {
@@ -559,7 +592,13 @@ fn draw_ports(f: &mut Frame, app: &mut App, area: Rect) {
     });
     let table = Table::new(
         rows,
-        [Constraint::Length(5), Constraint::Length(24), Constraint::Length(7), Constraint::Length(16), Constraint::Min(10)],
+        [
+            Constraint::Length(5),
+            Constraint::Length(24),
+            Constraint::Length(7),
+            Constraint::Length(16),
+            Constraint::Min(10),
+        ],
     )
     .header(header)
     .column_spacing(1)
@@ -582,9 +621,22 @@ fn strip_volumes(vols: &[Volume]) -> Vec<&Volume> {
 
 fn volume_line(app: &App, v: &Volume, mount_w: usize, width: u16) -> Line<'static> {
     let wide = width >= 100;
-    let bw = if wide { 20 } else if width >= 70 { 12 } else { 6 };
-    let recorded = app.fs.past.as_ref().filter(|p| Some(p.ts) == app.cursor).and_then(|p| p.vols.iter().find(|(m, _)| *m == v.mount)).map(|(_, u)| *u);
-    let (used, past) = match recorded.or_else(|| app.cursor.and_then(|ts| app.fs.used_at(&v.mount, ts)).map(|(_, u)| u)) {
+    let bw = if wide {
+        20
+    } else if width >= 70 {
+        12
+    } else {
+        6
+    };
+    let recorded = app
+        .fs
+        .past
+        .as_ref()
+        .filter(|p| Some(p.ts) == app.cursor)
+        .and_then(|p| p.vols.iter().find(|(m, _)| *m == v.mount))
+        .map(|(_, u)| *u);
+    let (used, past) = match recorded.or_else(|| app.cursor.and_then(|ts| app.fs.used_at(&v.mount, ts)).map(|(_, u)| u))
+    {
         Some(u) if app.cursor.is_some() => (u, true),
         _ => (v.used, false),
     };
@@ -613,7 +665,11 @@ fn volume_line(app: &App, v: &Volume, mount_w: usize, width: u16) -> Line<'stati
         spans.push(Span::styled(format!("  {}", fmt_eta(eta)), Style::default().fg(eta_color(eta)).bold()));
     }
     if let Some(fill) = fmt_fill(v.fill_bps, app.fs.window_ms()) {
-        let st = if v.fill_bps.is_some_and(|b| b > 0.0) { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::Green) };
+        let st = if v.fill_bps.is_some_and(|b| b > 0.0) {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Green)
+        };
         spans.push(Span::styled(format!("  {fill}"), st));
     }
     spans.push(Span::styled(format!("  avail {}", fmt_bytes(v.avail)), dim()));
@@ -641,7 +697,10 @@ fn volume_line(app: &App, v: &Volume, mount_w: usize, width: u16) -> Line<'stati
 fn scan_status(app: &App) -> Vec<Span<'static>> {
     let fs = &app.fs;
     if let Some(e) = &fs.error {
-        return vec![Span::styled(format!("storage engine unavailable: {}", clip(e, 80)), Style::default().fg(Color::Red))];
+        return vec![Span::styled(
+            format!("storage engine unavailable: {}", clip(e, 80)),
+            Style::default().fg(Color::Red),
+        )];
     }
     let Some(l) = fs.current() else {
         return vec![Span::styled("measuring… (numbers appear as the background scan reaches this directory)", dim())];
@@ -696,8 +755,13 @@ fn draw_fs(f: &mut Frame, app: &mut App, area: Rect) {
     let vols = strip_volumes(&app.fs.volumes);
     let vol_h = if area.height < 10 { 0 } else { (vols.len() as u16).min(4).min(area.height / 4) };
     let detail_h = if area.height >= 12 { 1 } else { 0 };
-    let [vol_area, crumb_area, table_area, detail_area] =
-        Layout::vertical([Constraint::Length(vol_h), Constraint::Length(1), Constraint::Min(2), Constraint::Length(detail_h)]).areas(area);
+    let [vol_area, crumb_area, table_area, detail_area] = Layout::vertical([
+        Constraint::Length(vol_h),
+        Constraint::Length(1),
+        Constraint::Min(2),
+        Constraint::Length(detail_h),
+    ])
+    .areas(area);
     let body_h = table_area.height.saturating_sub(2) as usize;
     let len = app.fs.len();
     scroll_into_view(app.fs.sel, &mut app.fs.offset, body_h, len);
@@ -706,7 +770,8 @@ fn draw_fs(f: &mut Frame, app: &mut App, area: Rect) {
     // volumes strip
     if vol_h > 0 {
         let mount_w = vols.iter().map(|v| v.mount.chars().count()).max().unwrap_or(1).clamp(1, 24);
-        let lines: Vec<Line> = vols.iter().take(vol_h as usize).map(|v| volume_line(app, v, mount_w, area.width)).collect();
+        let lines: Vec<Line> =
+            vols.iter().take(vol_h as usize).map(|v| volume_line(app, v, mount_w, area.width)).collect();
         f.render_widget(Paragraph::new(lines), vol_area);
     }
 
@@ -717,7 +782,8 @@ fn draw_fs(f: &mut Frame, app: &mut App, area: Rect) {
         FsMode::Tree => crumb.push(Span::styled(fs.path.clone(), Style::default().fg(ACCENT).bold())),
         FsMode::Growth => {
             crumb.push(Span::styled("growth ", Style::default().fg(Color::Yellow).bold()));
-            crumb.push(Span::styled(format!("last {} · anywhere", fmt_window(fs.window_ms())), Style::default().bold()));
+            crumb
+                .push(Span::styled(format!("last {} · anywhere", fmt_window(fs.window_ms())), Style::default().bold()));
         }
         FsMode::Largest => {
             crumb.push(Span::styled("largest below ", Style::default().fg(Color::Yellow).bold()));
@@ -737,7 +803,9 @@ fn draw_fs(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(ts) = app.cursor {
         let text = match fs.past_view() {
             Some(p) => format!("  ⏪ as of {} (recorded {})", fmt_clock(ts), fmt_clock(p.at.unwrap_or(ts))),
-            None if app.history_ok && fs.past.as_ref().is_none_or(|p| p.ts != ts) => format!("  ⏪ as of {} · loading recorded sizes…", fmt_clock(ts)),
+            None if app.history_ok && fs.past.as_ref().is_none_or(|p| p.ts != ts) => {
+                format!("  ⏪ as of {} · loading recorded sizes…", fmt_clock(ts))
+            }
             None => format!("  ⏪ as of {} · no directory sizes recorded then, showing the latest scan", fmt_clock(ts)),
         };
         crumb.push(Span::styled(text, Style::default().fg(Color::Magenta).bold()));
@@ -768,7 +836,13 @@ fn fs_detail(app: &App) -> Line<'static> {
     let fs = &app.fs;
     if fs.mode == FsMode::Growth {
         let notes = fs.growth.as_ref().map(|g| g.notes.join(" · ")).unwrap_or_default();
-        return Line::styled(format!(" {}", if notes.is_empty() { "⏎ on a writer: why it runs · on a path: open it".to_string() } else { notes }), dim());
+        return Line::styled(
+            format!(
+                " {}",
+                if notes.is_empty() { "⏎ on a writer: why it runs · on a path: open it".to_string() } else { notes }
+            ),
+            dim(),
+        );
     }
     let Some(e) = fs.selected_entry() else { return Line::raw("") };
     let mut v = Vec::new();
@@ -866,8 +940,11 @@ fn draw_fs_tree(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
         } else if !fs.opened {
             String::new()
         } else {
-            format!("Measuring {}… The first full scan of / takes a few minutes at background priority; \
-                     results appear as it goes and are cached for next time. fat only reads — it never deletes anything.", fs.path)
+            format!(
+                "Measuring {}… The first full scan of / takes a few minutes at background priority; \
+                     results appear as it goes and are cached for next time. fat only reads — it never deletes anything.",
+                fs.path
+            )
         };
         f.render_widget(Paragraph::new(msg).style(dim()).wrap(Wrap { trim: true }).block(block), area);
         return;
@@ -915,7 +992,8 @@ fn draw_fs_tree(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
         let msg = if !fs.filter.is_empty() {
             format!("nothing here matches '{}' — Esc clears the filter", fs.filter)
         } else if past.is_none() && fs.current().is_some_and(|l| l.dir.files > 1) {
-            "expanding… this directory was summarized by the background scan; its entries appear in a moment".to_string()
+            "expanding… this directory was summarized by the background scan; its entries appear in a moment"
+                .to_string()
         } else if dir_denied {
             if cfg!(target_os = "macos") {
                 "🔒 this directory could not be read (protected). ⏎ from its parent reads it once, or grant Full Disk Access.".to_string()
@@ -951,7 +1029,10 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
     }
     let title = Line::from(vec![
         Span::styled(" What is eating space ", Style::default().bold()),
-        Span::styled(format!("last {win} · {vol_text} "), if g.volumes.is_empty() { dim() } else { delta_style(total) }),
+        Span::styled(
+            format!("last {win} · {vol_text} "),
+            if g.volumes.is_empty() { dim() } else { delta_style(total) },
+        ),
         Span::styled(
             format!(
                 "· {} growers · {deleted_text} · {} writers ",
@@ -970,46 +1051,81 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
             .map(|(_, h)| Cell::from(Span::styled(h, Style::default().bold()))),
     );
     let rows = fs.grows.iter().enumerate().skip(fs.offset).take(body_h).map(|(i, r)| {
-        let (kind, kst, delta, dst, size, rate, ev, what): (&str, Style, String, Style, String, u64, String, Line) = match *r {
-            GrowthRow::Grower(j) => {
-                let x = &g.growers[j];
-                let rate: u64 = x.writers.iter().map(|w| w.2).sum();
-                let mut spans = if x.other {
-                    vec![Span::styled("other under ", dim()), Span::styled(format!("{}/", x.path.trim_end_matches('/')), Style::default().bold())]
-                } else {
-                    vec![Span::styled(grower_label(x), Style::default().bold())]
-                };
-                if let Some(w) = x.writers.iter().max_by_key(|w| w.2) {
-                    spans.push(Span::styled(format!("  ← {} ({})", w.1, w.0), Style::default().fg(Color::Yellow)));
-                    if x.writers.len() > 1 {
-                        spans.push(Span::styled(format!(" +{}", x.writers.len() - 1), dim()));
+        let (kind, kst, delta, dst, size, rate, ev, what): (&str, Style, String, Style, String, u64, String, Line) =
+            match *r {
+                GrowthRow::Grower(j) => {
+                    let x = &g.growers[j];
+                    let rate: u64 = x.writers.iter().map(|w| w.2).sum();
+                    let mut spans = if x.other {
+                        vec![
+                            Span::styled("other under ", dim()),
+                            Span::styled(format!("{}/", x.path.trim_end_matches('/')), Style::default().bold()),
+                        ]
+                    } else {
+                        vec![Span::styled(grower_label(x), Style::default().bold())]
+                    };
+                    if let Some(w) = x.writers.iter().max_by_key(|w| w.2) {
+                        spans.push(Span::styled(format!("  ← {} ({})", w.1, w.0), Style::default().fg(Color::Yellow)));
+                        if x.writers.len() > 1 {
+                            spans.push(Span::styled(format!(" +{}", x.writers.len() - 1), dim()));
+                        }
                     }
+                    if x.files_touched > 0 {
+                        spans.push(Span::styled(format!("  {} files", fmt_count(x.files_touched)), dim()));
+                    }
+                    (
+                        "grow",
+                        Style::default(),
+                        fmt_delta(x.delta),
+                        delta_style(x.delta),
+                        fmt_bytes(x.size),
+                        rate,
+                        evidence_tags(&x.evidence),
+                        Line::from(spans),
+                    )
                 }
-                if x.files_touched > 0 {
-                    spans.push(Span::styled(format!("  {} files", fmt_count(x.files_touched)), dim()));
+                GrowthRow::Deleted(j) => {
+                    let d = &fs.deleted[j];
+                    let files = if d.files == 1 {
+                        format!("{} (deleted)", d.biggest)
+                    } else {
+                        format!("{} deleted files, biggest {}", d.files, d.biggest)
+                    };
+                    let line = Line::from(vec![
+                        Span::styled(format!("{} ({}) holds ", d.name, d.pid), Style::default().fg(Color::Yellow)),
+                        Span::raw(files),
+                        Span::styled(" · restart it to free the space · ⏎ why", dim()),
+                    ]);
+                    (
+                        "deleted",
+                        Style::default().fg(Color::Magenta),
+                        fmt_bytes(d.bytes),
+                        Style::default().fg(Color::Magenta),
+                        String::new(),
+                        0,
+                        "open-files".into(),
+                        line,
+                    )
                 }
-                ("grow", Style::default(), fmt_delta(x.delta), delta_style(x.delta), fmt_bytes(x.size), rate, evidence_tags(&x.evidence), Line::from(spans))
-            }
-            GrowthRow::Deleted(j) => {
-                let d = &fs.deleted[j];
-                let files = if d.files == 1 { format!("{} (deleted)", d.biggest) } else { format!("{} deleted files, biggest {}", d.files, d.biggest) };
-                let line = Line::from(vec![
-                    Span::styled(format!("{} ({}) holds ", d.name, d.pid), Style::default().fg(Color::Yellow)),
-                    Span::raw(files),
-                    Span::styled(" · restart it to free the space · ⏎ why", dim()),
-                ]);
-                ("deleted", Style::default().fg(Color::Magenta), fmt_bytes(d.bytes), Style::default().fg(Color::Magenta), String::new(), 0, "open-files".into(), line)
-            }
-            GrowthRow::Writer(j) => {
-                let (pid, name, bytes) = &g.writers[j];
-                let rate = app.view().and_then(|s| s.proc(*pid)).map(|p| p.disk_write_bps).unwrap_or(0);
-                let line = Line::from(vec![
-                    Span::styled(name.clone(), Style::default().bold()),
-                    Span::styled(format!(" (pid {pid}) wrote {} in {win} · ⏎ why", fmt_bytes(*bytes)), dim()),
-                ]);
-                ("writer", Style::default().fg(ACCENT), fmt_bytes(*bytes), Style::default(), String::new(), rate, String::new(), line)
-            }
-        };
+                GrowthRow::Writer(j) => {
+                    let (pid, name, bytes) = &g.writers[j];
+                    let rate = app.view().and_then(|s| s.proc(*pid)).map(|p| p.disk_write_bps).unwrap_or(0);
+                    let line = Line::from(vec![
+                        Span::styled(name.clone(), Style::default().bold()),
+                        Span::styled(format!(" (pid {pid}) wrote {} in {win} · ⏎ why", fmt_bytes(*bytes)), dim()),
+                    ]);
+                    (
+                        "writer",
+                        Style::default().fg(ACCENT),
+                        fmt_bytes(*bytes),
+                        Style::default(),
+                        String::new(),
+                        rate,
+                        String::new(),
+                        line,
+                    )
+                }
+            };
         let mut cells = vec![Cell::from(Span::styled(kind, kst)), num(delta, dst)];
         if wide {
             cells.push(num(size, dim()));
@@ -1026,7 +1142,14 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
         row
     });
     let widths: Vec<Constraint> = if wide {
-        vec![Constraint::Length(7), Constraint::Length(9), Constraint::Length(8), Constraint::Length(8), Constraint::Length(24), Constraint::Min(10)]
+        vec![
+            Constraint::Length(7),
+            Constraint::Length(9),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(24),
+            Constraint::Min(10),
+        ]
     } else {
         vec![Constraint::Length(7), Constraint::Length(9), Constraint::Length(8), Constraint::Min(10)]
     };
@@ -1037,41 +1160,60 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
     f.render_widget(table, area);
     if fs.grows.is_empty() {
         let r = Rect { y: area.y + 2, height: 1, ..area };
-        f.render_widget(Paragraph::new(format!("✓ nothing grew noticeably in the last {win}")).style(Style::default().fg(Color::Green)), r);
+        f.render_widget(
+            Paragraph::new(format!("✓ nothing grew noticeably in the last {win}"))
+                .style(Style::default().fg(Color::Green)),
+            r,
+        );
     }
 }
 
 fn draw_fs_largest(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
     let fs = &app.fs;
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(dim())
-        .title(Line::from(vec![Span::styled(" Largest ", Style::default().bold()), Span::styled("⏎ opens its directory ", dim())]));
+    let block = Block::default().borders(Borders::TOP).border_style(dim()).title(Line::from(vec![
+        Span::styled(" Largest ", Style::default().bold()),
+        Span::styled("⏎ opens its directory ", dim()),
+    ]));
     let Some(list) = fs.largest.as_ref() else {
         f.render_widget(Paragraph::new("finding the largest entries…").style(dim()).block(block), area);
         return;
     };
     let base = fs.current().filter(|l| l.dir.path == fs.largest_path).map(|l| l.dir.size).unwrap_or(0).max(1);
-    let header = Row::new(["SIZE", "%", "FILES", "NEWEST", "PATH"].map(|h| Cell::from(Span::styled(h, Style::default().bold()))));
+    let header = Row::new(
+        ["SIZE", "%", "FILES", "NEWEST", "PATH"].map(|h| Cell::from(Span::styled(h, Style::default().bold()))),
+    );
     let rows = fs.rows.iter().enumerate().skip(fs.offset).take(body_h).map(|(i, &j)| {
         let e = &list[j];
-        let shown = e.path.strip_prefix(fs.largest_path.trim_end_matches('/')).filter(|s| !s.is_empty()).unwrap_or(&e.path);
+        let shown =
+            e.path.strip_prefix(fs.largest_path.trim_end_matches('/')).filter(|s| !s.is_empty()).unwrap_or(&e.path);
         let mut row = Row::new(vec![
             num(fmt_bytes(e.size), mem_style(e.size)),
             num(format!("{:.0}%", e.size as f64 * 100.0 / base as f64), dim()),
             num(fmt_count(e.files), dim()),
             num(fmt_mtime_age(e.newest_mtime, app.now), dim()),
-            Cell::from(Span::styled(if e.is_dir { format!("{shown}/") } else { shown.to_string() }, Style::default().bold())),
+            Cell::from(Span::styled(
+                if e.is_dir { format!("{shown}/") } else { shown.to_string() },
+                Style::default().bold(),
+            )),
         ]);
         if i == fs.sel {
             row = row.style(Style::default().bg(SEL_BG));
         }
         row
     });
-    let table = Table::new(rows, [Constraint::Length(8), Constraint::Length(5), Constraint::Length(7), Constraint::Length(8), Constraint::Min(10)])
-        .header(header)
-        .column_spacing(1)
-        .block(block);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(5),
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Min(10),
+        ],
+    )
+    .header(header)
+    .column_spacing(1)
+    .block(block);
     f.render_widget(table, area);
     if list.is_empty() {
         let r = Rect { y: area.y + 2, height: 1, ..area };
@@ -1082,12 +1224,18 @@ fn draw_fs_largest(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
 // ------------------------------------------------------------------- fleet
 
 fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
-    let header = Row::new(["NAME", "KIND", "STATUS", "CPU%", "MEMORY", "DETAIL"].map(|h| Cell::from(Span::styled(h, Style::default().bold()))));
+    let header = Row::new(
+        ["NAME", "KIND", "STATUS", "CPU%", "MEMORY", "DETAIL"]
+            .map(|h| Cell::from(Span::styled(h, Style::default().bold()))),
+    );
     let mut rows: Vec<Row> = Vec::with_capacity(app.fleet_len());
     if let Some(s) = app.live.as_ref() {
         let sys = &s.system;
         rows.push(Row::new(vec![
-            Cell::from(Span::styled(format!("● {}", if sys.hostname.is_empty() { "local" } else { &sys.hostname }), Style::default().fg(Color::Green).bold())),
+            Cell::from(Span::styled(
+                format!("● {}", if sys.hostname.is_empty() { "local" } else { &sys.hostname }),
+                Style::default().fg(Color::Green).bold(),
+            )),
             Cell::from("local"),
             Cell::from(Span::styled("live", Style::default().fg(Color::Green))),
             num(format!("{:.0}", sys.cpu), Style::default().fg(pct_color(sys.cpu))),
@@ -1107,27 +1255,48 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
     }
     for (i, c) in app.containers.iter().enumerate() {
         let glyph = if i + 1 == nc { "  └ " } else { "  ├ " };
-        let nprocs: usize = per_ctr.iter().filter(|(id, _)| !c.id.is_empty() && (id.starts_with(&c.id) || c.id.starts_with(**id))).map(|(_, n)| n).sum();
-        let detail = if nprocs > 0 { format!("{nprocs} procs · {} {}", c.image, c.ports) } else { format!("{} {}", c.image, c.ports) };
+        let nprocs: usize = per_ctr
+            .iter()
+            .filter(|(id, _)| !c.id.is_empty() && (id.starts_with(&c.id) || c.id.starts_with(**id)))
+            .map(|(_, n)| n)
+            .sum();
+        let detail = if nprocs > 0 {
+            format!("{nprocs} procs · {} {}", c.image, c.ports)
+        } else {
+            format!("{} {}", c.image, c.ports)
+        };
         let running = c.status.to_lowercase().starts_with("up") || c.status.to_lowercase().contains("running");
         rows.push(Row::new(vec![
             Cell::from(Line::from(vec![Span::styled(glyph, dim()), Span::raw(c.name.as_str())])),
             Cell::from(Span::styled(c.runtime.as_str(), dim())),
-            Cell::from(Span::styled(clip(&c.status, 14), Style::default().fg(if running { Color::Green } else { Color::Gray }))),
+            Cell::from(Span::styled(
+                clip(&c.status, 14),
+                Style::default().fg(if running { Color::Green } else { Color::Gray }),
+            )),
             num(format!("{:.1}", c.cpu), cpu_style(c.cpu)),
             Cell::from(Span::styled(fmt_bytes(c.mem), mem_style(c.mem))),
             Cell::from(Span::styled(detail, dim())),
         ]));
     }
     let n_rows = rows.len();
-    let rows = rows.into_iter().enumerate().map(|(i, r)| if i == app.fleet_sel { r.style(Style::default().bg(SEL_BG)) } else { r });
+    let rows = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| if i == app.fleet_sel { r.style(Style::default().bg(SEL_BG)) } else { r });
     let title = Line::from(vec![
         Span::styled(" Fleet ", Style::default().bold()),
         Span::styled(format!("1 local · {nc} containers "), dim()),
     ]);
     let table = Table::new(
         rows,
-        [Constraint::Min(18), Constraint::Length(8), Constraint::Length(16), Constraint::Length(5), Constraint::Length(14), Constraint::Min(10)],
+        [
+            Constraint::Min(18),
+            Constraint::Length(8),
+            Constraint::Length(16),
+            Constraint::Length(5),
+            Constraint::Length(14),
+            Constraint::Min(10),
+        ],
     )
     .header(header)
     .column_spacing(1)
@@ -1136,7 +1305,8 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
 
     let used = n_rows as u16 + 2;
     if nc == 0 && area.height > used + 2 {
-        let r = Rect { y: area.y + used + 1, height: area.height - used - 1, ..area }.inner(Margin { horizontal: 2, vertical: 0 });
+        let r = Rect { y: area.y + used + 1, height: area.height - used - 1, ..area }
+            .inner(Margin { horizontal: 2, vertical: 0 });
         let mut t = Text::default();
         if !app.fleet_loaded {
             t.lines.push(Line::styled("scanning for containers and remote hosts…", dim()));
@@ -1146,11 +1316,16 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
             }
             t.lines.push(Line::styled("No containers or remote hosts yet.", Style::default().bold()));
             t.lines.push(Line::raw(""));
-            t.lines.push(Line::raw("• Containers (docker / podman / orbstack / nerdctl) appear here automatically while they run."));
+            t.lines.push(Line::raw(
+                "• Containers (docker / podman / orbstack / nerdctl) appear here automatically while they run.",
+            ));
             t.lines.push(Line::raw(format!("• Remote hosts: add them to {}", app.config_path)));
             t.lines.push(Line::styled("      [[hosts]]", Style::default().fg(Color::Green)));
             t.lines.push(Line::styled("      name = \"devbox\"", Style::default().fg(Color::Green)));
-            t.lines.push(Line::styled("      ssh  = \"me@devbox\"   # needs `fat` installed there", Style::default().fg(Color::Green)));
+            t.lines.push(Line::styled(
+                "      ssh  = \"me@devbox\"   # needs `fat` installed there",
+                Style::default().fg(Color::Green),
+            ));
             t.lines.push(Line::raw("  or list many hosts in a file: [fleet] hosts_file = \"~/.config/fat/hosts\""));
         }
         f.render_widget(Paragraph::new(t).wrap(Wrap { trim: false }), r);
@@ -1204,7 +1379,12 @@ fn draw_chart(f: &mut Frame, app: &App, area: Rect) {
     let cursor: Vec<(f64, f64)> = app.cursor.map(|c| vec![(xs(c), 0.0), (xs(c), 100.0)]).unwrap_or_default();
 
     let mut datasets = vec![
-        Dataset::default().name("cpu%").marker(Marker::Braille).graph_type(GraphType::Line).style(Style::default().fg(ACCENT)).data(&cpu),
+        Dataset::default()
+            .name("cpu%")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(ACCENT))
+            .data(&cpu),
         Dataset::default()
             .name(format!("power (max {})", fmt_power(max_pw)))
             .marker(Marker::Braille)
@@ -1213,23 +1393,39 @@ fn draw_chart(f: &mut Frame, app: &App, area: Rect) {
             .data(&pw),
     ];
     if !spikes.is_empty() {
-        datasets.push(Dataset::default().name("spike").marker(Marker::Dot).graph_type(GraphType::Scatter).style(Style::default().fg(Color::Red)).data(&spikes));
+        datasets.push(
+            Dataset::default()
+                .name("spike")
+                .marker(Marker::Dot)
+                .graph_type(GraphType::Scatter)
+                .style(Style::default().fg(Color::Red))
+                .data(&spikes),
+        );
     }
     if !cursor.is_empty() {
-        datasets.push(Dataset::default().marker(Marker::Braille).graph_type(GraphType::Line).style(Style::default().fg(Color::Magenta)).data(&cursor));
+        datasets.push(
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Magenta))
+                .data(&cursor),
+        );
     }
     let span = window as f64 / 1000.0;
     let chart = Chart::new(datasets)
         .block(block)
         .legend_position(Some(LegendPosition::TopLeft))
         .hidden_legend_constraints((Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)))
-        .x_axis(
-            Axis::default()
-                .bounds([0.0, span])
-                .style(dim())
-                .labels(vec![Span::raw(fmt_clock(from)), Span::raw(fmt_clock(from + window / 2)), Span::raw("now")]),
-        )
-        .y_axis(Axis::default().bounds([0.0, 100.0]).style(dim()).labels(vec![Span::raw("0"), Span::raw("50"), Span::raw("100")]));
+        .x_axis(Axis::default().bounds([0.0, span]).style(dim()).labels(vec![
+            Span::raw(fmt_clock(from)),
+            Span::raw(fmt_clock(from + window / 2)),
+            Span::raw("now"),
+        ]))
+        .y_axis(Axis::default().bounds([0.0, 100.0]).style(dim()).labels(vec![
+            Span::raw("0"),
+            Span::raw("50"),
+            Span::raw("100"),
+        ]));
     f.render_widget(chart, area);
 }
 
@@ -1294,10 +1490,16 @@ fn draw_doctor(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(x.title.as_str(), Style::default().bold()),
             ])];
             if !x.detail.is_empty() {
-                lines.push(Line::from(vec![Span::raw("       "), Span::styled(clip(&x.detail, width.max(10) * 2), dim())]));
+                lines.push(Line::from(vec![
+                    Span::raw("       "),
+                    Span::styled(clip(&x.detail, width.max(10) * 2), dim()),
+                ]));
             }
             if let Some(a) = &x.action {
-                lines.push(Line::from(vec![Span::raw("       → "), Span::styled(a.as_str(), Style::default().fg(Color::Green))]));
+                lines.push(Line::from(vec![
+                    Span::raw("       → "),
+                    Span::styled(a.as_str(), Style::default().fg(Color::Green)),
+                ]));
             }
             ListItem::new(lines)
         })
@@ -1322,25 +1524,28 @@ fn draw_log(f: &mut Frame, app: &App, full: Rect) {
             Span::styled(" Action log ", Style::default().bold()),
             Span::styled("most recent first ", dim()),
         ]))
-        .title_bottom(Line::styled(
-            " ⏎ undo selected · u undo last · TERM/KILL can't be undone · Esc close ",
-            dim(),
-        ));
+        .title_bottom(Line::styled(" ⏎ undo selected · u undo last · TERM/KILL can't be undone · Esc close ", dim()));
     if app.log.is_empty() {
         let t = Text::from(vec![
             Line::styled("No actions yet.", Style::default().bold()),
             Line::styled("Pause (space), renice (r) or terminate (k) a process: every action lands here.", dim()),
-            Line::styled("A pause can be undone with u (a renice too, as root); a terminate cannot (pause first to try it out).", dim()),
+            Line::styled(
+                "A pause can be undone with u (a renice too, as root); a terminate cannot (pause first to try it out).",
+                dim(),
+            ),
         ]);
         f.render_widget(Paragraph::new(t).block(block), area);
         return;
     }
-    let header = Row::new(["TIME", "#", "ACTION", "PID", "NAME", "RESULT"].map(|h| Cell::from(Span::styled(h, Style::default().bold()))));
+    let header = Row::new(
+        ["TIME", "#", "ACTION", "PID", "NAME", "RESULT"].map(|h| Cell::from(Span::styled(h, Style::default().bold()))),
+    );
     let body_h = area.height.saturating_sub(3) as usize;
     let mut offset = 0;
     scroll_into_view(app.log_sel, &mut offset, body_h, app.log.len());
     let rows = app.log.iter().enumerate().skip(offset).take(body_h).map(|(i, r)| {
-        let (mark, ms) = if r.ok { ("✓", Style::default().fg(Color::Green)) } else { ("✗", Style::default().fg(Color::Red)) };
+        let (mark, ms) =
+            if r.ok { ("✓", Style::default().fg(Color::Green)) } else { ("✗", Style::default().fg(Color::Red)) };
         let mut result = vec![Span::styled(mark, ms), Span::raw(" "), Span::raw(r.message.as_str())];
         if r.undone {
             result.push(Span::styled("  (undone)", dim()));
@@ -1365,7 +1570,14 @@ fn draw_log(f: &mut Frame, app: &App, full: Rect) {
     });
     let table = Table::new(
         rows,
-        [Constraint::Length(14), Constraint::Length(4), Constraint::Length(9), Constraint::Length(7), Constraint::Length(16), Constraint::Min(10)],
+        [
+            Constraint::Length(14),
+            Constraint::Length(4),
+            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Length(16),
+            Constraint::Min(10),
+        ],
     )
     .header(header)
     .column_spacing(1)
@@ -1418,7 +1630,8 @@ fn draw_why(f: &mut Frame, app: &App, area: Rect) {
         t.lines.push(Line::raw(""));
         t.lines.push(Line::styled("What you can do", Style::default().fg(ACCENT).bold()));
         for s in &e.suggestions {
-            t.lines.push(Line::from(vec![Span::styled("→ ", Style::default().fg(Color::Green)), Span::raw(s.as_str())]));
+            t.lines
+                .push(Line::from(vec![Span::styled("→ ", Style::default().fg(Color::Green)), Span::raw(s.as_str())]));
         }
     }
     let block = Block::default()
@@ -1469,20 +1682,31 @@ fn draw_ask(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(Clear, r);
             f.render_widget(
                 Paragraph::new(t).wrap(Wrap { trim: true }).block(
-                    Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)).title(" Ask ").title_bottom(Line::styled(" Esc cancel ", dim())),
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(ACCENT))
+                        .title(" Ask ")
+                        .title_bottom(Line::styled(" Esc cancel ", dim())),
                 ),
                 r,
             );
         }
         AskState::Answer { question, text, scroll } => {
-            let r = centered(area.width.saturating_sub(area.width / 8).max(20), area.height.saturating_sub(area.height / 6).max(6), area);
+            let r = centered(
+                area.width.saturating_sub(area.width / 8).max(20),
+                area.height.saturating_sub(area.height / 6).max(6),
+                area,
+            );
             f.render_widget(Clear, r);
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ACCENT))
                 .title(Line::styled(format!(" Ask · {} ", clip(question, 60)), Style::default().bold()))
                 .title_bottom(Line::styled(" ↑↓ PgUp/PgDn scroll · ? ask again · Esc close ", dim()));
-            f.render_widget(Paragraph::new(text.as_str()).wrap(Wrap { trim: false }).scroll((*scroll, 0)).block(block), r);
+            f.render_widget(
+                Paragraph::new(text.as_str()).wrap(Wrap { trim: false }).scroll((*scroll, 0)).block(block),
+                r,
+            );
         }
     }
 }
@@ -1506,35 +1730,67 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
             ]);
             f.render_widget(Clear, r);
             f.render_widget(
-                Paragraph::new(t).wrap(Wrap { trim: true }).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Red)).title(" Confirm ")),
+                Paragraph::new(t).wrap(Wrap { trim: true }).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Red))
+                        .title(" Confirm "),
+                ),
                 r,
             );
         }
         Modal::Renice { pid, name, input, .. } => {
             let r = centered(60.min(area.width.saturating_sub(2)), 6, area);
             let t = Text::from(vec![
-                Line::from(vec![Span::raw("New nice value for "), Span::styled(format!("{pid} ({name})"), Style::default().bold())]),
-                Line::from(vec![Span::raw("> "), Span::styled(input.as_str(), Style::default().fg(Color::Yellow).bold()), Span::styled("▏", Style::default().fg(ACCENT))]),
+                Line::from(vec![
+                    Span::raw("New nice value for "),
+                    Span::styled(format!("{pid} ({name})"), Style::default().bold()),
+                ]),
+                Line::from(vec![
+                    Span::raw("> "),
+                    Span::styled(input.as_str(), Style::default().fg(Color::Yellow).bold()),
+                    Span::styled("▏", Style::default().fg(ACCENT)),
+                ]),
                 Line::styled("-20 highest … 20 lowest priority · Enter apply · Esc cancel · undo with u", dim()),
             ]);
             f.render_widget(Clear, r);
-            f.render_widget(Paragraph::new(t).wrap(Wrap { trim: true }).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)).title(" Renice ")), r);
+            f.render_widget(
+                Paragraph::new(t).wrap(Wrap { trim: true }).block(
+                    Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)).title(" Renice "),
+                ),
+                r,
+            );
         }
         Modal::AskInput(q) => {
             let r = centered(72.min(area.width.saturating_sub(2)), 6, area);
             let t = Text::from(vec![
                 Line::styled("Ask about this machine in plain language", dim()),
-                Line::from(vec![Span::styled("> ", Style::default().fg(ACCENT).bold()), Span::raw(q.as_str()), Span::styled("▏", Style::default().fg(ACCENT))]),
-                Line::styled("e.g. why is this machine slow? · what is using port 3000? · Enter ask · Esc cancel", dim()),
+                Line::from(vec![
+                    Span::styled("> ", Style::default().fg(ACCENT).bold()),
+                    Span::raw(q.as_str()),
+                    Span::styled("▏", Style::default().fg(ACCENT)),
+                ]),
+                Line::styled(
+                    "e.g. why is this machine slow? · what is using port 3000? · Enter ask · Esc cancel",
+                    dim(),
+                ),
             ]);
             f.render_widget(Clear, r);
-            f.render_widget(Paragraph::new(t).wrap(Wrap { trim: true }).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)).title(" Ask ")), r);
+            f.render_widget(
+                Paragraph::new(t).wrap(Wrap { trim: true }).block(
+                    Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)).title(" Ask "),
+                ),
+                r,
+            );
         }
     }
 }
 
 const HELP: &[(&str, &str)] = &[
-    ("1-8 / Tab", "switch view: Procs Ports Fs Timeline Doctor (Fleet when containers/hosts exist); the server profile adds Services first and Events"),
+    (
+        "1-8 / Tab",
+        "switch view: Procs Ports Fs Timeline Doctor (Fleet when containers/hosts exist); the server profile adds Services first and Events",
+    ),
     ("↑↓ PgUp PgDn g G", "move selection"),
     ("c m p n d i N", "sort by cpu mem power net disk pid name (again = reverse)"),
     ("t", "toggle process tree"),
@@ -1550,12 +1806,21 @@ const HELP: &[(&str, &str)] = &[
     ("Fs: ⏎ → l  ← ⌫", "storage: open directory · go up (⏎ on a 🔒 dir reads it once)"),
     ("Fs: s g w", "sort size/growth/io/name/files/age · growth view · window 10m/1h/24h"),
     ("Fs: b r", "biggest entries below here · rescan this directory (fat never deletes)"),
-    ("Services: ⏎ w W", "explain the unit (state, limits, processes, events, read-only next steps) · why its main pid · what happened recently"),
+    (
+        "Services: ⏎ w W",
+        "explain the unit (state, limits, processes, events, read-only next steps) · why its main pid · what happened recently",
+    ),
     ("Services: sort", "s state (problems first) · c cpu · m mem · d io · r restarts · N name"),
     ("Services: t f i", "group by kind · problems only · show inactive units"),
-    ("Events: ⏎ W f +/-", "what happened around the event (chain, culprits, evidence) · … recently · min severity · window 15m-7d"),
+    (
+        "Events: ⏎ W f +/-",
+        "what happened around the event (chain, culprits, evidence) · … recently · min severity · window 15m-7d",
+    ),
     ("Fleet: ⏎ → r", "drill into a host (read-only snapshot: doctor, units, procs) · fleet findings panel · poll now"),
-    ("Fleet: sort", "H health · c cpu · m mem · d disk · f findings · n name · l latency (nothing in Fleet acts on a host)"),
+    (
+        "Fleet: sort",
+        "H health · c cpu · m mem · d disk · f findings · n name · l latency (nothing in Fleet acts on a host)",
+    ),
     ("L / Esc", "return to live"),
     ("?", "ask in plain language"),
     ("h", "this help"),
@@ -1626,22 +1891,117 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let hints: &[(&str, &str)] = match app.tab {
-        Tab::Procs => &[("⏎", "why"), ("␣", "pause"), ("r", "renice"), ("k", "term"), ("K", "tree"), ("u", "undo"), ("a", "log"), ("/", "filter"), ("t", "tree"), ("cmpnd", "sort"), ("?", "ask"), ("h", "help"), ("q", "quit")],
-        Tab::Ports => &[("⏎", "why"), ("k", "kill tree"), ("␣", "pause"), ("u", "undo"), ("a", "log"), ("?", "ask"), ("h", "help"), ("q", "quit")],
-        Tab::Fs if app.fs.mode == FsMode::Growth => &[("⏎", "open / why"), ("w", "window"), ("g", "dirs"), ("/", "filter"), ("Esc", "back"), ("?", "ask"), ("h", "help"), ("q", "quit")],
-        Tab::Fs => &[("⏎", "open"), ("←", "up"), ("s", "sort"), ("g", "growth"), ("w", "window"), ("b", "biggest"), ("r", "rescan"), ("/", "filter"), ("?", "ask"), ("h", "help"), ("q", "quit")],
-        Tab::Fleet if app.fleet.drill.is_some() => &[("←→", "doctor/units/procs"), ("↑↓", "move"), ("r", "refresh"), ("Esc", "back"), ("h", "help"), ("q", "quit")],
-        Tab::Fleet if app.fleet.focus_findings => &[("↑↓", "move"), ("⏎", "show hosts"), ("←", "hosts"), ("r", "poll"), ("Esc", "back"), ("h", "help")],
-        Tab::Fleet if app.fleet.active() => &[("⏎", "drill in"), ("→", "findings"), ("H c m d f n l", "sort"), ("/", "filter"), ("r", "poll"), ("?", "ask"), ("h", "help"), ("q", "quit")],
+        Tab::Procs => &[
+            ("⏎", "why"),
+            ("␣", "pause"),
+            ("r", "renice"),
+            ("k", "term"),
+            ("K", "tree"),
+            ("u", "undo"),
+            ("a", "log"),
+            ("/", "filter"),
+            ("t", "tree"),
+            ("cmpnd", "sort"),
+            ("?", "ask"),
+            ("h", "help"),
+            ("q", "quit"),
+        ],
+        Tab::Ports => &[
+            ("⏎", "why"),
+            ("k", "kill tree"),
+            ("␣", "pause"),
+            ("u", "undo"),
+            ("a", "log"),
+            ("?", "ask"),
+            ("h", "help"),
+            ("q", "quit"),
+        ],
+        Tab::Fs if app.fs.mode == FsMode::Growth => &[
+            ("⏎", "open / why"),
+            ("w", "window"),
+            ("g", "dirs"),
+            ("/", "filter"),
+            ("Esc", "back"),
+            ("?", "ask"),
+            ("h", "help"),
+            ("q", "quit"),
+        ],
+        Tab::Fs => &[
+            ("⏎", "open"),
+            ("←", "up"),
+            ("s", "sort"),
+            ("g", "growth"),
+            ("w", "window"),
+            ("b", "biggest"),
+            ("r", "rescan"),
+            ("/", "filter"),
+            ("?", "ask"),
+            ("h", "help"),
+            ("q", "quit"),
+        ],
+        Tab::Fleet if app.fleet.drill.is_some() => &[
+            ("←→", "doctor/units/procs"),
+            ("↑↓", "move"),
+            ("r", "refresh"),
+            ("Esc", "back"),
+            ("h", "help"),
+            ("q", "quit"),
+        ],
+        Tab::Fleet if app.fleet.focus_findings => {
+            &[("↑↓", "move"), ("⏎", "show hosts"), ("←", "hosts"), ("r", "poll"), ("Esc", "back"), ("h", "help")]
+        }
+        Tab::Fleet if app.fleet.active() => &[
+            ("⏎", "drill in"),
+            ("→", "findings"),
+            ("H c m d f n l", "sort"),
+            ("/", "filter"),
+            ("r", "poll"),
+            ("?", "ask"),
+            ("h", "help"),
+            ("q", "quit"),
+        ],
         Tab::Fleet => &[("↑↓", "move"), ("?", "ask"), ("h", "help"), ("q", "quit")],
-        Tab::Services => &[("⏎", "explain"), ("w", "why pid"), ("W", "what happened"), ("s c m d r N", "sort"), ("t", "by kind"), ("f", "problems"), ("i", "inactive"), ("/", "filter"), ("h", "help"), ("q", "quit")],
-        Tab::Events => &[("⏎", "what happened"), ("W", "now"), ("f", "severity"), ("+/-", "window"), ("/", "filter"), ("r", "refresh"), ("h", "help"), ("q", "quit")],
-        Tab::Timeline => &[("←→", "scrub"), ("s", "spike"), ("+/-", "zoom"), ("L", "live"), ("⏎", "why"), ("?", "ask"), ("h", "help"), ("q", "quit")],
+        Tab::Services => &[
+            ("⏎", "explain"),
+            ("w", "why pid"),
+            ("W", "what happened"),
+            ("s c m d r N", "sort"),
+            ("t", "by kind"),
+            ("f", "problems"),
+            ("i", "inactive"),
+            ("/", "filter"),
+            ("h", "help"),
+            ("q", "quit"),
+        ],
+        Tab::Events => &[
+            ("⏎", "what happened"),
+            ("W", "now"),
+            ("f", "severity"),
+            ("+/-", "window"),
+            ("/", "filter"),
+            ("r", "refresh"),
+            ("h", "help"),
+            ("q", "quit"),
+        ],
+        Tab::Timeline => &[
+            ("←→", "scrub"),
+            ("s", "spike"),
+            ("+/-", "zoom"),
+            ("L", "live"),
+            ("⏎", "why"),
+            ("?", "ask"),
+            ("h", "help"),
+            ("q", "quit"),
+        ],
         Tab::Doctor => &[("⏎", "run action"), ("w", "why"), ("a", "log"), ("?", "ask"), ("h", "help"), ("q", "quit")],
     };
     let hints: &[(&str, &str)] = if app.panel.is_some() {
         &[("↑↓", "scroll"), ("w", "why pid"), ("Esc", "close")]
-    } else if app.modal == Modal::Log { &[("↑↓", "move"), ("⏎", "undo selected"), ("u", "undo last"), ("Esc", "close")] } else { hints };
+    } else if app.modal == Modal::Log {
+        &[("↑↓", "move"), ("⏎", "undo selected"), ("u", "undo last"), ("Esc", "close")]
+    } else {
+        hints
+    };
     let mut spans = Vec::with_capacity(hints.len() * 3);
     if app.rewound() && app.tab != Tab::Timeline {
         spans.push(Span::styled(" ⏪ L live ", Style::default().fg(Color::White).bg(Color::Magenta).bold()));
@@ -1663,8 +2023,8 @@ pub(super) fn centered(w: u16, h: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::model::{ActionKind, ActionRecord, Container, Explanation, Finding};
-    use crate::tui::app::tests::{linux_snap, proc, snap};
     use crate::tui::app::Modal;
+    use crate::tui::app::tests::{linux_snap, proc, snap};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1694,12 +2054,34 @@ mod tests {
         a.history_ok = true;
         a.config_path = "/Users/me/.config/fat/config.toml".into();
         a.set_findings(vec![
-            Finding { severity: "crit".into(), title: "node is pegging a core".into(), detail: "88% for 10m".into(), pids: vec![200], action: Some("pause 200".into()) },
-            Finding { severity: "warn".into(), title: "memory pressure".into(), detail: "swap in use".into(), pids: vec![], action: None },
+            Finding {
+                severity: "crit".into(),
+                title: "node is pegging a core".into(),
+                detail: "88% for 10m".into(),
+                pids: vec![200],
+                action: Some("pause 200".into()),
+            },
+            Finding {
+                severity: "warn".into(),
+                title: "memory pressure".into(),
+                detail: "swap in use".into(),
+                pids: vec![],
+                action: None,
+            },
         ]);
         a.set_log(vec![ActionRecord {
-            id: 3, ts: 1_000_000, kind: ActionKind::Pause, pid: 200, name: "node".into(), prev_nice: None, new_nice: None,
-            pids: vec![200], undoable: true, undone: false, ok: true, message: "stopped".into(),
+            id: 3,
+            ts: 1_000_000,
+            kind: ActionKind::Pause,
+            pid: 200,
+            name: "node".into(),
+            prev_nice: None,
+            new_nice: None,
+            pids: vec![200],
+            undoable: true,
+            undone: false,
+            ok: true,
+            message: "stopped".into(),
         }]);
         a
     }
@@ -1761,7 +2143,16 @@ mod tests {
         assert!(out.contains("6Fleet"), "{out}");
         assert!(out.contains("contacting 1 remote host"), "{out}");
         a.configured_hosts = 0;
-        a.set_fleet(Some(vec![Container { id: "abc".into(), name: "pg".into(), image: "postgres:16".into(), runtime: "docker".into(), status: "Up 3 hours".into(), cpu: 1.5, mem: 200 << 20, ports: "5432".into() }]));
+        a.set_fleet(Some(vec![Container {
+            id: "abc".into(),
+            name: "pg".into(),
+            image: "postgres:16".into(),
+            runtime: "docker".into(),
+            status: "Up 3 hours".into(),
+            cpu: 1.5,
+            mem: 200 << 20,
+            ports: "5432".into(),
+        }]));
         for (w, h) in SIZES {
             let out = render(&mut a, w, h);
             if h >= 24 {
@@ -1770,8 +2161,19 @@ mod tests {
         }
         // Remote hosts in the inventory: the fleet health table (both profiles).
         a.set_fleet_inventory(Ok(2));
-        a.fleet_host(crate::server::FleetHost { name: "devbox".into(), ok: true, health: 90, cpu: 12.0, ..Default::default() });
-        a.fleet_host(crate::server::FleetHost { name: "dead".into(), ok: false, error: Some("ssh: timeout".into()), ..Default::default() });
+        a.fleet_host(crate::server::FleetHost {
+            name: "devbox".into(),
+            ok: true,
+            health: 90,
+            cpu: 12.0,
+            ..Default::default()
+        });
+        a.fleet_host(crate::server::FleetHost {
+            name: "dead".into(),
+            ok: false,
+            error: Some("ssh: timeout".into()),
+            ..Default::default()
+        });
         for (w, h) in SIZES {
             let out = render(&mut a, w, h);
             if h >= 24 {
@@ -1976,7 +2378,12 @@ mod tests {
     fn linux_why_shows_cgroup_and_container() {
         for (w, h) in SIZES {
             let mut a = linux_app();
-            a.set_why(Explanation { pid: 500, headline: "postgres is busy".into(), chain: vec!["postgres (500)".into(), "containerd-shim".into()], ..Default::default() });
+            a.set_why(Explanation {
+                pid: 500,
+                headline: "postgres is busy".into(),
+                chain: vec!["postgres (500)".into(), "containerd-shim".into()],
+                ..Default::default()
+            });
             let out = render(&mut a, w, h);
             if h >= 24 {
                 assert!(out.contains("container db-1"), "{w}x{h}\n{out}");
@@ -1995,7 +2402,10 @@ mod tests {
             short_cgroup("/system.slice/docker-410892b21be2ffda255ceb4e7e2077d968864674cefc8174a3843e6f01c860f7.scope"),
             "/system.slice/docker-410892b21be2….scope"
         );
-        assert_eq!(short_cgroup("/user.slice/user-1000.slice/session-3.scope"), "/user.slice/user-1000.slice/session-3.scope");
+        assert_eq!(
+            short_cgroup("/user.slice/user-1000.slice/session-3.scope"),
+            "/user.slice/user-1000.slice/session-3.scope"
+        );
         assert_eq!(short_cgroup(""), "");
     }
 
@@ -2037,7 +2447,14 @@ mod tests {
         a.set_volumes(
             a.now,
             vec![
-                Volume { mount: "/".into(), read_only: true, total: 994 << 30, used: 11 << 30, avail: 300 << 30, ..Default::default() },
+                Volume {
+                    mount: "/".into(),
+                    read_only: true,
+                    total: 994 << 30,
+                    used: 11 << 30,
+                    avail: 300 << 30,
+                    ..Default::default()
+                },
                 Volume {
                     mount: "/System/Volumes/Data".into(),
                     fstype: "apfs".into(),
@@ -2055,7 +2472,15 @@ mod tests {
             ],
         );
         a.switch_tab(Tab::Fs);
-        let de = |p: &str, size: u64| DirEntry { path: p.into(), name: p.rsplit('/').next().unwrap().into(), is_dir: true, size, files: 1200, newest_mtime: a.now / 1000 - 120, ..Default::default() };
+        let de = |p: &str, size: u64| DirEntry {
+            path: p.into(),
+            name: p.rsplit('/').next().unwrap().into(),
+            is_dir: true,
+            size,
+            files: 1200,
+            newest_mtime: a.now / 1000 - 120,
+            ..Default::default()
+        };
         a.set_fs_listing(
             "/",
             Some(Listing {
@@ -2066,16 +2491,41 @@ mod tests {
                     DirEntry { denied: 2, size: 0, ..de("/private", 0) },
                     DirEntry { mount_point: true, size: 0, ..de("/Volumes", 0) },
                 ],
-                progress: ScanProgress { root: "/".into(), running: true, files_seen: 1_200_000, fraction: Some(0.43), ..Default::default() },
+                progress: ScanProgress {
+                    root: "/".into(),
+                    running: true,
+                    files_seen: 1_200_000,
+                    fraction: Some(0.43),
+                    ..Default::default()
+                },
             }),
         );
         a.set_fs_growth(Growth {
             growers: vec![
-                Grower { path: "/Users/me/Library/Caches/pip".into(), is_dir: true, delta: 1 << 30, size: 3 << 30, writers: vec![(200, "node".into(), 4 << 20)], evidence: vec![Evidence::Fsevents], ..Default::default() },
-                Grower { path: "/Users/me/Library/Caches".into(), is_dir: true, delta: 300 << 20, other: true, evidence: vec![Evidence::Fsevents], ..Default::default() },
+                Grower {
+                    path: "/Users/me/Library/Caches/pip".into(),
+                    is_dir: true,
+                    delta: 1 << 30,
+                    size: 3 << 30,
+                    writers: vec![(200, "node".into(), 4 << 20)],
+                    evidence: vec![Evidence::Fsevents],
+                    ..Default::default()
+                },
+                Grower {
+                    path: "/Users/me/Library/Caches".into(),
+                    is_dir: true,
+                    delta: 300 << 20,
+                    other: true,
+                    evidence: vec![Evidence::Fsevents],
+                    ..Default::default()
+                },
             ],
             writers: vec![(200, "node".into(), 1 << 30)],
-            deleted_open: vec![(400, "Chrome".into(), "/tmp/blob".into(), 2 << 30), (400, "Chrome".into(), "/tmp/blob2".into(), 1 << 30), (400, "Chrome".into(), "/tmp/tiny".into(), 4096)],
+            deleted_open: vec![
+                (400, "Chrome".into(), "/tmp/blob".into(), 2 << 30),
+                (400, "Chrome".into(), "/tmp/blob2".into(), 1 << 30),
+                (400, "Chrome".into(), "/tmp/tiny".into(), 4096),
+            ],
             notes: vec!["open-file attribution covers your own processes".into()],
             ..Default::default()
         });
@@ -2089,10 +2539,16 @@ mod tests {
             let out = render(&mut a, w, h);
             if h >= 24 {
                 assert!(out.contains("Fs"), "{w}x{h}\n{out}");
-                assert!(out.contains("/System/Volumes/Data") && out.contains("full in 3h"), "volume strip {w}x{h}\n{out}");
+                assert!(
+                    out.contains("/System/Volumes/Data") && out.contains("full in 3h"),
+                    "volume strip {w}x{h}\n{out}"
+                );
                 assert!(!out.contains("Preboot"), "helper volumes hidden\n{out}");
                 assert!(out.contains("scanning 43%") && out.contains("1.2M files"), "{w}x{h}\n{out}");
-                assert!(out.contains("Users/") && out.contains("400.0G") && out.contains("+1.3G"), "a remainder row adds to its children: {w}x{h}\n{out}");
+                assert!(
+                    out.contains("Users/") && out.contains("400.0G") && out.contains("+1.3G"),
+                    "a remainder row adds to its children: {w}x{h}\n{out}"
+                );
                 assert!(out.contains("🔒") || out.contains("private/"), "{out}");
             }
             if w >= 100 {
@@ -2102,11 +2558,19 @@ mod tests {
             a.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
             let out = render(&mut a, w, h);
             if h >= 24 {
-                assert!(out.contains("What is eating space") && out.contains("Library/Caches/pip") && out.contains("Chrome"), "{w}x{h}\n{out}");
+                assert!(
+                    out.contains("What is eating space")
+                        && out.contains("Library/Caches/pip")
+                        && out.contains("Chrome"),
+                    "{w}x{h}\n{out}"
+                );
                 assert!(out.contains("other under /Users/me/Library/Caches/"), "remainder row is labelled\n{out}");
                 assert_eq!(out.matches("Chrome (400) holds").count(), 1, "one row per holder\n{out}");
                 if w >= 120 {
-                    assert!(out.contains("2 deleted files, biggest /tmp/blob") && out.contains("1 small (<1M"), "{out}");
+                    assert!(
+                        out.contains("2 deleted files, biggest /tmp/blob") && out.contains("1 small (<1M"),
+                        "{out}"
+                    );
                 }
             }
             a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -2115,7 +2579,15 @@ mod tests {
             if h >= 24 {
                 assert!(out.contains("finding the largest"), "{out}");
             }
-            a.set_fs_largest("/", vec![crate::fs::DirEntry { path: "/Users/me/vm.img".into(), name: "vm.img".into(), size: 40 << 30, ..Default::default() }]);
+            a.set_fs_largest(
+                "/",
+                vec![crate::fs::DirEntry {
+                    path: "/Users/me/vm.img".into(),
+                    name: "vm.img".into(),
+                    size: 40 << 30,
+                    ..Default::default()
+                }],
+            );
             let out = render(&mut a, w, h);
             if h >= 24 {
                 assert!(out.contains("Users/me/vm.img") && out.contains("40.0G"), "{out}");
@@ -2145,7 +2617,13 @@ mod tests {
         // rewound with recorded sizes
         let ts = c.now - 1000;
         c.history_ok = true;
-        c.set_fs_past(crate::tui::app::fs_past_from(ts, "/", Some(ts - 60_000), &[("/".into(), 500 << 30), ("/Users".into(), 300 << 30), ("/Users/me".into(), 1)], vec![("/System/Volumes/Data".into(), 600 << 30)]));
+        c.set_fs_past(crate::tui::app::fs_past_from(
+            ts,
+            "/",
+            Some(ts - 60_000),
+            &[("/".into(), 500 << 30), ("/Users".into(), 300 << 30), ("/Users/me".into(), 1)],
+            vec![("/System/Volumes/Data".into(), 600 << 30)],
+        ));
         let out = render(&mut c, 160, 48);
         assert!(out.contains("recorded") && out.contains("300.0G") && !out.contains("400.0G"), "{out}");
         assert!(out.contains("600.0G/994.0G") && out.contains("⏪"), "{out}");
@@ -2155,7 +2633,8 @@ mod tests {
     fn help_lines_wrap_instead_of_cutting_off() {
         for inner in [76usize, 98, 40] {
             let lines = help_lines(inner);
-            let text: String = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect();
+            let text: String =
+                lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect();
             for l in &lines {
                 let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
                 // Only a single word longer than the column may overflow (narrow terminals).

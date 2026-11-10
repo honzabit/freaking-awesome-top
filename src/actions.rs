@@ -8,7 +8,7 @@
 //! write, a newer fat's record) are therefore never lost. Every read-allocate-
 //! append runs under an exclusive `flock` on `actions.jsonl.lock`, so concurrent
 //! fat processes never hand out the same id.
-use crate::model::{now_ms, ActionKind, ActionRecord, Snapshot};
+use crate::model::{ActionKind, ActionRecord, Snapshot, now_ms};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -22,12 +22,49 @@ const PROTECTED_NAMES: &[&str] = &["kernel_task", "launchd", "WindowServer", "lo
 /// refused for them whatever the uid. Renice and Resume stay allowed.
 #[cfg(not(target_os = "linux"))]
 const CRITICAL_NAMES: &[&str] = &[
-    "kernel_task", "launchd", "WindowServer", "loginwindow", "logd", "runningboardd", "coreaudiod",
-    "opendirectoryd", "mds", "mds_stores", "trustd", "syspolicyd", "secd", "securityd", "bluetoothd",
-    "configd", "notifyd", "distnoted", "cfprefsd", "usernoted", "UserEventAgent", "coreservicesd",
-    "lsd", "tccd", "powerd", "diskarbitrationd", "fseventsd", "mDNSResponder", "kernelmanagerd",
-    "watchdogd", "hidd", "airportd", "sshd", "launchservicesd", "nsurlsessiond", "containermanagerd",
-    "symptomsd", "thermalmonitord", "sandboxd", "authd", "keybagd", "apsd", "corebrightnessd",
+    "kernel_task",
+    "launchd",
+    "WindowServer",
+    "loginwindow",
+    "logd",
+    "runningboardd",
+    "coreaudiod",
+    "opendirectoryd",
+    "mds",
+    "mds_stores",
+    "trustd",
+    "syspolicyd",
+    "secd",
+    "securityd",
+    "bluetoothd",
+    "configd",
+    "notifyd",
+    "distnoted",
+    "cfprefsd",
+    "usernoted",
+    "UserEventAgent",
+    "coreservicesd",
+    "lsd",
+    "tccd",
+    "powerd",
+    "diskarbitrationd",
+    "fseventsd",
+    "mDNSResponder",
+    "kernelmanagerd",
+    "watchdogd",
+    "hidd",
+    "airportd",
+    "sshd",
+    "launchservicesd",
+    "nsurlsessiond",
+    "containermanagerd",
+    "symptomsd",
+    "thermalmonitord",
+    "sandboxd",
+    "authd",
+    "keybagd",
+    "apsd",
+    "corebrightnessd",
 ];
 /// Linux: init/session plumbing, the display server and compositor, and the cluster agent.
 /// Names are matched against the kernel's 15-char `comm` too ("systemd-journald" shows up as
@@ -35,10 +72,32 @@ const CRITICAL_NAMES: &[&str] = &[
 /// session's sshd or a container runtime is sometimes exactly what's wanted.
 #[cfg(target_os = "linux")]
 const CRITICAL_NAMES: &[&str] = &[
-    "systemd", "systemd-journald", "systemd-logind", "systemd-udevd", "systemd-resolved",
-    "systemd-networkd", "systemd-oomd", "dbus-daemon", "dbus-broker", "dbus-broker-launch", "Xorg", "Xwayland",
-    "gnome-shell", "gnome-session-binary", "kwin_wayland", "kwin_x11", "plasmashell", "gdm", "gdm3",
-    "gdm-session-worker", "sddm", "lightdm", "polkitd", "NetworkManager", "kubelet", "pipewire",
+    "systemd",
+    "systemd-journald",
+    "systemd-logind",
+    "systemd-udevd",
+    "systemd-resolved",
+    "systemd-networkd",
+    "systemd-oomd",
+    "dbus-daemon",
+    "dbus-broker",
+    "dbus-broker-launch",
+    "Xorg",
+    "Xwayland",
+    "gnome-shell",
+    "gnome-session-binary",
+    "kwin_wayland",
+    "kwin_x11",
+    "plasmashell",
+    "gdm",
+    "gdm3",
+    "gdm-session-worker",
+    "sddm",
+    "lightdm",
+    "polkitd",
+    "NetworkManager",
+    "kubelet",
+    "pipewire",
     "wireplumber",
 ];
 /// Process names that are allowed but deserve a warning.
@@ -58,7 +117,11 @@ fn name_is(name: &str, full: &str) -> bool {
     if name.eq_ignore_ascii_case(full) {
         return true;
     }
-    cfg!(target_os = "linux") && name.len() == 15 && full.len() > 15 && full.is_char_boundary(15) && full[..15].eq_ignore_ascii_case(name)
+    cfg!(target_os = "linux")
+        && name.len() == 15
+        && full.len() > 15
+        && full.is_char_boundary(15)
+        && full[..15].eq_ignore_ascii_case(name)
 }
 
 /// True for daemons whose loss or freeze stalls the login session (shared with blame).
@@ -68,9 +131,12 @@ pub fn is_critical_name(name: &str) -> bool {
 
 /// Refusal for actions that would freeze or end a critical daemon.
 pub fn critical_refusal(kind: ActionKind, name: &str) -> Option<String> {
-    let freezes_or_ends = matches!(kind, ActionKind::Pause | ActionKind::Term | ActionKind::Kill | ActionKind::KillTree);
+    let freezes_or_ends =
+        matches!(kind, ActionKind::Pause | ActionKind::Term | ActionKind::Kill | ActionKind::KillTree);
     (freezes_or_ends && is_critical_name(name)).then(|| {
-        format!("refusing: {name} is a system/session daemon other apps depend on; {kind:?} could hang the whole session")
+        format!(
+            "refusing: {name} is a system/session daemon other apps depend on; {kind:?} could hang the whole session"
+        )
     })
 }
 
@@ -135,11 +201,7 @@ pub struct LiveProc {
 
 /// Default journal location.
 pub fn journal_path() -> PathBuf {
-    dirs::state_dir()
-        .or_else(dirs::data_local_dir)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("fat")
-        .join("actions.jsonl")
+    dirs::state_dir().or_else(dirs::data_local_dir).unwrap_or_else(std::env::temp_dir).join("fat").join("actions.jsonl")
 }
 
 /// Exclusive advisory lock on `<journal>.lock`, released on drop (when the fd closes).
@@ -209,10 +271,7 @@ impl Actions {
 
         let snap_name = snap.proc(pid).map(|p| p.name.clone());
         let live = live_proc(pid);
-        let name = snap_name
-            .clone()
-            .or_else(|| live.as_ref().map(|l| l.name.clone()))
-            .unwrap_or_else(|| "?".into());
+        let name = snap_name.clone().or_else(|| live.as_ref().map(|l| l.name.clone())).unwrap_or_else(|| "?".into());
         let mut rec = blank(kind, pid, &name);
         let start_time = live.as_ref().map(|l| l.start_time);
         let mut resolves = Vec::new();
@@ -277,7 +336,11 @@ impl Actions {
             return failed(undo_kind, o.pid, &o.name, format!("#{id} did not succeed; nothing to undo"));
         }
         if !o.undoable {
-            let why = if matches!(o.kind, ActionKind::Term | ActionKind::Kill | ActionKind::KillTree) { ": a signal that ends a process can't be taken back" } else { "" };
+            let why = if matches!(o.kind, ActionKind::Term | ActionKind::Kill | ActionKind::KillTree) {
+                ": a signal that ends a process can't be taken back"
+            } else {
+                ""
+            };
             return failed(undo_kind, o.pid, &o.name, format!("#{id} ({:?}) is not undoable{why}", o.kind));
         }
         if o.undone {
@@ -410,11 +473,8 @@ fn open_entries(entries: &[Entry]) -> impl DoubleEndedIterator<Item = &Entry> {
 /// skipped here but stay untouched on disk, because nothing ever rewrites the file.
 fn load(path: &Path) -> Vec<Entry> {
     let Ok(text) = fs::read_to_string(path) else { return Vec::new() };
-    let mut entries: Vec<Entry> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<Entry>(l).ok())
-        .collect();
+    let mut entries: Vec<Entry> =
+        text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| serde_json::from_str::<Entry>(l).ok()).collect();
     let resolved: HashSet<u64> = entries.iter().flat_map(|e| e.resolves.iter().copied()).collect();
     for e in &mut entries {
         if resolved.contains(&e.rec.id) {
@@ -471,7 +531,8 @@ pub fn preview(kind: ActionKind, pid: u32, snap: &Snapshot, expect: Option<&Expe
     }
     if kind == ActionKind::KillTree {
         let ours = self_and_ancestors();
-        let mut desc: Vec<(usize, &crate::model::Proc)> = snap.descendants(pid).into_iter().map(|c| (depth_below(snap, c.pid, pid), c)).collect();
+        let mut desc: Vec<(usize, &crate::model::Proc)> =
+            snap.descendants(pid).into_iter().map(|c| (depth_below(snap, c.pid, pid), c)).collect();
         desc.sort_by(|a, b| b.0.cmp(&a.0));
         for (_, c) in desc {
             let skip = protection(c.pid, &c.name, &ours)
@@ -561,7 +622,9 @@ fn kernel_thread_refusal(_pid: u32, _name: &str) -> Result<(), String> {
 /// Process names agree, allowing for kernel truncation (16-char p_comm vs full name).
 fn names_match(a: &str, b: &str) -> bool {
     let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
-    !a.is_empty() && !b.is_empty() && (a == b || (a.len() >= 15 && b.starts_with(&a)) || (b.len() >= 15 && a.starts_with(&b)))
+    !a.is_empty()
+        && !b.is_empty()
+        && (a == b || (a.len() >= 15 && b.starts_with(&a)) || (b.len() >= 15 && a.starts_with(&b)))
 }
 
 /// The live process is still the one the caller chose.
@@ -628,7 +691,10 @@ fn check_target(
         let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
         let mine = [uid, euid];
         if !mine.contains(&live.uid) && !mine.contains(&live.ruid) {
-            return Err(format!("refusing: pid {pid} ({name}) belongs to uid {}, not you (run as root to act on it)", live.ruid));
+            return Err(format!(
+                "refusing: pid {pid} ({name}) belongs to uid {}, not you (run as root to act on it)",
+                live.ruid
+            ));
         }
     }
     Ok(warning)
@@ -746,7 +812,10 @@ fn renice(rec: &mut ActionRecord, pid: u32, nice: Option<i32>) -> Vec<(u32, i32)
             rec.message = if rec.undoable {
                 format!("nice {prev} -> {new}{scope}")
             } else {
-                format!("nice {prev} -> {new}{scope} (undo needs {}: lowering nice is privileged)", if cfg!(target_os = "linux") { "CAP_SYS_NICE (root)" } else { "root" })
+                format!(
+                    "nice {prev} -> {new}{scope} (undo needs {}: lowering nice is privileged)",
+                    if cfg!(target_os = "linux") { "CAP_SYS_NICE (root)" } else { "root" }
+                )
             };
         }
         Err(e) => {
@@ -829,7 +898,12 @@ fn restore_thread_nices(pid: u32, prev_main: i32, saved: &[(u32, i32)]) -> Resul
     if failed.is_empty() {
         Ok(())
     } else {
-        Err(format!("{} of {} threads not restored ({})", failed.len(), tids.len(), nice_error(last_err, pid, prev_main)))
+        Err(format!(
+            "{} of {} threads not restored ({})",
+            failed.len(),
+            tids.len(),
+            nice_error(last_err, pid, prev_main)
+        ))
     }
 }
 
@@ -1036,7 +1110,11 @@ pub fn set_nice(pid: u32, nice: i32) -> Result<(), String> {
             }
         }
         if failed > 0 {
-            return Err(format!("partial: {failed} of {} threads not changed ({})", tids.len(), nice_error(last, pid, nice)));
+            return Err(format!(
+                "partial: {failed} of {} threads not changed ({})",
+                tids.len(),
+                nice_error(last, pid, nice)
+            ));
         }
     }
     Ok(())
@@ -1089,7 +1167,11 @@ pub fn live_proc(pid: u32) -> Option<LiveProc> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
     let mut sys = System::new();
     let p = Pid::from_u32(pid);
-    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[p]), true, ProcessRefreshKind::nothing().with_user(sysinfo::UpdateKind::Always));
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[p]),
+        true,
+        ProcessRefreshKind::nothing().with_user(sysinfo::UpdateKind::Always),
+    );
     let pr = sys.process(p)?;
     if pr.status() == ProcessStatus::Zombie {
         return None;
@@ -1547,7 +1629,24 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_critical_and_warn_names() {
-        for n in ["systemd", "systemd-journald", "systemd-journal", "systemd-logind", "dbus-daemon", "dbus-broker", "Xorg", "Xwayland", "gnome-shell", "kwin_wayland", "plasmashell", "gdm", "sddm", "polkitd", "NetworkManager", "kubelet"] {
+        for n in [
+            "systemd",
+            "systemd-journald",
+            "systemd-journal",
+            "systemd-logind",
+            "dbus-daemon",
+            "dbus-broker",
+            "Xorg",
+            "Xwayland",
+            "gnome-shell",
+            "kwin_wayland",
+            "plasmashell",
+            "gdm",
+            "sddm",
+            "polkitd",
+            "NetworkManager",
+            "kubelet",
+        ] {
             assert!(is_critical_name(n), "{n}");
             assert!(critical_refusal(ActionKind::Pause, n).is_some(), "{n}");
             assert!(critical_refusal(ActionKind::Kill, n).is_some(), "{n}");
@@ -1605,11 +1704,20 @@ mod tests {
         let kw = "57 (kworker/0:1-events) I 2 0 0 0 -1 69238880 0 0 0 0 0 31 0 0 20 0 1 0 41 0 0 18446744073709551615 0 0 0 0 0 0 0 2147483647 0 0 0 0 17 0 0 0 0 0 0\n";
         fixture_pid(&root, 57, kw, "Uid:\t0\t0\t0\t0", 57);
         let tck = procfs::clk_tck();
-        let sl = format!("900 (sleep) S 1 900 900 0 -1 4194304 90 0 0 0 0 0 0 0 20 0 1 0 {} 2412544 220 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 1 0 0 0 0 0\n", 345 * tck + tck / 2);
+        let sl = format!(
+            "900 (sleep) S 1 900 900 0 -1 4194304 90 0 0 0 0 0 0 0 20 0 1 0 {} 2412544 220 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 1 0 0 0 0 0\n",
+            345 * tck + tck / 2
+        );
         fixture_pid(&root, 900, &sl, "Uid:\t1000\t1001\t1000\t1000", 900);
         // A thread id of 900: reachable as /proc/901 but not a process.
         fixture_pid(&root, 901, &sl.replacen("900", "901", 1), "Uid:\t1000\t1000\t1000\t1000", 900);
-        fixture_pid(&root, 902, "902 (defunct) Z 900 900 900 0 -1 4227084 0 0 0 0 0 0 0 0 20 0 1 0 50 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 1 0 0 0 0 0\n", "Uid:\t1000\t1000\t1000\t1000", 902);
+        fixture_pid(
+            &root,
+            902,
+            "902 (defunct) Z 900 900 900 0 -1 4227084 0 0 0 0 0 0 0 0 20 0 1 0 50 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 1 0 0 0 0 0\n",
+            "Uid:\t1000\t1000\t1000\t1000",
+            902,
+        );
 
         let l = live_proc_at(&root, 900).unwrap();
         assert_eq!((l.ppid, l.ruid, l.uid, l.name.as_str(), l.stopped), (1, 1000, 1001, "sleep", false));
@@ -1634,8 +1742,13 @@ mod tests {
         assert_eq!(l.name, "sleep");
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         assert!(l.start_time.abs_diff(now) <= 2, "{} vs now {now}", l.start_time);
-        if let Ok(out) = Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).env("LC_ALL", "C").env("TZ", "UTC").output()
-            && let Ok(d) = Command::new("date").args(["-u", "-d", String::from_utf8_lossy(&out.stdout).trim(), "+%s"]).output()
+        if let Ok(out) = Command::new("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .output()
+            && let Ok(d) =
+                Command::new("date").args(["-u", "-d", String::from_utf8_lossy(&out.stdout).trim(), "+%s"]).output()
             && let Ok(ps_start) = String::from_utf8_lossy(&d.stdout).trim().parse::<u64>()
         {
             assert!(ps_start.abs_diff(l.start_time) <= 1, "ps says {ps_start}, we say {}", l.start_time);

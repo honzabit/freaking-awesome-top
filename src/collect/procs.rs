@@ -114,11 +114,7 @@ pub fn nice(pid: u32) -> Option<i32> {
     unsafe {
         set_errno(0);
         let v = libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t);
-        if v == -1 && std::io::Error::last_os_error().raw_os_error().unwrap_or(0) != 0 {
-            None
-        } else {
-            Some(v)
-        }
+        if v == -1 && std::io::Error::last_os_error().raw_os_error().unwrap_or(0) != 0 { None } else { Some(v) }
     }
 }
 
@@ -151,11 +147,7 @@ mod mac {
             let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
             // SAFETY: valid out pointer to a properly sized struct.
             let rc = unsafe { libc::mach_timebase_info(&mut info) };
-            if rc != 0 || info.numer == 0 || info.denom == 0 {
-                (1, 1)
-            } else {
-                (info.numer as u64, info.denom as u64)
-            }
+            if rc != 0 || info.numer == 0 || info.denom == 0 { (1, 1) } else { (info.numer as u64, info.denom as u64) }
         })
     }
 
@@ -193,9 +185,8 @@ mod mac {
     /// SAFETY: `T` must be the struct matching `flavor` (the kernel writes sizeof that struct).
     unsafe fn rusage<T>(pid: u32, flavor: libc::c_int, out: &mut T) -> bool {
         // libc declares the buffer as `*mut rusage_info_t` (a void**); it's really a struct pointer.
-        let rc = unsafe {
-            libc::proc_pid_rusage(pid as libc::c_int, flavor, out as *mut T as *mut libc::rusage_info_t)
-        };
+        let rc =
+            unsafe { libc::proc_pid_rusage(pid as libc::c_int, flavor, out as *mut T as *mut libc::rusage_info_t) };
         rc == 0
     }
 
@@ -448,7 +439,6 @@ mod tests {
         }
     }
 }
-
 
 #[cfg(all(test, target_os = "macos"))]
 mod live {

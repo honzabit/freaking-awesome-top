@@ -52,7 +52,8 @@ pub fn inventory(cfg: &Config) -> anyhow::Result<Vec<Target>> {
         }
     };
     for h in &cfg.hosts {
-        let dest = h.ssh.clone().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| h.name.clone());
+        let dest =
+            h.ssh.clone().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| h.name.clone());
         let fat_path = h.fat_path.clone().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         add(Target { name: h.name.trim().to_string(), dest, fat_path, groups: h.groups.clone(), tags: h.tags.clone() });
     }
@@ -68,7 +69,9 @@ pub fn inventory(cfg: &Config) -> anyhow::Result<Vec<Target>> {
         && let Ok(text) = std::fs::read_to_string(p)
     {
         for name in parse_ssh_config_hosts(&text) {
-            if cfg.fleet.ssh_config_filter.is_empty() || cfg.fleet.ssh_config_filter.iter().any(|g| glob_match(g, &name)) {
+            if cfg.fleet.ssh_config_filter.is_empty()
+                || cfg.fleet.ssh_config_filter.iter().any(|g| glob_match(g, &name))
+            {
                 add(Target { dest: name.clone(), name, ..Default::default() });
             }
         }
@@ -102,7 +105,8 @@ fn expand_home(p: &str) -> String {
 
 /// Is `t` in group `g`, either by its own `groups` or by a `[fleet.groups]` glob list?
 pub fn in_group(t: &Target, g: &str, cfg: &Config) -> bool {
-    t.groups.iter().any(|x| x == g) || cfg.fleet.groups.get(g).is_some_and(|globs| globs.iter().any(|p| glob_match(p, &t.name)))
+    t.groups.iter().any(|x| x == g)
+        || cfg.fleet.groups.get(g).is_some_and(|globs| globs.iter().any(|p| glob_match(p, &t.name)))
 }
 
 /// Every group a target belongs to (own + configured), sorted.
@@ -215,7 +219,8 @@ pub fn parse_hosts_file(text: &str) -> Vec<Target> {
         let Some(name) = words.next() else { continue };
         let mut t = Target { name: name.to_string(), dest: name.to_string(), ..Default::default() };
         for w in words {
-            let list = |v: &str| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>();
+            let list =
+                |v: &str| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>();
             match w.split_once('=') {
                 Some(("ssh", v)) if !v.is_empty() => t.dest = v.to_string(),
                 Some(("fat", v)) if !v.is_empty() => t.fat_path = Some(v.to_string()),
@@ -281,7 +286,9 @@ mod tests {
 
     #[test]
     fn hosts_file() {
-        let t = parse_hosts_file("# fleet\nweb-01 ssh=admin@web-01.example.com groups=web,edge tags=prod\n\ndb-01 fat=/opt/fat/fat # primary\ncache-01 cache-01.example.com unknown=1\n");
+        let t = parse_hosts_file(
+            "# fleet\nweb-01 ssh=admin@web-01.example.com groups=web,edge tags=prod\n\ndb-01 fat=/opt/fat/fat # primary\ncache-01 cache-01.example.com unknown=1\n",
+        );
         assert_eq!(t.len(), 3);
         assert_eq!(t[0].dest, "admin@web-01.example.com");
         assert_eq!(t[0].groups, vec!["web", "edge"]);
@@ -298,11 +305,24 @@ mod tests {
     }
 
     fn cfg() -> Config {
-        let mut c = Config { hosts: vec![
-            HostCfg { name: "web-01".into(), groups: vec!["web".into()], tags: vec!["prod".into()], ..Default::default() },
-            HostCfg { name: "web-02".into(), ssh: Some("me@web-02.example.com".into()), groups: vec!["web".into()], ..Default::default() },
-            HostCfg { name: "db-01".into(), tags: vec!["prod".into(), "primary".into()], ..Default::default() },
-        ], ..Default::default() };
+        let mut c = Config {
+            hosts: vec![
+                HostCfg {
+                    name: "web-01".into(),
+                    groups: vec!["web".into()],
+                    tags: vec!["prod".into()],
+                    ..Default::default()
+                },
+                HostCfg {
+                    name: "web-02".into(),
+                    ssh: Some("me@web-02.example.com".into()),
+                    groups: vec!["web".into()],
+                    ..Default::default()
+                },
+                HostCfg { name: "db-01".into(), tags: vec!["prod".into(), "primary".into()], ..Default::default() },
+            ],
+            ..Default::default()
+        };
         c.fleet.groups.insert("data".into(), vec!["db-*".into()]);
         c
     }
@@ -318,7 +338,10 @@ mod tests {
         c.fleet.default_fat_path = Some("/usr/local/bin/fat".into());
         let all = inventory(&c).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(all.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["db-01", "queue-01", "web-01", "web-02"]);
+        assert_eq!(
+            all.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["db-01", "queue-01", "web-01", "web-02"]
+        );
         let db = &all[0];
         assert_eq!(db.groups, vec!["sql"], "groups merged across sources");
         assert_eq!(db.fat_path.as_deref(), Some("/usr/local/bin/fat"));
@@ -328,9 +351,18 @@ mod tests {
         assert_eq!(names(&Selector::default()).len(), 4);
         assert_eq!(names(&Selector { groups: vec!["web".into()], ..Default::default() }), vec!["web-01", "web-02"]);
         assert_eq!(names(&Selector { groups: vec!["data".into()], ..Default::default() }), vec!["db-01"]);
-        assert_eq!(names(&Selector { tags: vec!["prod".into()], ..Default::default() }), vec!["db-01", "queue-01", "web-01"]);
-        assert_eq!(names(&Selector { tags: vec!["prod".into(), "primary".into()], ..Default::default() }), vec!["db-01"]);
-        assert_eq!(names(&Selector { hosts: vec!["web-*".into()], exclude: vec!["*-02".into()], ..Default::default() }), vec!["web-01"]);
+        assert_eq!(
+            names(&Selector { tags: vec!["prod".into()], ..Default::default() }),
+            vec!["db-01", "queue-01", "web-01"]
+        );
+        assert_eq!(
+            names(&Selector { tags: vec!["prod".into(), "primary".into()], ..Default::default() }),
+            vec!["db-01"]
+        );
+        assert_eq!(
+            names(&Selector { hosts: vec!["web-*".into()], exclude: vec!["*-02".into()], ..Default::default() }),
+            vec!["web-01"]
+        );
         let sel = select(&all, &Selector { hosts: vec!["db-01".into()], ..Default::default() }, &c);
         assert_eq!(sel[0].groups, vec!["data", "sql"], "configured glob groups are attached");
     }

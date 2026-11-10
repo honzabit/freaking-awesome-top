@@ -147,7 +147,8 @@ impl Db {
         let mut p = self.path.as_os_str().to_owned();
         p.push(".writer-lock");
         use std::os::unix::fs::OpenOptionsExt;
-        let Ok(mut f) = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600).open(p)
+        let Ok(mut f) =
+            std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600).open(p)
         else {
             return false;
         };
@@ -171,8 +172,20 @@ impl Db {
             let g = |i: usize| -> rusqlite::Result<i64> { r.get::<_, Option<i64>>(i).map(|v| v.unwrap_or(0)) };
             Ok(Row {
                 path: r.get(0)?,
-                total: Agg { size: g(1)? as u64, apparent: g(2)? as u64, files: g(3)? as u64, newest: g(4)?, denied: g(5)? as u32 },
-                own: Agg { size: g(6)? as u64, apparent: g(7)? as u64, files: g(8)? as u64, newest: g(9)?, denied: g(10)? as u32 },
+                total: Agg {
+                    size: g(1)? as u64,
+                    apparent: g(2)? as u64,
+                    files: g(3)? as u64,
+                    newest: g(4)?,
+                    denied: g(5)? as u32,
+                },
+                own: Agg {
+                    size: g(6)? as u64,
+                    apparent: g(7)? as u64,
+                    files: g(8)? as u64,
+                    newest: g(9)?,
+                    denied: g(10)? as u32,
+                },
                 flags: g(11)? as u16,
                 at: g(12)?,
                 dev: g(13)? as u64,
@@ -187,7 +200,8 @@ impl Db {
         Ok(it.filter_map(Result::ok).collect())
     }
 
-    const COLS: &'static str = "path, size, apparent, files, newest, denied, own_size, own_apparent, own_files, own_newest, own_denied,
+    const COLS: &'static str =
+        "path, size, apparent, files, newest, denied, own_size, own_apparent, own_files, own_newest, own_denied,
          flags, scanned_at, dev, ino, mtime, ctime, self_size, self_apparent, big";
 
     /// All rows, parents before children.
@@ -257,7 +271,10 @@ impl Db {
                     big
                 ])?;
             }
-            tx.execute("INSERT INTO meta(k, v) VALUES ('updated', ?1) ON CONFLICT(k) DO UPDATE SET v = excluded.v", params![now])?;
+            tx.execute(
+                "INSERT INTO meta(k, v) VALUES ('updated', ?1) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                params![now],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -268,7 +285,10 @@ impl Db {
     }
 
     pub fn set_meta(&self, k: &str, v: i64) -> anyhow::Result<()> {
-        self.conn.execute("INSERT INTO meta(k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v", params![k, v])?;
+        self.conn.execute(
+            "INSERT INTO meta(k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            params![k, v],
+        )?;
         Ok(())
     }
 

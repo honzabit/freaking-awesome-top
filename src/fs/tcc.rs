@@ -124,7 +124,15 @@ mod tests {
 
     #[test]
     fn exact_rules_for_the_scanner() {
-        for rel in ["Desktop", "Library/Mail", "Library/Containers/com.foo", "Library/Group Containers/X.dev", "Pictures/Photos Library.photoslibrary", ".Trash", "Music/Music"] {
+        for rel in [
+            "Desktop",
+            "Library/Mail",
+            "Library/Containers/com.foo",
+            "Library/Group Containers/X.dev",
+            "Pictures/Photos Library.photoslibrary",
+            ".Trash",
+            "Music/Music",
+        ] {
             assert!(is_protected_rel(rel.as_bytes()), "{rel}");
         }
         for rel in ["Library/Containers", "Library/Containers/a/b", "Library/Caches", "code", "DesktopX"] {
@@ -138,20 +146,33 @@ mod tests {
     fn roots_for_the_growth_tracker() {
         let h = ["/Users/z"];
         assert_eq!(protected_root("/Users/z/Documents/a/b.txt", &h).as_deref(), Some("/Users/z/Documents"));
-        assert_eq!(protected_root("/Users/z/Library/Containers/com.x/Data/f", &h).as_deref(), Some("/Users/z/Library/Containers"));
-        assert_eq!(protected_root("/Users/z/Pictures/P.photoslibrary/db", &h).as_deref(), Some("/Users/z/Pictures/P.photoslibrary"));
+        assert_eq!(
+            protected_root("/Users/z/Library/Containers/com.x/Data/f", &h).as_deref(),
+            Some("/Users/z/Library/Containers")
+        );
+        assert_eq!(
+            protected_root("/Users/z/Pictures/P.photoslibrary/db", &h).as_deref(),
+            Some("/Users/z/Pictures/P.photoslibrary")
+        );
         assert_eq!(protected_root("/Volumes/Backup/x", &h).as_deref(), Some("/Volumes/Backup"));
         assert_eq!(protected_root("/Volumes", &h), None);
         assert_eq!(protected_root("/Users/z/DocumentsX/a", &h), None);
         assert_eq!(protected_root("/Users/z/Library/Caches/x", &h), None);
         assert_eq!(protected_root("/Users/z/.Trash/x", &h).as_deref(), Some("/Users/z/.Trash"));
-        assert_eq!(protected_root("/Library/Application Support/com.apple.TCC/TCC.db", &h).as_deref(), Some("/Library/Application Support/com.apple.TCC"));
+        assert_eq!(
+            protected_root("/Library/Application Support/com.apple.TCC/TCC.db", &h).as_deref(),
+            Some("/Library/Application Support/com.apple.TCC")
+        );
     }
 
     #[test]
     fn both_views_agree() {
         // Every directory the scanner refuses to enter lies inside a root the tracker protects.
-        for rel in HOME.iter().map(|r| r.to_string()).chain(["Library/Containers/a".into(), "Library/Group Containers/b".into(), "X/Y.photoslibrary".into()]) {
+        for rel in HOME.iter().map(|r| r.to_string()).chain([
+            "Library/Containers/a".into(),
+            "Library/Group Containers/b".into(),
+            "X/Y.photoslibrary".into(),
+        ]) {
             assert!(is_protected_rel(rel.as_bytes()), "{rel}");
             assert!(protected_root(&format!("/Users/z/{rel}"), &["/Users/z"]).is_some(), "{rel}");
         }

@@ -55,10 +55,7 @@ pub struct ExtrasCache {
 
 impl ExtrasCache {
     pub fn start() -> Self {
-        let shared = Arc::new(Shared {
-            extras: Mutex::new(Extras::default()),
-            last_read: Mutex::new(Instant::now()),
-        });
+        let shared = Arc::new(Shared { extras: Mutex::new(Extras::default()), last_read: Mutex::new(Instant::now()) });
         let weak = Arc::downgrade(&shared);
         // If the thread can't be spawned, values simply stay "unknown".
         let _ = thread::Builder::new().name("fat-sysextras".into()).spawn(move || poll_loop(weak));
@@ -198,13 +195,7 @@ pub fn sysctl_i32(name: &str) -> Option<i32> {
     let mut len = std::mem::size_of::<libc::c_int>();
     // SAFETY: out buffer is a c_int with its size passed in `len`; no new value is set.
     let rc = unsafe {
-        libc::sysctlbyname(
-            cname.as_ptr(),
-            &mut val as *mut _ as *mut libc::c_void,
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
+        libc::sysctlbyname(cname.as_ptr(), &mut val as *mut _ as *mut libc::c_void, &mut len, std::ptr::null_mut(), 0)
     };
     (rc == 0 && len == std::mem::size_of::<libc::c_int>()).then_some(val)
 }
@@ -375,14 +366,11 @@ pub fn parse_batt(s: &str) -> (Option<f32>, Option<bool>) {
     } else {
         None
     };
-    let pct = s
-        .lines()
-        .filter(|l| l.contains("InternalBattery"))
-        .find_map(|l| {
-            let end = l.find('%')?;
-            let start = l[..end].rfind(|c: char| !c.is_ascii_digit()).map(|i| i + 1).unwrap_or(0);
-            l[start..end].parse::<f32>().ok()
-        });
+    let pct = s.lines().filter(|l| l.contains("InternalBattery")).find_map(|l| {
+        let end = l.find('%')?;
+        let start = l[..end].rfind(|c: char| !c.is_ascii_digit()).map(|i| i + 1).unwrap_or(0);
+        l[start..end].parse::<f32>().ok()
+    });
     // On a desktop (no battery) "on battery" is meaningless.
     let on_batt = if pct.is_some() { on_batt } else { None };
     (pct, on_batt)
@@ -402,9 +390,8 @@ pub fn static_info(sys: &sysinfo::System) -> (String, String, String) {
         let cpu = lx::cpu_model(std::path::Path::new("/"), &brand, sys.cpus().len(), std::env::consts::ARCH);
         return (host, os, cpu);
     }
-    let os = sysinfo::System::long_os_version()
-        .or_else(sysinfo::System::os_version)
-        .unwrap_or_else(|| "unknown".into());
+    let os =
+        sysinfo::System::long_os_version().or_else(sysinfo::System::os_version).unwrap_or_else(|| "unknown".into());
     let cpu = sys
         .cpus()
         .first()
@@ -423,7 +410,8 @@ fn friendly_host(raw: Option<String>) -> String {
     let _ = looks_bad;
     #[cfg(target_os = "macos")]
     if looks_bad
-        && let Some(o) = crate::sys::run_fallback("/usr/sbin/scutil", &["--get", "LocalHostName"], Duration::from_secs(1))
+        && let Some(o) =
+            crate::sys::run_fallback("/usr/sbin/scutil", &["--get", "LocalHostName"], Duration::from_secs(1))
     {
         let name = o.trim().to_string();
         if !name.is_empty() && !name.contains(' ') {
@@ -457,11 +445,8 @@ pub mod lx {
     /// Sorted entries of `dir` whose file name starts with `prefix`.
     fn entries(dir: &Path, prefix: &str) -> Vec<PathBuf> {
         let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
-        let mut v: Vec<PathBuf> = rd
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
-            .map(|e| e.path())
-            .collect();
+        let mut v: Vec<PathBuf> =
+            rd.flatten().filter(|e| e.file_name().to_string_lossy().starts_with(prefix)).map(|e| e.path()).collect();
         v.sort();
         v
     }
@@ -843,7 +828,8 @@ pub mod lx {
     }
 
     /// Platform (non-PCI) drivers that are real GPUs (render engines), not display-only.
-    const PLATFORM_GPUS: &[&str] = &["panfrost", "panthor", "lima", "msm", "v3d", "etnaviv", "asahi", "tegra", "pvr", "imagination"];
+    const PLATFORM_GPUS: &[&str] =
+        &["panfrost", "panthor", "lima", "msm", "v3d", "etnaviv", "asahi", "tegra", "pvr", "imagination"];
 
     fn hexnum(s: &str) -> Option<u32> {
         u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
@@ -863,7 +849,9 @@ pub mod lx {
             let uevent = rd(&dev.join("uevent")).unwrap_or_default();
             let ue = |k: &str| uevent.lines().find_map(|l| l.strip_prefix(k)?.strip_prefix('=')).map(str::to_string);
             let driver = ue("DRIVER")
-                .or_else(|| fs::read_link(dev.join("driver")).ok()?.file_name().map(|f| f.to_string_lossy().into_owned()))
+                .or_else(|| {
+                    fs::read_link(dev.join("driver")).ok()?.file_name().map(|f| f.to_string_lossy().into_owned())
+                })
                 .unwrap_or_default();
             let vendor = rd(&dev.join("vendor")).and_then(|v| hexnum(&v));
             let class = rd(&dev.join("class")).and_then(|v| hexnum(&v));
@@ -1219,7 +1207,8 @@ mod tests {
     #[test]
     fn therm_parse() {
         assert_eq!(parse_therm("Note: No thermal warning level has been recorded\n"), "nominal");
-        let s = "CPU Power notify\n\tCPU_Scheduler_Limit \t= 100\n\tCPU_Available_CPUs \t= 8\n\tCPU_Speed_Limit \t= 60\n";
+        let s =
+            "CPU Power notify\n\tCPU_Scheduler_Limit \t= 100\n\tCPU_Available_CPUs \t= 8\n\tCPU_Speed_Limit \t= 60\n";
         assert_eq!(parse_therm(s), "serious");
         assert_eq!(parse_therm("CPU_Speed_Limit = 100"), "nominal");
         assert_eq!(parse_therm("Thermal warning level set to 0."), "nominal");
@@ -1282,9 +1271,18 @@ mod tests {
     #[test]
     fn psi_parse_and_pressure() {
         let f = Fixture::new("psi");
-        f.put("proc/pressure/cpu", "some avg10=3.25 avg60=1.10 avg300=0.40 total=12345678\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
-            .put("proc/pressure/memory", "some avg10=12.50 avg60=4.00 avg300=1.00 total=999\nfull avg10=2.00 avg60=1.00 avg300=0.30 total=500\n")
-            .put("proc/pressure/io", "some avg10=0.81 avg60=0.33 avg300=0.10 total=4000\nfull avg10=0.50 avg60=0.20 avg300=0.05 total=2500\n");
+        f.put(
+            "proc/pressure/cpu",
+            "some avg10=3.25 avg60=1.10 avg300=0.40 total=12345678\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .put(
+            "proc/pressure/memory",
+            "some avg10=12.50 avg60=4.00 avg300=1.00 total=999\nfull avg10=2.00 avg60=1.00 avg300=0.30 total=500\n",
+        )
+        .put(
+            "proc/pressure/io",
+            "some avg10=0.81 avg60=0.33 avg300=0.10 total=4000\nfull avg10=0.50 avg60=0.20 avg300=0.05 total=2500\n",
+        );
         let p = lx::read_psi(&f.p("proc/pressure")).unwrap();
         assert_eq!(p, Psi { cpu_some: 3.25, mem_some: 12.5, mem_full: 2.0, io_some: 0.81, io_full: 0.5 });
         assert_eq!(lx::mem_pressure_at(&f.p("proc")), "warn");
@@ -1431,21 +1429,24 @@ mod tests {
     #[test]
     fn drm_cards_sysfs() {
         let f = Fixture::new("drm");
-        f.put("drm/card0/device/uevent", "DRIVER=amdgpu\nPCI_CLASS=30000\nPCI_ID=1002:73BF\nPCI_SLOT_NAME=0000:03:00.0\n")
-            .put("drm/card0/device/vendor", "0x1002\n")
-            .put("drm/card0/device/device", "0x73bf\n")
-            .put("drm/card0/device/class", "0x030000\n")
-            .put("drm/card0/device/gpu_busy_percent", "37\n")
-            .put("drm/card0/device/mem_info_vram_used", "1073741824\n")
-            .put("drm/card0-DP-1/status", "connected\n")
-            .put("drm/card1/device/uevent", "DRIVER=i915\nPCI_SLOT_NAME=0000:00:02.0\n")
-            .put("drm/card1/device/vendor", "0x8086\n")
-            .put("drm/card1/device/device", "0x5917\n")
-            .put("drm/card1/device/class", "0x030000\n")
-            .put("drm/card2/device/uevent", "DRIVER=simple-framebuffer\n") // simpledrm: skipped
-            .put("drm/card3/device/uevent", "DRIVER=panfrost\nOF_NAME=gpu\n")
-            .put("drm/renderD128/dev", "226:128\n")
-            .put("drm/version", "drm 1.1.0 20060810\n");
+        f.put(
+            "drm/card0/device/uevent",
+            "DRIVER=amdgpu\nPCI_CLASS=30000\nPCI_ID=1002:73BF\nPCI_SLOT_NAME=0000:03:00.0\n",
+        )
+        .put("drm/card0/device/vendor", "0x1002\n")
+        .put("drm/card0/device/device", "0x73bf\n")
+        .put("drm/card0/device/class", "0x030000\n")
+        .put("drm/card0/device/gpu_busy_percent", "37\n")
+        .put("drm/card0/device/mem_info_vram_used", "1073741824\n")
+        .put("drm/card0-DP-1/status", "connected\n")
+        .put("drm/card1/device/uevent", "DRIVER=i915\nPCI_SLOT_NAME=0000:00:02.0\n")
+        .put("drm/card1/device/vendor", "0x8086\n")
+        .put("drm/card1/device/device", "0x5917\n")
+        .put("drm/card1/device/class", "0x030000\n")
+        .put("drm/card2/device/uevent", "DRIVER=simple-framebuffer\n") // simpledrm: skipped
+        .put("drm/card3/device/uevent", "DRIVER=panfrost\nOF_NAME=gpu\n")
+        .put("drm/renderD128/dev", "226:128\n")
+        .put("drm/version", "drm 1.1.0 20060810\n");
         let c = lx::read_drm_cards(&f.p("drm"));
         let names: Vec<&str> = c.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["AMD GPU 73bf (amdgpu)", "Intel GPU 5917 (i915)", "panfrost GPU"]);
@@ -1501,7 +1502,10 @@ mod tests {
     fn nvidia_smi_parse() {
         let g = lx::parse_nvidia_query("NVIDIA GeForce RTX 4090, 37, 2345\nNVIDIA A100-SXM4-80GB, [N/A], 0\n");
         assert_eq!(g.len(), 2);
-        assert_eq!((g[0].name.as_str(), g[0].util, g[0].mem_used), ("NVIDIA GeForce RTX 4090", 37.0, 2345 * 1024 * 1024));
+        assert_eq!(
+            (g[0].name.as_str(), g[0].util, g[0].mem_used),
+            ("NVIDIA GeForce RTX 4090", 37.0, 2345 * 1024 * 1024)
+        );
         assert_eq!(g[1].util, 0.0);
         let pmon = "# gpu         pid   type     sm    mem    enc    dec    jpg    ofa    command \n# Idx           #    C/G      %      %      %      %      %      %    name \n    0       2345     G     12      3      -      -      -      -    Xorg           \n    0       7777     C     55     20      -      -      -      -    python         \n    0          -     -      -      -      -      -      -      -    -              \n";
         let m = lx::parse_nvidia_pmon(pmon);

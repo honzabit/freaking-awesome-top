@@ -119,16 +119,7 @@ pub(crate) fn record_event(
         return;
     }
     let pids = if pid != 0 { vec![pid] } else { vec![] };
-    map.insert(
-        key.to_string(),
-        PathEv {
-            flags: fl,
-            count: 1,
-            first: stamp,
-            last: stamp,
-            pids,
-        },
-    );
+    map.insert(key.to_string(), PathEv { flags: fl, count: 1, first: stamp, last: stamp, pids });
 }
 
 /// (ts, [(mount, used, remote)]).
@@ -256,33 +247,18 @@ impl Tracker {
         } else {
             0
         };
-        let since = self
-            .mac
-            .clock
-            .id_at(from_ms)
-            .or((root_id > 0).then_some(root_id))
-            .unwrap_or_else(|| {
-                let rate = self.mac.clock.rate().unwrap_or(DEFAULT_ID_RATE).max(0.05);
-                cur.saturating_sub(((now_ms() - from_ms).max(0) as f64 * rate) as u64)
-                    .max(1)
-            });
-        self.mac.journal = Some(fsevents::Journal::start(
-            vec!["/".into()],
-            since,
-            EVENT_CAP,
-            self.exclude.clone(),
-        ));
+        let since = self.mac.clock.id_at(from_ms).or((root_id > 0).then_some(root_id)).unwrap_or_else(|| {
+            let rate = self.mac.clock.rate().unwrap_or(DEFAULT_ID_RATE).max(0.05);
+            cur.saturating_sub(((now_ms() - from_ms).max(0) as f64 * rate) as u64).max(1)
+        });
+        self.mac.journal = Some(fsevents::Journal::start(vec!["/".into()], since, EVENT_CAP, self.exclude.clone()));
         self.mac.journal_from_ms = from_ms;
     }
 
     /// Feed each collector snapshot (per-process write rates, for open-file attribution).
     pub fn observe(&mut self, snap: &Snapshot) {
         let ts = if snap.ts > 0 { snap.ts } else { now_ms() };
-        let dt = if self.last_snap > 0 {
-            (ts - self.last_snap).clamp(0, 10_000)
-        } else {
-            2_000
-        };
+        let dt = if self.last_snap > 0 { (ts - self.last_snap).clamp(0, 10_000) } else { 2_000 };
         self.last_snap = ts;
         let w: Vec<(u32, String, u64)> = snap
             .procs
@@ -317,8 +293,7 @@ impl Tracker {
     fn sample_volumes(&mut self, ts: Ts) {
         let v = self.vols.get_or_insert_with(super::volumes::Volumes::new).sample();
         self.last_vol = ts;
-        self.vol_samples
-            .push_back((ts, v.into_iter().map(|v| (v.mount, v.used, v.remote)).collect()));
+        self.vol_samples.push_back((ts, v.into_iter().map(|v| (v.mount, v.used, v.remote)).collect()));
         while self.vol_samples.front().is_some_and(|x| ts - x.0 > KEEP_MS) {
             self.vol_samples.pop_front();
         }
@@ -330,10 +305,8 @@ impl Tracker {
             map.retain(|_, s| s.samples.last().is_some_and(|x| x.0 >= cut));
             if map.len() >= BASELINE_CAP {
                 // Still full: forget the stalest half.
-                let mut v: Vec<(Ts, String)> = map
-                    .iter()
-                    .map(|(k, s)| (s.samples.last().map(|x| x.0).unwrap_or(0), k.clone()))
-                    .collect();
+                let mut v: Vec<(Ts, String)> =
+                    map.iter().map(|(k, s)| (s.samples.last().map(|x| x.0).unwrap_or(0), k.clone())).collect();
                 v.sort();
                 for (_, k) in v.into_iter().take(BASELINE_CAP / 2) {
                     map.remove(&k);
@@ -361,19 +334,13 @@ impl Tracker {
         history: Option<&crate::history::History>,
         scanner: Option<&super::scan::Scanner>,
     ) -> Growth {
-        let window_ms = if window_ms > 0 {
-            window_ms
-        } else {
-            super::DEFAULT_WINDOW_MS
-        };
+        let window_ms = if window_ms > 0 { window_ms } else { super::DEFAULT_WINDOW_MS };
         let now = now_ms();
         let from = now - window_ms;
         let root = match under {
             Some(u) if !u.is_empty() => {
                 let u = rollup::normalize(u);
-                std::fs::canonicalize(&u)
-                    .map(|c| c.to_string_lossy().into_owned())
-                    .unwrap_or(u)
+                std::fs::canonicalize(&u).map(|c| c.to_string_lossy().into_owned()).unwrap_or(u)
             }
             _ => "/".to_string(),
         };
@@ -425,11 +392,8 @@ impl Tracker {
             }
         }
         // Writer pids from fanotify carry no rate: fill in names/rates from the last snapshot.
-        let last_rates: HashMap<u32, u64> = self
-            .writes
-            .back()
-            .map(|w| w.2.iter().map(|x| (x.0, x.2)).collect())
-            .unwrap_or_default();
+        let last_rates: HashMap<u32, u64> =
+            self.writes.back().map(|w| w.2.iter().map(|x| (x.0, x.2)).collect()).unwrap_or_default();
         for g in &mut growers {
             for w in &mut g.writers {
                 if w.1.is_empty() {
@@ -453,11 +417,7 @@ impl Tracker {
         let deleted_open = super::volumes::deleted_open();
 
         // Unexplained growth.
-        if let Some((m, d)) = volumes
-            .iter()
-            .find(|v| v.1 > 0 && (root == "/" || under_prefix(&root, &v.0)))
-            .cloned()
-        {
+        if let Some((m, d)) = volumes.iter().find(|v| v.1 > 0 && (root == "/" || under_prefix(&root, &v.0))).cloned() {
             let explained: i64 = top_level_sum(&growers);
             if d > 64 << 20 && explained * 2 < d {
                 notes.push(format!(
@@ -469,15 +429,7 @@ impl Tracker {
         }
         let mut seen_notes = std::collections::HashSet::new();
         notes.retain(|n| seen_notes.insert(n.clone()));
-        Growth {
-            from,
-            to: now,
-            volumes,
-            growers,
-            writers,
-            deleted_open,
-            notes,
-        }
+        Growth { from, to: now, volumes, growers, writers, deleted_open, notes }
     }
 
     fn proc_name(&self, pid: u32) -> String {
@@ -502,11 +454,8 @@ impl Tracker {
                 e.1 += *bps as f64 * *dt as f64 / 1000.0;
             }
         }
-        let mut v: Vec<(u32, String, u64)> = by
-            .into_iter()
-            .map(|(p, (n, b))| (p, n, b as u64))
-            .filter(|x| x.2 > 0)
-            .collect();
+        let mut v: Vec<(u32, String, u64)> =
+            by.into_iter().map(|(p, (n, b))| (p, n, b as u64)).filter(|x| x.2 > 0).collect();
         v.sort_by(|a, b| b.2.cmp(&a.2));
         v
     }
@@ -542,7 +491,9 @@ impl Tracker {
                     .find(|x| x.0 <= from)
                     // Only a sample that covers most of the window: a delta over the last few
                     // seconds of a one-shot CLI run would read as "the window's growth".
-                    .or_else(|| self.vol_samples.front().filter(|x| x.0 < now && x.0 <= from + ((now - from) / 4).max(30_000)));
+                    .or_else(|| {
+                        self.vol_samples.front().filter(|x| x.0 < now && x.0 <= from + ((now - from) / 4).max(30_000))
+                    });
                 base = s.and_then(|x| x.1.iter().find(|v| v.0 == *mount).map(|v| v.1));
             }
             if let Some(b) = base {
@@ -553,13 +504,8 @@ impl Tracker {
             notes.push("volume deltas need recorder history (`fat record`) or a fat that has been running".into());
         }
         if root != "/" {
-            let vols: Vec<super::Volume> = latest
-                .iter()
-                .map(|(m, _, _)| super::Volume {
-                    mount: m.clone(),
-                    ..Default::default()
-                })
-                .collect();
+            let vols: Vec<super::Volume> =
+                latest.iter().map(|(m, _, _)| super::Volume { mount: m.clone(), ..Default::default() }).collect();
             if let Some(v) = super::volumes::volume_for(&vols, root) {
                 let m = v.mount.clone();
                 out.retain(|x| x.0 == m);
@@ -611,9 +557,7 @@ impl Tracker {
                         Some(b) => b >= from,
                         None => exact_times && e.flags & F_CREATED != 0,
                     };
-                    let before = seen
-                        .as_ref()
-                        .and_then(|x| x.samples.iter().rev().find(|y| y.0 <= from).map(|y| y.1));
+                    let before = seen.as_ref().and_then(|x| x.samples.iter().rev().find(|y| y.0 <= from).map(|y| y.1));
                     let after = seen.as_ref().and_then(|x| x.samples.first().map(|y| y.1));
                     o.delta = match (before, created, after) {
                         (Some(b), _, _) => Some(s.alloc as i64 - b as i64),
@@ -681,11 +625,8 @@ impl Tracker {
             let Some(j) = self.mac.journal.as_ref() else {
                 return (vec![], false);
             };
-            let done = j.wait_history(
-                HISTORY_WAIT
-                    .saturating_sub(t0.elapsed())
-                    .max(std::time::Duration::from_millis(500)),
-            );
+            let done =
+                j.wait_history(HISTORY_WAIT.saturating_sub(t0.elapsed()).max(std::time::Duration::from_millis(500)));
             let since_id = j.since_id;
             let (err, dropped) = {
                 let st = j.state.lock().unwrap();
@@ -724,12 +665,8 @@ impl Tracker {
             let b = match boundary {
                 Some(b) if b + 1 < since_id && tries < 3 => {
                     // The window starts before the journal: replay from the exact id.
-                    self.mac.journal = Some(fsevents::Journal::start(
-                        vec!["/".into()],
-                        b,
-                        EVENT_CAP,
-                        self.exclude.clone(),
-                    ));
+                    self.mac.journal =
+                        Some(fsevents::Journal::start(vec!["/".into()], b, EVENT_CAP, self.exclude.clone()));
                     self.mac.journal_from_ms = from;
                     continue;
                 }
@@ -796,12 +733,8 @@ impl Tracker {
         if mode == watch::Mode::Inotify
             && let Some(sc) = scanner
         {
-            let hot: Vec<String> = sc
-                .largest(root, 40)
-                .into_iter()
-                .filter(|d| d.is_dir && !d.mount_point)
-                .map(|d| d.path)
-                .collect();
+            let hot: Vec<String> =
+                sc.largest(root, 40).into_iter().filter(|d| d.is_dir && !d.mount_point).map(|d| d.path).collect();
             w.add_dirs(&hot);
         }
         let (entries, started, overflow, marked, errors, partial) = {
@@ -823,15 +756,8 @@ impl Tracker {
         match mode {
             watch::Mode::Fanotify => notes.push(format!("fanotify on {marked} filesystem(s) since {}", hhmm(started))),
             watch::Mode::Inotify => {
-                let why = if unsafe { libc::geteuid() } == 0 {
-                    "fanotify unavailable"
-                } else {
-                    "fanotify needs root"
-                };
-                notes.push(format!(
-                    "{why}; using inotify on {marked} dirs (non-recursive) since {}",
-                    hhmm(started)
-                ));
+                let why = if unsafe { libc::geteuid() } == 0 { "fanotify unavailable" } else { "fanotify needs root" };
+                notes.push(format!("{why}; using inotify on {marked} dirs (non-recursive) since {}", hhmm(started)));
             }
             watch::Mode::Off => notes.push(format!("no file watch available: {}", errors.join("; "))),
         }
@@ -839,9 +765,7 @@ impl Tracker {
             notes.push(format!("fanotify: {}", errors.join("; ")));
         }
         if overflow > 0 {
-            notes.push(format!(
-                "watch queue overflowed {overflow} times: some changes were missed"
-            ));
+            notes.push(format!("watch queue overflowed {overflow} times: some changes were missed"));
         }
         if started > from + 5_000 {
             notes.push(format!(
@@ -864,12 +788,7 @@ impl Tracker {
     ) -> Vec<Obs> {
         let mut roots: Vec<String> = vec![];
         if let Some(sc) = scanner {
-            roots = sc
-                .largest(root, 12)
-                .into_iter()
-                .filter(|d| d.is_dir && !d.mount_point)
-                .map(|d| d.path)
-                .collect();
+            roots = sc.largest(root, 12).into_iter().filter(|d| d.is_dir && !d.mount_point).map(|d| d.path).collect();
             roots.retain(|r| may_stat(r, &self.home));
             roots.truncate(6);
         }
@@ -902,16 +821,7 @@ impl Tracker {
             .hits
             .iter()
             .filter(|(p, _)| !excl.iter().any(|e| under_prefix(p, e)))
-            .map(|(p, _)| {
-                (
-                    p.clone(),
-                    PathEv {
-                        flags: F_MODIFIED,
-                        count: 1,
-                        ..Default::default()
-                    },
-                )
-            })
+            .map(|(p, _)| (p.clone(), PathEv { flags: F_MODIFIED, count: 1, ..Default::default() }))
             .collect();
         let pre: HashMap<String, Option<paths::FileStat>> = w.hits.into_iter().map(|(p, s)| (p, Some(s))).collect();
         let mut o = self.events_to_obs(entries, from, Evidence::Mtime, may_stat, false, Some(&pre));
@@ -931,18 +841,9 @@ impl Tracker {
     #[cfg(test)]
     fn live_paths(&self) -> usize {
         #[cfg(target_os = "macos")]
-        return self
-            .mac
-            .journal
-            .as_ref()
-            .map(|j| j.state.lock().unwrap().paths.len())
-            .unwrap_or(0);
+        return self.mac.journal.as_ref().map(|j| j.state.lock().unwrap().paths.len()).unwrap_or(0);
         #[cfg(target_os = "linux")]
-        return self
-            .watch
-            .as_ref()
-            .map(|w| w.state.lock().unwrap().paths.len())
-            .unwrap_or(0);
+        return self.watch.as_ref().map(|w| w.state.lock().unwrap().paths.len()).unwrap_or(0);
         #[allow(unreachable_code)]
         0
     }
@@ -969,11 +870,7 @@ pub(crate) fn human(b: i64) -> String {
         (a, "B")
     };
     let s = if b < 0 { "-" } else { "" };
-    if u == "B" {
-        format!("{s}{v:.0} {u}")
-    } else {
-        format!("{s}{v:.1} {u}")
-    }
+    if u == "B" { format!("{s}{v:.0} {u}") } else { format!("{s}{v:.1} {u}") }
 }
 
 /// Evidence::ScanDiff: recorded dir sizes near window start vs the latest snapshot (or the
@@ -1044,12 +941,7 @@ fn scan_diff(
                 .map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string())
                 .unwrap_or_default()
         };
-        notes.push(format!(
-            "scan diff {}–{} ({} dirs moved >= 1 MiB)",
-            fmt(t0),
-            fmt(t1),
-            out.len()
-        ));
+        notes.push(format!("scan diff {}–{} ({} dirs moved >= 1 MiB)", fmt(t0), fmt(t1), out.len()));
     }
     out
 }
@@ -1063,10 +955,7 @@ fn scan_diff_slack(window_ms: i64) -> i64 {
 /// For files with an unknown delta, use the scanner's earlier listing of their parent dir.
 fn scanner_baselines(sc: &super::scan::Scanner, obs: &[Obs], from: Ts) -> Vec<Obs> {
     let mut by_parent: HashMap<&str, Vec<&Obs>> = HashMap::new();
-    for o in obs
-        .iter()
-        .filter(|o| o.delta.is_none() && !o.is_dir && o.size.is_some_and(|s| s > 0))
-    {
+    for o in obs.iter().filter(|o| o.delta.is_none() && !o.is_dir && o.size.is_some_and(|s| s > 0)) {
         if let Some(p) = parent_of(&o.path) {
             by_parent.entry(p).or_default().push(o);
         }
@@ -1128,9 +1017,7 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> PathBuf {
-        let base = std::env::var("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir());
+        let base = std::env::var("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
         let d = base.join(format!("fat-growth-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -1153,11 +1040,7 @@ mod tests {
         // Baselines from "before the window".
         Tracker::remember(&mut t.baseline, &s(&oldf), from - 10_000, 4096, None);
         Tracker::remember(&mut t.baseline, &s(&gone), from - 10_000, 1 << 20, None);
-        let ev = |f| PathEv {
-            flags: f,
-            count: 1,
-            ..Default::default()
-        };
+        let ev = |f| PathEv { flags: f, count: 1, ..Default::default() };
         let entries = vec![
             (s(&newf), ev(F_CREATED)),
             (s(&oldf), ev(F_MODIFIED)),
@@ -1181,11 +1064,7 @@ mod tests {
     fn protected_paths_counted_not_stated() {
         let mut t = Tracker::with_state_dir(None);
         t.home = "/Users/zz-test".into();
-        let ev = PathEv {
-            flags: F_MODIFIED,
-            count: 1,
-            ..Default::default()
-        };
+        let ev = PathEv { flags: F_MODIFIED, count: 1, ..Default::default() };
         let entries = vec![
             ("/Users/zz-test/Documents/a.txt".to_string(), ev.clone()),
             ("/Users/zz-test/Documents/b/c.txt".to_string(), ev.clone()),
@@ -1225,17 +1104,9 @@ mod tests {
         assert!(st.success());
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let g = t.report(5 * 60_000, Some(&ds), None, None);
-        eprintln!(
-            "growers={:?}\nnotes={:?}\nlive_paths={}",
-            g.growers,
-            g.notes,
-            t.live_paths()
-        );
-        let hit = g
-            .growers
-            .iter()
-            .find(|x| x.path == fp)
-            .unwrap_or_else(|| panic!("{fp} not reported: {:?}", g.growers));
+        eprintln!("growers={:?}\nnotes={:?}\nlive_paths={}", g.growers, g.notes, t.live_paths());
+        let hit =
+            g.growers.iter().find(|x| x.path == fp).unwrap_or_else(|| panic!("{fp} not reported: {:?}", g.growers));
         assert!(hit.delta >= 3_000_000, "{hit:?}");
         assert!(
             hit.evidence.contains(&Evidence::Fsevents)
@@ -1256,20 +1127,13 @@ mod tests {
         let fp = format!("{ds}/app.log");
         let mut child = std::process::Command::new("sh")
             .arg("-c")
-            .arg(format!(
-                "exec >'{fp}'; while :; do head -c 65536 /dev/zero; sleep 0.05; done"
-            ))
+            .arg(format!("exec >'{fp}'; while :; do head -c 65536 /dev/zero; sleep 0.05; done"))
             .spawn()
             .unwrap();
         let pid = child.id();
         let snap = |ts: Ts| Snapshot {
             ts,
-            procs: vec![crate::model::Proc {
-                pid,
-                name: "sh".into(),
-                disk_write_bps: 1_000_000,
-                ..Default::default()
-            }],
+            procs: vec![crate::model::Proc { pid, name: "sh".into(), disk_write_bps: 1_000_000, ..Default::default() }],
             ..Default::default()
         };
         let mut t = Tracker::with_state_dir(None);
@@ -1306,11 +1170,7 @@ mod tests {
         let g2 = t.report(super::super::DEFAULT_WINDOW_MS, None, None, None);
         let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
         unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-        let rss_mb = if cfg!(target_os = "macos") {
-            ru.ru_maxrss as f64 / 1e6
-        } else {
-            ru.ru_maxrss as f64 / 1e3
-        };
+        let rss_mb = if cfg!(target_os = "macos") { ru.ru_maxrss as f64 / 1e6 } else { ru.ru_maxrss as f64 / 1e3 };
         eprintln!(
             "first report {first:?}, second {:?}, live paths {}, max rss {rss_mb:.0} MB, cpu user {:.2}s sys {:.2}s",
             t1.elapsed(),

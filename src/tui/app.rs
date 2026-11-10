@@ -7,8 +7,8 @@ use crate::history::Point;
 use crate::model::{ActionKind, ActionRecord, Container, Explanation, Finding, Proc, Snapshot, Ts};
 use crate::server::{Event, FleetHost, FleetSummary, Incident, Profile, ServerCfg, Severity};
 use crate::tui::server::{
-    DrillView, EventsView, FleetSort, FleetView, HostDrill, Panel, ServicesView, UnitSort, EVENTS_REFRESH_MS, EVENT_RING, EVENT_WINDOWS,
-    EVENT_WINDOW_NAMES, INCIDENT_WINDOW_MS,
+    DrillView, EVENT_RING, EVENT_WINDOW_NAMES, EVENT_WINDOWS, EVENTS_REFRESH_MS, EventsView, FleetSort, FleetView,
+    HostDrill, INCIDENT_WINDOW_MS, Panel, ServicesView, UnitSort,
 };
 use crate::tui::widgets::{DELETED_MIN_BYTES, DeletedGroup, contains_ci, group_deleted};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -48,11 +48,13 @@ impl Tab {
     /// Every tab (tests iterate it). Which ones a profile shows, and their number keys, come
     /// from [`App::tab_order`].
     #[cfg(test)]
-    pub const ALL: [Tab; 8] = [Tab::Services, Tab::Events, Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
+    pub const ALL: [Tab; 8] =
+        [Tab::Services, Tab::Events, Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
     /// Desktop: today's layout, number keys 1-6. Fleet is last so hiding it never renumbers.
     pub const DESKTOP: [Tab; 6] = [Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
     /// Server: services first, the event timeline next to processes.
-    pub const SERVER: [Tab; 8] = [Tab::Services, Tab::Procs, Tab::Events, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
+    pub const SERVER: [Tab; 8] =
+        [Tab::Services, Tab::Procs, Tab::Events, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
     pub fn title(self) -> &'static str {
         match self {
             Tab::Services => "Services",
@@ -101,32 +103,62 @@ impl SortKey {
 pub enum Command {
     /// `start` is the target's start time when it was chosen (0 = unknown); the action is
     /// refused if the pid has since been reused by another process.
-    Act { kind: ActionKind, pid: u32, nice: Option<i32>, start: u64 },
+    Act {
+        kind: ActionKind,
+        pid: u32,
+        nice: Option<i32>,
+        start: u64,
+    },
     /// Undo the most recent undoable action.
     Undo,
     /// Undo one journal entry by id (from the action log).
     UndoId(u64),
     Explain(u32),
     /// `id` ties the eventual answer to this question (a cancelled ask's late answer is dropped).
-    Ask { id: u64, question: String },
+    Ask {
+        id: u64,
+        question: String,
+    },
     RefreshLog,
-    RefreshTimeline { from: Ts, to: Ts },
+    RefreshTimeline {
+        from: Ts,
+        to: Ts,
+    },
     LoadAt(Ts),
     /// Storage: children of `path`. `explicit` = the user drilled into a protected / mounted
     /// entry, which allows reading it (TCC-protected dirs, network mounts) this once.
-    FsList { path: String, explicit: bool },
+    FsList {
+        path: String,
+        explicit: bool,
+    },
     /// Storage growth report for the last `window_ms` (`under` = only paths below it).
-    FsGrowth { window_ms: i64, under: Option<String> },
+    FsGrowth {
+        window_ms: i64,
+        under: Option<String>,
+    },
     FsRescan(String),
     FsLargest(String),
     /// Recorded directory sizes below `path` and volume use near `ts` (time travel).
-    FsAt { ts: Ts, path: String },
+    FsAt {
+        ts: Ts,
+        path: String,
+    },
     /// Server profile: recorded events in [from, to] (falls back to the live ring).
-    LoadEvents { from: Ts, to: Ts },
+    LoadEvents {
+        from: Ts,
+        to: Ts,
+    },
     /// Explain one event ("what happened around it"); `id` ties the answer to the panel.
-    ExplainEvent { id: u64, event: Box<Event> },
+    ExplainEvent {
+        id: u64,
+        event: Box<Event>,
+    },
     /// What happened at `at` (None = now) within `window_ms`.
-    WhatHappened { id: u64, at: Option<Ts>, window_ms: i64 },
+    WhatHappened {
+        id: u64,
+        at: Option<Ts>,
+        window_ms: i64,
+    },
     /// Header counters from the recorder (OOM kills in the last 24h).
     RefreshCounts,
     /// Poll every inventory host once (read-only), streaming rows back.
@@ -141,8 +173,16 @@ pub enum Modal {
     None,
     /// Editing `App::filter` (shown in the footer).
     Filter,
-    Confirm { prompt: String, cmd: Command },
-    Renice { pid: u32, name: String, input: String, start: u64 },
+    Confirm {
+        prompt: String,
+        cmd: Command,
+    },
+    Renice {
+        pid: u32,
+        name: String,
+        input: String,
+        start: u64,
+    },
     AskInput(String),
     Help,
     /// The action journal (`a`): most recent first, `u`/⏎ undo.
@@ -266,7 +306,9 @@ pub fn parent_dir(p: &str) -> Option<String> {
 /// another full row (older reports) is skipped so it is not counted twice.
 pub fn child_growth(path: &str, growers: &[Grower]) -> ChildGrowth {
     let mut under: Vec<&Grower> = growers.iter().filter(|g| path_within(&g.path, path)).collect();
-    under.sort_by(|a, b| a.path.len().cmp(&b.path.len()).then_with(|| a.path.cmp(&b.path)).then_with(|| b.other.cmp(&a.other)));
+    under.sort_by(|a, b| {
+        a.path.len().cmp(&b.path.len()).then_with(|| a.path.cmp(&b.path)).then_with(|| b.other.cmp(&a.other))
+    });
     under.dedup_by(|a, b| a.path == b.path && a.other == b.other);
     let mut out = ChildGrowth::default();
     let mut kept: Vec<&Grower> = Vec::new();
@@ -293,7 +335,8 @@ pub fn child_growth(path: &str, growers: &[Grower]) -> ChildGrowth {
         }
     }
     out.write_bps = writers.values().map(|w| w.1).sum();
-    out.top_writer = writers.into_iter().max_by_key(|(pid, w)| (w.1, std::cmp::Reverse(*pid))).map(|(pid, (n, b))| (pid, n, b));
+    out.top_writer =
+        writers.into_iter().max_by_key(|(pid, w)| (w.1, std::cmp::Reverse(*pid))).map(|(pid, (n, b))| (pid, n, b));
     out
 }
 
@@ -311,16 +354,28 @@ pub fn growth_rows(g: &Growth, filter_lower: &str) -> (Vec<GrowthRow>, Vec<Delet
             .iter()
             .enumerate()
             .filter(|(_, x)| x.delta != 0 || !x.writers.is_empty())
-            .filter(|(_, x)| contains_ci(&x.path, filter_lower) || x.writers.iter().any(|w| contains_ci(&w.1, filter_lower)))
+            .filter(|(_, x)| {
+                contains_ci(&x.path, filter_lower) || x.writers.iter().any(|w| contains_ci(&w.1, filter_lower))
+            })
             .map(|(i, _)| GrowthRow::Grower(i)),
     );
     // Only files worth restarting a process for (browsers alone hold hundreds of small temp
     // files), one row per holder, biggest first.
-    let matching: Vec<(u32, String, String, u64)> =
-        g.deleted_open.iter().filter(|x| contains_ci(&x.1, filter_lower) || contains_ci(&x.2, filter_lower)).cloned().collect();
+    let matching: Vec<(u32, String, String, u64)> = g
+        .deleted_open
+        .iter()
+        .filter(|x| contains_ci(&x.1, filter_lower) || contains_ci(&x.2, filter_lower))
+        .cloned()
+        .collect();
     let (groups, _, _) = group_deleted(&matching, DELETED_MIN_BYTES);
     v.extend((0..groups.len().min(DELETED_ROWS)).map(GrowthRow::Deleted));
-    v.extend(g.writers.iter().enumerate().filter(|(_, x)| contains_ci(&x.1, filter_lower)).map(|(i, _)| GrowthRow::Writer(i)));
+    v.extend(
+        g.writers
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| contains_ci(&x.1, filter_lower))
+            .map(|(i, _)| GrowthRow::Writer(i)),
+    );
     (v, groups)
 }
 
@@ -520,7 +575,8 @@ impl FsView {
             }
         }
         let len = self.len();
-        let found = self.sel_name.clone().and_then(|n| (0..len).find(|&i| self.row_key(i).as_deref() == Some(n.as_str())));
+        let found =
+            self.sel_name.clone().and_then(|n| (0..len).find(|&i| self.row_key(i).as_deref() == Some(n.as_str())));
         self.sel = found.unwrap_or_else(|| self.sel.min(len.saturating_sub(1)));
     }
 
@@ -847,10 +903,11 @@ impl App {
     /// Rebuild the server views' row caches (cheap when nothing changed).
     pub fn ensure_server_rows(&mut self) {
         let warn = self.server_cfg.exhaustion_warn;
-        let units: &[crate::server::Unit] = match if self.cursor.is_some() { self.past.as_ref() } else { self.live.as_ref() } {
-            Some(s) => &s.units,
-            None => &[],
-        };
+        let units: &[crate::server::Unit] =
+            match if self.cursor.is_some() { self.past.as_ref() } else { self.live.as_ref() } {
+                Some(s) => &s.units,
+                None => &[],
+            };
         self.svc.ensure_rows(units, warn);
         self.ev.ensure_rows(&self.event_ring, self.now);
         self.fleet.ensure_rows();
@@ -1038,15 +1095,18 @@ impl App {
                 }
             }
             if let (Some(n), Some(live)) = (r.new_nice, self.live.as_mut())
-                && let Some(p) = live.procs.iter_mut().find(|p| p.pid == r.pid) {
-                    p.nice = n;
-                }
+                && let Some(p) = live.procs.iter_mut().find(|p| p.pid == r.pid)
+            {
+                p.nice = n;
+            }
         }
     }
 
     pub fn undo_done(&mut self, r: Option<&ActionRecord>) {
         match r {
-            Some(r) if r.ok => self.set_status(format!("↶ undid #{} on {} ({}) {}", r.id, r.pid, r.name, r.message), false),
+            Some(r) if r.ok => {
+                self.set_status(format!("↶ undid #{} on {} ({}) {}", r.id, r.pid, r.name, r.message), false)
+            }
             Some(r) => self.set_status(format!("✗ undo failed: {}", r.message), true),
             None => self.set_status("nothing to undo", false),
         }
@@ -1139,7 +1199,11 @@ impl App {
         if self.tab == Tab::Fs && self.fs.opened && self.fs.error.is_none() {
             let mut out = Vec::new();
             // A summarized (folded) directory is being re-expanded after focus: poll fast too.
-            let scanning = self.fs.listing.as_ref().is_none_or(|l| l.dir.partial || l.progress.running || (l.children.is_empty() && l.dir.files > 1));
+            let scanning = self
+                .fs
+                .listing
+                .as_ref()
+                .is_none_or(|l| l.dir.partial || l.progress.running || (l.children.is_empty() && l.dir.files > 1));
             let every = if scanning { FS_LIST_REFRESH_MS } else { FS_LIST_IDLE_REFRESH_MS };
             if now - self.fs.last_list_req >= every {
                 out.push(self.fs.list_cmd(now));
@@ -1313,12 +1377,7 @@ impl App {
         self.fs.rows_dirty = true;
         self.rows_dirty = true;
         let tol = (self.interval_ms as i64 * 3).max(5000);
-        let hit = self
-            .ring
-            .iter()
-            .min_by_key(|s| (s.ts - ts).abs())
-            .filter(|s| (s.ts - ts).abs() <= tol)
-            .cloned();
+        let hit = self.ring.iter().min_by_key(|s| (s.ts - ts).abs()).filter(|s| (s.ts - ts).abs() <= tol).cloned();
         match hit {
             Some(s) => {
                 self.past = Some(s);
@@ -1564,11 +1623,20 @@ impl App {
             self.why = None;
         }
         if t == Tab::Fleet && !self.fleet_visible() {
-            self.set_status("no Fleet yet: start a container or add hosts ([[hosts]] or [fleet] hosts_file) to the config", false);
+            self.set_status(
+                "no Fleet yet: start a container or add hosts ([[hosts]] or [fleet] hosts_file) to the config",
+                false,
+            );
             return Vec::new();
         }
         if !self.tab_order().contains(&t) {
-            self.set_status(format!("{} is part of the server profile (FAT_PROFILE=server or profile = \"server\" in [server])", t.title()), false);
+            self.set_status(
+                format!(
+                    "{} is part of the server profile (FAT_PROFILE=server or profile = \"server\" in [server])",
+                    t.title()
+                ),
+                false,
+            );
             return Vec::new();
         }
         self.tab = t;
@@ -1696,7 +1764,9 @@ impl App {
                 }
                 Some(r) => {
                     let why = match r.kind {
-                        ActionKind::Term | ActionKind::Kill | ActionKind::KillTree => "a signal to end a process cannot be taken back",
+                        ActionKind::Term | ActionKind::Kill | ActionKind::KillTree => {
+                            "a signal to end a process cannot be taken back"
+                        }
                         _ if !r.ok => "it did not succeed",
                         _ => "fat could not record how to reverse it",
                     };
@@ -1755,7 +1825,15 @@ impl App {
     }
 
     /// Shared action keys for any process-centric view.
-    fn process_action(&mut self, code: KeyCode, pid: u32, name: String, start: u64, paused: bool, k_is_tree: bool) -> Vec<Command> {
+    fn process_action(
+        &mut self,
+        code: KeyCode,
+        pid: u32,
+        name: String,
+        start: u64,
+        paused: bool,
+        k_is_tree: bool,
+    ) -> Vec<Command> {
         if self.rewound() {
             self.set_status("⏪ viewing the past — press L to return to live before acting", true);
             return Vec::new();
@@ -1782,14 +1860,18 @@ impl App {
             }
             KeyCode::Char('k') if !k_is_tree => {
                 self.modal = Modal::Confirm {
-                    prompt: format!("Send TERM to {pid} ({name})? This cannot be undone (space pauses it instead, which can).{hub_warn}"),
+                    prompt: format!(
+                        "Send TERM to {pid} ({name})? This cannot be undone (space pauses it instead, which can).{hub_warn}"
+                    ),
                     cmd: Command::Act { kind: ActionKind::Term, pid, nice: None, start },
                 };
                 Vec::new()
             }
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.modal = Modal::Confirm {
-                    prompt: format!("Terminate {pid} ({name}) AND all its descendants? This cannot be undone.{hub_warn}"),
+                    prompt: format!(
+                        "Terminate {pid} ({name}) AND all its descendants? This cannot be undone.{hub_warn}"
+                    ),
                     cmd: Command::Act { kind: ActionKind::KillTree, pid, nice: None, start },
                 };
                 Vec::new()
@@ -1850,7 +1932,9 @@ impl App {
             KeyCode::PageDown => self.fs.move_sel(15),
             KeyCode::Home => self.fs.move_sel(isize::MIN / 2),
             KeyCode::End | KeyCode::Char('G') => self.fs.move_sel(isize::MAX / 2),
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => return self.fs_open_selected(k.code == KeyCode::Enter),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                return self.fs_open_selected(k.code == KeyCode::Enter);
+            }
             KeyCode::Left | KeyCode::Backspace => return self.fs_up(),
             KeyCode::Char('s') => {
                 if self.fs.mode == FsMode::Tree {
@@ -1867,8 +1951,12 @@ impl App {
             }
             KeyCode::Char('w') | KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('-') => {
                 let n = FS_WINDOWS.len();
-                self.fs.window = if k.code == KeyCode::Char('-') { (self.fs.window + n - 1) % n } else { (self.fs.window + 1) % n };
-                self.set_status(format!("growth window: last {}", crate::tui::widgets::fmt_window(self.fs.window_ms())), false);
+                self.fs.window =
+                    if k.code == KeyCode::Char('-') { (self.fs.window + n - 1) % n } else { (self.fs.window + 1) % n };
+                self.set_status(
+                    format!("growth window: last {}", crate::tui::widgets::fmt_window(self.fs.window_ms())),
+                    false,
+                );
                 return vec![self.fs.growth_cmd(now)];
             }
             KeyCode::Char('r') => {
@@ -1908,7 +1996,9 @@ impl App {
                 Vec::new()
             }
             FsMode::Growth => {
-                let (Some(row), Some(g)) = (self.fs.selected_growth(), self.fs.growth.as_ref()) else { return Vec::new() };
+                let (Some(row), Some(g)) = (self.fs.selected_growth(), self.fs.growth.as_ref()) else {
+                    return Vec::new();
+                };
                 match row {
                     GrowthRow::Grower(i) => {
                         let Some(x) = g.growers.get(i) else { return Vec::new() };
@@ -1922,8 +2012,12 @@ impl App {
                         }
                     }
                     // Only ⏎ explains (→ is navigation).
-                    GrowthRow::Deleted(i) if enter => self.fs.deleted.get(i).map(|d| vec![Command::Explain(d.pid)]).unwrap_or_default(),
-                    GrowthRow::Writer(i) if enter => g.writers.get(i).map(|w| vec![Command::Explain(w.0)]).unwrap_or_default(),
+                    GrowthRow::Deleted(i) if enter => {
+                        self.fs.deleted.get(i).map(|d| vec![Command::Explain(d.pid)]).unwrap_or_default()
+                    }
+                    GrowthRow::Writer(i) if enter => {
+                        g.writers.get(i).map(|w| vec![Command::Explain(w.0)]).unwrap_or_default()
+                    }
                     _ => Vec::new(),
                 }
             }
@@ -2039,10 +2133,11 @@ impl App {
     fn on_services_key(&mut self, k: KeyEvent) -> Vec<Command> {
         self.ensure_server_rows();
         // Field access (not self.view()) so the selection can move while units are borrowed.
-        let units_ref: &[crate::server::Unit] = match if self.cursor.is_some() { self.past.as_ref() } else { self.live.as_ref() } {
-            Some(s) => &s.units,
-            None => &[],
-        };
+        let units_ref: &[crate::server::Unit] =
+            match if self.cursor.is_some() { self.past.as_ref() } else { self.live.as_ref() } {
+                Some(s) => &s.units,
+                None => &[],
+            };
         let delta = match k.code {
             KeyCode::Up => Some(-1),
             KeyCode::Down => Some(1),
@@ -2118,7 +2213,10 @@ impl App {
             KeyCode::Enter => {
                 let Some(e) = self.ev.selected().cloned() else { return Vec::new() };
                 let id = self.next_incident_id();
-                self.panel = Some(Panel::loading(format!("What happened · {} {}", crate::tui::widgets::fmt_clock(e.ts), e.kind.as_str()), id));
+                self.panel = Some(Panel::loading(
+                    format!("What happened · {} {}", crate::tui::widgets::fmt_clock(e.ts), e.kind.as_str()),
+                    id,
+                ));
                 return vec![Command::ExplainEvent { id, event: Box::new(e) }];
             }
             KeyCode::Char('W') => return self.what_happened_now(),
@@ -2368,7 +2466,9 @@ fn reduce_units(units: &[crate::server::Unit]) -> Vec<crate::server::Unit> {
     let mut keep: HashSet<usize> = units
         .iter()
         .enumerate()
-        .filter(|(_, u)| u.is_failed() || u.flapping || u.recent_restarts > 0 || !matches!(u.state.as_str(), "active" | "inactive"))
+        .filter(|(_, u)| {
+            u.is_failed() || u.flapping || u.recent_restarts > 0 || !matches!(u.state.as_str(), "active" | "inactive")
+        })
         .map(|(i, _)| i)
         .collect();
     let mut idx: Vec<usize> = (0..units.len()).collect();
@@ -2405,11 +2505,9 @@ fn cmp_proc(a: &Proc, b: &Proc, key: SortKey) -> Ordering {
         SortKey::Net => (a.net_rx_bps + a.net_tx_bps).cmp(&(b.net_rx_bps + b.net_tx_bps)),
         SortKey::Disk => (a.disk_read_bps + a.disk_write_bps).cmp(&(b.disk_read_bps + b.disk_write_bps)),
         SortKey::Pid => a.pid.cmp(&b.pid),
-        SortKey::Name => a
-            .name
-            .bytes()
-            .map(|c| c.to_ascii_lowercase())
-            .cmp(b.name.bytes().map(|c| c.to_ascii_lowercase())),
+        SortKey::Name => {
+            a.name.bytes().map(|c| c.to_ascii_lowercase()).cmp(b.name.bytes().map(|c| c.to_ascii_lowercase()))
+        }
     };
     o.then(a.pid.cmp(&b.pid))
 }
@@ -2442,13 +2540,21 @@ pub fn build_rows(procs: &[Proc], key: SortKey, desc: bool, tree: bool, filter_l
 }
 
 /// [`build_rows`] with the container list the filter can match names against.
-pub fn build_rows_in(procs: &[Proc], containers: &[Container], key: SortKey, desc: bool, tree: bool, filter_lower: &str) -> Vec<Row> {
+pub fn build_rows_in(
+    procs: &[Proc],
+    containers: &[Container],
+    key: SortKey,
+    desc: bool,
+    tree: bool,
+    filter_lower: &str,
+) -> Vec<Row> {
     let ord = |a: usize, b: usize| {
         let o = cmp_proc(&procs[a], &procs[b], key);
         if desc { o.reverse() } else { o }
     };
     if !tree {
-        let mut v: Vec<usize> = (0..procs.len()).filter(|&i| proc_matches(&procs[i], containers, filter_lower)).collect();
+        let mut v: Vec<usize> =
+            (0..procs.len()).filter(|&i| proc_matches(&procs[i], containers, filter_lower)).collect();
         v.sort_by(|&a, &b| ord(a, b));
         return v.into_iter().map(|idx| Row { idx, depth: 0 }).collect();
     }
@@ -2614,8 +2720,26 @@ pub(crate) mod tests {
                 proc(400, 1, "Google Chrome Helper", 12.0, 3 << 30),
             ],
             ports: vec![
-                Port { proto: Proto::Tcp, addr: "127.0.0.1".into(), port: 5432, pid: 400, process: "postgres".into(), state: "LISTEN".into(), orphan: false, note: "postgres".into() },
-                Port { proto: Proto::Tcp, addr: "*".into(), port: 3000, pid: 200, process: "node".into(), state: "LISTEN".into(), orphan: true, note: "vite dev server in ~/proj".into() },
+                Port {
+                    proto: Proto::Tcp,
+                    addr: "127.0.0.1".into(),
+                    port: 5432,
+                    pid: 400,
+                    process: "postgres".into(),
+                    state: "LISTEN".into(),
+                    orphan: false,
+                    note: "postgres".into(),
+                },
+                Port {
+                    proto: Proto::Tcp,
+                    addr: "*".into(),
+                    port: 3000,
+                    pid: 200,
+                    process: "node".into(),
+                    state: "LISTEN".into(),
+                    orphan: true,
+                    note: "vite dev server in ~/proj".into(),
+                },
             ],
             containers: vec![],
             ..Default::default()
@@ -2633,7 +2757,8 @@ pub(crate) mod tests {
         s.system.gpus.clear();
         s.system.battery_pct = None;
         s.system.on_battery = None;
-        s.system.psi = Some(crate::model::Psi { cpu_some: 12.5, mem_some: 0.4, mem_full: 0.1, io_some: 31.0, io_full: 8.0 });
+        s.system.psi =
+            Some(crate::model::Psi { cpu_some: 12.5, mem_some: 0.4, mem_full: 0.1, io_some: 31.0, io_full: 8.0 });
         s.system.temp_c = Some(71.0);
         s.system.power_mw = 48_200.0;
         s.system.power_source = "rapl".into();
@@ -2643,10 +2768,19 @@ pub(crate) mod tests {
             p.cgroup = "/user.slice/user-1000.slice/session-3.scope".into();
         }
         let ctr = "/system.slice/docker-410892b21be2ffda255ceb4e7e2077d968864674cefc8174a3843e6f01c860f7.scope";
-        s.procs.push(Proc { cgroup: ctr.into(), container: Some("410892b21be2".into()), ..proc(500, 1, "postgres", 22.0, 400 << 20) });
-        s.procs.push(Proc { cgroup: ctr.into(), container: Some("410892b21be2".into()), ..proc(501, 500, "pg-worker", 3.0, 60 << 20) });
         s.procs.push(Proc {
-            cgroup: "/system.slice/docker-f592d553371ffde52670af3ebf50d462cf46a69dde69dc441c816a077198847a.scope".into(),
+            cgroup: ctr.into(),
+            container: Some("410892b21be2".into()),
+            ..proc(500, 1, "postgres", 22.0, 400 << 20)
+        });
+        s.procs.push(Proc {
+            cgroup: ctr.into(),
+            container: Some("410892b21be2".into()),
+            ..proc(501, 500, "pg-worker", 3.0, 60 << 20)
+        });
+        s.procs.push(Proc {
+            cgroup: "/system.slice/docker-f592d553371ffde52670af3ebf50d462cf46a69dde69dc441c816a077198847a.scope"
+                .into(),
             container: Some("f592d553371f".into()),
             ..proc(600, 1, "clickhouse", 9.0, 2 << 30)
         });
@@ -2854,8 +2988,25 @@ pub(crate) mod tests {
     #[test]
     fn log_overlay_undoes_the_selected_entry_only_if_undoable() {
         let mut a = app();
-        let rec = |id: u64, kind: ActionKind, undoable: bool, undone: bool| ActionRecord { id, ts: 0, kind, pid: 200, name: "node".into(), prev_nice: None, new_nice: None, pids: vec![], ok: true, undoable, undone, message: String::new() };
-        a.set_log(vec![rec(3, ActionKind::Term, false, false), rec(2, ActionKind::Pause, true, false), rec(1, ActionKind::Pause, true, true)]);
+        let rec = |id: u64, kind: ActionKind, undoable: bool, undone: bool| ActionRecord {
+            id,
+            ts: 0,
+            kind,
+            pid: 200,
+            name: "node".into(),
+            prev_nice: None,
+            new_nice: None,
+            pids: vec![],
+            ok: true,
+            undoable,
+            undone,
+            message: String::new(),
+        };
+        a.set_log(vec![
+            rec(3, ActionKind::Term, false, false),
+            rec(2, ActionKind::Pause, true, false),
+            rec(1, ActionKind::Pause, true, true),
+        ]);
         a.on_key(key('a'));
         assert!(a.on_key(code(KeyCode::Enter)).is_empty(), "TERM is not undoable");
         assert!(a.status.as_ref().unwrap().text.contains("cannot be taken back"));
@@ -2887,21 +3038,33 @@ pub(crate) mod tests {
     #[test]
     fn pause_toggle_and_renice_prompt() {
         let mut a = app();
-        assert_eq!(a.on_key(key(' ')), vec![Command::Act { kind: ActionKind::Pause, pid: 200, nice: None, start: 1700000200 }]);
+        assert_eq!(
+            a.on_key(key(' ')),
+            vec![Command::Act { kind: ActionKind::Pause, pid: 200, nice: None, start: 1700000200 }]
+        );
         a.on_key(key('i'));
         a.ensure_rows();
         while a.sel_pid != Some(300) {
             a.on_key(code(KeyCode::Down));
         }
-        assert_eq!(a.on_key(key('z')), vec![Command::Act { kind: ActionKind::Resume, pid: 300, nice: None, start: 1700000300 }]);
+        assert_eq!(
+            a.on_key(key('z')),
+            vec![Command::Act { kind: ActionKind::Resume, pid: 300, nice: None, start: 1700000300 }]
+        );
         a.on_key(key('r'));
         a.on_key(code(KeyCode::Backspace));
         a.on_key(code(KeyCode::Backspace));
         a.on_key(key('5'));
-        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Act { kind: ActionKind::Renice, pid: 300, nice: Some(5), start: 1700000300 }]);
+        assert_eq!(
+            a.on_key(code(KeyCode::Enter)),
+            vec![Command::Act { kind: ActionKind::Renice, pid: 300, nice: Some(5), start: 1700000300 }]
+        );
         // default +10
         a.on_key(key('r'));
-        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Act { kind: ActionKind::Renice, pid: 300, nice: Some(10), start: 1700000300 }]);
+        assert_eq!(
+            a.on_key(code(KeyCode::Enter)),
+            vec![Command::Act { kind: ActionKind::Renice, pid: 300, nice: Some(10), start: 1700000300 }]
+        );
         // invalid keeps prompt open
         a.on_key(key('r'));
         for c in "99".chars() {
@@ -2915,8 +3078,18 @@ pub(crate) mod tests {
     fn action_done_marks_paused() {
         let mut a = app();
         let r = ActionRecord {
-            id: 7, ts: 0, kind: ActionKind::Pause, pid: 200, name: "node".into(), prev_nice: None, new_nice: None,
-            pids: vec![200], undoable: true, undone: false, ok: true, message: "SIGSTOP".into(),
+            id: 7,
+            ts: 0,
+            kind: ActionKind::Pause,
+            pid: 200,
+            name: "node".into(),
+            prev_nice: None,
+            new_nice: None,
+            pids: vec![200],
+            undoable: true,
+            undone: false,
+            ok: true,
+            message: "SIGSTOP".into(),
         };
         a.action_done(&r);
         assert_eq!(a.live.as_ref().unwrap().proc(200).unwrap().status, "T");
@@ -2933,7 +3106,9 @@ pub(crate) mod tests {
         assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Explain(200)]);
         a.on_key(key('k'));
         match &a.modal {
-            Modal::Confirm { cmd, .. } => assert_eq!(*cmd, Command::Act { kind: ActionKind::KillTree, pid: 200, nice: None, start: 1700000200 }),
+            Modal::Confirm { cmd, .. } => {
+                assert_eq!(*cmd, Command::Act { kind: ActionKind::KillTree, pid: 200, nice: None, start: 1700000200 })
+            }
             m => panic!("expected confirm, got {m:?}"),
         }
     }
@@ -3059,9 +3234,23 @@ pub(crate) mod tests {
     #[test]
     fn ports_actions_on_the_vm_host_warn_and_pause_asks_first() {
         let mut s = snap(1_000_000);
-        let helper = "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper";
-        s.procs.push(Proc { exe: helper.into(), cmd: helper.into(), ..proc(13792, 1, "OrbStack Helper", 30.0, 2 << 30) });
-        s.ports.push(Port { proto: Proto::Tcp, addr: "127.0.0.1".into(), port: 8080, pid: 13792, process: "OrbStack Helper".into(), state: "LISTEN".into(), orphan: false, note: String::new() });
+        let helper =
+            "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper";
+        s.procs.push(Proc {
+            exe: helper.into(),
+            cmd: helper.into(),
+            ..proc(13792, 1, "OrbStack Helper", 30.0, 2 << 30)
+        });
+        s.ports.push(Port {
+            proto: Proto::Tcp,
+            addr: "127.0.0.1".into(),
+            port: 8080,
+            pid: 13792,
+            process: "OrbStack Helper".into(),
+            state: "LISTEN".into(),
+            orphan: false,
+            note: String::new(),
+        });
         let mut a = App::new(1000);
         a.now = 1_000_000;
         a.on_snapshot(s);
@@ -3087,13 +3276,18 @@ pub(crate) mod tests {
         // k (tree kill on Ports) says it is the VM host, besides "cannot be undone".
         a.on_key(key('k'));
         match &a.modal {
-            Modal::Confirm { prompt, .. } => assert!(prompt.contains("cannot be undone") && prompt.contains("OrbStack VM"), "{prompt}"),
+            Modal::Confirm { prompt, .. } => {
+                assert!(prompt.contains("cannot be undone") && prompt.contains("OrbStack VM"), "{prompt}")
+            }
             m => panic!("{m:?}"),
         }
         a.on_key(code(KeyCode::Esc));
         // A plain process still pauses with one key, and its prompt has no warning.
         let mut b = app();
-        assert_eq!(b.on_key(key(' ')), vec![Command::Act { kind: ActionKind::Pause, pid: 200, nice: None, start: 1700000200 }]);
+        assert_eq!(
+            b.on_key(key(' ')),
+            vec![Command::Act { kind: ActionKind::Pause, pid: 200, nice: None, start: 1700000200 }]
+        );
         b.on_key(key('k'));
         assert!(matches!(&b.modal, Modal::Confirm { prompt, .. } if !prompt.contains("WARNING")));
     }
@@ -3103,7 +3297,13 @@ pub(crate) mod tests {
         let mut a = app();
         a.on_key(key('5'));
         a.set_findings_with_starts(
-            vec![Finding { severity: "warn".into(), title: "orphan".into(), detail: "".into(), pids: vec![200], action: Some("kill 200 --tree".into()) }],
+            vec![Finding {
+                severity: "warn".into(),
+                title: "orphan".into(),
+                detail: "".into(),
+                pids: vec![200],
+                action: Some("kill 200 --tree".into()),
+            }],
             HashMap::from([(200, 42)]),
         );
         a.on_key(code(KeyCode::Enter));
@@ -3120,7 +3320,13 @@ pub(crate) mod tests {
         a.set_findings_with_starts(
             vec![
                 Finding { severity: "info".into(), title: "x".into(), detail: "".into(), pids: vec![], action: None },
-                Finding { severity: "crit".into(), title: "node hot".into(), detail: "".into(), pids: vec![200], action: Some("pause 200".into()) },
+                Finding {
+                    severity: "crit".into(),
+                    title: "node hot".into(),
+                    detail: "".into(),
+                    pids: vec![200],
+                    action: Some("pause 200".into()),
+                },
             ],
             HashMap::from([(200, 42)]),
         );
@@ -3190,7 +3396,13 @@ pub(crate) mod tests {
         let mut a = app();
         let cmds = a.on_key(key('3'));
         assert_eq!(a.tab, Tab::Fs);
-        assert_eq!(cmds, vec![Command::FsList { path: "/".into(), explicit: false }, Command::FsGrowth { window_ms: 600_000, under: None }]);
+        assert_eq!(
+            cmds,
+            vec![
+                Command::FsList { path: "/".into(), explicit: false },
+                Command::FsGrowth { window_ms: 600_000, under: None }
+            ]
+        );
         a.set_fs_listing(
             "/",
             Some(listing(
@@ -3250,7 +3462,10 @@ pub(crate) mod tests {
         // a stale answer for "/" is ignored
         a.set_fs_listing("/", Some(listing("/", vec![de("/x", 1, true)], false)));
         assert!(a.fs.listing.is_none());
-        a.set_fs_listing("/Users", Some(listing("/Users", vec![de("/Users/me", 450, true), de("/Users/Shared", 50, true)], false)));
+        a.set_fs_listing(
+            "/Users",
+            Some(listing("/Users", vec![de("/Users/me", 450, true), de("/Users/Shared", 50, true)], false)),
+        );
         assert_eq!(fs_names(&mut a), vec!["me", "Shared"]);
         a.on_key(key('l'));
         assert_eq!(a.fs.path, "/Users/me");
@@ -3280,7 +3495,11 @@ pub(crate) mod tests {
         assert_eq!(cmds[0], Command::FsList { path: "/private".into(), explicit: true });
         a.set_fs_listing("/private", Some(listing("/private", vec![de("/private/var", 90, true)], false)));
         let cmds = a.on_key(code(KeyCode::Enter));
-        assert_eq!(cmds[0], Command::FsList { path: "/private/var".into(), explicit: true }, "still under the explicit root");
+        assert_eq!(
+            cmds[0],
+            Command::FsList { path: "/private/var".into(), explicit: true },
+            "still under the explicit root"
+        );
         a.on_key(code(KeyCode::Left));
         a.on_key(code(KeyCode::Left));
         assert_eq!(a.fs.path, "/");
@@ -3320,7 +3539,10 @@ pub(crate) mod tests {
     fn fs_growth_view_window_and_writers() {
         let mut a = fs_app();
         a.set_fs_growth(Growth {
-            growers: vec![grower("/Users/me/Library/Caches", 3 << 30, vec![(200, "node", 5 << 20)]), grower("/private/var/log/x.log", 1 << 20, vec![])],
+            growers: vec![
+                grower("/Users/me/Library/Caches", 3 << 30, vec![(200, "node", 5 << 20)]),
+                grower("/private/var/log/x.log", 1 << 20, vec![]),
+            ],
             writers: vec![(200, "node".into(), 3 << 30)],
             deleted_open: vec![(400, "Chrome".into(), "/tmp/gone".into(), 2 << 30)],
             ..Default::default()
@@ -3335,7 +3557,10 @@ pub(crate) mod tests {
         assert_eq!(cmds, vec![Command::FsGrowth { window_ms: 600_000, under: None }]);
         assert_eq!(a.fs.mode, FsMode::Growth);
         a.fs.ensure_rows();
-        assert_eq!(a.fs.grows, vec![GrowthRow::Grower(0), GrowthRow::Grower(1), GrowthRow::Deleted(0), GrowthRow::Writer(0)]);
+        assert_eq!(
+            a.fs.grows,
+            vec![GrowthRow::Grower(0), GrowthRow::Grower(1), GrowthRow::Deleted(0), GrowthRow::Writer(0)]
+        );
         // window cycles 10m -> 1h -> 24h -> 10m
         assert_eq!(a.on_key(key('w')), vec![Command::FsGrowth { window_ms: 3_600_000, under: None }]);
         a.on_key(key('w'));
@@ -3357,7 +3582,14 @@ pub(crate) mod tests {
         assert_eq!(a.fs.mode, FsMode::Tree);
         assert_eq!(a.fs.path, "/private/var/log");
         assert_eq!(cmds[0], Command::FsList { path: "/private/var/log".into(), explicit: false });
-        a.set_fs_listing("/private/var/log", Some(listing("/private/var/log", vec![de("/private/var/log/a", 9, false), de("/private/var/log/x.log", 5, false)], false)));
+        a.set_fs_listing(
+            "/private/var/log",
+            Some(listing(
+                "/private/var/log",
+                vec![de("/private/var/log/a", 9, false), de("/private/var/log/x.log", 5, false)],
+                false,
+            )),
+        );
         a.fs.ensure_rows();
         assert_eq!(a.fs.selected_entry().unwrap().name, "x.log");
         // Esc leaves the growth view
@@ -3406,7 +3638,12 @@ pub(crate) mod tests {
         assert_eq!(child_growth("/Applications", &gs).delta, -(4 << 20));
         assert_eq!(child_growth("/", &gs).delta, (10 << 20) + (1 << 20) + 5 - (4 << 20));
         assert_eq!(child_growth("/nope", &gs), ChildGrowth::default());
-        assert!(path_within("/a/b", "/a") && path_within("/a", "/a") && path_within("/a/b", "/a/") && path_within("/x", "/"));
+        assert!(
+            path_within("/a/b", "/a")
+                && path_within("/a", "/a")
+                && path_within("/a/b", "/a/")
+                && path_within("/x", "/")
+        );
         assert!(!path_within("/a/bc", "/a/b"));
         assert_eq!(parent_dir("/a/b"), Some("/a".into()));
         assert_eq!(parent_dir("/a"), Some("/".into()));
@@ -3418,7 +3655,10 @@ pub(crate) mod tests {
     fn fs_volume_ring_for_time_travel() {
         let mut a = app();
         for i in 0..5 {
-            a.set_volumes(1_000_000 + i * 1000, vec![Volume { mount: "/".into(), used: 100 + i as u64, ..Default::default() }]);
+            a.set_volumes(
+                1_000_000 + i * 1000,
+                vec![Volume { mount: "/".into(), used: 100 + i as u64, ..Default::default() }],
+            );
         }
         assert_eq!(a.fs.used_at("/", 1_002_100), Some((1_002_000, 102)));
         assert_eq!(a.fs.used_at("/", 5_000_000), None, "outside what this session saw");

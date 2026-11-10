@@ -12,9 +12,11 @@ struct Fx {
 
 impl Fx {
     fn new(tag: &str) -> Fx {
-        let root = std::env::temp_dir()
-            .join("fat-scan-tests")
-            .join(format!("{tag}-{}-{}", std::process::id(), N.fetch_add(1, AO::SeqCst)));
+        let root = std::env::temp_dir().join("fat-scan-tests").join(format!(
+            "{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, AO::SeqCst)
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         // Canonical (macOS temp dir is behind the /var -> /private/var symlink).
@@ -124,7 +126,8 @@ fn bg_opts() -> Options {
 
 fn wait_complete(sc: &Scanner, root: &str) {
     wait_for("background scan completes", 20, &|| {
-        sc.progress().iter().any(|p| p.root == root && p.completed_at > 0) && sc.list(root).is_some_and(|l| !l.dir.partial)
+        sc.progress().iter().any(|p| p.root == root && p.completed_at > 0)
+            && sc.list(root).is_some_and(|l| !l.dir.partial)
     });
 }
 
@@ -136,7 +139,8 @@ fn child<'a>(l: &'a Listing, name: &str) -> &'a DirEntry {
 fn step(sc: &Scanner) -> Option<Vec<u8>> {
     let sh = sc.sh();
     let job = lock(&sh.st).pop(false)?;
-    let res = sys::read_dir(&job.path, sh.opts.big_file, if job.expand { EXPAND_FILES } else { 0 }, &job.policy, &sh.links);
+    let res =
+        sys::read_dir(&job.path, sh.opts.big_file, if job.expand { EXPAND_FILES } else { 0 }, &job.policy, &sh.links);
     lock(&sh.st).apply(&job, res, &sh.opts);
     Some(job.path)
 }
@@ -307,7 +311,10 @@ fn progressive_partial_flags() {
     assert_eq!(steps, 7);
     let l = sc.list(&root).unwrap();
     assert!(!l.dir.partial && l.children.iter().all(|c| !c.partial));
-    assert_eq!((l.dir.size, l.dir.files), { let d = du(&fx.root, &mut HashSet::new()); (d.0, d.2) });
+    assert_eq!((l.dir.size, l.dir.files), {
+        let d = du(&fx.root, &mut HashSet::new());
+        (d.0, d.2)
+    });
 
     // A refresh keeps showing the previous numbers (flagged partial) instead of dropping to 0.
     {
@@ -428,7 +435,10 @@ fn folding_keeps_totals_and_expands_on_focus() {
     let sc = Scanner::with_options(o);
     let root = fx.s("");
     let l = sc.scan_blocking(&root, 30_000).unwrap();
-    assert_eq!((l.dir.size, l.dir.files), { let d = du(&fx.root, &mut HashSet::new()); (d.0, d.2) });
+    assert_eq!((l.dir.size, l.dir.files), {
+        let d = du(&fx.root, &mut HashSet::new());
+        (d.0, d.2)
+    });
     // "many" is small: its children were folded into it, but it is kept (child of the root).
     let many = sc.list(&fx.s("many")).unwrap();
     assert!(many.children.is_empty());
@@ -572,7 +582,10 @@ fn bench_real_paths() {
             background: false,
             battery_check: false,
             budget: std::env::var("FAT_BENCH_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(0.25),
-            threads: std::env::var("FAT_BENCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(Options::default().threads),
+            threads: std::env::var("FAT_BENCH_THREADS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(Options::default().threads),
             ..Options::default()
         });
         let (t0, c0) = (Instant::now(), ru());
@@ -599,8 +612,19 @@ fn bench_real_paths() {
         match l {
             Some(l) => println!(
                 "BENCH {p}: {:.2}s wall, {:.2}s cpu ({:.0}% of a core), {} files ({:.0}/s), size {} KiB, apparent {}, files(tree) {}, denied {}, partial {}, errors {}, index nodes {}, bytes_seen {}",
-                dt, cpu, 100.0 * cpu / dt, files, files as f64 / dt, l.dir.size / 1024, l.dir.apparent, l.dir.files,
-                l.dir.denied, l.dir.partial, errs, sc.index_nodes(), bytes
+                dt,
+                cpu,
+                100.0 * cpu / dt,
+                files,
+                files as f64 / dt,
+                l.dir.size / 1024,
+                l.dir.apparent,
+                l.dir.files,
+                l.dir.denied,
+                l.dir.partial,
+                errs,
+                sc.index_nodes(),
+                bytes
             ),
             None => println!("BENCH {p}: no listing"),
         }
@@ -617,9 +641,22 @@ fn bench_real_paths() {
         let show = std::env::var("FAT_BENCH_SHOW").unwrap_or_default();
         for q in std::iter::once(p).chain(show.split(':').filter(|q| !q.is_empty())) {
             let Some(l) = sc.list(q) else { continue };
-            println!("  {q}: {} KiB partial={} files={} denied={}", l.dir.size / 1024, l.dir.partial, l.dir.files, l.dir.denied);
+            println!(
+                "  {q}: {} KiB partial={} files={} denied={}",
+                l.dir.size / 1024,
+                l.dir.partial,
+                l.dir.files,
+                l.dir.denied
+            );
             for c in l.children.iter().take(14) {
-                println!("   {:>12} KiB  {}{}{}{}", c.size / 1024, c.name, if c.mount_point { " [mount]" } else { "" }, if c.denied > 0 { format!(" [denied {}]", c.denied) } else { String::new() }, if c.partial { " [partial]" } else { "" });
+                println!(
+                    "   {:>12} KiB  {}{}{}{}",
+                    c.size / 1024,
+                    c.name,
+                    if c.mount_point { " [mount]" } else { "" },
+                    if c.denied > 0 { format!(" [denied {}]", c.denied) } else { String::new() },
+                    if c.partial { " [partial]" } else { "" }
+                );
             }
         }
     }
@@ -736,7 +773,9 @@ fn restat_sees_changes_in_cold_tree() {
     // New file in the folded p/q: p/q's mtime changes, p's does not.
     fx.file("p/q/new-big", 3_000_000);
     age(&fx.p("p/q/new-big"), 3 * 3600);
-    wait_for("restat sees the file in the folded dir", 20, &|| sc.list(&root).is_some_and(|l| l.dir.size > before + 2_500_000));
+    wait_for("restat sees the file in the folded dir", 20, &|| {
+        sc.list(&root).is_some_and(|l| l.dir.size > before + 2_500_000)
+    });
     let mid = sc.list(&root).unwrap().dir.size;
     // A big file kept by name grows in place, and is made to look old.
     {
@@ -881,7 +920,12 @@ fn root_kind_inherits_from_ancestors() {
     assert_eq!(q.root_kind(b"/Users/me/Documents/proj"), Kind::Normal);
     assert!(q.background_ok(b"/Users/me/Documents/proj/x"));
     // Root with $HOME=/var/root still protects other users' private folders.
-    let root = Policy { protect: true, home: b"/var/root".to_vec(), other_homes: vec![b"/Users/me".to_vec()], ..Default::default() };
+    let root = Policy {
+        protect: true,
+        home: b"/var/root".to_vec(),
+        other_homes: vec![b"/Users/me".to_vec()],
+        ..Default::default()
+    };
     assert_eq!(root.classify(b"/Users/me/Desktop", 1, 1), Kind::Protected);
 }
 

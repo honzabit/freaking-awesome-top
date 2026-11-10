@@ -99,7 +99,8 @@ pub fn diagnose_server_with(snap: &Snapshot, recorded: Option<&[Event]>, cfg: &S
     }
     let mut ef = diagnose_events(&events, now);
     // Unit findings already cover a unit that is failed/flapping right now.
-    let covered: HashSet<String> = snap.units.iter().filter(|u| u.is_failed() || u.flapping).map(|u| u.name.clone()).collect();
+    let covered: HashSet<String> =
+        snap.units.iter().filter(|u| u.is_failed() || u.flapping).map(|u| u.name.clone()).collect();
     ef.retain(|f| !covered.iter().any(|n| f.title.starts_with(&format!("{n} ")) && f.title.contains("restart")));
     out.extend(ef);
     let mut seen = HashSet::new();
@@ -146,7 +147,10 @@ fn units_with(units: &[Unit], cfg: &ServerCfg) -> Vec<Finding> {
         }
         detail.push('.');
         detail.push_str(&match u.result.as_str() {
-            "oom-kill" => " It was killed for exceeding its memory limit: check MemoryMax/--memory against its real need.".to_string(),
+            "oom-kill" => {
+                " It was killed for exceeding its memory limit: check MemoryMax/--memory against its real need."
+                    .to_string()
+            }
             "core-dump" | "signal" => " It crashed; `coredumpctl list` shows core dumps.".to_string(),
             "start-limit-hit" => " systemd gave up after too many restarts in a row.".to_string(),
             "timeout" => " It did not start or stop within its timeout.".to_string(),
@@ -160,7 +164,10 @@ fn units_with(units: &[Unit], cfg: &ServerCfg) -> Vec<Finding> {
             if crate::blame::is_protected_server_name(u.name.trim_end_matches(".service")) {
                 detail.push_str(" It is a database/system service: find out why before restarting it.");
             } else {
-                detail.push_str(&format!(" After fixing the cause: `systemctl reset-failed {0} && systemctl restart {0}`.", u.name));
+                detail.push_str(&format!(
+                    " After fixing the cause: `systemctl reset-failed {0} && systemctl restart {0}`.",
+                    u.name
+                ));
             }
         }
         let sev = if u.kind == UnitKind::Cgroup { Severity::Warn } else { Severity::Crit };
@@ -171,7 +178,10 @@ fn units_with(units: &[Unit], cfg: &ServerCfg) -> Vec<Finding> {
         out.push(finding(
             Severity::Crit,
             format!("{} more failed units", rest.len()),
-            format!("Also failed: {}. `systemctl --failed` lists systemd ones.", rest.iter().take(20).copied().collect::<Vec<_>>().join(", ")),
+            format!(
+                "Also failed: {}. `systemctl --failed` lists systemd ones.",
+                rest.iter().take(20).copied().collect::<Vec<_>>().join(", ")
+            ),
             vec![],
         ));
     }
@@ -185,14 +195,25 @@ fn units_with(units: &[Unit], cfg: &ServerCfg) -> Vec<Finding> {
                 u.recent_restarts,
                 human_dur(cfg.flap_window_s as i64 * 1000),
                 u.restarts,
-                if u.result.is_empty() || u.result == "success" { String::new() } else { format!("; last result {}", u.result) }
+                if u.result.is_empty() || u.result == "success" {
+                    String::new()
+                } else {
+                    format!("; last result {}", u.result)
+                }
             );
             if let Some(c) = u.exit_code.filter(|c| *c != 0) {
                 detail.push_str(&format!(" Last exit status {c}."));
             }
-            detail.push_str(" A restart loop hides the real error: the first lines of each start in its log say why it dies.");
+            detail.push_str(
+                " A restart loop hides the real error: the first lines of each start in its log say why it dies.",
+            );
             detail.push_str(&steps(u));
-            out.push(finding(Severity::Warn, format!("{} is in a restart loop", u.name), detail, u.main_pid.into_iter().collect()));
+            out.push(finding(
+                Severity::Warn,
+                format!("{} is in a restart loop", u.name),
+                detail,
+                u.main_pid.into_iter().collect(),
+            ));
         }
         // Memory limit.
         if let Some(l) = u.mem_limit.filter(|l| *l > 0) {
@@ -213,7 +234,8 @@ fn units_with(units: &[Unit], cfg: &ServerCfg) -> Vec<Finding> {
                 ));
             }
         }
-        if u.oom_kills > 0 && u.mem_limit.is_none_or(|l| (u.mem as f64 / l.max(1) as f64) < cfg.exhaustion_warn as f64) {
+        if u.oom_kills > 0 && u.mem_limit.is_none_or(|l| (u.mem as f64 / l.max(1) as f64) < cfg.exhaustion_warn as f64)
+        {
             out.push(finding(
                 Severity::Info,
                 format!("{} has had {} OOM kill{}", u.name, u.oom_kills, if u.oom_kills == 1 { "" } else { "s" }),
@@ -302,7 +324,15 @@ fn kernel_with(k: &Kernel, sys: &System, cfg: &ServerCfg) -> Vec<Finding> {
             .d_state
             .iter()
             .take(6)
-            .map(|d| format!("{} (pid {}{}{})", d.name, d.pid, if d.wchan.is_empty() { String::new() } else { format!(", in {}", d.wchan) }, d.unit.as_ref().map(|u| format!(", {u}")).unwrap_or_default()))
+            .map(|d| {
+                format!(
+                    "{} (pid {}{}{})",
+                    d.name,
+                    d.pid,
+                    if d.wchan.is_empty() { String::new() } else { format!(", in {}", d.wchan) },
+                    d.unit.as_ref().map(|u| format!(", {u}")).unwrap_or_default()
+                )
+            })
             .collect();
         let mut detail = format!(
             "Load {:.1} on {} cores while CPU is only {:.0}% busy: the load is tasks waiting, not computing{}.",
@@ -315,7 +345,12 @@ fn kernel_with(k: &Kernel, sys: &System, cfg: &ServerCfg) -> Vec<Finding> {
             detail.push_str(&format!(" Waiting: {}.", ds.join(", ")));
         }
         detail.push_str(" Usual causes: a slow or failing disk, a hung network/NFS/FUSE mount, or a starved VM. `fat what-happened` shows when it started and who did the I/O.");
-        out.push(finding(if sys.load[0] / cores >= 4.0 { Severity::Crit } else { Severity::Warn }, format!("Load {:.1} with idle CPU", sys.load[0]), detail, k.d_state.iter().map(|d| d.pid).collect()));
+        out.push(finding(
+            if sys.load[0] / cores >= 4.0 { Severity::Crit } else { Severity::Warn },
+            format!("Load {:.1} with idle CPU", sys.load[0]),
+            detail,
+            k.d_state.iter().map(|d| d.pid).collect(),
+        ));
     }
     if k.steal_pct >= STEAL_WARN {
         out.push(finding(
@@ -355,9 +390,18 @@ fn kernel_with(k: &Kernel, sys: &System, cfg: &ServerCfg) -> Vec<Finding> {
             continue;
         }
         let (effect, cmd) = match what {
-            "file descriptors" => ("opening files and sockets fails with \"Too many open files\"", "cat /proc/sys/fs/file-nr; then count /proc/<pid>/fd for the top services"),
-            "conntrack entries" => ("new connections are dropped (\"nf_conntrack: table full\")", "conntrack -S; sysctl net.netfilter.nf_conntrack_max"),
-            _ => ("outgoing connections fail with \"Cannot assign requested address\"", "ss -s; ss -tan state time-wait | wc -l"),
+            "file descriptors" => (
+                "opening files and sockets fails with \"Too many open files\"",
+                "cat /proc/sys/fs/file-nr; then count /proc/<pid>/fd for the top services",
+            ),
+            "conntrack entries" => (
+                "new connections are dropped (\"nf_conntrack: table full\")",
+                "conntrack -S; sysctl net.netfilter.nf_conntrack_max",
+            ),
+            _ => (
+                "outgoing connections fail with \"Cannot assign requested address\"",
+                "ss -s; ss -tan state time-wait | wc -l",
+            ),
         };
         out.push(finding(
             if r >= 0.95 { Severity::Crit } else { Severity::Warn },
@@ -409,7 +453,13 @@ fn kernel_with(k: &Kernel, sys: &System, cfg: &ServerCfg) -> Vec<Finding> {
         out.push(finding(
             Severity::Crit,
             format!("Filesystem errors on {}", f.mount.clone().unwrap_or_else(|| f.device.clone())),
-            format!("{} has recorded {} filesystem error{}{}. Check `journalctl -k` for the first one and plan an fsck.", f.device, f.errors, if f.errors == 1 { "" } else { "s" }, if f.read_only { " and is read-only" } else { "" }),
+            format!(
+                "{} has recorded {} filesystem error{}{}. Check `journalctl -k` for the first one and plan an fsck.",
+                f.device,
+                f.errors,
+                if f.errors == 1 { "" } else { "s" },
+                if f.read_only { " and is read-only" } else { "" }
+            ),
             vec![],
         ));
     }
@@ -417,7 +467,12 @@ fn kernel_with(k: &Kernel, sys: &System, cfg: &ServerCfg) -> Vec<Finding> {
         out.push(finding(
             Severity::Crit,
             format!("I/O errors on {}", d.name),
-            format!("{} reports {} I/O errors. `smartctl -a /dev/{}` (root) shows the drive's health.", d.name, d.io_errors.unwrap_or(0), d.name),
+            format!(
+                "{} reports {} I/O errors. `smartctl -a /dev/{}` (root) shows the drive's health.",
+                d.name,
+                d.io_errors.unwrap_or(0),
+                d.name
+            ),
             vec![],
         ));
     }
@@ -426,11 +481,19 @@ fn kernel_with(k: &Kernel, sys: &System, cfg: &ServerCfg) -> Vec<Finding> {
             out.push(finding(
                 Severity::Crit,
                 format!("RAID {} degraded", md.name),
-                format!("{} ({}) is {}: one more disk failure loses data. `cat /proc/mdstat`; `mdadm --detail /dev/{}`.", md.name, md.level, md.state, md.name),
+                format!(
+                    "{} ({}) is {}: one more disk failure loses data. `cat /proc/mdstat`; `mdadm --detail /dev/{}`.",
+                    md.name, md.level, md.state, md.name
+                ),
                 vec![],
             ));
         } else if let Some(p) = md.sync_pct {
-            out.push(finding(Severity::Info, format!("RAID {} {} {:.0}%", md.name, md.state, p), format!("{} is {} ({p:.0}% done); I/O is slower until it finishes.", md.name, md.state), vec![]));
+            out.push(finding(
+                Severity::Info,
+                format!("RAID {} {} {:.0}%", md.name, md.state, p),
+                format!("{} is {} ({p:.0}% done); I/O is slower until it finishes.", md.name, md.state),
+                vec![],
+            ));
         }
     }
     if k.ntp_synced == Some(false) {
@@ -457,7 +520,8 @@ fn kernel_with(k: &Kernel, sys: &System, cfg: &ServerCfg) -> Vec<Finding> {
 
 /// Findings from recent events (OOM kills in the last 24h, restart storms, hung tasks).
 pub fn diagnose_events(events: &[Event], now: Ts) -> Vec<Finding> {
-    let recent: Vec<&Event> = events.iter().filter(|e| e.ts <= now + 60_000 && now - e.ts <= EVENT_HORIZON_MS).collect();
+    let recent: Vec<&Event> =
+        events.iter().filter(|e| e.ts <= now + 60_000 && now - e.ts <= EVENT_HORIZON_MS).collect();
     let mut out = Vec::new();
     let ago = |t: Ts| format!("{} ago", human_dur(now - t));
     // OOM kills, grouped.
@@ -468,7 +532,11 @@ pub fn diagnose_events(events: &[Event], now: Ts) -> Vec<Finding> {
             let v = e.extra.get("victim").cloned().or_else(|| e.unit.clone()).unwrap_or_else(|| e.subject.clone());
             *victims.entry(v).or_default() += 1;
         }
-        let list = victims.iter().map(|(v, n)| if *n > 1 { format!("{v} x{n}") } else { v.clone() }).collect::<Vec<_>>().join(", ");
+        let list = victims
+            .iter()
+            .map(|(v, n)| if *n > 1 { format!("{v} x{n}") } else { v.clone() })
+            .collect::<Vec<_>>()
+            .join(", ");
         out.push(finding(
             if now - last.ts <= 3_600_000 { Severity::Crit } else { Severity::Warn },
             format!("{} OOM kill{} in 24h", ooms.len(), if ooms.len() == 1 { "" } else { "s" }),
@@ -495,10 +563,20 @@ pub fn diagnose_events(events: &[Event], now: Ts) -> Vec<Finding> {
     }
     // Kernel trouble.
     let groups: [(EventKind, Severity, &str, &str); 5] = [
-        (EventKind::HungTask, Severity::Warn, "hung task", "tasks stuck in the kernel in D state (usually storage or a stuck mount)"),
+        (
+            EventKind::HungTask,
+            Severity::Warn,
+            "hung task",
+            "tasks stuck in the kernel in D state (usually storage or a stuck mount)",
+        ),
         (EventKind::DiskError, Severity::Crit, "disk/filesystem error", "the kernel logged I/O or filesystem errors"),
         (EventKind::RoRemount, Severity::Crit, "read-only remount", "a filesystem went read-only after errors"),
-        (EventKind::KernelWarn, Severity::Info, "kernel warning", "WARN/BUG/soft lockup/segfault lines in the kernel log"),
+        (
+            EventKind::KernelWarn,
+            Severity::Info,
+            "kernel warning",
+            "WARN/BUG/soft lockup/segfault lines in the kernel log",
+        ),
         (EventKind::ClockUnsynced, Severity::Warn, "clock unsync", "the system clock lost synchronisation"),
     ];
     for (kind, sev, word, what) in groups {
@@ -515,7 +593,13 @@ pub fn diagnose_events(events: &[Event], now: Ts) -> Vec<Finding> {
         out.push(finding(
             sev,
             format!("{} {word}{} in 24h", ev.len(), if ev.len() == 1 { "" } else { "s" }),
-            format!("{what}: {} ({}). Last: {}. `fat events --kind {}` lists them.", subj.join(", "), ago(last.ts), last.detail, kind.as_str().replace('_', "-")),
+            format!(
+                "{what}: {} ({}). Last: {}. `fat events --kind {}` lists them.",
+                subj.join(", "),
+                ago(last.ts),
+                last.detail,
+                kind.as_str().replace('_', "-")
+            ),
             ev.iter().filter_map(|e| e.pid).collect(),
         ));
     }
@@ -530,7 +614,13 @@ mod tests {
     const GB: u64 = 1 << 30;
 
     fn u(name: &str) -> Unit {
-        Unit { name: name.into(), kind: UnitKind::Systemd, state: "active".into(), main_pid: Some(10), ..Default::default() }
+        Unit {
+            name: name.into(),
+            kind: UnitKind::Systemd,
+            state: "active".into(),
+            main_pid: Some(10),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -560,7 +650,11 @@ mod tests {
         assert!(t.contains(&"api.service failed (exit-code, status 2)"), "{t:?}");
         let api = fs.iter().find(|f| f.title.starts_with("api.service")).unwrap();
         assert_eq!(api.severity, "crit");
-        assert!(api.detail.contains("journalctl -u api.service") && api.detail.contains("systemctl restart api.service"), "{}", api.detail);
+        assert!(
+            api.detail.contains("journalctl -u api.service") && api.detail.contains("systemctl restart api.service"),
+            "{}",
+            api.detail
+        );
         assert_eq!(api.action, None, "fat never restarts units");
         let pg = fs.iter().find(|f| f.title.starts_with("postgresql.service")).unwrap();
         assert!(!pg.detail.contains("systemctl restart") && pg.detail.contains("find out why"), "{}", pg.detail);
@@ -593,8 +687,23 @@ mod tests {
             iowait_pct: 30.0,
             steal_pct: 15.0,
             procs_blocked: 9,
-            d_state: vec![DStateProc { pid: 7, name: "tar".into(), wchan: "io_schedule".into(), seconds: 30, unit: Some("backup.service".into()) }],
-            disks: vec![DiskStat { name: "sda".into(), w_await_ms: 250.0, queue_depth: 30.0, util_pct: 100.0, ..Default::default() }, DiskStat { name: "sdb".into(), io_errors: Some(3), ..Default::default() }],
+            d_state: vec![DStateProc {
+                pid: 7,
+                name: "tar".into(),
+                wchan: "io_schedule".into(),
+                seconds: 30,
+                unit: Some("backup.service".into()),
+            }],
+            disks: vec![
+                DiskStat {
+                    name: "sda".into(),
+                    w_await_ms: 250.0,
+                    queue_depth: 30.0,
+                    util_pct: 100.0,
+                    ..Default::default()
+                },
+                DiskStat { name: "sdb".into(), io_errors: Some(3), ..Default::default() },
+            ],
             fd_used: Some(96_000),
             fd_max: Some(100_000),
             conntrack_used: Some(10),
@@ -602,8 +711,19 @@ mod tests {
             ephemeral_used: Some(25_000),
             ephemeral_range: Some((32768, 60999)),
             ro_remounts: vec!["/data".into()],
-            fs_errors: vec![FsErrorStat { device: "sdc1".into(), mount: Some("/srv".into()), errors: 2, read_only: false }],
-            mdraid: vec![MdArray { name: "md0".into(), level: "raid1".into(), state: "degraded".into(), degraded: true, sync_pct: None }],
+            fs_errors: vec![FsErrorStat {
+                device: "sdc1".into(),
+                mount: Some("/srv".into()),
+                errors: 2,
+                read_only: false,
+            }],
+            mdraid: vec![MdArray {
+                name: "md0".into(),
+                level: "raid1".into(),
+                state: "degraded".into(),
+                degraded: true,
+                sync_pct: None,
+            }],
             ntp_synced: Some(false),
             taint: 4097,
             taint_flags: "PO".into(),
@@ -617,11 +737,25 @@ mod tests {
         let t: Vec<&str> = fs.iter().map(|f| f.title.as_str()).collect();
         let load = fs.iter().find(|f| f.title.starts_with("Load 12.0 with idle CPU")).expect("load idle");
         assert_eq!(load.severity, "warn");
-        assert!(load.detail.contains("tar (pid 7, in io_schedule, backup.service)") && load.detail.contains("sda await 250 ms"), "{}", load.detail);
+        assert!(
+            load.detail.contains("tar (pid 7, in io_schedule, backup.service)")
+                && load.detail.contains("sda await 250 ms"),
+            "{}",
+            load.detail
+        );
         for want in [
-            "CPU steal 15%", "sda I/O latency 250 ms", "file descriptors 96% used", "ephemeral ports 89% used", "/data is read-only",
-            "Filesystem errors on /srv", "I/O errors on sdb", "RAID md0 degraded", "Clock not synchronised", "Kernel tainted (PO)",
-            "Swap thrashing (1200 pages/s)", "Memory stalls: the system is thrashing",
+            "CPU steal 15%",
+            "sda I/O latency 250 ms",
+            "file descriptors 96% used",
+            "ephemeral ports 89% used",
+            "/data is read-only",
+            "Filesystem errors on /srv",
+            "I/O errors on sdb",
+            "RAID md0 degraded",
+            "Clock not synchronised",
+            "Kernel tainted (PO)",
+            "Swap thrashing (1200 pages/s)",
+            "Memory stalls: the system is thrashing",
         ] {
             assert!(t.contains(&want), "missing {want}: {t:?}");
         }
@@ -629,7 +763,8 @@ mod tests {
         assert!(!t.iter().any(|x| x.starts_with("iowait")), "slow disk already explains iowait");
         assert_eq!(fs.iter().find(|f| f.title.starts_with("file descriptors")).unwrap().severity, "crit");
         // Quiet kernel: nothing.
-        let quiet = kernel_with(&Kernel::default(), &System { cores: 4, load: [0.5, 0.5, 0.5], ..Default::default() }, &cfg);
+        let quiet =
+            kernel_with(&Kernel::default(), &System { cores: 4, load: [0.5, 0.5, 0.5], ..Default::default() }, &cfg);
         assert!(quiet.is_empty(), "{quiet:?}");
         // Thresholds are config.
         let lax = ServerCfg { disk_await_warn_ms: 500.0, exhaustion_warn: 0.99, ..Default::default() };
@@ -669,7 +804,11 @@ mod tests {
         let graded = |sev: Severity| {
             let mut e = ev(40, EventKind::DiskError, None, &[]);
             e.severity = sev;
-            diagnose_events(&[e], now).into_iter().find(|f| f.title == "1 disk/filesystem error in 24h").expect("disk error").severity
+            diagnose_events(&[e], now)
+                .into_iter()
+                .find(|f| f.title == "1 disk/filesystem error in 24h")
+                .expect("disk error")
+                .severity
         };
         assert_eq!(graded(Severity::Warn), "warn", "a discard warning is not a media error");
         assert_eq!(graded(Severity::Crit), "crit");
@@ -678,7 +817,13 @@ mod tests {
         let mut flap = u("api.service");
         flap.flapping = true;
         flap.recent_restarts = 3;
-        let snap = Snapshot { ts: now, units: vec![flap], kernel: Some(Kernel::default()), system: System { cores: 2, ..Default::default() }, ..Default::default() };
+        let snap = Snapshot {
+            ts: now,
+            units: vec![flap],
+            kernel: Some(Kernel::default()),
+            system: System { cores: 2, ..Default::default() },
+            ..Default::default()
+        };
         let all = diagnose_server_with(&snap, Some(&events), &ServerCfg::default());
         assert!(all.iter().any(|f| f.title == "api.service is in a restart loop"));
         assert!(!all.iter().any(|f| f.title == "api.service restarted 3 times in 24h"), "{all:?}");
@@ -689,13 +834,33 @@ mod tests {
     #[test]
     fn servers_protect_databases_and_plumbing() {
         use crate::blame::is_protected_server_name as prot;
-        for n in ["postgres", "postgresql@16-main.service", "mysql.service", "mysqld", "redis-server", "mongod", "clickhouse-server", "ssh.service", "systemd-journald", "dbus.service", "kubelet.service"] {
+        for n in [
+            "postgres",
+            "postgresql@16-main.service",
+            "mysql.service",
+            "mysqld",
+            "redis-server",
+            "mongod",
+            "clickhouse-server",
+            "ssh.service",
+            "systemd-journald",
+            "dbus.service",
+            "kubelet.service",
+        ] {
             assert!(prot(n), "{n}");
         }
         for n in ["api.service", "node", "backup.service", "nginx"] {
             assert!(!prot(n), "{n}");
         }
-        let p = |pid: u32, ppid: u32, name: &str, cmd: &str, cpu: f32| crate::model::Proc { pid, ppid, name: name.into(), cmd: cmd.into(), user: "root".into(), cpu, ..Default::default() };
+        let p = |pid: u32, ppid: u32, name: &str, cmd: &str, cpu: f32| crate::model::Proc {
+            pid,
+            ppid,
+            name: name.into(),
+            cmd: cmd.into(),
+            user: "root".into(),
+            cpu,
+            ..Default::default()
+        };
         let snap = Snapshot {
             system: System { os: "Linux 6.1".into(), cores: 4, load: [1.0; 3], ..Default::default() },
             procs: vec![

@@ -1499,7 +1499,11 @@ fn coordinator(sh: Arc<Shared>) {
             flush(&sh);
         }
         let st = lock(&sh.st);
-        let tick = sh.opts.reload_interval.min(sh.opts.flush_interval).clamp(Duration::from_millis(20), Duration::from_secs(1));
+        let tick = sh
+            .opts
+            .reload_interval
+            .min(sh.opts.flush_interval)
+            .clamp(Duration::from_millis(20), Duration::from_secs(1));
         let _ = sh.done.wait_timeout(st, tick);
     }
     flush(&sh);
@@ -1775,7 +1779,11 @@ fn restat_pass(sh: &Arc<Shared>, root: &[u8]) {
                     at: n.at,
                     folded: n.has(F_FOLDED),
                     warm: n.own.newest >= now / 1000 - WARM_SECS,
-                    kept: if n.has(F_FOLDED) { n.children.iter().map(|&c| st.tree.n(c).name.clone()).collect() } else { HashSet::new() },
+                    kept: if n.has(F_FOLDED) {
+                        n.children.iter().map(|&c| st.tree.n(c).name.clone()).collect()
+                    } else {
+                        HashSet::new()
+                    },
                     big: n.big.iter().map(|f| (f.name.clone(), f.size, f.mtime)).collect(),
                     path,
                 });
@@ -1835,7 +1843,13 @@ fn restat_pass(sh: &Arc<Shared>, root: &[u8]) {
                 (level == 0 && p.rsplit(|&b| b == b'/').next().is_some_and(|n| it.kept.contains(n))) || policy.blocks(p)
             };
             !it.folded
-                || !sys::subdir_changed_after(&it.path, it.at.saturating_mul(1_000_000), if it.warm { 4 } else { 1 }, 256, &skip)
+                || !sys::subdir_changed_after(
+                    &it.path,
+                    it.at.saturating_mul(1_000_000),
+                    if it.warm { 4 } else { 1 },
+                    256,
+                    &skip,
+                )
         };
         if !same || !big_same() || !folded_same() {
             changed.push((it.id, it.stamp));

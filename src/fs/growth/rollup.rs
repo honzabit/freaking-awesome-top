@@ -28,16 +28,7 @@ pub struct Obs {
 
 impl Obs {
     pub fn new(path: impl Into<String>, ev: Evidence) -> Obs {
-        Obs {
-            path: path.into(),
-            is_dir: false,
-            delta: None,
-            size: None,
-            touched: 0,
-            writers: vec![],
-            ev,
-            total: false,
-        }
+        Obs { path: path.into(), is_dir: false, delta: None, size: None, touched: 0, writers: vec![], ev, total: false }
     }
 }
 
@@ -87,10 +78,7 @@ pub fn merge(obs: Vec<Obs>) -> Vec<Item> {
         .into_iter()
         .map(|(path, mut v)| {
             v.sort_by_key(|o| rank(o.ev));
-            let mut it = Item {
-                path,
-                ..Default::default()
-            };
+            let mut it = Item { path, ..Default::default() };
             if let Some(best) = v.iter().find(|o| o.delta.is_some()) {
                 it.delta = best.delta.unwrap_or(0);
                 it.total = best.total;
@@ -149,11 +137,7 @@ struct Node {
 /// fill remaining slots after the byte growers.
 pub fn rollup(root: &str, items: Vec<Item>, cap: usize) -> Vec<Grower> {
     let root = normalize(root);
-    let mut nodes: Vec<Node> = vec![Node {
-        path: root.clone(),
-        is_dir: true,
-        ..Default::default()
-    }];
+    let mut nodes: Vec<Node> = vec![Node { path: root.clone(), is_dir: true, ..Default::default() }];
     let mut idx: HashMap<String, usize> = HashMap::new();
     idx.insert(root.clone(), 0);
     for it in items {
@@ -182,11 +166,7 @@ pub fn rollup(root: &str, items: Vec<Item>, cap: usize) -> Vec<Grower> {
             }
             let par = parent(&c).and_then(|pp| idx.get(pp).copied()).unwrap_or(0);
             let i = nodes.len();
-            nodes.push(Node {
-                path: c.clone(),
-                is_dir: true,
-                ..Default::default()
-            });
+            nodes.push(Node { path: c.clone(), is_dir: true, ..Default::default() });
             nodes[par].children.push(i);
             idx.insert(c, i);
         }
@@ -274,8 +254,21 @@ const CHILD_SHARE: i64 = 10;
 /// always broken down into their children when any child moved.
 fn is_generic(p: &str) -> bool {
     const FIXED: &[&str] = &[
-        "/", "/Users", "/home", "/root", "/var/root", "/private", "/private/var", "/private/var/root", "/var",
-        "/System", "/System/Volumes", "/System/Volumes/Data", "/Volumes", "/mnt", "/media",
+        "/",
+        "/Users",
+        "/home",
+        "/root",
+        "/var/root",
+        "/private",
+        "/private/var",
+        "/private/var/root",
+        "/var",
+        "/System",
+        "/System/Volumes",
+        "/System/Volumes/Data",
+        "/Volumes",
+        "/mnt",
+        "/media",
     ];
     if FIXED.contains(&p) {
         return true;
@@ -314,7 +307,13 @@ fn select_growers(nodes: &[Node], cap: usize) -> Vec<Grower> {
             .copied()
             .filter(|&c| nodes[c].delta != 0 && nodes[c].delta.saturating_abs() >= thr.max(1))
             .collect();
-        kids.sort_by(|&a, &b| nodes[b].delta.saturating_abs().cmp(&nodes[a].delta.saturating_abs()).then(nodes[a].path.cmp(&nodes[b].path)));
+        kids.sort_by(|&a, &b| {
+            nodes[b]
+                .delta
+                .saturating_abs()
+                .cmp(&nodes[a].delta.saturating_abs())
+                .then(nodes[a].path.cmp(&nodes[b].path))
+        });
         kids.truncate(cap);
         if kids.is_empty() {
             // Nothing deeper explains it: the node itself is the most specific answer.
@@ -325,7 +324,10 @@ fn select_growers(nodes: &[Node], cap: usize) -> Vec<Grower> {
         }
         let explained: i64 = kids.iter().map(|&c| nodes[c].delta).sum();
         let rest = d - explained;
-        if rest != 0 && rest.signum() == d.signum() && rest.saturating_abs() >= MIN_REMAINDER.max(d.saturating_abs() * REMAINDER_SHARE / 100) {
+        if rest != 0
+            && rest.signum() == d.signum()
+            && rest.saturating_abs() >= MIN_REMAINDER.max(d.saturating_abs() * REMAINDER_SHARE / 100)
+        {
             picks.push(Pick::Other(i, rest));
         }
         // Reverse so the biggest child is expanded first (only matters for determinism).
@@ -364,7 +366,9 @@ fn select_growers(nodes: &[Node], cap: usize) -> Vec<Grower> {
                 let mut w: Vec<(u32, String, u64)> = vec![];
                 let mut ev: Vec<Evidence> = vec![];
                 let mut touched = 0u64;
-                let unlisted = n.children.iter().copied().filter(|c| !listed.iter().any(|&l| l == *c || super::under_prefix(&nodes[l].path, &nodes[*c].path)));
+                let unlisted = n.children.iter().copied().filter(|c| {
+                    !listed.iter().any(|&l| l == *c || super::under_prefix(&nodes[l].path, &nodes[*c].path))
+                });
                 for c in unlisted {
                     merge_writers(&mut w, &nodes[c].writers);
                     touched += nodes[c].touched;
@@ -389,7 +393,9 @@ fn select_growers(nodes: &[Node], cap: usize) -> Vec<Grower> {
                 ev.sort_by_key(|e| rank(*e));
                 // SIZE of the remainder too, not the whole directory: the outermost listed
                 // paths below it have rows of their own, so their bytes are not counted twice.
-                let outer = listed.iter().filter(|&&l| !listed.iter().any(|&m| m != l && super::under_prefix(&nodes[l].path, &nodes[m].path)));
+                let outer = listed.iter().filter(|&&l| {
+                    !listed.iter().any(|&m| m != l && super::under_prefix(&nodes[l].path, &nodes[m].path))
+                });
                 let listed_size: u64 = outer.map(|&l| nodes[l].size.unwrap_or(0)).sum();
                 Grower {
                     path: n.path.clone(),
@@ -533,7 +539,19 @@ mod tests {
         let g = rollup("/", items, 50);
         assert_eq!(paths(&g), vec![("/w/a/big", 1000 * MB)]);
         // 30% unexplained but only 3 MB: below the 10 MB floor.
-        let g = rollup("/", vec![item("/v/k/x", 7 * MB), item("/v/k/y1", MB / 2), item("/v/k/y2", MB / 2), item("/v/k/y3", MB / 2), item("/v/k/y4", MB / 2), item("/v/k/y5", MB / 2), item("/v/k/y6", MB / 2)], 50);
+        let g = rollup(
+            "/",
+            vec![
+                item("/v/k/x", 7 * MB),
+                item("/v/k/y1", MB / 2),
+                item("/v/k/y2", MB / 2),
+                item("/v/k/y3", MB / 2),
+                item("/v/k/y4", MB / 2),
+                item("/v/k/y5", MB / 2),
+                item("/v/k/y6", MB / 2),
+            ],
+            50,
+        );
         assert!(!g.iter().any(|x| x.other), "{:?}", paths(&g));
     }
 
@@ -545,7 +563,11 @@ mod tests {
         items.extend((0..40).map(|i| item(&format!("/Users/me/dl{i}.bin"), 8 * MB)));
         let g = rollup("/", items, 50);
         assert_eq!(g[0].path, "/Users/me/code/app/target/debug/app");
-        assert!(!g.iter().any(|x| x.path == "/" || (x.path == "/Users/me" && !x.other) || x.path == "/Users"), "{:?}", paths(&g));
+        assert!(
+            !g.iter().any(|x| x.path == "/" || (x.path == "/Users/me" && !x.other) || x.path == "/Users"),
+            "{:?}",
+            paths(&g)
+        );
         no_overlap(&g);
         // A home dir with many equal children is broken down into them (it is generic).
         let items: Vec<Item> = (0..5).map(|i| item(&format!("/Users/me/p{i}/f"), 100 * MB)).collect();
@@ -636,10 +658,7 @@ mod tests {
         assert_eq!(m.size, Some(900));
         assert_eq!(m.touched, 3);
         assert_eq!(m.writers, vec![(7, "dd".to_string(), 100)]);
-        assert_eq!(
-            m.evidence,
-            vec![Evidence::Fsevents, Evidence::OpenFiles, Evidence::Mtime]
-        );
+        assert_eq!(m.evidence, vec![Evidence::Fsevents, Evidence::OpenFiles, Evidence::Mtime]);
 
         let mut s = Obs::new("/x", Evidence::ScanDiff);
         s.delta = Some(10);

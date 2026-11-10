@@ -355,7 +355,8 @@ pub fn group_deleted(v: &[(u32, String, String, u64)], min: u64) -> (Vec<Deleted
                     g.biggest = path.clone();
                 }
             }
-            None => groups.push((DeletedGroup { pid: *pid, name: name.clone(), files: 1, bytes: *b, biggest: path.clone() }, *b)),
+            None => groups
+                .push((DeletedGroup { pid: *pid, name: name.clone(), files: 1, bytes: *b, biggest: path.clone() }, *b)),
         }
     }
     let mut groups: Vec<DeletedGroup> = groups.into_iter().map(|(g, _)| g).collect();
@@ -413,7 +414,11 @@ pub fn volume_hidden(v: &crate::fs::Volume, all: &[crate::fs::Volume]) -> bool {
     if m == "/" && v.read_only && all.iter().any(|o| o.primary && o.mount != "/") {
         return true;
     }
-    m.starts_with("/etc/") || m.starts_with("/dev/") || m.starts_with("/proc") || m.starts_with("/sys/") || v.fstype == "squashfs"
+    m.starts_with("/etc/")
+        || m.starts_with("/dev/")
+        || m.starts_with("/proc")
+        || m.starts_with("/sys/")
+        || v.fstype == "squashfs"
 }
 
 #[cfg(test)]
@@ -471,8 +476,20 @@ mod tests {
     #[test]
     fn hidden_volumes() {
         use crate::fs::Volume;
-        let v = |m: &str, ro: bool, primary: bool| Volume { mount: m.into(), total: 100, read_only: ro, primary, ..Default::default() };
-        let mac = vec![v("/", true, false), v("/System/Volumes/Data", false, true), v("/System/Volumes/VM", false, false), v("/System/Volumes/Preboot", false, false), v("/Volumes/Install", true, false)];
+        let v = |m: &str, ro: bool, primary: bool| Volume {
+            mount: m.into(),
+            total: 100,
+            read_only: ro,
+            primary,
+            ..Default::default()
+        };
+        let mac = vec![
+            v("/", true, false),
+            v("/System/Volumes/Data", false, true),
+            v("/System/Volumes/VM", false, false),
+            v("/System/Volumes/Preboot", false, false),
+            v("/Volumes/Install", true, false),
+        ];
         let shown: Vec<&str> = mac.iter().filter(|x| !volume_hidden(x, &mac)).map(|x| x.mount.as_str()).collect();
         assert_eq!(shown, vec!["/System/Volumes/Data", "/System/Volumes/VM", "/Volumes/Install"]);
         let linux = vec![v("/", false, true), v("/etc/hosts", false, false), v("/home", false, false)];

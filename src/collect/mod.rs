@@ -143,9 +143,7 @@ impl Collector {
         if let Some(n) = self.user_names.get(&uid) {
             return n.clone();
         }
-        let lookup = |users: &Users| {
-            users.iter().find(|u| **u.id() == uid).map(|u| u.name().to_string())
-        };
+        let lookup = |users: &Users| users.iter().find(|u| **u.id() == uid).map(|u| u.name().to_string());
         let mut name = lookup(&self.users);
         if name.is_none() && self.users_loaded.elapsed() > USERS_REFRESH {
             self.users.refresh();
@@ -296,12 +294,7 @@ impl Collector {
             .values()
             .map(|p| {
                 let pid = p.pid().as_u32();
-                let cmd = p
-                    .cmd()
-                    .iter()
-                    .map(|s| s.to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let cmd = p.cmd().iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join(" ");
                 let uid = p.user_id().map(|u| **u);
                 let du = p.disk_usage();
                 let base = Proc {
@@ -430,7 +423,9 @@ impl Collector {
                     cg_psi = true;
                 }
             }
-            if let Some(cpus) = self.cg.cpus.as_ref().filter(|c| c.len() < per_core.len() && c.iter().all(|&i| i < per_core.len())) {
+            if let Some(cpus) =
+                self.cg.cpus.as_ref().filter(|c| c.len() < per_core.len() && c.iter().all(|&i| i < per_core.len()))
+            {
                 per_core = cpus.iter().map(|&i| per_core[i]).collect();
                 cpu = per_core.iter().sum::<f32>() / per_core.len().max(1) as f32;
             }
@@ -607,7 +602,10 @@ mod tests {
         }
         let s = c.sample();
         let me = s.proc(std::process::id()).expect("self");
-        eprintln!("self: {me:?}\nsystem: power_source={} psi={:?} temp={:?}", s.system.power_source, s.system.psi, s.system.temp_c);
+        eprintln!(
+            "self: {me:?}\nsystem: power_source={} psi={:?} temp={:?}",
+            s.system.power_source, s.system.psi, s.system.temp_c
+        );
         assert!(me.cpu > 20.0, "own cpu {}", me.cpu);
         assert!(me.threads >= 1);
         assert!(me.start_time > 1_000_000_000);

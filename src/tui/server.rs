@@ -53,7 +53,10 @@ impl Panel {
 pub fn incident_panel(inc: &Incident) -> Panel {
     let mut sections = Vec::new();
     if !inc.chain.is_empty() {
-        sections.push(("What happened".to_string(), inc.chain.iter().enumerate().map(|(i, s)| format!("{}{s}", if i == 0 { "" } else { "↳ " })).collect()));
+        sections.push((
+            "What happened".to_string(),
+            inc.chain.iter().enumerate().map(|(i, s)| format!("{}{s}", if i == 0 { "" } else { "↳ " })).collect(),
+        ));
     }
     if !inc.culprits.is_empty() {
         let v = inc
@@ -95,7 +98,11 @@ pub fn incident_panel(inc: &Incident) -> Panel {
     let host = if inc.host.is_empty() { String::new() } else { format!("{} · ", inc.host) };
     Panel {
         title: format!("What happened · {host}{when}"),
-        headline: if inc.headline.is_empty() { "nothing unusual found in this window".into() } else { inc.headline.clone() },
+        headline: if inc.headline.is_empty() {
+            "nothing unusual found in this window".into()
+        } else {
+            inc.headline.clone()
+        },
         severity: inc.severity,
         sections,
         pid: inc.culprits.iter().find_map(|c| c.pid),
@@ -286,7 +293,10 @@ impl ServicesView {
         }
         self.dirty = false;
         (self.rows, self.hidden) = unit_order(units, self, warn);
-        let found = self.sel_key.as_ref().and_then(|(k, n)| self.rows.iter().position(|&i| units[i].kind == *k && units[i].name == *n));
+        let found = self
+            .sel_key
+            .as_ref()
+            .and_then(|(k, n)| self.rows.iter().position(|&i| units[i].kind == *k && units[i].name == *n));
         self.sel = found.unwrap_or_else(|| self.sel.min(self.rows.len().saturating_sub(1)));
     }
 
@@ -362,7 +372,8 @@ pub fn unit_hints(u: &Unit) -> Vec<String> {
             let c = u.container.as_ref();
             // The runtime as detected; unknown = no runtime CLI is suggested at all.
             let rt = c.map(|c| c.runtime.as_str()).unwrap_or("");
-            let name = c.map(|c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() }).unwrap_or(u.name.as_str());
+            let name =
+                c.map(|c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() }).unwrap_or(u.name.as_str());
             match rt {
                 "" => {
                     if !u.cgroup.is_empty() {
@@ -379,7 +390,9 @@ pub fn unit_hints(u: &Unit) -> Vec<String> {
                     v.push(format!("{rt} inspect {name}"));
                 }
             }
-            if let Some((pod, ns)) = c.and_then(|c| Some((c.pod.as_deref()?, c.namespace.as_deref().unwrap_or("default")))) {
+            if let Some((pod, ns)) =
+                c.and_then(|c| Some((c.pod.as_deref()?, c.namespace.as_deref().unwrap_or("default"))))
+            {
                 v.push(format!("kubectl -n {ns} describe pod {pod}"));
             }
         }
@@ -402,7 +415,15 @@ pub fn unit_hints(u: &Unit) -> Vec<String> {
 /// processes, its recent events and read-only next steps.
 pub fn unit_panel(u: &Unit, snap: Option<&Snapshot>, events: &[Event], warn: f32, now: Ts) -> Panel {
     let since = u.since.map(|s| format!(" for {}", fmt_dur(((now - s).max(0) / 1000) as u64))).unwrap_or_default();
-    let mut head = format!("{} {}{since}", u.name, if u.sub_state.is_empty() || u.sub_state == u.state { u.state.clone() } else { format!("{} ({})", u.state, u.sub_state) });
+    let mut head = format!(
+        "{} {}{since}",
+        u.name,
+        if u.sub_state.is_empty() || u.sub_state == u.state {
+            u.state.clone()
+        } else {
+            format!("{} ({})", u.state, u.sub_state)
+        }
+    );
     if !u.result.is_empty() && u.result != "success" {
         head.push_str(&format!(" · result {}", u.result));
     }
@@ -445,7 +466,11 @@ pub fn unit_panel(u: &Unit, snap: Option<&Snapshot>, events: &[Event], warn: f32
     }
     what.push(format!("restarts {} total, {} recently", u.restarts, u.recent_restarts));
 
-    let mut res = vec![format!("cpu {:.1}%{}", u.cpu, u.cpu_quota.map(|q| format!(" of a {q:.2}-core quota")).unwrap_or_default())];
+    let mut res = vec![format!(
+        "cpu {:.1}%{}",
+        u.cpu,
+        u.cpu_quota.map(|q| format!(" of a {q:.2}-core quota")).unwrap_or_default()
+    )];
     let mut mem = format!("memory {}", fmt_bytes(u.mem));
     if let (Some(l), Some(r)) = (u.mem_limit, mem_limit_ratio(u)) {
         mem.push_str(&format!(" of {} limit ({:.0}%)", fmt_bytes(l), r * 100.0));
@@ -464,7 +489,10 @@ pub fn unit_panel(u: &Unit, snap: Option<&Snapshot>, events: &[Event], warn: f32
         res.push(format!("throttled {:.0}% of the last interval by its cpu limit", u.cpu_throttled_pct));
     }
     if let Some(p) = &u.psi {
-        res.push(format!("pressure (avg10) cpu {:.0}% mem {:.0}%/{:.0}% io {:.0}%/{:.0}% (some/full)", p.cpu_some, p.mem_some, p.mem_full, p.io_some, p.io_full));
+        res.push(format!(
+            "pressure (avg10) cpu {:.0}% mem {:.0}%/{:.0}% io {:.0}%/{:.0}% (some/full)",
+            p.cpu_some, p.mem_some, p.mem_full, p.io_some, p.io_full
+        ));
     }
     if u.oom_kills > 0 {
         res.push(format!("{} OOM kill(s) inside this unit", u.oom_kills));
@@ -478,7 +506,16 @@ pub fn unit_panel(u: &Unit, snap: Option<&Snapshot>, events: &[Event], warn: f32
             let mut v: Vec<String> = procs
                 .iter()
                 .take(PANEL_ITEMS)
-                .map(|p| format!("{} {} cpu {:.1}% mem {}{}", p.pid, p.name, p.cpu, fmt_bytes(p.mem), if p.status == "D" { " (D: waiting on I/O)" } else { "" }))
+                .map(|p| {
+                    format!(
+                        "{} {} cpu {:.1}% mem {}{}",
+                        p.pid,
+                        p.name,
+                        p.cpu,
+                        fmt_bytes(p.mem),
+                        if p.status == "D" { " (D: waiting on I/O)" } else { "" }
+                    )
+                })
                 .collect();
             if procs.len() > PANEL_ITEMS {
                 v.push(format!("… {} more", procs.len() - PANEL_ITEMS));
@@ -495,7 +532,15 @@ pub fn unit_panel(u: &Unit, snap: Option<&Snapshot>, events: &[Event], warn: f32
     if !u.notes.is_empty() {
         sections.push(("Notes".to_string(), u.notes.clone()));
     }
-    Panel { title: format!("Unit · {}", u.name), headline: head, severity, sections, pid: u.main_pid, pending: None, scroll: 0 }
+    Panel {
+        title: format!("Unit · {}", u.name),
+        headline: head,
+        severity,
+        sections,
+        pid: u.main_pid,
+        pending: None,
+        scroll: 0,
+    }
 }
 
 // ------------------------------------------------------------------------------- events
@@ -581,8 +626,12 @@ impl EventsView {
         let from = now - self.window_ms();
         self.merged = merge_events(self.recorded.as_deref().unwrap_or(&[]), ring, from);
         let f = self.filter_lower.as_str();
-        self.rows = (0..self.merged.len()).rev().filter(|&i| self.merged[i].severity >= self.min_sev && event_matches(&self.merged[i], f)).collect();
-        let found = self.sel_key.as_ref().and_then(|k| self.rows.iter().position(|&i| event_key(&self.merged[i]) == *k));
+        self.rows = (0..self.merged.len())
+            .rev()
+            .filter(|&i| self.merged[i].severity >= self.min_sev && event_matches(&self.merged[i], f))
+            .collect();
+        let found =
+            self.sel_key.as_ref().and_then(|k| self.rows.iter().position(|&i| event_key(&self.merged[i]) == *k));
         self.sel = found.unwrap_or_else(|| self.sel.min(self.rows.len().saturating_sub(1)));
     }
 
@@ -626,7 +675,15 @@ pub enum FleetSort {
 }
 
 impl FleetSort {
-    pub const ALL: [FleetSort; 7] = [FleetSort::Health, FleetSort::Cpu, FleetSort::Mem, FleetSort::Disk, FleetSort::Findings, FleetSort::Name, FleetSort::Latency];
+    pub const ALL: [FleetSort; 7] = [
+        FleetSort::Health,
+        FleetSort::Cpu,
+        FleetSort::Mem,
+        FleetSort::Disk,
+        FleetSort::Findings,
+        FleetSort::Name,
+        FleetSort::Latency,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             FleetSort::Health => "health",
@@ -801,7 +858,10 @@ impl FleetView {
         self.dirty = false;
         let f = self.filter_lower.as_str();
         let mut rows: Vec<usize> = (0..self.hosts.len())
-            .filter(|&i| host_matches(&self.hosts[i], f) && self.only.as_ref().is_none_or(|(_, set)| set.contains(&self.hosts[i].name)))
+            .filter(|&i| {
+                host_matches(&self.hosts[i], f)
+                    && self.only.as_ref().is_none_or(|(_, set)| set.contains(&self.hosts[i].name))
+            })
             .collect();
         rows.sort_by(|&a, &b| {
             let o = cmp_host(&self.hosts[a], &self.hosts[b], self.sort);
@@ -856,7 +916,7 @@ impl FleetView {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::server::{ContainerMeta, DiskStat, Kernel, Pressure, Profile, SevCounts, ServerCfg};
+    use crate::server::{ContainerMeta, DiskStat, Kernel, Pressure, Profile, ServerCfg, SevCounts};
     use crate::tui::app::{App, Command, Modal, Tab};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -941,7 +1001,14 @@ pub(crate) mod tests {
             softirq_pct: 1.5,
             procs_running: 3,
             procs_blocked: 9,
-            pressure: Some(Pressure { cpu_some: 12.5, mem_some: 0.4, mem_full: 0.1, io_some: 31.0, io_full: 8.0, ..Default::default() }),
+            pressure: Some(Pressure {
+                cpu_some: 12.5,
+                mem_some: 0.4,
+                mem_full: 0.1,
+                io_some: 31.0,
+                io_full: 8.0,
+                ..Default::default()
+            }),
             mem_available: 20 << 30,
             fd_used: Some(10_000),
             fd_max: Some(100_000),
@@ -956,9 +1023,36 @@ pub(crate) mod tests {
             ..Default::default()
         });
         s.events = vec![
-            Event { ts: ts - 60_000, kind: EventKind::OomKill, severity: Severity::Crit, subject: "unit:db.service".into(), unit: Some("db.service".into()), pid: Some(4242), detail: "db (4242) killed by the OOM killer, anon-rss 5.9G".into(), source: "kmsg".into(), ..Default::default() },
-            Event { ts: ts - 30_000, kind: EventKind::UnitFlapping, severity: Severity::Warn, subject: "unit:worker.service".into(), unit: Some("worker.service".into()), detail: "worker.service restarted 5 times in 10m".into(), source: "systemd".into(), ..Default::default() },
-            Event { ts: ts - 10_000, kind: EventKind::DiskLatencySpike, severity: Severity::Warn, subject: "disk:nvme0n1".into(), detail: "nvme0n1 write await 230ms".into(), source: "procfs".into(), ..Default::default() },
+            Event {
+                ts: ts - 60_000,
+                kind: EventKind::OomKill,
+                severity: Severity::Crit,
+                subject: "unit:db.service".into(),
+                unit: Some("db.service".into()),
+                pid: Some(4242),
+                detail: "db (4242) killed by the OOM killer, anon-rss 5.9G".into(),
+                source: "kmsg".into(),
+                ..Default::default()
+            },
+            Event {
+                ts: ts - 30_000,
+                kind: EventKind::UnitFlapping,
+                severity: Severity::Warn,
+                subject: "unit:worker.service".into(),
+                unit: Some("worker.service".into()),
+                detail: "worker.service restarted 5 times in 10m".into(),
+                source: "systemd".into(),
+                ..Default::default()
+            },
+            Event {
+                ts: ts - 10_000,
+                kind: EventKind::DiskLatencySpike,
+                severity: Severity::Warn,
+                subject: "disk:nvme0n1".into(),
+                detail: "nvme0n1 write await 230ms".into(),
+                source: "procfs".into(),
+                ..Default::default()
+            },
         ];
         s
     }
@@ -1021,8 +1115,20 @@ pub(crate) mod tests {
             unreachable: hosts.iter().filter(|h| !h.ok).count(),
             hosts,
             findings: vec![
-                FleetFinding { title: "disk /var almost full".into(), severity: Severity::Crit, count: crit.len(), hosts: crit, ..Default::default() },
-                FleetFinding { title: "a unit is flapping".into(), severity: Severity::Warn, count: 2, hosts: vec!["web-0001".into(), "web-0002".into()], ..Default::default() },
+                FleetFinding {
+                    title: "disk /var almost full".into(),
+                    severity: Severity::Crit,
+                    count: crit.len(),
+                    hosts: crit,
+                    ..Default::default()
+                },
+                FleetFinding {
+                    title: "a unit is flapping".into(),
+                    severity: Severity::Warn,
+                    count: 2,
+                    hosts: vec!["web-0001".into(), "web-0002".into()],
+                    ..Default::default()
+                },
             ],
         };
         a.fleet_done(summary);
@@ -1113,7 +1219,10 @@ pub(crate) mod tests {
         a.on_key(code(KeyCode::Enter));
         a.ensure_server_rows();
         let units = a.units();
-        assert!(!a.svc.rows.is_empty() && a.svc.rows.iter().all(|&i| units[i].container.as_ref().unwrap().runtime == "podman"));
+        assert!(
+            !a.svc.rows.is_empty()
+                && a.svc.rows.iter().all(|&i| units[i].container.as_ref().unwrap().runtime == "podman")
+        );
         assert_eq!(a.active_filter(), "podman");
         a.on_key(code(KeyCode::Esc));
         assert!(a.svc.filter.is_empty());
@@ -1143,7 +1252,11 @@ pub(crate) mod tests {
         let u = a.units().iter().find(|u| u.name == "db.service").unwrap();
         let p = unit_panel(u, a.view(), &a.event_ring.iter().cloned().collect::<Vec<_>>(), 0.85, a.now);
         assert_eq!(p.severity, Severity::Crit);
-        assert!(p.headline.contains("result oom-kill") && p.headline.contains("exit 137") && p.headline.contains("for 12m"), "{}", p.headline);
+        assert!(
+            p.headline.contains("result oom-kill") && p.headline.contains("exit 137") && p.headline.contains("for 12m"),
+            "{}",
+            p.headline
+        );
         let flat: Vec<&String> = p.sections.iter().flat_map(|(_, v)| v).collect();
         assert!(flat.iter().any(|l| l.contains("OOM kill")), "{flat:?}");
         assert!(flat.iter().any(|l| l.contains("killed by the OOM killer")), "{flat:?}");
@@ -1165,7 +1278,14 @@ pub(crate) mod tests {
         // recorder answer for the current request merges and de-duplicates
         let Command::LoadEvents { from, .. } = cmds[0] else { unreachable!() };
         let mut rec: Vec<Event> = a.event_ring.iter().cloned().collect();
-        rec.push(Event { ts: a.now - 3_000_000, kind: EventKind::UnitFailed, severity: Severity::Crit, subject: "unit:old.service".into(), detail: "old.service failed".into(), ..Default::default() });
+        rec.push(Event {
+            ts: a.now - 3_000_000,
+            kind: EventKind::UnitFailed,
+            severity: Severity::Crit,
+            subject: "unit:old.service".into(),
+            detail: "old.service failed".into(),
+            ..Default::default()
+        });
         a.set_events(from, Some(rec));
         a.ensure_server_rows();
         assert_eq!(a.ev.merged.len(), 4);
@@ -1204,8 +1324,18 @@ pub(crate) mod tests {
             at: event.ts,
             severity: Severity::Crit,
             headline: "db.service OOM-killed — backup.service grew to 6 GiB".into(),
-            chain: vec!["db.service failed".into(), "the kernel OOM-killed db (4242)".into(), "backup.service grew 4 GiB in 5 min".into()],
-            culprits: vec![crate::server::Culprit { kind: "unit".into(), name: "backup.service".into(), pid: Some(777), why: "6 GiB at 03:11".into(), ..Default::default() }],
+            chain: vec![
+                "db.service failed".into(),
+                "the kernel OOM-killed db (4242)".into(),
+                "backup.service grew 4 GiB in 5 min".into(),
+            ],
+            culprits: vec![crate::server::Culprit {
+                kind: "unit".into(),
+                name: "backup.service".into(),
+                pid: Some(777),
+                why: "6 GiB at 03:11".into(),
+                ..Default::default()
+            }],
             suggestions: vec!["journalctl -u backup.service --since 03:00".into()],
             gaps: vec!["recorder not running before 03:05".into()],
             ..Default::default()

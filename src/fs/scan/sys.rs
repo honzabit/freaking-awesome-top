@@ -22,7 +22,9 @@ pub struct BigFile {
 pub enum Kind {
     Normal,
     /// Another filesystem (or a macOS firmlink alias). `descend` = scan it as its own tree.
-    Mount { descend: bool },
+    Mount {
+        descend: bool,
+    },
     /// macOS privacy-protected: not read in the background.
     Protected,
 }
@@ -287,13 +289,7 @@ pub fn lstat(path: &[u8]) -> Option<(u64, u64, i64, i64, bool)> {
         if libc::lstat(c.as_ptr(), &mut s) != 0 {
             return None;
         }
-        Some((
-            s.st_dev as u64,
-            s.st_ino as u64,
-            mns(&s),
-            cns(&s),
-            (s.st_mode & libc::S_IFMT) == libc::S_IFDIR,
-        ))
+        Some((s.st_dev as u64, s.st_ino as u64, mns(&s), cns(&s), (s.st_mode & libc::S_IFMT) == libc::S_IFDIR))
     }
 }
 
@@ -321,11 +317,32 @@ pub struct MountInfo {
 
 /// Filesystems never descended, even on explicit request (kernel pseudo fs, automounters).
 const PSEUDO_FS: &[&str] = &[
-    "proc", "sysfs", "devtmpfs", "devpts", "devfs", "cgroup", "cgroup2", "securityfs", "debugfs",
-    "tracefs", "bpf", "fusectl", "configfs", "pstore", "efivarfs", "binfmt_misc", "autofs", "nsfs",
-    "mqueue", "hugetlbfs", "rpc_pipefs", "selinuxfs", "nfsd",
+    "proc",
+    "sysfs",
+    "devtmpfs",
+    "devpts",
+    "devfs",
+    "cgroup",
+    "cgroup2",
+    "securityfs",
+    "debugfs",
+    "tracefs",
+    "bpf",
+    "fusectl",
+    "configfs",
+    "pstore",
+    "efivarfs",
+    "binfmt_misc",
+    "autofs",
+    "nsfs",
+    "mqueue",
+    "hugetlbfs",
+    "rpc_pipefs",
+    "selinuxfs",
+    "nfsd",
 ];
-const DISK_FS: &[&str] = &["ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "bcachefs", "jfs", "reiserfs", "nilfs2"];
+const DISK_FS: &[&str] =
+    &["ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "bcachefs", "jfs", "reiserfs", "nilfs2"];
 
 impl MountInfo {
     pub fn pseudo(&self) -> bool {

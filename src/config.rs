@@ -81,12 +81,23 @@ pub struct AskCfg {
 }
 
 impl Default for AskCfg {
-    fn default() -> Self { Self { model: "claude-opus-5-5".into(), enabled: true } }
+    fn default() -> Self {
+        Self { model: "claude-opus-5-5".into(), enabled: true }
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { interval_ms: 1500, hosts: vec![], containers: true, history_path: None, history_days: 3, ask: AskCfg::default(), server: Default::default(), fleet: Default::default() }
+        Self {
+            interval_ms: 1500,
+            hosts: vec![],
+            containers: true,
+            history_path: None,
+            history_days: 3,
+            ask: AskCfg::default(),
+            server: Default::default(),
+            fleet: Default::default(),
+        }
     }
 }
 
@@ -97,13 +108,15 @@ impl Config {
         }
         let dot_config = dirs::home_dir().map(|h| h.join(".config").join("fat").join("config.toml"));
         if let Some(p) = &dot_config
-            && p.exists() {
-                return p.clone();
-            }
+            && p.exists()
+        {
+            return p.clone();
+        }
         if let Some(p) = dirs::config_dir().map(|d| d.join("fat").join("config.toml"))
-            && p.exists() {
-                return p;
-            }
+            && p.exists()
+        {
+            return p;
+        }
         dot_config
             .or_else(|| dirs::config_dir().map(|d| d.join("fat").join("config.toml")))
             .unwrap_or_else(|| PathBuf::from("fat-config.toml"))

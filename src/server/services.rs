@@ -42,7 +42,10 @@ enum CgMode {
     V2(PathBuf),
     /// Legacy/hybrid: controllers under `root` ("memory", "cpu", "cpuacct", "pids"), unit tree
     /// (for discovery and the procs join) under `tree`.
-    V1 { root: PathBuf, tree: PathBuf },
+    V1 {
+        root: PathBuf,
+        tree: PathBuf,
+    },
     None,
 }
 
@@ -167,9 +170,11 @@ pub struct Services {
 
 impl Services {
     pub fn new(cfg: &ServerCfg) -> Services {
-        let systemd = cfg!(target_os = "linux") && Path::new("/run/systemd/system").is_dir() && which("systemctl").is_some();
+        let systemd =
+            cfg!(target_os = "linux") && Path::new("/run/systemd/system").is_dir() && which("systemctl").is_some();
         let timeout = Duration::from_secs(cfg.unit_refresh_s.max(1));
-        let runner: Option<Runner> = systemd.then(|| Box::new(move |args: &[&str]| run_systemctl(args, timeout)) as Runner);
+        let runner: Option<Runner> =
+            systemd.then(|| Box::new(move |args: &[&str]| run_systemctl(args, timeout)) as Runner);
         Self::with_sources(cfg, CgMode::detect(), runner, runtime::Resolver::new())
     }
 
@@ -221,15 +226,22 @@ impl Services {
         }
         match &self.cg {
             CgMode::V2(_) => {}
-            CgMode::V1 { .. } => notes.push("cgroup v1: per-unit io and pressure (PSI) unavailable; memory/cpu best effort".to_string()),
-            CgMode::None if cfg!(target_os = "linux") => notes.push("no cgroup filesystem mounted: unit resources unknown".to_string()),
+            CgMode::V1 { .. } => {
+                notes.push("cgroup v1: per-unit io and pressure (PSI) unavailable; memory/cpu best effort".to_string())
+            }
+            CgMode::None if cfg!(target_os = "linux") => {
+                notes.push("no cgroup filesystem mounted: unit resources unknown".to_string())
+            }
             CgMode::None => {}
         }
         if self.systemctl.is_none() && cfg!(target_os = "linux") {
             notes.push("systemd not detected: units come from cgroups and container runtimes only".into());
         }
         if self.walk_truncated {
-            notes.push(format!("cgroup tree larger than {} directories: walk truncated (raise server.max_units)", self.max_dirs()));
+            notes.push(format!(
+                "cgroup tree larger than {} directories: walk truncated (raise server.max_units)",
+                self.max_dirs()
+            ));
         }
 
         // 1. Candidate units: (Unit skeleton, cgroup rel path or "").
@@ -241,7 +253,13 @@ impl Services {
                 continue;
             }
             let p = self.props.get(&l.id);
-            let cg = p.map(|p| p.control_group.clone()).filter(|c| !c.is_empty()).or_else(|| self.dirs.iter().find(|d| d.kind == UnitKind::Systemd && d.key == l.id).map(|d| d.rel.clone())).unwrap_or_default();
+            let cg = p
+                .map(|p| p.control_group.clone())
+                .filter(|c| !c.is_empty())
+                .or_else(|| {
+                    self.dirs.iter().find(|d| d.kind == UnitKind::Systemd && d.key == l.id).map(|d| d.rel.clone())
+                })
+                .unwrap_or_default();
             let state = normalize_state(&l.active);
             let mut u = Unit {
                 name: l.id.clone(),
@@ -275,7 +293,14 @@ impl Services {
                         continue;
                     }
                     seen_names.insert((UnitKind::Systemd, d.key.clone()));
-                    let mut u = Unit { name: d.key.clone(), kind: UnitKind::Systemd, state: "active".into(), sub_state: "running".into(), cgroup: d.rel.clone(), ..Default::default() };
+                    let mut u = Unit {
+                        name: d.key.clone(),
+                        kind: UnitKind::Systemd,
+                        state: "active".into(),
+                        sub_state: "running".into(),
+                        cgroup: d.rel.clone(),
+                        ..Default::default()
+                    };
                     if self.systemctl.is_some() {
                         u.notes.push("not listed by systemd (state from cgroup)".into());
                     }
@@ -287,7 +312,11 @@ impl Services {
                     let mut u = Unit {
                         name: meta.name.clone(),
                         kind: UnitKind::Container,
-                        state: st.state.clone().filter(|s| s != "inactive" && s != "failed").unwrap_or_else(|| "active".into()),
+                        state: st
+                            .state
+                            .clone()
+                            .filter(|s| s != "inactive" && s != "failed")
+                            .unwrap_or_else(|| "active".into()),
                         sub_state: if st.sub_state.is_empty() { "running".into() } else { st.sub_state.clone() },
                         description: meta.image.clone(),
                         exit_code: None,
@@ -297,14 +326,28 @@ impl Services {
                         ..Default::default()
                     };
                     if meta.name == meta.id {
-                        u.notes.push(if is_root() { "name unknown: no runtime state visible from here (other mount namespace?)" } else { "name unknown: reading the runtime's state needs root" }.into());
+                        u.notes.push(
+                            if is_root() {
+                                "name unknown: no runtime state visible from here (other mount namespace?)"
+                            } else {
+                                "name unknown: reading the runtime's state needs root"
+                            }
+                            .into(),
+                        );
                     }
                     u.container = Some(meta);
                     seen_names.insert((UnitKind::Container, u.name.clone()));
                     units.push(u);
                 }
                 UnitKind::Pod => {
-                    let u = Unit { name: d.key.clone(), kind: UnitKind::Pod, state: "active".into(), sub_state: "running".into(), cgroup: d.rel.clone(), ..Default::default() };
+                    let u = Unit {
+                        name: d.key.clone(),
+                        kind: UnitKind::Pod,
+                        state: "active".into(),
+                        sub_state: "running".into(),
+                        cgroup: d.rel.clone(),
+                        ..Default::default()
+                    };
                     units.push(u);
                 }
                 UnitKind::Cgroup => {}
@@ -349,7 +392,10 @@ impl Services {
                 } else {
                     ("unknown", "")
                 };
-                let health = ["unhealthy", "healthy", "starting"].into_iter().find(|h| st.contains(&format!("({h}"))).map(str::to_string);
+                let health = ["unhealthy", "healthy", "starting"]
+                    .into_iter()
+                    .find(|h| st.contains(&format!("({h}")))
+                    .map(str::to_string);
                 units.push(Unit {
                     name: if c.name.is_empty() { short.clone() } else { c.name.clone() },
                     kind: UnitKind::Container,
@@ -358,7 +404,14 @@ impl Services {
                     description: c.image.clone(),
                     cpu: c.cpu,
                     mem: c.mem,
-                    container: Some(super::ContainerMeta { id: short, name: c.name.clone(), image: c.image.clone(), runtime: c.runtime.clone(), health, ..Default::default() }),
+                    container: Some(super::ContainerMeta {
+                        id: short,
+                        name: c.name.clone(),
+                        image: c.image.clone(),
+                        runtime: c.runtime.clone(),
+                        health,
+                        ..Default::default()
+                    }),
                     notes: vec!["resources from the runtime CLI (no cgroup visible)".into()],
                     ..Default::default()
                 });
@@ -389,7 +442,14 @@ impl Services {
                 Some(i) => i,
                 None => match unit_of_cgroup(&p.cgroup) {
                     Some(r) if r.kind == UnitKind::Cgroup && tree_present => {
-                        units.push(Unit { name: r.key.clone(), kind: UnitKind::Cgroup, state: "active".into(), sub_state: "running".into(), cgroup: r.key.clone(), ..Default::default() });
+                        units.push(Unit {
+                            name: r.key.clone(),
+                            kind: UnitKind::Cgroup,
+                            state: "active".into(),
+                            sub_state: "running".into(),
+                            cgroup: r.key.clone(),
+                            ..Default::default()
+                        });
                         let i = units.len() - 1;
                         by_path.insert(r.key, i);
                         i
@@ -429,7 +489,14 @@ impl Services {
                 && let Some(last) = &t.last
             {
                 let n = std::mem::take(&mut t.held_restarts);
-                let mut e = event(now, EventKind::UnitRestart, Severity::Warn, last, format!("{} restarted {n} times since the last report", last.name), if last.kind == UnitKind::Systemd { "systemd" } else { "runtime" });
+                let mut e = event(
+                    now,
+                    EventKind::UnitRestart,
+                    Severity::Warn,
+                    last,
+                    format!("{} restarted {n} times since the last report", last.name),
+                    if last.kind == UnitKind::Systemd { "systemd" } else { "runtime" },
+                );
                 e.value = Some(n as f64);
                 departed.push(e);
             }
@@ -441,7 +508,14 @@ impl Services {
                 && last.state != "failed"
                 && (last.kind != UnitKind::Systemd || !last.name.ends_with(".scope"))
             {
-                departed.push(event(now, EventKind::UnitStop, Severity::Info, last, format!("{} went away", last.name), "cgroup"));
+                departed.push(event(
+                    now,
+                    EventKind::UnitStop,
+                    Severity::Info,
+                    last,
+                    format!("{} went away", last.name),
+                    "cgroup",
+                ));
             }
         }
         self.pending.extend(departed);
@@ -457,7 +531,8 @@ impl Services {
                     u.state = "inactive".into();
                 }
                 u.sub_state = "exited".into();
-                (u.cpu, u.io_read_bps, u.io_write_bps, u.cpu_throttled_pct, u.pids, u.main_pid, u.mem) = (0.0, 0, 0, 0.0, 0, None, 0);
+                (u.cpu, u.io_read_bps, u.io_write_bps, u.cpu_throttled_pct, u.pids, u.main_pid, u.mem) =
+                    (0.0, 0, 0, 0.0, 0, None, 0);
                 units.push(u);
             }
         }
@@ -467,9 +542,18 @@ impl Services {
         self.limits.retain(|k, _| cgs.contains(k.as_str()));
 
         // 4. Bound and order: failed first, then busy, inactive last (dropped first).
-        units.sort_by(|a, b| rank(a).cmp(&rank(b)).then(b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal)).then(a.name.cmp(&b.name)));
+        units.sort_by(|a, b| {
+            rank(a)
+                .cmp(&rank(b))
+                .then(b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal))
+                .then(a.name.cmp(&b.name))
+        });
         if units.len() > self.cfg.max_units {
-            notes.push(format!("{} units over server.max_units = {}: least relevant (inactive first) not shown", units.len() - self.cfg.max_units, self.cfg.max_units));
+            notes.push(format!(
+                "{} units over server.max_units = {}: least relevant (inactive first) not shown",
+                units.len() - self.cfg.max_units,
+                self.cfg.max_units
+            ));
             units.truncate(self.cfg.max_units);
         }
         self.notes = notes;
@@ -520,18 +604,39 @@ impl Services {
                     Some(r) if r.kind == UnitKind::Container => {
                         if keys.insert((r.kind, r.key.clone())) {
                             let full = hex_tail(&name).unwrap_or(&r.key).to_ascii_lowercase();
-                            out.push(Dir { rel: crel.clone(), kind: r.kind, key: r.key, full_id: full, runtime: runtime::runtime_of_segment(&name, &crel) });
+                            out.push(Dir {
+                                rel: crel.clone(),
+                                kind: r.kind,
+                                key: r.key,
+                                full_id: full,
+                                runtime: runtime::runtime_of_segment(&name, &crel),
+                            });
                         }
                         continue; // a container's inner cgroups are the container
                     }
                     Some(r) if r.kind == UnitKind::Pod => {
                         if keys.insert((r.kind, r.key.clone())) {
-                            out.push(Dir { rel: crel.clone(), kind: r.kind, key: r.key, full_id: String::new(), runtime: "" });
+                            out.push(Dir {
+                                rel: crel.clone(),
+                                kind: r.kind,
+                                key: r.key,
+                                full_id: String::new(),
+                                runtime: "",
+                            });
                         }
                     }
-                    Some(r) if r.kind == UnitKind::Systemd && unit_of_cgroup(&format!("/{name}")).is_some_and(|x| x.kind == UnitKind::Systemd) => {
+                    Some(r)
+                        if r.kind == UnitKind::Systemd
+                            && unit_of_cgroup(&format!("/{name}")).is_some_and(|x| x.kind == UnitKind::Systemd) =>
+                    {
                         if !in_unit && keys.insert((r.kind, r.key.clone())) {
-                            out.push(Dir { rel: crel.clone(), kind: r.kind, key: r.key, full_id: String::new(), runtime: "" });
+                            out.push(Dir {
+                                rel: crel.clone(),
+                                kind: r.kind,
+                                key: r.key,
+                                full_id: String::new(),
+                                runtime: "",
+                            });
                         }
                         // A unit's inner cgroups are the unit. Only a per-user service manager
                         // (systemd's user@UID.service) nests units of its own, among them
@@ -567,7 +672,8 @@ impl Services {
             let prev = self.listed.get(id);
             let changed = prev.is_none_or(|p| p.active != l.active || p.sub != l.sub);
             let transient = matches!(l.active.as_str(), "activating" | "deactivating" | "reloading");
-            let main_gone = self.props.get(id).and_then(|p| p.main_pid).is_some_and(|m| !procs.is_empty() && !alive.contains(&m));
+            let main_gone =
+                self.props.get(id).and_then(|p| p.main_pid).is_some_and(|m| !procs.is_empty() && !alive.contains(&m));
             // The periodic full pass skips inactive units: nothing about them changes without
             // a state change, which list-units already shows.
             let stale = full && l.active != "inactive";
@@ -640,7 +746,8 @@ impl Services {
                 }
                 let periods = c.periods.saturating_sub(p.periods);
                 if periods > 0 {
-                    u.cpu_throttled_pct = (c.throttled.saturating_sub(p.throttled) as f64 / periods as f64 * 100.0).min(100.0) as f32;
+                    u.cpu_throttled_pct =
+                        (c.throttled.saturating_sub(p.throttled) as f64 / periods as f64 * 100.0).min(100.0) as f32;
                 }
             }
         }
@@ -650,11 +757,24 @@ impl Services {
     }
 
     /// Compare with the previous observation of the same unit; queue events; update tracking.
-    fn observe(&mut self, u: &mut Unit, pids: HashSet<u32>, (pids_cur, pids_max): (Option<u64>, Option<u64>), now: Ts, baseline: bool) {
+    fn observe(
+        &mut self,
+        u: &mut Unit,
+        pids: HashSet<u32>,
+        (pids_cur, pids_max): (Option<u64>, Option<u64>),
+        now: Ts,
+        baseline: bool,
+    ) {
         let cfg = &self.cfg;
         let k = tkey(u.kind, &u.name);
         let is_new = !self.track.contains_key(&k);
-        let t = self.track.entry(k).or_insert_with(|| Track { first_seen: now, state: u.state.clone(), restarts: u.restarts, oom_kills: u.oom_kills, ..Default::default() });
+        let t = self.track.entry(k).or_insert_with(|| Track {
+            first_seen: now,
+            state: u.state.clone(),
+            restarts: u.restarts,
+            oom_kills: u.oom_kills,
+            ..Default::default()
+        });
         let was_present = t.present || is_new;
         let reappeared = !is_new && !t.present;
         let prev_state = if reappeared { "inactive".to_string() } else { t.state.clone() };
@@ -666,7 +786,11 @@ impl Services {
         if !is_new {
             if u.restarts > t.restarts {
                 restarted = u.restarts - t.restarts;
-            } else if reappeared && u.kind == UnitKind::Container && u.restarts == 0 && now - t.last_seen <= (cfg.flap_window_s * 1000) as i64 {
+            } else if reappeared
+                && u.kind == UnitKind::Container
+                && u.restarts == 0
+                && now - t.last_seen <= (cfg.flap_window_s * 1000) as i64
+            {
                 restarted = 1;
             }
         }
@@ -703,8 +827,24 @@ impl Services {
             let count = restarted + t.held_restarts;
             if count > 0 && (!coalesce || cooled) {
                 let mins = cfg.flap_window_s / 60;
-                let what = if count > restarted || coalesce { format!("restarted {count} times since the last report") } else { "restarted".to_string() };
-                ev.push(event(now, EventKind::UnitRestart, Severity::Warn, u, format!("{} {what}{why}, {} restart(s) in the last {}", u.name, recent, if mins > 0 { format!("{mins} min") } else { format!("{} s", cfg.flap_window_s) }), src));
+                let what = if count > restarted || coalesce {
+                    format!("restarted {count} times since the last report")
+                } else {
+                    "restarted".to_string()
+                };
+                ev.push(event(
+                    now,
+                    EventKind::UnitRestart,
+                    Severity::Warn,
+                    u,
+                    format!(
+                        "{} {what}{why}, {} restart(s) in the last {}",
+                        u.name,
+                        recent,
+                        if mins > 0 { format!("{mins} min") } else { format!("{} s", cfg.flap_window_s) }
+                    ),
+                    src,
+                ));
                 ev.last_mut().expect("pushed").value = Some(count as f64);
                 t.held_restarts = 0;
                 t.last_restart_ev = Some(now);
@@ -712,7 +852,14 @@ impl Services {
                 t.held_restarts += restarted;
             }
             if flapping && !t.flapping {
-                ev.push(event(now, EventKind::UnitFlapping, Severity::Crit, u, format!("{} is flapping: {} restarts within {} s{why}", u.name, recent, cfg.flap_window_s), src));
+                ev.push(event(
+                    now,
+                    EventKind::UnitFlapping,
+                    Severity::Crit,
+                    u,
+                    format!("{} is flapping: {} restarts within {} s{why}", u.name, recent, cfg.flap_window_s),
+                    src,
+                ));
                 ev.last_mut().expect("pushed").value = Some(recent as f64);
             }
             if prev_state != u.state || is_new {
@@ -720,32 +867,62 @@ impl Services {
                 let was_down = is_new || matches!(prev_state.as_str(), "inactive" | "failed" | "unknown" | "");
                 if u.state == "failed" {
                     let crit = matches!(u.result.as_str(), "oom-kill" | "start-limit-hit" | "core-dump" | "watchdog");
-                    ev.push(event(now, EventKind::UnitFailed, if crit { Severity::Crit } else { Severity::Warn }, u, format!("{} failed{why}", u.name), src));
+                    ev.push(event(
+                        now,
+                        EventKind::UnitFailed,
+                        if crit { Severity::Crit } else { Severity::Warn },
+                        u,
+                        format!("{} failed{why}", u.name),
+                        src,
+                    ));
                 } else if active_now && was_down && restarted == 0 && !quiet_lifecycle {
                     ev.push(event(now, EventKind::UnitStart, Severity::Info, u, format!("{} started", u.name), src));
                 } else if u.state == "inactive" && !was_down && restarted == 0 && !quiet_lifecycle {
-                    ev.push(event(now, EventKind::UnitStop, Severity::Info, u, format!("{} stopped{why}", u.name), src));
+                    ev.push(event(
+                        now,
+                        EventKind::UnitStop,
+                        Severity::Info,
+                        u,
+                        format!("{} stopped{why}", u.name),
+                        src,
+                    ));
                 }
             }
             let cgroup_oom = !is_new && u.oom_kills > t.oom_kills && u.kind != UnitKind::Pod;
             // A unit killed by the OOM killer usually dies between two samples and its cgroup
             // (with memory.events) goes with it; systemd still reports Result=oom-kill.
-            let result_oom = u.result == "oom-kill" && (restarted > 0 || (u.state == "failed" && prev_state != "failed"));
+            let result_oom =
+                u.result == "oom-kill" && (restarted > 0 || (u.state == "failed" && prev_state != "failed"));
             if !cgroup_oom && result_oom && !t.oom_this_run {
                 let lim = u.mem_limit.map(|l| format!(" (limit {})", human(l))).unwrap_or_default();
-                let mut e = event(now, EventKind::OomKill, Severity::Crit, u, format!("{} was OOM-killed{lim}", u.name), src);
+                let mut e =
+                    event(now, EventKind::OomKill, Severity::Crit, u, format!("{} was OOM-killed{lim}", u.name), src);
                 e.extra.insert("cgroup".into(), u.cgroup.clone());
                 ev.push(e);
             }
             // The kill result_oom reports belongs to the run that ended; a new run starts clean.
-            if result_oom || restarted > 0 || (matches!(u.state.as_str(), "active" | "activating") && prev_state != u.state) {
+            if result_oom
+                || restarted > 0
+                || (matches!(u.state.as_str(), "active" | "activating") && prev_state != u.state)
+            {
                 t.oom_this_run = false;
             }
             if cgroup_oom {
                 t.oom_this_run = true;
                 let n = u.oom_kills - t.oom_kills;
                 let lim = u.mem_limit.map(|l| format!(" of its {} limit", human(l))).unwrap_or_default();
-                let mut e = event(now, EventKind::OomKill, Severity::Crit, u, format!("{n} process(es) OOM-killed in {} (memory {}{lim})", u.name, human(u.mem.max(u.mem_peak.unwrap_or(0)))), "cgroup");
+                let mut e = event(
+                    now,
+                    EventKind::OomKill,
+                    Severity::Crit,
+                    u,
+                    format!(
+                        "{n} process(es) OOM-killed in {} (memory {}{lim})",
+                        u.name,
+                        human(u.mem.max(u.mem_peak.unwrap_or(0)))
+                    ),
+                    "cgroup",
+                );
                 e.value = Some(n as f64);
                 e.extra.insert("cgroup".into(), u.cgroup.clone());
                 if let Some(l) = u.mem_limit {
@@ -757,16 +934,43 @@ impl Services {
             let thr = cfg.throttle_warn_pct;
             if u.cpu_throttled_pct >= thr && !t.throttled {
                 let q = u.cpu_quota.map(|q| format!(" (cpu.max {q:.2} cores)")).unwrap_or_default();
-                let mut e = event(now, EventKind::Throttle, Severity::Warn, u, format!("{} throttled in {:.0}% of CPU periods{q} while using {:.0}% cpu", u.name, u.cpu_throttled_pct, u.cpu), "cgroup");
+                let mut e = event(
+                    now,
+                    EventKind::Throttle,
+                    Severity::Warn,
+                    u,
+                    format!(
+                        "{} throttled in {:.0}% of CPU periods{q} while using {:.0}% cpu",
+                        u.name, u.cpu_throttled_pct, u.cpu
+                    ),
+                    "cgroup",
+                );
                 e.value = Some(u.cpu_throttled_pct as f64);
                 ev.push(e);
             }
             // memory.max / pids.max close to exhaustion (memory counts only non-reclaimable use).
             if let Some(l) = u.mem_limit.filter(|&l| l > 0) {
                 let raw = u.mem as f64 / l as f64;
-                let used = if raw >= cfg.exhaustion_warn as f64 { reclaim_adjusted(&self.cg, &u.cgroup, u.mem) as f64 / l as f64 } else { raw };
+                let used = if raw >= cfg.exhaustion_warn as f64 {
+                    reclaim_adjusted(&self.cg, &u.cgroup, u.mem) as f64 / l as f64
+                } else {
+                    raw
+                };
                 if used >= cfg.exhaustion_warn as f64 && !t.mem_high {
-                    let mut e = event(now, EventKind::Exhaustion, Severity::Warn, u, format!("{} at {:.0}% of its memory limit ({} of {})", u.name, used * 100.0, human((used * l as f64) as u64), human(l)), "cgroup");
+                    let mut e = event(
+                        now,
+                        EventKind::Exhaustion,
+                        Severity::Warn,
+                        u,
+                        format!(
+                            "{} at {:.0}% of its memory limit ({} of {})",
+                            u.name,
+                            used * 100.0,
+                            human((used * l as f64) as u64),
+                            human(l)
+                        ),
+                        "cgroup",
+                    );
                     e.value = Some(used * 100.0);
                     e.extra.insert("resource".into(), "memory.max".into());
                     ev.push(e);
@@ -778,7 +982,14 @@ impl Services {
             if let (Some(c), Some(m)) = (pids_cur, pids_max.filter(|&m| m > 0 && m < u64::MAX)) {
                 let r = c as f64 / m as f64;
                 if r >= cfg.exhaustion_warn as f64 && !t.pids_high {
-                    let mut e = event(now, EventKind::Exhaustion, Severity::Warn, u, format!("{} at {c} of {m} tasks (pids.max)", u.name), "cgroup");
+                    let mut e = event(
+                        now,
+                        EventKind::Exhaustion,
+                        Severity::Warn,
+                        u,
+                        format!("{} at {c} of {m} tasks (pids.max)", u.name),
+                        "cgroup",
+                    );
                     e.value = Some(r * 100.0);
                     e.extra.insert("resource".into(), "pids.max".into());
                     ev.push(e);
@@ -792,7 +1003,14 @@ impl Services {
                 let fresh = pids.difference(&t.pids).count() as u32;
                 let cooled = t.last_burst.is_none_or(|b| now - b >= (cfg.spike_cooldown_s * 1000) as i64);
                 if cfg.burst_procs > 0 && fresh >= cfg.burst_procs && cooled {
-                    let mut e = event(now, EventKind::DeployBurst, Severity::Info, u, format!("{fresh} new processes in {} within one sample", u.name), "procfs");
+                    let mut e = event(
+                        now,
+                        EventKind::DeployBurst,
+                        Severity::Info,
+                        u,
+                        format!("{fresh} new processes in {} within one sample", u.name),
+                        "procfs",
+                    );
                     e.value = Some(fresh as f64);
                     ev.push(e);
                     t.last_burst = Some(now);
@@ -858,7 +1076,9 @@ fn outcome(u: &Unit) -> String {
     match (u.result.as_str(), u.exit_code) {
         ("" | "success", None | Some(0)) => String::new(),
         ("" | "success", Some(c)) => format!(" (exit status {c})"),
-        (r @ ("signal" | "core-dump" | "oom-kill" | "watchdog" | "timeout"), Some(c)) if c > 128 => format!(" ({r}, signal {})", c - 128),
+        (r @ ("signal" | "core-dump" | "oom-kill" | "watchdog" | "timeout"), Some(c)) if c > 128 => {
+            format!(" ({r}, signal {})", c - 128)
+        }
         (r, Some(c)) if c != 0 => format!(" ({r}, status {c})"),
         (r, _) => format!(" ({r})"),
     }
@@ -878,7 +1098,18 @@ fn event(ts: Ts, kind: EventKind, severity: Severity, u: &Unit, detail: String, 
     if let Some(c) = u.exit_code.filter(|&c| c != 0) {
         extra.insert("exit_code".into(), c.to_string());
     }
-    Event { ts, kind, severity, subject, unit: Some(u.name.clone()), pid: u.main_pid, detail, value: None, source: source.into(), extra }
+    Event {
+        ts,
+        kind,
+        severity,
+        subject,
+        unit: Some(u.name.clone()),
+        pid: u.main_pid,
+        detail,
+        value: None,
+        source: source.into(),
+        extra,
+    }
 }
 
 fn human(b: u64) -> String {
@@ -926,11 +1157,19 @@ fn read_counters(cg: &CgMode, rel: &str, want_freeze: bool) -> Counters {
             c.oom_kills = rd(&d.join("memory.events")).and_then(|t| kv(&t, "oom_kill"));
             c.io = rd(&d.join("io.stat")).map(|t| parse_io_stat(&t));
             c.pids = rd_u64(&d.join("pids.current"));
-            let (cpu, mem, io) = (rd(&d.join("cpu.pressure")), rd(&d.join("memory.pressure")), rd(&d.join("io.pressure")));
+            let (cpu, mem, io) =
+                (rd(&d.join("cpu.pressure")), rd(&d.join("memory.pressure")), rd(&d.join("io.pressure")));
             if cpu.is_some() || mem.is_some() || io.is_some() {
                 let f = |t: Option<String>| t.map(|t| parse_pressure(&t)).unwrap_or_default();
                 let ((cs, cf), (ms, mf), (is, isf)) = (f(cpu), f(mem), f(io));
-                c.psi = Some(Pressure { cpu_some: cs, cpu_full: cf, mem_some: ms, mem_full: mf, io_some: is, io_full: isf });
+                c.psi = Some(Pressure {
+                    cpu_some: cs,
+                    cpu_full: cf,
+                    mem_some: ms,
+                    mem_full: mf,
+                    io_some: is,
+                    io_full: isf,
+                });
             }
             if want_freeze {
                 c.frozen = rd(&d.join("cgroup.freeze")).is_some_and(|t| t.trim() == "1");
@@ -948,7 +1187,8 @@ fn read_counters(cg: &CgMode, rel: &str, want_freeze: bool) -> Counters {
             }
             c.pids = rd_u64(&cg_dir(&root.join("pids"), rel).join("pids.current"));
             if want_freeze {
-                c.frozen = rd(&cg_dir(&root.join("freezer"), rel).join("freezer.state")).is_some_and(|t| t.trim() == "FROZEN");
+                c.frozen =
+                    rd(&cg_dir(&root.join("freezer"), rel).join("freezer.state")).is_some_and(|t| t.trim() == "FROZEN");
             }
         }
         CgMode::None => {}
@@ -972,7 +1212,8 @@ fn read_limits(cg: &CgMode, rel: &str) -> Limits {
             let period = rd_u64(&cpu.join("cpu.cfs_period_us")).filter(|&p| p > 0);
             Limits {
                 // v1 reports "unlimited" as a huge page-rounded number.
-                mem_max: rd_u64(&cg_dir(&root.join("memory"), rel).join("memory.limit_in_bytes")).filter(|&l| l < 1 << 60),
+                mem_max: rd_u64(&cg_dir(&root.join("memory"), rel).join("memory.limit_in_bytes"))
+                    .filter(|&l| l < 1 << 60),
                 cpu_quota: quota.zip(period).map(|(q, p)| q as f32 / p as f32),
                 pids_max: rd(&cg_dir(&root.join("pids"), rel).join("pids.max")).and_then(|t| t.trim().parse().ok()),
             }
@@ -1023,7 +1264,8 @@ fn hex_tail(seg: &str) -> Option<&str> {
 // ---------------------------------------------------------------------------------------------
 
 fn which(name: &str) -> Option<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let mut dirs: Vec<PathBuf> =
+        std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
     dirs.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from));
     dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file())
 }
@@ -1236,7 +1478,11 @@ pub fn parse_kind(s: &str) -> Option<UnitKind> {
 
 /// Keep failed (and flapping) units only, and/or one kind.
 pub fn filter(units: Vec<Unit>, failed: bool, kind: Option<UnitKind>) -> Vec<Unit> {
-    units.into_iter().filter(|u| !failed || u.is_failed() || u.flapping).filter(|u| kind.is_none_or(|k| u.kind == k)).collect()
+    units
+        .into_iter()
+        .filter(|u| !failed || u.is_failed() || u.flapping)
+        .filter(|u| kind.is_none_or(|k| u.kind == k))
+        .collect()
 }
 
 /// Two samples a short interval apart (rates need an interval), using a fresh collector.
@@ -1276,15 +1522,26 @@ pub fn render(units: &[Unit], notes: &[String]) -> String {
     let flapping = units.iter().filter(|u| u.flapping).count();
     let active = units.iter().filter(|u| u.state == "active").count();
     out.push_str(&format!("{} units: {active} active, {failed} failed, {flapping} flapping\n", units.len()));
-    out.push_str(&format!("{:<12} {:<9} {:<40} {:>6} {:>7} {:>7} {:>5} {:>4} {:>5} {:>9} {:>11}  {}\n", "STATE", "KIND", "NAME", "CPU%", "MEM", "LIMIT", "PIDS", "RST", "THR%", "IO r/w/s", "PSI c/m/io", "DETAIL"));
+    out.push_str(&format!(
+        "{:<12} {:<9} {:<40} {:>6} {:>7} {:>7} {:>5} {:>4} {:>5} {:>9} {:>11}  {}\n",
+        "STATE", "KIND", "NAME", "CPU%", "MEM", "LIMIT", "PIDS", "RST", "THR%", "IO r/w/s", "PSI c/m/io", "DETAIL"
+    ));
     for u in units {
         let mut name = u.name.clone();
         if name.chars().count() > 40 {
-            name = format!("…{}", name.chars().rev().take(39).collect::<Vec<_>>().into_iter().rev().collect::<String>());
+            name =
+                format!("…{}", name.chars().rev().take(39).collect::<Vec<_>>().into_iter().rev().collect::<String>());
         }
         let state = if u.flapping { format!("{}!flap", u.state) } else { u.state.clone() };
-        let io = if u.io_read_bps + u.io_write_bps > 0 { format!("{}/{}", human(u.io_read_bps), human(u.io_write_bps)) } else { "-".into() };
-        let psi = u.psi.map(|p| format!("{:.0}/{:.0}/{:.0}", p.cpu_some, p.mem_some, p.io_some)).unwrap_or_else(|| "-".into());
+        let io = if u.io_read_bps + u.io_write_bps > 0 {
+            format!("{}/{}", human(u.io_read_bps), human(u.io_write_bps))
+        } else {
+            "-".into()
+        };
+        let psi = u
+            .psi
+            .map(|p| format!("{:.0}/{:.0}/{:.0}", p.cpu_some, p.mem_some, p.io_some))
+            .unwrap_or_else(|| "-".into());
         let rst = if u.recent_restarts > 0 { format!("{}*", u.restarts) } else { u.restarts.to_string() };
         let mut detail = vec![u.sub_state.clone()];
         let why = outcome(u);
@@ -1303,7 +1560,11 @@ pub fn render(units: &[Unit], notes: &[String]) -> String {
         {
             detail.push(m.runtime.clone());
         }
-        let (cpu, mem) = if u.state == "inactive" || (u.state == "failed" && u.mem == 0) { ("-".to_string(), "-".to_string()) } else { (format!("{:.1}", u.cpu), human(u.mem)) };
+        let (cpu, mem) = if u.state == "inactive" || (u.state == "failed" && u.mem == 0) {
+            ("-".to_string(), "-".to_string())
+        } else {
+            (format!("{:.1}", u.cpu), human(u.mem))
+        };
         out.push_str(&format!(
             "{:<12} {:<9} {:<40} {:>6} {:>7} {:>7} {:>5} {:>4} {:>5} {:>9} {:>11}  {}\n",
             state,
@@ -1332,14 +1593,20 @@ pub fn render(units: &[Unit], notes: &[String]) -> String {
 /// `fat services [--failed] [--kind K] [--json]`.
 pub fn cli(cfg: &ServerCfg, failed: bool, kind: Option<&str>, json: bool) -> anyhow::Result<()> {
     let kind = match kind {
-        Some(k) => Some(parse_kind(k).ok_or_else(|| anyhow::anyhow!("unknown --kind {k:?}: use systemd, container, k8s-pod or cgroup"))?),
+        Some(k) => Some(
+            parse_kind(k)
+                .ok_or_else(|| anyhow::anyhow!("unknown --kind {k:?}: use systemd, container, k8s-pod or cgroup"))?,
+        ),
         None => None,
     };
     let (units, notes) = sample_once(cfg);
     let total = units.len();
     let units = filter(units, failed, kind);
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "units": units, "total_units": total, "notes": notes }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "units": units, "total_units": total, "notes": notes }))?
+        );
     } else {
         let what = match (failed, kind) {
             (true, Some(k)) => format!("failed or flapping {} units", k.as_str()),

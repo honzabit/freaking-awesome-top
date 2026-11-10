@@ -24,7 +24,8 @@ impl Drop for Root {
 
 // Real lines from a live OOM in a transient scope with MemoryMax=50M (7.2 kernel, a host
 // running inside a VM whose cgroup namespace is nested, hence the long memcg path).
-const OOM_INVOKED: &str = "6,2233,316540620461,-;tail invoked oom-killer: gfp_mask=0x100cca(GFP_HIGHUSER_MOVABLE), order=0, oom_score_adj=0";
+const OOM_INVOKED: &str =
+    "6,2233,316540620461,-;tail invoked oom-killer: gfp_mask=0x100cca(GFP_HIGHUSER_MOVABLE), order=0, oom_score_adj=0";
 const OOM_CTX: &str = "6,2320,316540620638,-;oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=child,mems_allowed=0,oom_memcg=/scon/container/01M6YQ2MJJZ9B1T0GT6R8Q13ZE.nl1gfr/child/system.slice/fat-oomtest.scope,task_memcg=/scon/container/01M6YQ2MJJZ9B1T0GT6R8Q13ZE.nl1gfr/child/system.slice/fat-oomtest.scope,task=tail,pid=2417529,uid=0";
 const OOM_KILLED: &str = "3,2321,316540620648,-;Memory cgroup out of memory: Killed process 2417529 (tail) total-vm:58868kB, anon-rss:51200kB, file-rss:1576kB, shmem-rss:0kB, UID:0 pgtables:152kB oom_score_adj:0";
 
@@ -55,8 +56,16 @@ fn oom_report_folds_into_one_event() {
 
 #[test]
 fn parse_oom_variants() {
-    let o = parse_oom(&[&OOM_INVOKED[OOM_INVOKED.find(';').unwrap() + 1..], &OOM_CTX[OOM_CTX.find(';').unwrap() + 1..], &OOM_KILLED[OOM_KILLED.find(';').unwrap() + 1..]]).unwrap();
-    assert_eq!((o.victim_pid, o.victim_name.as_str(), o.anon_rss_kb, o.file_rss_kb, o.oom_score_adj), (2417529, "tail", 51200, 1576, 0));
+    let o = parse_oom(&[
+        &OOM_INVOKED[OOM_INVOKED.find(';').unwrap() + 1..],
+        &OOM_CTX[OOM_CTX.find(';').unwrap() + 1..],
+        &OOM_KILLED[OOM_KILLED.find(';').unwrap() + 1..],
+    ])
+    .unwrap();
+    assert_eq!(
+        (o.victim_pid, o.victim_name.as_str(), o.anon_rss_kb, o.file_rss_kb, o.oom_score_adj),
+        (2417529, "tail", 51200, 1576, 0)
+    );
     assert_eq!(o.invoker.as_deref(), Some("tail"));
     // Host-wide OOM, name with spaces and parens, negative adj (5.x format).
     let o = parse_oom(&[
@@ -69,7 +78,8 @@ fn parse_oom_variants() {
     assert_eq!(o.memcg, "/system.slice/app.service");
     assert_eq!((o.anon_rss_kb, o.shmem_rss_kb, o.oom_score_adj), (2048, 8, -500));
     // 4.x: no oom-kill: line, no UID.
-    let o = parse_oom(&["Killed process 77 (java) total-vm:100kB, anon-rss:50kB, file-rss:0kB, shmem-rss:0kB"]).unwrap();
+    let o =
+        parse_oom(&["Killed process 77 (java) total-vm:100kB, anon-rss:50kB, file-rss:0kB, shmem-rss:0kB"]).unwrap();
     assert_eq!((o.victim_pid, o.victim_name.as_str(), o.anon_rss_kb), (77, "java", 50));
     assert!(parse_oom(&["nothing here"]).is_none());
 }
@@ -82,11 +92,26 @@ fn legacy_memcg_oom_report() {
     let boot = 1_700_000_000_000;
     let mut asm = OomAssembler::default();
     assert!(asm.feed("4,100,5000,-;java invoked oom-killer: gfp_mask=0x14000c0(GFP_KERNEL), nodemask=(null), order=0, oom_score_adj=0", boot).is_none());
-    assert!(asm.feed("6,104,5000,-;Task in /system.slice/java.service killed as a result of limit of /system.slice/java.service", boot).is_none());
+    assert!(
+        asm.feed(
+            "6,104,5000,-;Task in /system.slice/java.service killed as a result of limit of /system.slice/java.service",
+            boot
+        )
+        .is_none()
+    );
     assert!(asm.feed("6,105,5000,-;memory: usage 65536kB, limit 65536kB, failcnt 12", boot).is_none());
-    assert!(asm.feed("3,106,5000,-;Memory cgroup out of memory: Kill process 1234 (java) score 999 or sacrifice child", boot).is_none());
+    assert!(
+        asm.feed(
+            "3,106,5000,-;Memory cgroup out of memory: Kill process 1234 (java) score 999 or sacrifice child",
+            boot
+        )
+        .is_none()
+    );
     let e = asm
-        .feed("3,107,5000,-;Killed process 1234 (java) total-vm:2000kB, anon-rss:1000kB, file-rss:0kB, shmem-rss:0kB", boot)
+        .feed(
+            "3,107,5000,-;Killed process 1234 (java) total-vm:2000kB, anon-rss:1000kB, file-rss:0kB, shmem-rss:0kB",
+            boot,
+        )
         .expect("oom event");
     assert_eq!(e.extra["constraint"], "CONSTRAINT_MEMCG");
     assert_eq!(e.extra["memcg"], "/system.slice/java.service");
@@ -95,9 +120,13 @@ fn legacy_memcg_oom_report() {
     assert!(e.detail.contains("hit its memory limit") && !e.detail.contains("host out of memory"), "{}", e.detail);
     // A host-wide OOM on the same kernels stays "host out of memory".
     let mut asm = OomAssembler::default();
-    assert!(asm.feed("4,200,5000,-;app invoked oom-killer: gfp_mask=0x14200ca, order=0, oom_score_adj=0", boot).is_none());
+    assert!(
+        asm.feed("4,200,5000,-;app invoked oom-killer: gfp_mask=0x14200ca, order=0, oom_score_adj=0", boot).is_none()
+    );
     assert!(asm.feed("3,201,5000,-;Out of memory: Kill process 77 (app) score 900 or sacrifice child", boot).is_none());
-    let e = asm.feed("3,202,5000,-;Killed process 77 (app) total-vm:100kB, anon-rss:50kB, file-rss:0kB, shmem-rss:0kB", boot).unwrap();
+    let e = asm
+        .feed("3,202,5000,-;Killed process 77 (app) total-vm:100kB, anon-rss:50kB, file-rss:0kB, shmem-rss:0kB", boot)
+        .unwrap();
     assert_eq!(e.extra["constraint"], "CONSTRAINT_NONE");
     assert!(e.detail.contains("host out of memory"), "{}", e.detail);
 }
@@ -106,7 +135,10 @@ fn legacy_memcg_oom_report() {
 #[test]
 fn disk_error_device_names() {
     let k = |r: &str| parse_kmsg_record(r, 0).unwrap();
-    assert_eq!(k("3,100,5000,-;sd 2:0:0:0: [sdb] tag#0 FAILED Result: hostbyte=DID_OK driverbyte=DRIVER_SENSE").subject, "disk:sdb");
+    assert_eq!(
+        k("3,100,5000,-;sd 2:0:0:0: [sdb] tag#0 FAILED Result: hostbyte=DID_OK driverbyte=DRIVER_SENSE").subject,
+        "disk:sdb"
+    );
     assert_eq!(k("3,102,5000,-;Buffer I/O error on device sdb1, logical block 0").subject, "disk:sdb1");
     assert_eq!(k("3,103,5000,-;Buffer I/O error on dev dm-0, logical block 0, async page read").subject, "disk:dm-0");
 }
@@ -123,13 +155,17 @@ fn kmsg_classification() {
     assert_eq!((e.kind, e.severity, e.pid), (EventKind::KernelWarn, Severity::Crit, Some(991)));
     let e = k("6,12,1,-;nginx[2211]: segfault at 0 ip 000055d5 sp 00007ffd error 4 in nginx[55d5+1000] likely on CPU 1 (core 1, socket 0)").unwrap();
     assert_eq!((e.kind, e.pid, e.subject.as_str()), (EventKind::KernelWarn, Some(2211), "pid:2211"));
-    let e = k("6,13,1,-;traps: python3[4040] general protection fault ip:7f sp:7ffc error:0 in libc.so.6[7f+1]").unwrap();
+    let e =
+        k("6,13,1,-;traps: python3[4040] general protection fault ip:7f sp:7ffc error:0 in libc.so.6[7f+1]").unwrap();
     assert_eq!(e.pid, Some(4040));
-    let e = k("3,14,1,-;EXT4-fs error (device sda1): ext4_find_entry:1455: inode #2: comm ls: reading directory lblock 0").unwrap();
+    let e =
+        k("3,14,1,-;EXT4-fs error (device sda1): ext4_find_entry:1455: inode #2: comm ls: reading directory lblock 0")
+            .unwrap();
     assert_eq!((e.kind, e.subject.as_str()), (EventKind::DiskError, "disk:sda1"));
     let e = k("2,15,1,-;EXT4-fs (sda1): Remounting filesystem read-only").unwrap();
     assert_eq!((e.kind, e.subject.as_str()), (EventKind::RoRemount, "disk:sda1"));
-    let e = k("3,16,1,-;I/O error, dev nvme0n1, sector 123456 op 0x0:(READ) flags 0x80700 phys_seg 1 prio class 2").unwrap();
+    let e = k("3,16,1,-;I/O error, dev nvme0n1, sector 123456 op 0x0:(READ) flags 0x80700 phys_seg 1 prio class 2")
+        .unwrap();
     assert_eq!((e.kind, e.subject.as_str()), (EventKind::DiskError, "disk:nvme0n1"));
     let e = k("3,17,1,-;blk_update_request: I/O error, dev sdb, sector 2048 op 0x1:(WRITE) flags 0x0").unwrap();
     assert_eq!(e.subject, "disk:sdb");
@@ -143,7 +179,9 @@ fn kmsg_classification() {
     assert_eq!(e.subject, "disk:ata1");
     let e = k("4,22,1,-;nf_conntrack: nf_conntrack: table full, dropping packet").unwrap();
     assert_eq!((e.kind, e.extra["resource"].as_str()), (EventKind::Exhaustion, "conntrack"));
-    let e = k("6,23,1,-;TCP: request_sock_TCP: Possible SYN flooding on port 8080. Sending cookies.  Check SNMP counters.").unwrap();
+    let e =
+        k("6,23,1,-;TCP: request_sock_TCP: Possible SYN flooding on port 8080. Sending cookies.  Check SNMP counters.")
+            .unwrap();
     assert_eq!((e.extra["resource"].as_str(), e.extra["port"].as_str()), ("syn_backlog", "8080"));
     let e = k("6,24,1,-;cgroup: fork rejected by pids controller in /system.slice/worker.service").unwrap();
     assert_eq!((e.unit.as_deref(), e.subject.as_str()), (Some("worker.service"), "unit:worker.service"));
@@ -186,10 +224,24 @@ fn diskstats_and_partitions() {
     let names: Vec<&str> = d.iter().map(|x| x.name.as_str()).collect();
     assert_eq!(names, ["loop1", "vda", "vdb", "nvme0n1", "sda", "dm-0", "md127"]);
     let vdb = &d[2];
-    assert_eq!((vdb.reads, vdb.read_sectors, vdb.read_ms, vdb.writes, vdb.write_ms, vdb.io_ms, vdb.weighted_ms), (1942118, 273037762, 47544, 11461492, 2528555, 2134656, 4558956));
+    assert_eq!(
+        (vdb.reads, vdb.read_sectors, vdb.read_ms, vdb.writes, vdb.write_ms, vdb.io_ms, vdb.weighted_ms),
+        (1942118, 273037762, 47544, 11461492, 2528555, 2134656, 4558956)
+    );
     // Old 2.6-era 14-field line still parses.
     assert_eq!(d[3].weighted_ms, 8);
-    for (n, p) in [("sda1", true), ("xvda12", true), ("nvme0n1p3", true), ("mmcblk0p1", true), ("nvme0n1", false), ("mmcblk0", false), ("md0", false), ("dm-3", false), ("sdaa", false), ("loop7", false)] {
+    for (n, p) in [
+        ("sda1", true),
+        ("xvda12", true),
+        ("nvme0n1p3", true),
+        ("mmcblk0p1", true),
+        ("nvme0n1", false),
+        ("mmcblk0", false),
+        ("md0", false),
+        ("dm-3", false),
+        ("sdaa", false),
+        ("loop7", false),
+    ] {
         assert_eq!(is_partition_name(n), p, "{n}");
     }
 }
@@ -220,13 +272,19 @@ unused devices: <none>
 ",
     );
     assert_eq!(md.len(), 4);
-    assert_eq!((md[0].name.as_str(), md[0].level.as_str(), md[0].degraded, md[0].state.as_str(), md[0].sync_pct), ("md1", "raid1", true, "recovering", Some(8.5)));
+    assert_eq!(
+        (md[0].name.as_str(), md[0].level.as_str(), md[0].degraded, md[0].state.as_str(), md[0].sync_pct),
+        ("md1", "raid1", true, "recovering", Some(8.5))
+    );
     assert!(!md[1].degraded && md[1].state == "active");
     assert_eq!(md[2].level, "raid5");
     assert_eq!(md[3].state, "inactive");
     assert_eq!(parse_file_nr("220225\t0\t9223372036854775807\n"), Some((220225, 9223372036854775807)));
     assert_eq!(parse_port_range("32768\t60999\n"), Some((32768, 60999)));
-    assert_eq!(stat_state_start("42 (a (b) c) D 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1000 10"), Some(('D', 98765)));
+    assert_eq!(
+        stat_state_start("42 (a (b) c) D 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1000 10"),
+        Some(('D', 98765))
+    );
     let mi = parse_mountinfo(
         "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
 23 22 8:2 / /var\\040data rw,relatime - ext4 /dev/sda2 ro,errors=remount-ro
@@ -248,7 +306,10 @@ Tcp: 1 200 120000 -1 100 50 3 2 7 1000 900 42 0 5 0
 TcpExt: SyncookiesSent ListenOverflows ListenDrops TCPBacklogDrop
 TcpExt: 0 11 13 2",
     );
-    assert_eq!((m["Tcp.RetransSegs"], m["TcpExt.ListenOverflows"], m["TcpExt.ListenDrops"], m["Tcp.MaxConn"]), (42, 11, 13, 0));
+    assert_eq!(
+        (m["Tcp.RetransSegs"], m["TcpExt.ListenOverflows"], m["TcpExt.ListenDrops"], m["Tcp.MaxConn"]),
+        (42, 11, 13, 0)
+    );
     let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
    0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0000000000000000 100 0 0 10 0
    1: 0100007F:8001 0100007F:1F90 01 00000000:00000000 00:00000000 00000000     0        0 2 1 0000000000000000 20 4 30 10 -1
@@ -268,11 +329,17 @@ fn proc_d(pid: u32, name: &str, cg: &str) -> Proc {
 fn fixture(r: &Root, cpu: &str, disk: &str, retrans: u64, conntrack: u64, oom: u64, mount_opts: &str) {
     r.put("proc/stat", &format!("cpu  {cpu}\ncpu0 1 1 1 1 1 1 1 1 0 0\nprocs_running 3\nprocs_blocked 2\n"));
     r.put("proc/pressure/cpu", "some avg10=1.00 avg60=0 avg300=0 total=1\nfull avg10=0.00 avg60=0 avg300=0 total=0\n");
-    r.put("proc/pressure/memory", "some avg10=30.00 avg60=0 avg300=0 total=1\nfull avg10=25.50 avg60=0 avg300=0 total=1\n");
+    r.put(
+        "proc/pressure/memory",
+        "some avg10=30.00 avg60=0 avg300=0 total=1\nfull avg10=25.50 avg60=0 avg300=0 total=1\n",
+    );
     r.put("proc/pressure/io", "some avg10=2.00 avg60=0 avg300=0 total=1\nfull avg10=1.00 avg60=0 avg300=0 total=1\n");
     r.put("proc/meminfo", "MemTotal: 8000000 kB\nMemFree: 1000 kB\nMemAvailable: 4000000 kB\n");
     r.put("proc/vmstat", &format!("nr_free_pages 1\npswpin 100\npswpout 200\noom_kill {oom}\n"));
-    r.put("sys/devices/system/node/node0/meminfo", "Node 0 MemTotal:       8000000 kB\nNode 0 MemFree:         1000 kB\n");
+    r.put(
+        "sys/devices/system/node/node0/meminfo",
+        "Node 0 MemTotal:       8000000 kB\nNode 0 MemFree:         1000 kB\n",
+    );
     r.put("proc/diskstats", &format!(" 8 0 sda {disk}\n 8 1 sda1 1 0 1 1 1 0 1 1 0 1 1\n"));
     r.put("sys/class/block/sda1/partition", "1\n");
     r.put("sys/block/sda/device/ioerr_cnt", "0x3\n");
@@ -298,7 +365,11 @@ fn sampler_over_fixture_root() {
     let r = Root::new("sampler");
     let cfg = ServerCfg { dstate_min_s: 5, disk_await_warn_ms: 100.0, exhaustion_warn: 0.85, ..Default::default() };
     let mut ks = KernelSampler::with_root(&cfg, &r.0, false);
-    let units = vec![Unit { name: "backup.service".into(), cgroup: "/system.slice/backup.service".into(), ..Default::default() }];
+    let units = vec![Unit {
+        name: "backup.service".into(),
+        cgroup: "/system.slice/backup.service".into(),
+        ..Default::default()
+    }];
     let procs = vec![proc_d(77, "dd", "/system.slice/backup.service"), proc_d(88, "sleepy", "/")];
 
     // user nice system idle iowait irq softirq steal
@@ -338,9 +409,21 @@ fn sampler_over_fixture_root() {
     assert_eq!(d.r_bps, 800 * 512 / 10);
     assert_eq!(k.tcp_retrans_ps, 10.0);
     assert_eq!(k.d_state.len(), 1);
-    assert_eq!(k.d_state[0], DStateProc { pid: 77, name: "dd".into(), wchan: "io_schedule".into(), seconds: 10, unit: Some("backup.service".into()) });
+    assert_eq!(
+        k.d_state[0],
+        DStateProc {
+            pid: 77,
+            name: "dd".into(),
+            wchan: "io_schedule".into(),
+            seconds: 10,
+            unit: Some("backup.service".into())
+        }
+    );
     assert_eq!(k.ro_remounts, vec!["/data".to_string()]);
-    assert_eq!(k.fs_errors, vec![FsErrorStat { device: "sda1".into(), mount: Some("/".into()), errors: 4, read_only: false }]);
+    assert_eq!(
+        k.fs_errors,
+        vec![FsErrorStat { device: "sda1".into(), mount: Some("/".into()), errors: 4, read_only: false }]
+    );
     assert_eq!(k.taint_flags, "PWO");
     let ev = ks.drain_events();
     let get = |kind| ev.iter().filter(|e| e.kind == kind).collect::<Vec<_>>();
@@ -362,7 +445,12 @@ fn sampler_over_fixture_root() {
 #[test]
 fn collapse_merges_floods() {
     let mk = |d: &str| event(1, EventKind::DiskError, Severity::Crit, "disk:sdb", d.into(), "kmsg");
-    let mut v = vec![mk("I/O error, dev sdb, sector 1"), mk("I/O error, dev sdb, sector 2"), mk("I/O error, dev sdb, sector 3"), event(2, EventKind::Other, Severity::Info, "host", "x".into(), "kmsg")];
+    let mut v = vec![
+        mk("I/O error, dev sdb, sector 1"),
+        mk("I/O error, dev sdb, sector 2"),
+        mk("I/O error, dev sdb, sector 3"),
+        event(2, EventKind::Other, Severity::Info, "host", "x".into(), "kmsg"),
+    ];
     collapse(&mut v);
     assert_eq!(v.len(), 2);
     assert_eq!(v[0].extra["repeats"], "3");
@@ -370,7 +458,13 @@ fn collapse_merges_floods() {
 
 #[test]
 fn render_and_report_off_linux_are_safe() {
-    let r = KernelReport { kernel: Some(Kernel { disks: vec![DiskStat { name: "sda".into(), ..Default::default() }], ..Default::default() }), ..Default::default() };
+    let r = KernelReport {
+        kernel: Some(Kernel {
+            disks: vec![DiskStat { name: "sda".into(), ..Default::default() }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
     let s = render(&r);
     assert!(s.contains("sda") && s.contains("steal"));
     if !cfg!(target_os = "linux") {
@@ -423,11 +517,19 @@ fn bench_kernel_sample() {
     let mut tcp = String::from("  sl  local_address rem_address   st\n");
     for i in 0..100_000u32 {
         // 4 local addresses x 25k connections to one remote endpoint.
-        tcp.push_str(&format!("{i:>6}: 0{}00007F:{:04X} 0200007F:1F90 01 00000000:00000000 00:00000000 00000000 0 0 1 1\n", 1 + i % 4, 32768 + (i / 4) % 28000));
+        tcp.push_str(&format!(
+            "{i:>6}: 0{}00007F:{:04X} 0200007F:1F90 01 00000000:00000000 00:00000000 00000000 0 0 1 1\n",
+            1 + i % 4,
+            32768 + (i / 4) % 28000
+        ));
     }
     let t = Instant::now();
     let (u, _) = ephemeral_usage(&[&tcp], (32768, 60999));
-    println!("ephemeral scan of 100k sockets ({} MB): {:.1} ms, used {u}", tcp.len() / 1_000_000, t.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "ephemeral scan of 100k sockets ({} MB): {:.1} ms, used {u}",
+        tcp.len() / 1_000_000,
+        t.elapsed().as_secs_f64() * 1e3
+    );
     assert_eq!(u, 25_000);
 }
 
@@ -444,12 +546,29 @@ fn dstate_worker_thread_found() {
     r.put("proc/99/task/101/stat", "101 (io-worker) D 1 99 99 0 -1 0 0 0 0 0 0 0 0 0 20 0 3 0 4100 1 1");
     r.put("proc/99/task/101/wchan", "io_schedule");
     r.put("proc/99/task/102/stat", "102 (gc) S 1 99 99 0 -1 0 0 0 0 0 0 0 0 0 20 0 3 0 4200 1 1");
-    let units = vec![Unit { name: "app.service".into(), cgroup: "/system.slice/app.service".into(), ..Default::default() }];
-    let procs = vec![Proc { pid: 99, name: "java".into(), status: "S".into(), threads: 3, cgroup: "/system.slice/app.service".into(), ..Default::default() }];
+    let units =
+        vec![Unit { name: "app.service".into(), cgroup: "/system.slice/app.service".into(), ..Default::default() }];
+    let procs = vec![Proc {
+        pid: 99,
+        name: "java".into(),
+        status: "S".into(),
+        threads: 3,
+        cgroup: "/system.slice/app.service".into(),
+        ..Default::default()
+    }];
     let k = ks.sample_at(&procs, &units, 1_000_000, None);
     assert!(k.d_state.is_empty(), "not yet blocked long enough");
     let k = ks.sample_at(&procs, &units, 1_010_000, Some(10.0));
-    assert_eq!(k.d_state, vec![DStateProc { pid: 99, name: "java".into(), wchan: "io_schedule".into(), seconds: 10, unit: Some("app.service".into()) }]);
+    assert_eq!(
+        k.d_state,
+        vec![DStateProc {
+            pid: 99,
+            name: "java".into(),
+            wchan: "io_schedule".into(),
+            seconds: 10,
+            unit: Some("app.service".into())
+        }]
+    );
     let ev = ks.drain_events();
     assert_eq!(ev.iter().filter(|e| e.kind == EventKind::HungTask).count(), 1, "{ev:?}");
     // Nothing more blocked than found: no thread walk.

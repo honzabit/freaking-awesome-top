@@ -41,23 +41,16 @@ pub fn from_meta(m: &std::fs::Metadata) -> FileStat {
 }
 
 pub fn home() -> String {
-    dirs::home_dir()
-        .map(|h| h.to_string_lossy().into_owned())
-        .unwrap_or_default()
+    dirs::home_dir().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// Directories fat itself writes (history DB, caches): their churn is never "growth".
 pub fn own_dirs() -> Vec<String> {
-    let mut v: Vec<String> = [
-        dirs::data_local_dir(),
-        dirs::cache_dir(),
-        dirs::data_dir(),
-        dirs::config_dir(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|d| d.join("fat").to_string_lossy().into_owned())
-    .collect();
+    let mut v: Vec<String> = [dirs::data_local_dir(), dirs::cache_dir(), dirs::data_dir(), dirs::config_dir()]
+        .into_iter()
+        .flatten()
+        .map(|d| d.join("fat").to_string_lossy().into_owned())
+        .collect();
     if let Some(h) = dirs::home_dir() {
         v.push(h.join(".cache").join("fat").to_string_lossy().into_owned());
     }
@@ -119,9 +112,7 @@ pub fn full_disk_access() -> bool {
 
 /// Linux pseudo / virtual trees never worth watching or walking.
 pub fn is_pseudo_path(p: &str) -> bool {
-    ["/proc", "/sys", "/dev", "/run"]
-        .iter()
-        .any(|r| super::under_prefix(p, r))
+    ["/proc", "/sys", "/dev", "/run"].iter().any(|r| super::under_prefix(p, r))
 }
 
 #[cfg(test)]
@@ -132,30 +123,18 @@ mod tests {
     fn protected_roots() {
         let h = "/Users/z";
         if cfg!(target_os = "macos") {
-            assert_eq!(
-                protected_root("/Users/z/Documents/a/b.txt", h).as_deref(),
-                Some("/Users/z/Documents")
-            );
-            assert_eq!(
-                protected_root("/Users/z/Documents", h).as_deref(),
-                Some("/Users/z/Documents")
-            );
+            assert_eq!(protected_root("/Users/z/Documents/a/b.txt", h).as_deref(), Some("/Users/z/Documents"));
+            assert_eq!(protected_root("/Users/z/Documents", h).as_deref(), Some("/Users/z/Documents"));
             assert_eq!(protected_root("/Users/z/DocumentsX/a", h), None);
             assert_eq!(
                 protected_root("/Users/z/Library/Containers/com.x/Data/f", h).as_deref(),
                 Some("/Users/z/Library/Containers")
             );
-            assert_eq!(
-                protected_root("/Volumes/Backup/x", h).as_deref(),
-                Some("/Volumes/Backup")
-            );
+            assert_eq!(protected_root("/Volumes/Backup/x", h).as_deref(), Some("/Volumes/Backup"));
             assert_eq!(protected_root("/Volumes", h), None);
             assert_eq!(protected_root("/Users/z/Library/Caches/x", h), None);
             // Another user's home (fat running as root, $HOME=/var/root).
-            assert_eq!(
-                protected_root("/Users/other/Desktop/x", "/var/root").as_deref(),
-                Some("/Users/other/Desktop")
-            );
+            assert_eq!(protected_root("/Users/other/Desktop/x", "/var/root").as_deref(), Some("/Users/other/Desktop"));
         } else {
             assert_eq!(protected_root("/home/z/Documents/a", "/home/z"), None);
         }

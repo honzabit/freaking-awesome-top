@@ -17,12 +17,7 @@ pub struct Walk {
 /// `skip(path)` returns true for directories that must not be entered.
 pub fn walk(roots: &[String], from_ms: i64, budget: Duration, max_hits: usize, skip: &dyn Fn(&str) -> bool) -> Walk {
     let t0 = Instant::now();
-    let mut w = Walk {
-        hits: vec![],
-        dirs: 0,
-        files: 0,
-        truncated: false,
-    };
+    let mut w = Walk { hits: vec![], dirs: 0, files: 0, truncated: false };
     let from_s = from_ms / 1000;
     for root in roots {
         let Some(rs) = paths::lstat(root) else { continue };
@@ -74,20 +69,11 @@ mod tests {
         let old = d.join("a/old.txt");
         std::fs::write(&old, b"x").unwrap();
         let past = std::time::SystemTime::now() - Duration::from_secs(3600);
-        std::fs::File::options()
-            .write(true)
-            .open(&old)
-            .unwrap()
-            .set_modified(past)
-            .unwrap();
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(past).unwrap();
         let root = d.to_string_lossy().into_owned();
         let from = crate::model::now_ms() - 60_000;
         let w = walk(&[root], from, Duration::from_secs(5), 100, &|p| p.ends_with("/skipme"));
-        let names: Vec<_> = w
-            .hits
-            .iter()
-            .map(|h| h.0.rsplit('/').next().unwrap().to_string())
-            .collect();
+        let names: Vec<_> = w.hits.iter().map(|h| h.0.rsplit('/').next().unwrap().to_string()).collect();
         assert_eq!(names, vec!["new.bin"]);
         assert!(!w.truncated);
         assert!(w.hits[0].1.alloc >= 8192);

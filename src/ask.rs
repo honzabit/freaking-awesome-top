@@ -87,7 +87,13 @@ pub fn dry_run(question: &str, snap: &Snapshot, findings: &[Finding], cfg: &crat
     (request_json(question, snap, findings, &cfg.model), note)
 }
 
-fn call_claude(question: &str, snap: &Snapshot, findings: &[Finding], model: &str, key: &str) -> Result<String, String> {
+fn call_claude(
+    question: &str,
+    snap: &Snapshot,
+    findings: &[Finding],
+    model: &str,
+    key: &str,
+) -> Result<String, String> {
     // Sent as these exact bytes, so `fat ask --dry-run` shows precisely what leaves the machine.
     let body = request_json(question, snap, findings, model);
     let url = endpoint();
@@ -156,7 +162,10 @@ pub(crate) fn parse_response(v: &Value) -> Result<String, String> {
         .unwrap_or_default();
     let mut answer = text.join("").trim().to_string();
     if answer.is_empty() {
-        return Err(format!("Claude returned no text (stop_reason: {})", if stop.is_empty() { "unknown" } else { stop }));
+        return Err(format!(
+            "Claude returned no text (stop_reason: {})",
+            if stop.is_empty() { "unknown" } else { stop }
+        ));
     }
     if stop == "max_tokens" {
         answer.push_str("\n\n[answer truncated]");
@@ -201,10 +210,12 @@ fn secret_name(name: &str) -> bool {
         return false;
     }
     // Words that end in these letters without being about secrets.
-    const NOT_PASS: &[&str] = &["bypass", "compass", "encompass", "surpass", "trespass", "overpass", "underpass", "impass"];
+    const NOT_PASS: &[&str] =
+        &["bypass", "compass", "encompass", "surpass", "trespass", "overpass", "underpass", "impass"];
     const NOT_KEY: &[&str] = &["monkey", "hotkey", "turkey", "donkey", "hockey", "jockey", "whiskey"];
     l.split(['-', '_', '.']).filter(|w| !w.is_empty()).any(|w| {
-        const CONTAINS: &[&str] = &["token", "secret", "passw", "passphrase", "credential", "cookie", "signature", "apikey", "privatekey"];
+        const CONTAINS: &[&str] =
+            &["token", "secret", "passw", "passphrase", "credential", "cookie", "signature", "apikey", "privatekey"];
         CONTAINS.iter().any(|c| w.contains(c))
             || matches!(w, "pw" | "pin" | "bearer" | "private")
             || w.starts_with("session")
@@ -246,12 +257,19 @@ fn known_secret(w: &str) -> bool {
         return true;
     }
     // AWS access key ids.
-    if (w.starts_with("AKIA") || w.starts_with("ASIA")) && w.len() == 20 && w.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+    if (w.starts_with("AKIA") || w.starts_with("ASIA"))
+        && w.len() == 20
+        && w.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
         return true;
     }
     // JWT: three base64url parts, the first two starting with '{"' encoded.
     let parts: Vec<&str> = w.split('.').collect();
-    if parts.len() == 3 && parts[0].starts_with("eyJ") && parts[1].starts_with("eyJ") && parts.iter().all(|p| !p.is_empty()) {
+    if parts.len() == 3
+        && parts[0].starts_with("eyJ")
+        && parts[1].starts_with("eyJ")
+        && parts.iter().all(|p| !p.is_empty())
+    {
         return true;
     }
     false
@@ -373,7 +391,8 @@ pub(crate) fn redact(text: &str) -> String {
         }
         if mask_next {
             // "Authorization: Bearer X": the scheme stays, the credential after it goes.
-            let scheme = ["bearer", "basic", "token", "digest"].contains(&tok.to_ascii_lowercase().trim_start_matches(['"', '\'']));
+            let scheme = ["bearer", "basic", "token", "digest"]
+                .contains(&tok.to_ascii_lowercase().trim_start_matches(['"', '\'']));
             if scheme {
                 out.push_str(tok);
             } else {
@@ -409,8 +428,25 @@ pub(crate) fn redact(text: &str) -> String {
             }
             // mysql -pSECRET (attached). Ports (-p8080) and well-known flags that happen to
             // start with -p (find -print, cc -pthread) stay.
-            const P_FLAGS: [&str; 12] = ["-print", "-print0", "-printf", "-prune", "-path", "-perm", "-pthread", "-pipe", "-pedantic", "-pie", "-pg", "-pic"];
-            if tok.len() > 2 && tok.starts_with("-p") && !tok[2..].chars().all(|c| c.is_ascii_digit()) && !P_FLAGS.contains(&tok) {
+            const P_FLAGS: [&str; 12] = [
+                "-print",
+                "-print0",
+                "-printf",
+                "-prune",
+                "-path",
+                "-perm",
+                "-pthread",
+                "-pipe",
+                "-pedantic",
+                "-pie",
+                "-pg",
+                "-pic",
+            ];
+            if tok.len() > 2
+                && tok.starts_with("-p")
+                && !tok[2..].chars().all(|c| c.is_ascii_digit())
+                && !P_FLAGS.contains(&tok)
+            {
                 out.push_str("-p");
                 out.push_str(MASK);
                 continue;
@@ -556,7 +592,14 @@ fn context_with(snap: &Snapshot, findings: &[Finding], scale: usize, cmd_len: us
     let lim = |n: usize| (n * scale / 4).max(1);
     let list = |ps: Vec<&Proc>| ps.into_iter().map(|p| proc_json(snap, p, cmd_len)).collect::<Vec<_>>();
     let ctr_procs = |c: &crate::model::Container| {
-        snap.procs.iter().filter(|p| p.container.as_deref().is_some_and(|id| !c.id.is_empty() && (id.starts_with(&c.id) || c.id.starts_with(id)))).count()
+        snap.procs
+            .iter()
+            .filter(|p| {
+                p.container
+                    .as_deref()
+                    .is_some_and(|id| !c.id.is_empty() && (id.starts_with(&c.id) || c.id.starts_with(id)))
+            })
+            .count()
     };
     let mut v = json!({
         "host": snap.host,
@@ -728,7 +771,11 @@ pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding]) -> 
                     s.cpu, s.cores, s.load[0], s.load[1], s.load[2]
                 ));
                 if let Some(psi) = &s.psi {
-                    out.push(format!("CPU pressure: tasks waited for a CPU {:.1}% of the last 10s{}.", psi.cpu_some, stall_hint(psi.cpu_some)));
+                    out.push(format!(
+                        "CPU pressure: tasks waited for a CPU {:.1}% of the last 10s{}.",
+                        psi.cpu_some,
+                        stall_hint(psi.cpu_some)
+                    ));
                 }
                 push_top(&mut out, "Top CPU:", top_by(snap, 5, |p| p.cpu as f64), |p| format!("{:.1}% cpu", p.cpu));
             }
@@ -765,10 +812,13 @@ pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding]) -> 
                         stall_hint(psi.mem_some.max(psi.mem_full * 4.0))
                     ));
                 }
-                push_top(&mut out, "Top memory:", top_by(snap, 5, |p| p.mem as f64), |p| format!("{} rss", human(p.mem)));
+                push_top(&mut out, "Top memory:", top_by(snap, 5, |p| p.mem as f64), |p| {
+                    format!("{} rss", human(p.mem))
+                });
             }
             Topic::Ports => {
-                let listening: Vec<_> = snap.ports.iter().filter(|p| p.state == "LISTEN" || p.state.is_empty()).collect();
+                let listening: Vec<_> =
+                    snap.ports.iter().filter(|p| p.state == "LISTEN" || p.state.is_empty()).collect();
                 out.push(format!("{} listening sockets.", listening.len()));
                 let orphans: Vec<_> = listening.iter().filter(|p| p.orphan).collect();
                 if !orphans.is_empty() {
@@ -785,11 +835,19 @@ pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding]) -> 
             Topic::Disk => {
                 out.push(format!("Disk read {}/s, write {}/s.", human(s.disk_read_bps), human(s.disk_write_bps)));
                 if let Some(psi) = &s.psi {
-                    out.push(format!("IO pressure: some tasks waited on io {:.1}%, all {:.1}% of the last 10s{}.", psi.io_some, psi.io_full, stall_hint(psi.io_some)));
+                    out.push(format!(
+                        "IO pressure: some tasks waited on io {:.1}%, all {:.1}% of the last 10s{}.",
+                        psi.io_some,
+                        psi.io_full,
+                        stall_hint(psi.io_some)
+                    ));
                 }
-                push_top(&mut out, "Top disk:", top_by(snap, 5, |p| (p.disk_read_bps + p.disk_write_bps) as f64), |p| {
-                    format!("r {}/s w {}/s", human(p.disk_read_bps), human(p.disk_write_bps))
-                });
+                push_top(
+                    &mut out,
+                    "Top disk:",
+                    top_by(snap, 5, |p| (p.disk_read_bps + p.disk_write_bps) as f64),
+                    |p| format!("r {}/s w {}/s", human(p.disk_read_bps), human(p.disk_write_bps)),
+                );
             }
             Topic::Network => {
                 out.push(format!("Network in {}/s, out {}/s.", human(s.net_rx_bps), human(s.net_tx_bps)));
@@ -835,7 +893,10 @@ fn container_section(out: &mut Vec<String>, snap: &Snapshot) {
         }
     }
     if snap.containers.is_empty() && by_ctr.is_empty() {
-        out.push("No containers found (no reachable docker / podman / nerdctl, and no process in a container cgroup).".into());
+        out.push(
+            "No containers found (no reachable docker / podman / nerdctl, and no process in a container cgroup)."
+                .into(),
+        );
         return;
     }
     if !snap.containers.is_empty() {
@@ -843,7 +904,14 @@ fn container_section(out: &mut Vec<String>, snap: &Snapshot) {
         let mut cs: Vec<_> = snap.containers.iter().collect();
         cs.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
         for c in cs.iter().take(10) {
-            out.push(format!("  {:<24} {:>6.1}% cpu {:>8}  {} ({})", trunc(&c.name, 24), c.cpu, human(c.mem), trunc(&c.image, 40), c.runtime));
+            out.push(format!(
+                "  {:<24} {:>6.1}% cpu {:>8}  {} ({})",
+                trunc(&c.name, 24),
+                c.cpu,
+                human(c.mem),
+                trunc(&c.image, 40),
+                c.runtime
+            ));
         }
     }
     if !by_ctr.is_empty() {
@@ -896,7 +964,13 @@ mod tests {
         }
         Snapshot {
             host: "local".into(),
-            system: System { cores: 12, cpu: 40.0, thermal: "fair".into(), mem_pressure: "warn".into(), ..Default::default() },
+            system: System {
+                cores: 12,
+                cpu: 40.0,
+                thermal: "fair".into(),
+                mem_pressure: "warn".into(),
+                ..Default::default()
+            },
             procs,
             ports: vec![Port {
                 proto: Proto::Tcp,
@@ -944,14 +1018,16 @@ mod tests {
             p.name = "x".repeat(200);
             p.cmd = "y ".repeat(500);
         }
-        let many: Vec<Finding> = (0..50).map(|_| Finding { detail: "z".repeat(400), ..findings()[0].clone() }).collect();
+        let many: Vec<Finding> =
+            (0..50).map(|_| Finding { detail: "z".repeat(400), ..findings()[0].clone() }).collect();
         assert!(build_context(&s, &many).len() <= MAX_CONTEXT_BYTES);
     }
 
     fn linux_snap() -> Snapshot {
         let mut s = snap();
         s.system.os = "Ubuntu 24.04".into();
-        s.system.psi = Some(crate::model::Psi { cpu_some: 23.0, mem_some: 1.0, mem_full: 0.5, io_some: 7.0, io_full: 2.0 });
+        s.system.psi =
+            Some(crate::model::Psi { cpu_some: 23.0, mem_some: 1.0, mem_full: 0.5, io_some: 7.0, io_full: 2.0 });
         s.system.temp_c = Some(81.0);
         s.system.thermal = String::new();
         s.system.power_source = "rapl".into();
@@ -959,7 +1035,14 @@ mod tests {
         s.procs[1].cgroup = "/system.slice/docker-410892b21be2ffda.scope".into();
         s.procs[1].container = Some("410892b21be2".into());
         s.procs[2].cgroup = "/user.slice/user-1000.slice/user@1000.service/app.slice/code.scope".into();
-        s.containers = vec![crate::model::Container { id: "410892b21be2".into(), name: "api-1".into(), image: "node:22".into(), runtime: "docker".into(), cpu: 180.0, ..Default::default() }];
+        s.containers = vec![crate::model::Container {
+            id: "410892b21be2".into(),
+            name: "api-1".into(),
+            image: "node:22".into(),
+            runtime: "docker".into(),
+            cpu: 180.0,
+            ..Default::default()
+        }];
         s
     }
 
@@ -981,7 +1064,11 @@ mod tests {
         assert_eq!(v["containers"][0]["procs"], 1);
         // macOS digest is unchanged: no Linux keys
         let m: Value = serde_json::from_str(&build_context(&snap(), &findings())).unwrap();
-        assert!(m["system"].get("psi").is_none() && m["system"].get("temp_c").is_none() && m["system"].get("power_source").is_none());
+        assert!(
+            m["system"].get("psi").is_none()
+                && m["system"].get("temp_c").is_none()
+                && m["system"].get("power_source").is_none()
+        );
         assert!(m["top_cpu"][0].get("ctr").is_none() && m["top_cpu"][0].get("cgroup").is_none());
     }
 
@@ -1016,13 +1103,19 @@ mod tests {
         assert_eq!(redact_cmd("ls -la /tmp"), "ls -la /tmp");
         let cases = [
             ("node app.js --api-key=sk-ant-api03-AbCdEfGhIjKlMnOpQrSt", "node app.js --api-key=***"),
-            ("git clone https://ghp_abcdefghijklmnopqrstuvwxyz0123@github.com/x/y", "git clone https://***@github.com/x/y"),
+            (
+                "git clone https://ghp_abcdefghijklmnopqrstuvwxyz0123@github.com/x/y",
+                "git clone https://***@github.com/x/y",
+            ),
             ("psql postgres://admin:s3cr3t@db:5432/app", "psql postgres://***@db:5432/app"),
             ("mysql -uroot -phunter2 db", "mysql -uroot -p*** db"),
             ("mysql --password hunter2", "mysql --password ***"),
             ("curl -u bob:hunter2 -H Authorization: Bearer abc.def", "curl -u bob:*** -H Authorization: Bearer ***"),
             ("curl -H 'Authorization: Bearer xyz123'", "curl -H 'Authorization: Bearer ***"),
-            ("env AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE x", "env AWS_SECRET_ACCESS_KEY=*** AWS_ACCESS_KEY_ID=*** x"),
+            (
+                "env AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE x",
+                "env AWS_SECRET_ACCESS_KEY=*** AWS_ACCESS_KEY_ID=*** x",
+            ),
             ("bot --slack xoxb-1234567890-abcdefghij", "bot --slack ***"),
             ("gh --with github_pat_11ABCDEFG0123456789_abcdefghijklmnop", "gh --with ***"),
             ("app --jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl", "app --jwt ***"),
@@ -1075,10 +1168,16 @@ mod tests {
             "node server.js --api-key {} GITHUB_TOKEN={} --password {} -p{} https://u:{}@h/x",
             secrets[0], secrets[1], secrets[2], secrets[5], secrets[5]
         );
-        s.procs[2].cmd = format!("aws s3 ls AWS_ACCESS_KEY_ID={} Authorization: Bearer {} {}", secrets[3], secrets[4], secrets[6]);
+        s.procs[2].cmd =
+            format!("aws s3 ls AWS_ACCESS_KEY_ID={} Authorization: Bearer {} {}", secrets[3], secrets[4], secrets[6]);
         s.procs[2].cpu = 500.0;
         s.ports[0].note = format!("vite dev · ~/code/app?token={} · {}", secrets[8], secrets[7]);
-        s.containers = vec![crate::model::Container { name: "db".into(), image: format!("reg.io/x:{}", secrets[7]), status: "up".into(), ..Default::default() }];
+        s.containers = vec![crate::model::Container {
+            name: "db".into(),
+            image: format!("reg.io/x:{}", secrets[7]),
+            status: "up".into(),
+            ..Default::default()
+        }];
         let f = vec![Finding {
             severity: "warn".into(),
             title: format!("node --password {} is hot", secrets[2]),
@@ -1105,7 +1204,10 @@ mod tests {
     fn home_and_user_name_are_replaced() {
         let mut v = json!({"cwd": "/Users/alice/code/app", "user": "alice", "h": "/home/alice", "n": "alicex", "e": "/tmp/-Users-alice-x"});
         redact_value(&mut v, Some("/Users/alice"), Some("alice"));
-        assert_eq!(v, json!({"cwd": "~/code/app", "user": "me", "h": "/home/me", "n": "alicex", "e": "/tmp/-Users-me-x"}));
+        assert_eq!(
+            v,
+            json!({"cwd": "~/code/app", "user": "me", "h": "/home/me", "n": "alicex", "e": "/tmp/-Users-me-x"})
+        );
     }
 
     #[test]
@@ -1143,7 +1245,10 @@ mod tests {
     fn parses_empty_and_errors() {
         let v: Value = serde_json::from_str(r#"{"stop_reason":"end_turn","content":[]}"#).unwrap();
         assert!(parse_response(&v).is_err());
-        let m = http_error_message(401, r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#);
+        let m = http_error_message(
+            401,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+        );
         assert_eq!(m, "Claude API error 401 (authentication_error): invalid x-api-key");
         assert!(http_error_message(502, "<html>bad gateway</html>").contains("502"));
     }

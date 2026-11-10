@@ -26,14 +26,14 @@ pub mod widgets;
 
 use crate::actions::Actions;
 use crate::config::Config;
-use crate::history::History;
-use crate::history::Point;
-use crate::fs::{DirEntry, Growth, Listing, Volume};
-use crate::model::{Container, Explanation, Finding, Snapshot, Ts, now_ms};
-use app::{App, Command};
 use crate::fleet::fanout::{self, Transport};
 use crate::fleet::inventory::Target;
+use crate::fs::{DirEntry, Growth, Listing, Volume};
+use crate::history::History;
+use crate::history::Point;
+use crate::model::{Container, Explanation, Finding, Snapshot, Ts, now_ms};
 use crate::server::{FleetHost, FleetSummary, Incident};
+use app::{App, Command};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -54,7 +54,9 @@ enum Msg {
     CollectorError(String),
     /// Findings plus the start time of every pid they mention (from the same snapshot).
     Findings(Vec<Finding>, HashMap<u32, u64>),
-    Fleet { containers: Option<Vec<Container>> },
+    Fleet {
+        containers: Option<Vec<Container>>,
+    },
     /// Server profile: recorder events for the window starting at `from` (None = no recorder).
     Events(Ts, Option<Vec<crate::server::Event>>),
     Incident(u64, Result<Incident, String>),
@@ -80,11 +82,20 @@ enum Msg {
 
 /// Work for the storage thread.
 enum FsReq {
-    List { path: String, explicit: bool },
-    Growth { window_ms: i64, under: Option<String> },
+    List {
+        path: String,
+        explicit: bool,
+    },
+    Growth {
+        window_ms: i64,
+        under: Option<String>,
+    },
     Rescan(String),
     Largest(String),
-    At { ts: Ts, path: String },
+    At {
+        ts: Ts,
+        path: String,
+    },
     /// Every collector sample, for the growth tracker's open-file attribution.
     Observe(Box<Snapshot>),
 }
@@ -111,13 +122,28 @@ impl FsShared {
 
 /// Work for the history thread.
 enum HistReq {
-    Timeline { from: Ts, to: Ts },
+    Timeline {
+        from: Ts,
+        to: Ts,
+    },
     LoadAt(Ts),
     Explain(Box<Snapshot>, u32),
     /// Server profile requests (incident engine and recorder event tables).
-    Events { from: Ts, to: Ts },
-    ExplainEvent { id: u64, live: Box<Snapshot>, event: Box<crate::server::Event> },
-    WhatHappened { id: u64, live: Box<Snapshot>, at: Option<Ts>, window_ms: i64 },
+    Events {
+        from: Ts,
+        to: Ts,
+    },
+    ExplainEvent {
+        id: u64,
+        live: Box<Snapshot>,
+        event: Box<crate::server::Event>,
+    },
+    WhatHappened {
+        id: u64,
+        live: Box<Snapshot>,
+        at: Option<Ts>,
+        window_ms: i64,
+    },
     Counts,
 }
 
@@ -268,7 +294,8 @@ fn spawn_sampler(cfg: Config, profile: crate::server::Profile, tx: Sender<Msg>, 
         };
         // The TUI may start over a per-user DB of another fat version (kept aside), never the
         // shared system recorder's.
-        let may_reset = History::resolve(cfg.history_path.as_deref()) != std::path::Path::new(crate::history::SYSTEM_DB);
+        let may_reset =
+            History::resolve(cfg.history_path.as_deref()) != std::path::Path::new(crate::history::SYSTEM_DB);
         let mut hist =
             guarded(|| History::open_recorder(cfg.history_path.as_deref(), may_reset)).ok().and_then(Result::ok);
         if server.is_some()
@@ -294,7 +321,9 @@ fn spawn_sampler(cfg: Config, profile: crate::server::Profile, tx: Sender<Msg>, 
                 && guarded(|| ss.fill(&mut snap)).is_err()
             {
                 server = None;
-                let _ = tx.send(Msg::CollectorError("server sampling (services, kernel, events) failed and was turned off".into()));
+                let _ = tx.send(Msg::CollectorError(
+                    "server sampling (services, kernel, events) failed and was turned off".into(),
+                ));
             }
             let now = now_ms();
             if now - last_rec >= 2000 {
@@ -396,7 +425,10 @@ impl KernelLogCache {
             let got = guarded(|| (self.read)(since)).ok().and_then(Result::ok).unwrap_or_default();
             self.cached = Some((Instant::now(), since, got));
         }
-        self.cached.as_ref().map(|(_, _, v)| v.iter().filter(|e| e.ts >= from && e.ts <= to).cloned().collect()).unwrap_or_default()
+        self.cached
+            .as_ref()
+            .map(|(_, _, v)| v.iter().filter(|e| e.ts >= from && e.ts <= to).cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -429,7 +461,9 @@ fn spawn_history(hist: Option<History>, tx: Sender<Msg>, mut klog: Option<Kernel
                 }
             }
             if let Some((from, to)) = events {
-                let mut got = hist.as_ref().and_then(|h| guarded(|| crate::server::incident::timeline(h, from, to, &[])).ok()?.ok());
+                let mut got = hist
+                    .as_ref()
+                    .and_then(|h| guarded(|| crate::server::incident::timeline(h, from, to, &[])).ok()?.ok());
                 if let Some(k) = klog.as_mut() {
                     got = Some(crate::server::incident::merge_events(got.unwrap_or_default(), k.events(from, to)));
                 }
@@ -443,7 +477,10 @@ fn spawn_history(hist: Option<History>, tx: Sender<Msg>, mut klog: Option<Kernel
                 let n = match klog.as_mut() {
                     // Recorder and kernel log together, each kill once.
                     Some(k) => {
-                        let rec = hist.as_ref().and_then(|h| guarded(|| crate::server::incident::timeline(h, from, to, &oom)).ok()?.ok()).unwrap_or_default();
+                        let rec = hist
+                            .as_ref()
+                            .and_then(|h| guarded(|| crate::server::incident::timeline(h, from, to, &oom)).ok()?.ok())
+                            .unwrap_or_default();
                         let kev: Vec<_> = k.events(from, to).into_iter().filter(|e| e.kind == oom[0]).collect();
                         Some(crate::server::incident::merge_events(rec, kev).len() as u64)
                     }
@@ -502,10 +539,14 @@ fn spawn_history(hist: Option<History>, tx: Sender<Msg>, mut klog: Option<Kernel
 /// snapshot and the kernel log when the recorder has nothing, and lists what it lacked.
 fn run_incident(hist: Option<&History>, r: HistReq) -> (u64, Result<Incident, String>) {
     match r {
-        HistReq::ExplainEvent { id, live, event } => (id, guarded(|| crate::server::incident::explain_event(hist, &live, &event))),
-        HistReq::WhatHappened { id, live, at, window_ms } => {
-            (id, guarded(|| crate::server::incident::what_happened(hist, &live, at, window_ms)).and_then(|r| r.map_err(|e| e.to_string())))
+        HistReq::ExplainEvent { id, live, event } => {
+            (id, guarded(|| crate::server::incident::explain_event(hist, &live, &event)))
         }
+        HistReq::WhatHappened { id, live, at, window_ms } => (
+            id,
+            guarded(|| crate::server::incident::what_happened(hist, &live, at, window_ms))
+                .and_then(|r| r.map_err(|e| e.to_string())),
+        ),
         _ => (0, Err("not an incident request".into())),
     }
 }
@@ -517,7 +558,9 @@ type Inventory = Arc<Mutex<Option<Vec<Target>>>>;
 /// a network home) and report its size.
 fn spawn_inventory(cfg: Config, inv: Inventory, tx: Sender<Msg>) {
     let _ = thread::Builder::new().name("fat-inventory".into()).spawn(move || {
-        let r = guarded(|| crate::fleet::inventory::inventory(&cfg)).map_err(|e| format!("inventory unavailable ({e})")).and_then(|r| r.map_err(|e| e.to_string()));
+        let r = guarded(|| crate::fleet::inventory::inventory(&cfg))
+            .map_err(|e| format!("inventory unavailable ({e})"))
+            .and_then(|r| r.map_err(|e| e.to_string()));
         let msg = match r {
             Ok(t) => {
                 let n = t.len();
@@ -550,7 +593,8 @@ fn fleet_poll(targets: &[Target], cfg: &crate::server::FleetCfg, tr: &dyn Transp
             return;
         }
     };
-    let findings: Vec<(String, Vec<Finding>)> = polled.iter().map(|p| (p.host.name.clone(), p.findings.clone())).collect();
+    let findings: Vec<(String, Vec<Finding>)> =
+        polled.iter().map(|p| (p.host.name.clone(), p.findings.clone())).collect();
     let rows: Vec<FleetHost> = polled.into_iter().map(|p| p.host).collect();
     // Every affected host is kept: the panel shows as many names as fit, and ⏎ on a finding
     // filters the table to all of them.
@@ -566,7 +610,11 @@ fn fleet_poll(targets: &[Target], cfg: &crate::server::FleetCfg, tr: &dyn Transp
 }
 
 /// Fetch one host's snapshot (read-only allowlisted command) and diagnose it locally.
-fn fleet_drill(t: &Target, cfg: &crate::server::FleetCfg, tr: &dyn Transport) -> Result<(Box<Snapshot>, Vec<Finding>), String> {
+fn fleet_drill(
+    t: &Target,
+    cfg: &crate::server::FleetCfg,
+    tr: &dyn Transport,
+) -> Result<(Box<Snapshot>, Vec<Finding>), String> {
     let args: Vec<String> = ["snapshot", "--json", "--fast"].iter().map(|s| s.to_string()).collect();
     let out = guarded(|| fanout::remote_read_only(t, &args, cfg, tr)).and_then(|r| r.map_err(|e| e.to_string()))?;
     let snap = crate::fleet::parse_remote_snapshot(&out, &t.name).map_err(|e| e.to_string())?;
@@ -684,7 +732,8 @@ fn spawn_fs(history_path: Option<String>, tx: Sender<Msg>, shared: Arc<FsShared>
         let (gtx, grx) = mpsc::channel::<FsReq>();
         {
             let (sc, tx, shared, hp) = (scanner.clone(), tx.clone(), shared.clone(), history_path.clone());
-            let _ = thread::Builder::new().name("fat-fs-growth".into()).spawn(move || growth_loop(grx, sc, hp, tx, shared));
+            let _ =
+                thread::Builder::new().name("fat-fs-growth".into()).spawn(move || growth_loop(grx, sc, hp, tx, shared));
         }
         let hist = guarded(|| History::open(history_path.as_deref())).ok().and_then(Result::ok);
         let mut focused = String::new();
@@ -777,7 +826,13 @@ fn spawn_fs(history_path: Option<String>, tx: Sender<Msg>, shared: Arc<FsShared>
 
 /// The growth thread: owns the Tracker, observes every sample, answers growth reports
 /// (coalesced: only the newest request in a burst is computed).
-fn growth_loop(rx: Receiver<FsReq>, scanner: crate::fs::scan::Scanner, history_path: Option<String>, tx: Sender<Msg>, shared: Arc<FsShared>) {
+fn growth_loop(
+    rx: Receiver<FsReq>,
+    scanner: crate::fs::scan::Scanner,
+    history_path: Option<String>,
+    tx: Sender<Msg>,
+    shared: Arc<FsShared>,
+) {
     let mut tracker = guarded(crate::fs::growth::Tracker::new).ok();
     let hist = guarded(|| History::open(history_path.as_deref())).ok().and_then(Result::ok);
     let mut growth_err = false;
@@ -816,7 +871,10 @@ fn growth_loop(rx: Receiver<FsReq>, scanner: crate::fs::scan::Scanner, history_p
                 tracker = None;
                 if !growth_err {
                     growth_err = true;
-                    let _ = tx.send(Msg::FsGrowth(Box::new(Growth { notes: vec![format!("growth tracking unavailable ({e})")], ..Default::default() })));
+                    let _ = tx.send(Msg::FsGrowth(Box::new(Growth {
+                        notes: vec![format!("growth tracking unavailable ({e})")],
+                        ..Default::default()
+                    })));
                 }
             }
         }
@@ -830,7 +888,8 @@ fn fs_past(hist: Option<&History>, ts: Ts, path: &str, shared: &FsShared) -> app
         Ok(Ok(Some((at, rows)))) => (Some(at), rows),
         _ => (None, Vec::new()),
     };
-    let mounts: Vec<String> = shared.volumes.lock().map(|v| v.iter().map(|x| x.mount.clone()).collect()).unwrap_or_default();
+    let mounts: Vec<String> =
+        shared.volumes.lock().map(|v| v.iter().map(|x| x.mount.clone()).collect()).unwrap_or_default();
     let vols = mounts
         .into_iter()
         .filter_map(|m| {
@@ -873,7 +932,9 @@ impl Ctx {
         if app.fs.error.is_some() {
             return;
         }
-        let tx = self.fs.get_or_insert_with(|| spawn_fs(self.cfg.history_path.clone(), self.tx.clone(), self.fs_shared.clone()));
+        let tx = self
+            .fs
+            .get_or_insert_with(|| spawn_fs(self.cfg.history_path.clone(), self.tx.clone(), self.fs_shared.clone()));
         if tx.send(req).is_err() {
             app.set_fs_error("storage thread stopped".into());
         }
@@ -930,13 +991,16 @@ impl Ctx {
                     return;
                 }
                 let (cfg, tr, tx) = (self.cfg.fleet.clone(), self.transport.clone(), self.tx.clone());
-                let spawned = thread::Builder::new().name("fat-fleet-poll".into()).spawn(move || fleet_poll(&targets, &cfg, tr.as_ref(), &tx));
+                let spawned = thread::Builder::new()
+                    .name("fat-fleet-poll".into())
+                    .spawn(move || fleet_poll(&targets, &cfg, tr.as_ref(), &tx));
                 if let Err(e) = spawned {
                     app.fleet_failed(e.to_string());
                 }
             }
             Command::FleetDrill(name) => {
-                let target = self.inventory.lock().ok().and_then(|g| g.as_ref()?.iter().find(|t| t.name == name).cloned());
+                let target =
+                    self.inventory.lock().ok().and_then(|g| g.as_ref()?.iter().find(|t| t.name == name).cloned());
                 let Some(t) = target else {
                     app.set_fleet_drill(&name, Err("not in the inventory".into()));
                     return;
@@ -989,9 +1053,10 @@ impl Ctx {
             }
             Command::RefreshLog => {
                 if let Some(a) = self.actions()
-                    && let Ok(log) = guarded(|| a.log()) {
-                        app.set_log(log);
-                    }
+                    && let Ok(log) = guarded(|| a.log())
+                {
+                    app.set_log(log);
+                }
             }
             Command::Explain(pid) => {
                 let Some(s) = app.view() else {
@@ -1061,7 +1126,12 @@ fn apply_msg(app: &mut App, msg: Msg) {
     }
 }
 
-fn event_loop(term: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, ctx: &mut Ctx, rx: Receiver<Msg>) -> anyhow::Result<()> {
+fn event_loop(
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    ctx: &mut Ctx,
+    rx: Receiver<Msg>,
+) -> anyhow::Result<()> {
     let mut dirty = true;
     let mut last_draw = 0i64;
     while !app.quit {
@@ -1110,7 +1180,8 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, ctx:
 pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
     let _ = UI_THREAD.set(thread::current().id());
     install_panic_hook();
-    let config_path = guarded(|| Config::path().display().to_string()).unwrap_or_else(|_| "~/.config/fat/config.toml".into());
+    let config_path =
+        guarded(|| Config::path().display().to_string()).unwrap_or_else(|_| "~/.config/fat/config.toml".into());
     let hist = guarded(|| History::open(cfg.history_path.as_deref())).ok().and_then(Result::ok);
 
     let (tx, rx) = mpsc::channel::<Msg>();
@@ -1125,13 +1196,24 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
     app.history_ok = hist.is_some();
     app.configured_hosts = cfg.hosts.len();
     app.set_profile(profile, cfg.server.clone(), cfg.fleet.tui_refresh_s);
-    let klog = (profile == crate::server::Profile::Server && cfg.server.kmsg && cfg!(target_os = "linux"))
-        .then(|| KernelLogCache { read: Box::new(|since| crate::server::kernel::read_kmsg_since(Some(since))), cached: None });
+    let klog = (profile == crate::server::Profile::Server && cfg.server.kmsg && cfg!(target_os = "linux")).then(|| {
+        KernelLogCache { read: Box::new(|since| crate::server::kernel::read_kmsg_since(Some(since))), cached: None }
+    });
     let hist_tx = spawn_history(hist, tx.clone(), klog);
     let inventory: Inventory = Arc::default();
     spawn_inventory(cfg.clone(), inventory.clone(), tx.clone());
     let transport: Arc<dyn Transport> = Arc::new(fanout::SshTransport { cfg: cfg.fleet.clone() });
-    let mut ctx = Ctx { cfg, hist: Some(hist_tx), actions: None, actions_failed: false, tx, fs_shared, fs: None, inventory, transport };
+    let mut ctx = Ctx {
+        cfg,
+        hist: Some(hist_tx),
+        actions: None,
+        actions_failed: false,
+        tx,
+        fs_shared,
+        fs: None,
+        inventory,
+        transport,
+    };
     // Nothing else runs before the first frame: the journal is read when the action log (`a`)
     // opens or an action runs, samples arrive from the sampler thread.
 
@@ -1279,7 +1361,9 @@ mod tests {
         req.send(HistReq::Explain(Box::new(s.clone()), s.procs[0].pid)).unwrap();
         let (mut past, mut timeline, mut why) = (Vec::new(), None, None);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while (timeline.is_none() || why.is_none() || past.last().map(|(t, _)| *t) != Some(last_ts)) && Instant::now() < deadline {
+        while (timeline.is_none() || why.is_none() || past.last().map(|(t, _)| *t) != Some(last_ts))
+            && Instant::now() < deadline
+        {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(Msg::Past(ts, snap)) => past.push((ts, snap.is_some())),
                 Ok(Msg::Timeline(t)) => timeline = Some(t),

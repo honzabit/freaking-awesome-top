@@ -25,7 +25,12 @@ unsafe extern "C" {
     fn IOObjectGetClass(o: IoObject, name: *mut c_char) -> KernReturn;
     fn IORegistryEntryCreateCFProperty(entry: IoObject, key: CFTypeRef, alloc: CFTypeRef, options: u32) -> CFTypeRef;
     fn IORegistryEntryGetRegistryEntryID(entry: IoObject, id: *mut u64) -> KernReturn;
-    fn IORegistryEntryCreateIterator(entry: IoObject, plane: *const c_char, options: u32, it: *mut IoObject) -> KernReturn;
+    fn IORegistryEntryCreateIterator(
+        entry: IoObject,
+        plane: *const c_char,
+        options: u32,
+        it: *mut IoObject,
+    ) -> KernReturn;
     fn IOPSCopyPowerSourcesInfo() -> CFTypeRef;
     fn IOPSCopyPowerSourcesList(blob: CFTypeRef) -> CFTypeRef;
     fn IOPSGetPowerSourceDescription(blob: CFTypeRef, ps: CFTypeRef) -> CFTypeRef;
@@ -113,7 +118,8 @@ pub fn block_storage_stats() -> Option<Vec<(String, u64, u64)>> {
         let Some(id) = entry_id(&drv) else { continue };
         let Some(stats) = property(&drv, "Statistics") else { continue };
         // SAFETY: `stats` is a live CF object; readers type-check.
-        let (r, w) = unsafe { (cf::dict_i64(stats.as_ptr(), "Bytes (Read)"), cf::dict_i64(stats.as_ptr(), "Bytes (Write)")) };
+        let (r, w) =
+            unsafe { (cf::dict_i64(stats.as_ptr(), "Bytes (Read)"), cf::dict_i64(stats.as_ptr(), "Bytes (Write)")) };
         out.push((id_string(id), r.unwrap_or(0).max(0) as u64, w.unwrap_or(0).max(0) as u64));
     }
     Some(out)
@@ -179,7 +185,9 @@ pub fn battery() -> Option<(Option<f32>, Option<bool>)> {
         let mut state = None;
         for ps in cf::array_items(list.as_ptr()) {
             let d = IOPSGetPowerSourceDescription(blob.as_ptr(), ps);
-            if cf::dict_string(d, "Type").as_deref() != Some("InternalBattery") || cf::dict_i64(d, "Is Present") == Some(0) {
+            if cf::dict_string(d, "Type").as_deref() != Some("InternalBattery")
+                || cf::dict_i64(d, "Is Present") == Some(0)
+            {
                 continue;
             }
             pct = battery_percent(cf::dict_i64(d, "Current Capacity"), cf::dict_i64(d, "Max Capacity"));
@@ -231,7 +239,10 @@ mod tests {
         let map = block_storage_bsd_map().unwrap();
         for (bsd, (id, whole)) in &map {
             assert!(bsd.starts_with("disk"), "{bsd}");
-            assert!(whole.starts_with("disk") && bsd.starts_with(whole.as_str()) || bsd.starts_with("disk"), "{bsd} {whole}");
+            assert!(
+                whole.starts_with("disk") && bsd.starts_with(whole.as_str()) || bsd.starts_with("disk"),
+                "{bsd} {whole}"
+            );
             assert!(stats.iter().any(|s| &s.0 == id), "map id {id} has stats");
         }
         let g = gpus().unwrap();

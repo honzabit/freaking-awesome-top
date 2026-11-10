@@ -77,11 +77,12 @@ impl Drop for NetSampler {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Ok(mut slot) = self.child.lock()
-            && let Some(mut c) = slot.take() {
-                // Only ever our own child.
-                let _ = c.kill();
-                let _ = c.wait();
-            }
+            && let Some(mut c) = slot.take()
+        {
+            // Only ever our own child.
+            let _ = c.kill();
+            let _ = c.wait();
+        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -101,7 +102,8 @@ fn sampler_loop(rates: Arc<Mutex<Rates>>, stop: Arc<AtomicBool>, slot: Arc<Mutex
     let mut failures = 0u32;
     // SAFETY: geteuid has no preconditions.
     let root = unsafe { libc::geteuid() } == 0;
-    let nsenter = root && std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("nsenter").is_file()));
+    let nsenter = root
+        && std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("nsenter").is_file()));
     let mut nl: Option<diag::Sampler> = None;
     let mut nl_failures = 0u32;
     while !stop.load(Ordering::SeqCst) {
@@ -121,7 +123,9 @@ fn sampler_loop(rates: Arc<Mutex<Rates>>, stop: Arc<AtomicBool>, slot: Arc<Mutex
                     if nsenter {
                         for pid in missed {
                             let t = pid.to_string();
-                            if let Some(o) = run_capture(&slot, &stop, "nsenter", &["-n", "-t", &t, "ss", "-tinpeH"], CHILD_TIMEOUT) {
+                            if let Some(o) =
+                                run_capture(&slot, &stop, "nsenter", &["-n", "-t", &t, "ss", "-tinpeH"], CHILD_TIMEOUT)
+                            {
                                 socks.extend(linux::parse_ss(&o));
                             }
                         }
@@ -233,7 +237,13 @@ const MAX_OUTPUT: usize = 64 << 20;
 /// Run `program args` (with `LC_ALL=C`) and capture stdout, killing it after `timeout`.
 /// The child is parked in `slot` while running so Drop can kill it; it is always reaped
 /// here (no zombies). None on spawn failure, timeout, non-zero exit or stop.
-fn run_capture(slot: &Mutex<Option<Child>>, stop: &AtomicBool, program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+fn run_capture(
+    slot: &Mutex<Option<Child>>,
+    stop: &AtomicBool,
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
     let mut child = Command::new(program)
         .args(args)
         .env("LC_ALL", "C")
@@ -520,7 +530,10 @@ mod diag {
                 match typ {
                     NLMSG_DONE => return Ok(true),
                     NLMSG_ERROR => {
-                        let e = payload.get(0..4).map(|b| i32::from_ne_bytes(b.try_into().unwrap_or_default())).unwrap_or(-libc::EBADMSG);
+                        let e = payload
+                            .get(0..4)
+                            .map(|b| i32::from_ne_bytes(b.try_into().unwrap_or_default()))
+                            .unwrap_or(-libc::EBADMSG);
                         return Err(if e < 0 { -e } else { libc::EBADMSG });
                     }
                     SOCK_DIAG_BY_FAMILY => out.extend(parse_diag_msg(payload)),
@@ -601,7 +614,8 @@ mod diag {
         /// One full TCP dump of `family` on `fd`.
         pub fn dump(fd: RawFd, family: u8, seq: u32, buf: &mut Vec<u8>, out: &mut Vec<DiagSock>) -> io::Result<()> {
             let req = build_request(family, seq);
-            let addr = SockaddrNl { nl_family: libc::AF_NETLINK as libc::sa_family_t, nl_pad: 0, nl_pid: 0, nl_groups: 0 };
+            let addr =
+                SockaddrNl { nl_family: libc::AF_NETLINK as libc::sa_family_t, nl_pad: 0, nl_pid: 0, nl_groups: 0 };
             // SAFETY: req and addr are valid for the given lengths.
             let n = unsafe {
                 libc::sendto(
@@ -665,7 +679,16 @@ mod diag {
                 let fd = open_socket()?;
                 // SAFETY: geteuid has no preconditions.
                 let me = unsafe { libc::geteuid() };
-                Ok(Sampler { fd, seq: 0, buf: Vec::new(), cycle: 0, owners: HashMap::new(), unowned: HashMap::new(), all_fds: can_read_all_fds(Path::new("/proc")), me })
+                Ok(Sampler {
+                    fd,
+                    seq: 0,
+                    buf: Vec::new(),
+                    cycle: 0,
+                    owners: HashMap::new(),
+                    unowned: HashMap::new(),
+                    all_fds: can_read_all_fds(Path::new("/proc")),
+                    me,
+                })
             }
 
             fn dump_both(&mut self, fd: RawFd, out: &mut Vec<DiagSock>) -> io::Result<()> {
@@ -862,7 +885,11 @@ mod diag {
             use std::os::unix::fs::symlink;
             let root = std::env::temp_dir().join(format!("fat-netowners-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
-            for (pid, links) in [(300u32, vec!["socket:[11]", "pipe:[5]"]), (40, vec!["socket:[11]", "socket:[12]"]), (7, vec!["/dev/null"])] {
+            for (pid, links) in [
+                (300u32, vec!["socket:[11]", "pipe:[5]"]),
+                (40, vec!["socket:[11]", "socket:[12]"]),
+                (7, vec!["/dev/null"]),
+            ] {
                 let fd = root.join(pid.to_string()).join("fd");
                 std::fs::create_dir_all(&fd).unwrap();
                 for (i, l) in links.iter().enumerate() {
@@ -1031,7 +1058,7 @@ FIN-WAIT-2 0 0                 10.0.2.15:40000          1.2.3.4:443 users:((\"cu
             let cur: Sockets = [
                 (SockKey::Ino(1), st(10, 3000, 300)),
                 (SockKey::Ino(2), st(10, 7000, 0)),
-                (SockKey::Ino(5), st(20, 400, 0)), // new socket: counted fully
+                (SockKey::Ino(5), st(20, 400, 0)),   // new socket: counted fully
                 (SockKey::Ino(4), st(30, 500, 500)), // idle
             ]
             .into_iter()
@@ -1096,7 +1123,9 @@ mod tests {
         assert_eq!(m.get(&99), Some(&(2, 1)));
         assert_eq!(m.len(), 3);
         // Real `-J bytes_in,bytes_out -x` output (macOS 15), duplicates summed.
-        let m = parse_output(",bytes_in,bytes_out,\nkernel_task.0,175032304,68613412,\nlaunchd.1,0,0,\napsd.363,4395,27812,\napsd.363,5,8,\n");
+        let m = parse_output(
+            ",bytes_in,bytes_out,\nkernel_task.0,175032304,68613412,\nlaunchd.1,0,0,\napsd.363,4395,27812,\napsd.363,5,8,\n",
+        );
         assert_eq!(m.get(&363), Some(&(4400, 27820)));
         assert_eq!(m.get(&1), Some(&(0, 0)));
         assert!(parse_output("").is_empty());
@@ -1196,7 +1225,8 @@ mod tests {
                 loop {
                     let (socks, missed) = s.sample(&[]).expect("dump");
                     assert!(missed.is_empty());
-                    let (sa, sb) = (socks.get(&linux::SockKey::Ino(ia)).copied(), socks.get(&linux::SockKey::Ino(ib)).copied());
+                    let (sa, sb) =
+                        (socks.get(&linux::SockKey::Ino(ia)).copied(), socks.get(&linux::SockKey::Ino(ib)).copied());
                     // tcpi_bytes_acked also counts the connecting side's SYN (+1).
                     let ok = matches!((sa, sb), (Some(x), Some(y)) if x.pid == me && y.pid == me
                         && (300_000..=300_001).contains(&x.tx) && x.rx == 50_000
@@ -1274,21 +1304,28 @@ mod tests {
             println!("foreign netns sampled: {}", foreign.len());
             let ss = || super::super::ss_sample(&slot, &flag, root).expect("ss");
             let n = 20;
-            let (mut nl_wall, mut nl_cpu, mut ss_wall, mut ss_cpu) = (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            let (mut nl_wall, mut nl_cpu, mut ss_wall, mut ss_cpu) =
+                (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
             let mut nl_socks = 0;
             let mut ss_socks = 0;
             // Warm the owner cache once (first netlink sample walks /proc for every socket).
             let t = Instant::now();
             let c = thread_cpu();
             let first = nl.sample(&foreign).unwrap().0;
-            println!("netlink first sample (cold owner cache): {:?} wall, {:?} cpu, {} sockets", t.elapsed(), thread_cpu() - c, first.len());
+            println!(
+                "netlink first sample (cold owner cache): {:?} wall, {:?} cpu, {} sockets",
+                t.elapsed(),
+                thread_cpu() - c,
+                first.len()
+            );
             for _ in 0..n {
                 // A full sampler cycle: the sampler loop re-lists foreign netns every time and
                 // spawns one setns thread per netns, so both are inside the measurement.
                 quiet.store(true, std::sync::atomic::Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(20));
                 let (t, c) = (Instant::now(), process_cpu());
-                let foreign = if root { crate::collect::ports::foreign_netns(super::super::MAX_NETNS) } else { Vec::new() };
+                let foreign =
+                    if root { crate::collect::ports::foreign_netns(super::super::MAX_NETNS) } else { Vec::new() };
                 nl_socks = nl.sample(&foreign).unwrap().0.len();
                 nl_wall += t.elapsed();
                 nl_cpu += process_cpu().saturating_sub(c);
@@ -1299,8 +1336,16 @@ mod tests {
                 ss_cpu += (thread_cpu() - c) + (children_cpu() - k);
             }
             let per = |d: Duration| d / n;
-            println!("netlink: {:?} wall, {:?} cpu per cycle incl. netns walk + setns threads ({nl_socks} sockets with traffic+owner)", per(nl_wall), per(nl_cpu));
-            println!("ss:      {:?} wall, {:?} cpu per sample incl. child ({ss_socks} sockets with pid)", per(ss_wall), per(ss_cpu));
+            println!(
+                "netlink: {:?} wall, {:?} cpu per cycle incl. netns walk + setns threads ({nl_socks} sockets with traffic+owner)",
+                per(nl_wall),
+                per(nl_cpu)
+            );
+            println!(
+                "ss:      {:?} wall, {:?} cpu per sample incl. child ({ss_socks} sockets with pid)",
+                per(ss_wall),
+                per(ss_cpu)
+            );
             // Agreement: both methods over the same 2s window.
             let (n0, s0, t0) = (nl.sample(&foreign).unwrap().0, ss(), Instant::now());
             std::thread::sleep(Duration::from_secs(2));
@@ -1309,7 +1354,8 @@ mod tests {
             let rn = linux::compute_rates(&n0, &n1, secs);
             let rs = linux::compute_rates(&s0, &s1, secs);
             println!("own pid {me}: netlink {:?} B/s, ss {:?} B/s", rn.get(&me), rs.get(&me));
-            let mut pids: Vec<_> = rn.keys().chain(rs.keys()).copied().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            let mut pids: Vec<_> =
+                rn.keys().chain(rs.keys()).copied().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
             pids.sort();
             for p in pids {
                 println!("  pid {p}: netlink {:?} ss {:?}", rn.get(&p), rs.get(&p));

@@ -427,9 +427,8 @@ fn is_orphan(ppid: u32, name: &str, exe: &str, cmd: &str, home: Option<&str>) ->
     let base = exe.rsplit('/').next().filter(|b| !b.is_empty()).unwrap_or(name).to_lowercase();
     let lname = name.to_lowercase();
     const RUNTIMES: &[&str] = &["node", "bun", "deno", "ruby", "java", "php", "beam.smp", "dotnet", "elixir", "erl"];
-    let is_runtime = |n: &str| {
-        RUNTIMES.contains(&n) || n.starts_with("python") || n.starts_with("node") && n.len() <= 6
-    };
+    let is_runtime =
+        |n: &str| RUNTIMES.contains(&n) || n.starts_with("python") || n.starts_with("node") && n.len() <= 6;
     if is_runtime(&base) || is_runtime(&lname) {
         return true;
     }
@@ -560,7 +559,9 @@ mod linux {
         const CAP_SYS_PTRACE: u32 = 19;
         std::fs::read_to_string(proc_root.join("self/status"))
             .ok()
-            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("CapEff:")).and_then(|v| u64::from_str_radix(v.trim(), 16).ok()))
+            .and_then(|t| {
+                t.lines().find_map(|l| l.strip_prefix("CapEff:")).and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+            })
             .is_some_and(|caps| caps & (1 << CAP_SYS_PTRACE) != 0)
     }
 
@@ -571,7 +572,11 @@ mod linux {
     /// process of that uid; processes we can't read are skipped without a syscall on their
     /// fd dir, and the walk stops as soon as every wanted inode is found *or* every one still
     /// missing belongs to a uid whose processes we can't read (e.g. root's sshd, unprivileged).
-    pub fn socket_owners_uid(proc_root: &Path, wanted: &HashMap<u64, u32>, readable_uid: &dyn Fn(u32) -> bool) -> HashMap<u64, u32> {
+    pub fn socket_owners_uid(
+        proc_root: &Path,
+        wanted: &HashMap<u64, u32>,
+        readable_uid: &dyn Fn(u32) -> bool,
+    ) -> HashMap<u64, u32> {
         use std::os::unix::fs::MetadataExt;
         let mut found = HashMap::new();
         let mut left_readable = wanted.values().filter(|&&u| readable_uid(u)).count();
@@ -579,9 +584,7 @@ mod linux {
             return found;
         }
         let Ok(rd) = std::fs::read_dir(proc_root) else { return found };
-        let mut pids: Vec<u32> = rd
-            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-            .collect();
+        let mut pids: Vec<u32> = rd.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok()).collect();
         pids.sort_unstable();
         for pid in pids {
             let dir = proc_root.join(pid.to_string());
@@ -686,7 +689,8 @@ mod linux {
         let mut rows: Vec<(Proto, NetRow, bool)> = Vec::new();
         let mut seen_ino: HashSet<u64> = HashSet::new();
         let mut read_ns = |net: &Path, foreign: bool, rows: &mut Vec<(Proto, NetRow, bool)>| {
-            for (file, proto) in [("tcp", Proto::Tcp), ("tcp6", Proto::Tcp), ("udp", Proto::Udp), ("udp6", Proto::Udp)] {
+            for (file, proto) in [("tcp", Proto::Tcp), ("tcp6", Proto::Tcp), ("udp", Proto::Udp), ("udp6", Proto::Udp)]
+            {
                 let Ok(text) = std::fs::read_to_string(net.join(file)) else { continue };
                 for r in parse_proc_net(&text) {
                     let keep = match proto {
@@ -705,7 +709,8 @@ mod linux {
         for (_, pid) in foreign_netns(proc_root, MAX_NETNS) {
             read_ns(&proc_root.join(pid.to_string()).join("net"), true, &mut rows);
         }
-        let wanted: HashMap<u64, u32> = rows.iter().filter(|(_, r, _)| r.inode != 0).map(|(_, r, _)| (r.inode, r.uid)).collect();
+        let wanted: HashMap<u64, u32> =
+            rows.iter().filter(|(_, r, _)| r.inode != 0).map(|(_, r, _)| (r.inode, r.uid)).collect();
         let owners = socket_owners_uid(proc_root, &wanted, readable_uid);
         let mut stat_cache: HashMap<u32, Option<(String, u32)>> = HashMap::new();
         rows.into_iter()
@@ -753,8 +758,9 @@ mod linux {
                     // CAP_SYS_PTRACE), so say which one is missing.
                     // SAFETY: geteuid has no preconditions and cannot fail.
                     let root_already = unsafe { libc::geteuid() } == 0;
-                    let mut note = if root_already { "owner hidden (needs CAP_SYS_PTRACE)" } else { "owner hidden (needs root)" }
-                        .to_string();
+                    let mut note =
+                        if root_already { "owner hidden (needs CAP_SYS_PTRACE)" } else { "owner hidden (needs root)" }
+                            .to_string();
                     if let Some(uid) = s.hidden_uid {
                         let name = users.entry(uid).or_insert_with(|| user_of(uid));
                         match name {
@@ -820,7 +826,9 @@ mod linux {
                         let mut n = describe(name, &cmd, &cwd, start, now, home);
                         if s.foreign_ns {
                             // Not reachable on this address from fat's own netns: say where it lives.
-                            let ctr = p.and_then(|p| p.container.clone()).or_else(|| crate::collect::linux::container_id(&cgroup));
+                            let ctr = p
+                                .and_then(|p| p.container.clone())
+                                .or_else(|| crate::collect::linux::container_id(&cgroup));
                             match ctr {
                                 Some(c) => n.push_str(&format!(" · in container {c} (own network namespace)")),
                                 None => n.push_str(" · in another network namespace"),
@@ -840,9 +848,7 @@ mod linux {
     /// vte-spawn-*.scope / app-*.scope for terminal windows, docker-*.scope) are not
     /// services either, so processes there can still be orphans.
     pub fn unit_managed(cgroup: &str) -> bool {
-        cgroup
-            .split('/')
-            .any(|c| c.ends_with(".service") && !c.starts_with("user@"))
+        cgroup.split('/').any(|c| c.ends_with(".service") && !c.starts_with("user@"))
     }
 
     /// Linux orphan heuristic. A listener is flagged when ALL of:
@@ -874,14 +880,20 @@ mod linux {
         let path = if exe.is_empty() { cmd.split_whitespace().next().unwrap_or("") } else { exe };
         const SYSTEM_PREFIXES: &[&str] =
             &["/usr/sbin/", "/sbin/", "/usr/libexec/", "/usr/lib/systemd/", "/lib/systemd/", "/snap/"];
-        const IDE_SERVERS: &[&str] =
-            &["/.vscode-server/", "/.vscode-server-insiders/", "/.cursor-server/", "/.windsurf-server/", "/.vscode-remote/"];
+        const IDE_SERVERS: &[&str] = &[
+            "/.vscode-server/",
+            "/.vscode-server-insiders/",
+            "/.cursor-server/",
+            "/.windsurf-server/",
+            "/.vscode-remote/",
+        ];
         if SYSTEM_PREFIXES.iter().any(|p| path.starts_with(p)) || IDE_SERVERS.iter().any(|d| path.contains(d)) {
             return false;
         }
         let base = path.rsplit('/').next().filter(|b| !b.is_empty()).unwrap_or(name).to_lowercase();
         let lname = name.to_lowercase();
-        const RUNTIMES: &[&str] = &["node", "bun", "deno", "ruby", "java", "php", "beam.smp", "dotnet", "elixir", "erl"];
+        const RUNTIMES: &[&str] =
+            &["node", "bun", "deno", "ruby", "java", "php", "beam.smp", "dotnet", "elixir", "erl"];
         let is_runtime =
             |n: &str| RUNTIMES.contains(&n) || n.starts_with("python") || n.starts_with("node") && n.len() <= 6;
         if is_runtime(&base) || is_runtime(&lname) {
@@ -967,7 +979,11 @@ mod linux {
         }
 
         fn fixture() -> std::path::PathBuf {
-            let root = std::env::temp_dir().join(format!("fat-ports-{}-{:?}", std::process::id(), std::thread::current().id()));
+            let root = std::env::temp_dir().join(format!(
+                "fat-ports-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("net")).unwrap();
             std::fs::write(root.join("net/tcp"), TCP).unwrap();
@@ -984,7 +1000,11 @@ mod linux {
                 }
             };
             // Python dual-stack http.server holds both the [::]:18081 listener and the v4 one.
-            mk(4242, "4242 (python3) S 1 4242 4242 0 -1", &["/dev/null", "socket:[8711507]", "socket:[8713261]", "pipe:[5]"]);
+            mk(
+                4242,
+                "4242 (python3) S 1 4242 4242 0 -1",
+                &["/dev/null", "socket:[8711507]", "socket:[8713261]", "pipe:[5]"],
+            );
             // A forked worker sharing the same listener: lower pid wins attribution.
             mk(5000, "5000 (python3 worker) S 4242 4242 4242 0 -1", &["socket:[8711507]"]);
             // Postgres on ::1:5432 with a ')' in comm.
@@ -1210,7 +1230,13 @@ TST=LISTEN
         assert!(!is_orphan(500, "node", "/opt/homebrew/bin/node", "", home));
         // launchd-managed system / app agents.
         assert!(!is_orphan(1, "rapportd", "/usr/libexec/rapportd", "", home));
-        assert!(!is_orphan(1, "ControlCenter", "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter", "", home));
+        assert!(!is_orphan(
+            1,
+            "ControlCenter",
+            "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+            "",
+            home
+        ));
         assert!(!is_orphan(1, "node", "/Applications/Foo.app/Contents/Resources/node", "", home));
         assert!(!is_orphan(1, "helper", "/Users/me/Library/Application Support/x/helper", "", home));
         // Homebrew service: launchd child but not a runtime.
@@ -1241,7 +1267,10 @@ TST=LISTEN
         let ports = ports(&[]);
         let dt = t.elapsed();
         for p in &ports {
-            println!("{:?} {}:{} pid={} {} orphan={} note={}", p.proto, p.addr, p.port, p.pid, p.process, p.orphan, p.note);
+            println!(
+                "{:?} {}:{} pid={} {} orphan={} note={}",
+                p.proto, p.addr, p.port, p.pid, p.process, p.orphan, p.note
+            );
         }
         println!("{} ports in {:?}", ports.len(), dt);
         assert!(dt < Duration::from_millis(400));
@@ -1262,8 +1291,16 @@ TST=LISTEN
         let me = std::process::id();
         let raw = dedup(crate::sys::darwin::libproc::listeners().unwrap().iter().map(from_listener).collect());
         let mine: Vec<&RawSock> = raw.iter().filter(|s| s.pid == me).collect();
-        assert!(mine.iter().any(|s| s.proto == Proto::Tcp && s.port == tport && s.addr == "127.0.0.1" && s.state == "LISTEN"), "{mine:?}");
-        assert!(mine.iter().any(|s| s.proto == Proto::Udp && s.port == uport && s.addr == "127.0.0.1" && s.state.is_empty()), "{mine:?}");
+        assert!(
+            mine.iter()
+                .any(|s| s.proto == Proto::Tcp && s.port == tport && s.addr == "127.0.0.1" && s.state == "LISTEN"),
+            "{mine:?}"
+        );
+        assert!(
+            mine.iter()
+                .any(|s| s.proto == Proto::Udp && s.port == uport && s.addr == "127.0.0.1" && s.state.is_empty()),
+            "{mine:?}"
+        );
         if let Some(a) = &any {
             let p = a.local_addr().unwrap().port();
             assert!(mine.iter().any(|s| s.port == p && s.addr == "*"), "{mine:?}");
@@ -1279,7 +1316,8 @@ TST=LISTEN
     fn ports_match_lsof() {
         let key = |s: &RawSock| (s.proto == Proto::Udp, s.port, s.pid, s.addr.clone());
         let t = Instant::now();
-        let native: Vec<_> = dedup(crate::sys::darwin::libproc::listeners().unwrap().iter().map(from_listener).collect());
+        let native: Vec<_> =
+            dedup(crate::sys::darwin::libproc::listeners().unwrap().iter().map(from_listener).collect());
         let dn = t.elapsed();
         let t = Instant::now();
         let lsof = dedup(parse_lsof(&run_lsof().unwrap()));
