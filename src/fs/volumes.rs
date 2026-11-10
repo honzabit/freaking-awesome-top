@@ -871,6 +871,8 @@ pub fn deleted_open_uncached() -> Vec<(u32, String, String, u64)> {
 
 /// Parse `lsof -F pcftsiDn +L1` output; regular files only, one entry per (dev, inode).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// A match guard would let a non-REG `n` line fall through to other arms; the nested `if` is the intent.
+#[allow(clippy::collapsible_match)]
 pub fn parse_lsof_deleted(text: &str) -> Vec<(u32, String, String, u64)> {
     let mut out = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();

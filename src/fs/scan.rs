@@ -1082,7 +1082,7 @@ impl Scanner {
                 }
             }
         }
-        cands.sort_by(|a, b| b.0.cmp(&a.0));
+        cands.sort_by_key(|x| std::cmp::Reverse(x.0));
         cands
             .into_iter()
             .take(n)
@@ -1790,7 +1790,7 @@ fn restat_pass(sh: &Arc<Shared>, root: &[u8]) {
             }
             stack.extend(n.children.iter().copied());
         }
-        hot.sort_by(|a, b| b.0.cmp(&a.0));
+        hot.sort_by_key(|x| std::cmp::Reverse(x.0));
         let mut changed: Vec<(Id, u32)> = hot.into_iter().take(MAX_HOT_REREADS).map(|(_, x, s)| (x, s)).collect();
         // Hinted paths: re-read the deepest kept directory holding each one.
         let mut hinted = 0;

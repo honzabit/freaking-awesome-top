@@ -1264,7 +1264,7 @@ impl History {
         }
         let mut dirs: Vec<&(String, u64, u64)> = dirs.iter().collect();
         if dirs.len() > DIR_MAX_ROWS {
-            dirs.sort_by(|a, b| b.1.cmp(&a.1));
+            dirs.sort_by_key(|x| std::cmp::Reverse(x.1));
             dirs.truncate(DIR_MAX_ROWS);
         }
         let is_key = match self.last_dir_key {

@@ -423,7 +423,7 @@ impl Actions {
     /// Most recent first.
     pub fn log(&self) -> Vec<ActionRecord> {
         let mut v: Vec<ActionRecord> = load(&self.path).into_iter().map(|e| e.rec).collect();
-        v.sort_by(|a, b| b.id.cmp(&a.id));
+        v.sort_by_key(|x| std::cmp::Reverse(x.id));
         v
     }
 
@@ -533,7 +533,7 @@ pub fn preview(kind: ActionKind, pid: u32, snap: &Snapshot, expect: Option<&Expe
         let ours = self_and_ancestors();
         let mut desc: Vec<(usize, &crate::model::Proc)> =
             snap.descendants(pid).into_iter().map(|c| (depth_below(snap, c.pid, pid), c)).collect();
-        desc.sort_by(|a, b| b.0.cmp(&a.0));
+        desc.sort_by_key(|x| std::cmp::Reverse(x.0));
         for (_, c) in desc {
             let skip = protection(c.pid, &c.name, &ours)
                 .err()
@@ -986,7 +986,7 @@ fn kill_tree(rec: &mut ActionRecord, pid: u32, snap: &Snapshot) {
         .into_iter()
         .map(|p| (depth_below(snap, p.pid, pid), p.pid, p.name.clone(), p.start_time))
         .collect();
-    desc.sort_by(|a, b| b.0.cmp(&a.0));
+    desc.sort_by_key(|x| std::cmp::Reverse(x.0));
 
     let mut sent = Vec::new();
     let mut skipped = Vec::new();
@@ -1467,8 +1467,11 @@ mod tests {
         assert_eq!(get_nice(pid), Ok(target));
         if !is_root() {
             assert_eq!(n.undoable, target <= before || can_lower_nice_to(before));
-            if !can_lower_nice_to(-5) {
-                let neg = a.apply(ActionKind::Renice, pid, Some(-5), &snap);
+            // Lowering below the current value needs privilege (the start value is inherited and
+            // may already be negative, e.g. on CI runners).
+            let lower = (target - 1).max(-20);
+            if lower < target && !can_lower_nice_to(lower) {
+                let neg = a.apply(ActionKind::Renice, pid, Some(lower), &snap);
                 assert!(!neg.ok && neg.message.contains("root"), "{neg:?}");
             }
         }

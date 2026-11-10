@@ -207,7 +207,10 @@ mod mac {
         };
         Some(Counters {
             energy_nj: energy_nj.unwrap_or(0),
-            has_energy: energy_nj.is_some(),
+            // A counter stuck at 0 is no counter: macOS VMs (CI runners, virtualized Macs) have
+            // V6 but never fill ri_energy_nj, and real hardware bills energy from the first
+            // instruction. Use the cpu-time model there instead of showing 0 mW for everything.
+            has_energy: energy_nj.is_some_and(|e| e > 0),
             cpu_ns: ticks_to_ns(ri.ri_user_time.saturating_add(ri.ri_system_time)),
             child_cpu_ns: ticks_to_ns(ri.ri_child_user_time.saturating_add(ri.ri_child_system_time)),
             disk_read: ri.ri_diskio_bytesread,

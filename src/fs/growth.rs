@@ -456,7 +456,7 @@ impl Tracker {
         }
         let mut v: Vec<(u32, String, u64)> =
             by.into_iter().map(|(p, (n, b))| (p, n, b as u64)).filter(|x| x.2 > 0).collect();
-        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v.sort_by_key(|x| std::cmp::Reverse(x.2));
         v
     }
 
@@ -511,7 +511,7 @@ impl Tracker {
                 out.retain(|x| x.0 == m);
             }
         }
-        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out.sort_by_key(|x| std::cmp::Reverse(x.1));
         out
     }
 

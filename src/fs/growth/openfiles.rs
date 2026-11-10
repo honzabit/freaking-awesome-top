@@ -51,7 +51,7 @@ impl OpenFiles {
             .filter(|p| p.disk_write_bps > 0 && p.pid != me)
             .map(|p| (p.pid, p.name.clone(), p.disk_write_bps))
             .collect();
-        w.sort_by(|a, b| b.2.cmp(&a.2));
+        w.sort_by_key(|x| std::cmp::Reverse(x.2));
         w.truncate(TOP_WRITERS);
         // A sample without rates yet (the first one) must not hold off the next for 5 s.
         if w.is_empty() {

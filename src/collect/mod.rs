@@ -527,7 +527,8 @@ mod tests {
         assert!(s2.system.cores > 0);
         assert_eq!(s2.system.per_core.len(), s2.system.cores);
         assert!(!s2.system.hostname.is_empty());
-        assert!(s2.procs.len() > 10);
+        // A fresh container may hold only this test and its shell.
+        assert!(!s2.procs.is_empty());
         assert_eq!(s2.host, "local");
         assert!(s2.system.power_mw >= 0.0);
     }
@@ -585,7 +586,10 @@ mod tests {
         assert_eq!(p.name, "sleep");
         assert!(p.cmd.contains("300"));
         assert_eq!(p.status, "T");
-        assert_eq!(p.nice, 0);
+        // The child inherits our nice, which is not 0 everywhere (CI runners start jobs at -10).
+        // SAFETY: getpriority on ourselves.
+        let ours = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        assert_eq!(p.nice, ours);
     }
 
     /// Linux: cpu% is live on the 2nd sample, threads/start/cgroup are filled, mem matches

@@ -62,7 +62,7 @@ pub fn merge_writers(into: &mut Vec<(u32, String, u64)>, from: &[(u32, String, u
             None => into.push(w.clone()),
         }
     }
-    into.sort_by(|a, b| b.2.cmp(&a.2));
+    into.sort_by_key(|x| std::cmp::Reverse(x.2));
     into.truncate(5);
 }
 

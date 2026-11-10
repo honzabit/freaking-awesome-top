@@ -390,38 +390,39 @@ fn interrupted_scan_resumes_from_cache() {
     let fx = Fx::new("resume");
     fx.file("a/x/f", 30_000);
     fx.file("b/y/g", 40_000);
-    fx.file("c/h", 50_000);
+    fx.file("c/z/h", 50_000);
     let db = fx.p(".index/fs-index.db");
     let root = fx.s("");
-    let total = {
+    // Directory read order is the filesystem's (ext4 hashes names, APFS sorts them), so stop
+    // at whichever top-level dir finishes first: the other two are still pending then.
+    let (total, done) = {
         let sc = Scanner::with_options(Options { cache_path: Some(db.clone()), ..opts() });
         queue_root(&sc, &root);
-        // Read the root and all of a/ (depth-first), then "quit".
-        while let Some(p) = step(&sc) {
-            if p == norm(&fx.s("a/x")) {
-                break;
-            }
+        let finished = |n: &str| sc.list(&fx.s(n)).is_some_and(|l| !l.dir.partial);
+        let mut done = None;
+        while done.is_none() && step(&sc).is_some() {
+            done = ["a", "b", "c"].into_iter().find(|n| finished(n));
         }
-        assert!(!sc.list(&fx.s("a")).unwrap().dir.partial, "a/ finished");
-        assert!(sc.list(&root).unwrap().dir.partial);
+        let done = done.expect("a top-level dir finished");
+        assert!(sc.list(&root).unwrap().dir.partial, "root still partial after only {done}/ finished");
         flush(sc.sh());
         drop(sc);
-        du(&fx.root, &mut HashSet::new()).0
+        (du(&fx.root, &mut HashSet::new()).0, done)
     };
     let sc = Scanner::with_options(Options { cache_path: Some(db), ..opts() });
-    let a = sc.list(&fx.s("a")).expect("a/ loaded from cache");
+    let a = sc.list(&fx.s(done)).expect("finished dir loaded from cache");
     assert!(!a.dir.partial);
     sc.ensure(&root, true);
-    // The root's lower bound includes a/ from the cache even before anything is re-read.
+    // The root's lower bound includes the finished dir from the cache even before anything is re-read.
     let l = sc.list(&root).unwrap();
     assert!(l.dir.partial && l.dir.size >= a.dir.size, "{} < {}", l.dir.size, a.dir.size);
     let fin = sc.scan_blocking(&root, 30_000).unwrap();
     assert!(!fin.dir.partial);
-    assert!(!child(&fin, "a").partial);
+    assert!(!child(&fin, done).partial);
     // Everything but the index dir, which the first run created mid-way.
     let idx = fin.children.iter().find(|c| c.name == ".index").map_or(0, |c| c.size);
     assert!(fin.dir.size >= total - idx.min(total), "{} vs du {total}", fin.dir.size);
-    assert_eq!(child(&fin, "a").size, a.dir.size);
+    assert_eq!(child(&fin, done).size, a.dir.size);
 }
 
 #[test]

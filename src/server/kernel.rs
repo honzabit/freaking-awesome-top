@@ -755,6 +755,8 @@ impl KernelSampler {
         }
     }
 
+    // The refresh check stays a nested `if`: as a match guard it would mutate `last_run` from a guard.
+    #[allow(clippy::collapsible_match)]
     fn read_kernel_log(&mut self, _k: &Kernel, now: Ts, prev_vm: Option<VmCounters>, vm: VmCounters) {
         if matches!(self.log, KernelLog::Init) {
             self.log = open_kernel_log(now);
