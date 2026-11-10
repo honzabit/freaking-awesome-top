@@ -1703,10 +1703,10 @@ fn draw_ask(f: &mut Frame, app: &App, area: Rect) {
                 .border_style(Style::default().fg(ACCENT))
                 .title(Line::styled(format!(" Ask · {} ", clip(question, 60)), Style::default().bold()))
                 .title_bottom(Line::styled(" ↑↓ PgUp/PgDn scroll · ? ask again · Esc close ", dim()));
-            f.render_widget(
-                Paragraph::new(text.as_str()).wrap(Wrap { trim: false }).scroll((*scroll, 0)).block(block),
-                r,
-            );
+            // The answer is Markdown (the model writes it so); render it, pre-wrapped to the box.
+            let lines = super::markdown::render(text, r.width.saturating_sub(2));
+            let max_scroll = (lines.len() as u16).saturating_sub(r.height.saturating_sub(2));
+            f.render_widget(Paragraph::new(lines).scroll(((*scroll).min(max_scroll), 0)).block(block), r);
         }
     }
 }
@@ -2288,6 +2288,25 @@ mod tests {
             let out = render(&mut a, w, h);
             if h >= 24 {
                 assert!(out.contains("because node"));
+            }
+            // Answers are Markdown: shown formatted, without the markers.
+            a.ask = AskState::Thinking { question: "q".into(), since: a.now, id: 2 };
+            a.set_answer(2, "**Disk** writes come from `prometheus`:\n- pid 1810 writes *steadily*\n".into());
+            let out = render(&mut a, w, h);
+            if h >= 24 && w >= 60 {
+                assert!(out.contains("Disk writes come from prometheus:"), "{out}");
+                assert!(out.contains("• pid 1810 writes steadily"), "{out}");
+                assert!(!out.contains("**") && !out.contains('`'), "{out}");
+            }
+            // Scrolling past the end stops at the last page instead of showing an empty box.
+            a.ask = AskState::Thinking { question: "q".into(), since: a.now, id: 3 };
+            a.set_answer(3, "line\n".repeat(200));
+            if let AskState::Answer { scroll, .. } = &mut a.ask {
+                *scroll = u16::MAX;
+            }
+            let out = render(&mut a, w, h);
+            if h >= 24 {
+                assert!(out.contains("line"), "{out}");
             }
         }
     }

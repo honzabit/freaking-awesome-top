@@ -1445,7 +1445,9 @@ fn tool_ask(state: &mut State, args: &Value) -> Result<Value> {
     state.snapshot()?;
     let snap = &state.last.as_ref().expect("snapshot cached").1;
     let findings = crate::blame::diagnose(snap, state.history.as_ref());
-    let answer = crate::ask::ask(&q, snap, &findings, &state.config.ask);
+    let storage =
+        crate::ask::wants_storage(&q).then(|| crate::ask::gather_storage(&q, state.config.history_path.as_deref()));
+    let answer = crate::ask::ask(&q, snap, &findings, storage.as_ref(), &state.config.ask);
     Ok(json!({ "question": q, "answer": answer, "findings": findings }))
 }
 

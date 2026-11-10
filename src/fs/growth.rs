@@ -429,7 +429,7 @@ impl Tracker {
         }
         let mut seen_notes = std::collections::HashSet::new();
         notes.retain(|n| seen_notes.insert(n.clone()));
-        Growth { from, to: now, volumes, growers, writers, deleted_open, notes }
+        Growth { from, to: now, volumes, growers, writers, deleted_open, notes, root }
     }
 
     fn proc_name(&self, pid: u32) -> String {

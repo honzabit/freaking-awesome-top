@@ -6,6 +6,7 @@
 //! credentials, long hex/base64 blobs; the home directory becomes `~`, the user name "me").
 //! `fat ask --dry-run` prints the exact body without sending it. Without a key, a rule-based
 //! answerer assembles a reply from findings and top consumers.
+use crate::fs::{Growth, Volume};
 use crate::model::{Finding, Proc, Snapshot};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -29,18 +30,33 @@ Linux digests may add: system.psi (pressure stall information, avg10 % of time t
 above ~10% means real contention, and mem_full or io_full above a few % means the machine is thrashing), \
 system.temp_c (hottest sensor), system.power_source (rapl = measured package energy, estimate = CPU-time model, \
 rusage = macOS per-task energy), and per process `ctr` (the container it runs in) and `cgroup` (systemd unit or slice). \
-Attribute load to containers or systemd units when the processes involved share one.";
+Attribute load to containers or systemd units when the processes involved share one. \
+Processes may carry disk_w_kbps / disk_r_kbps (current write / read rate). For questions about disk space or \
+writes, the digest adds `storage`: volumes (use, free space, I/O, fill_kbps and eta_full_h when filling), growers \
+(paths whose allocated size changed in the window, most specific first, with delta_mb, the processes seen writing \
+there, and evidence: fsevents/watch = exact paths seen changing, open_files = files a writing process holds open, \
+scan_diff = two scans compared, mtime = recently modified, an upper bound), writers (bytes each process wrote in \
+the window), deleted_open (space held by deleted files still open) and notes (what evidence was unavailable). \
+Name the paths and the processes from it; say which evidence backs each claim. \
+Format the answer as GitHub-flavored Markdown for a terminal: short paragraphs, `-` bullet lists, **bold** for the \
+key finding, `code` for commands, paths, pids and units. No tables and no headings above level 3.";
 
 /// Answer a question. Uses Claude API if ANTHROPIC_API_KEY is set (cfg.ask.enabled), else a
 /// rule-based answer built from findings. Never panics; errors become explanatory text.
-pub fn ask(question: &str, snap: &Snapshot, findings: &[Finding], cfg: &crate::config::AskCfg) -> String {
+pub fn ask(
+    question: &str,
+    snap: &Snapshot,
+    findings: &[Finding],
+    storage: Option<&Storage>,
+    cfg: &crate::config::AskCfg,
+) -> String {
     let key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.trim().is_empty());
     match key {
-        Some(key) if cfg.enabled => match call_claude(question, snap, findings, &cfg.model, key.trim()) {
+        Some(key) if cfg.enabled => match call_claude(question, snap, findings, storage, &cfg.model, key.trim()) {
             Ok(answer) => answer,
-            Err(e) => format!("{e}\n\nOffline answer instead:\n{}", offline_answer(question, snap, findings)),
+            Err(e) => format!("{e}\n\nOffline answer instead:\n{}", offline_answer(question, snap, findings, storage)),
         },
-        _ => offline_answer(question, snap, findings),
+        _ => offline_answer(question, snap, findings, storage),
     }
 }
 
@@ -66,8 +82,14 @@ pub(crate) fn request_body(question: &str, context: &str, model: &str) -> Value 
 }
 
 /// The exact bytes `ask` would POST for this question (redacted; see [`redact`]).
-pub fn request_json(question: &str, snap: &Snapshot, findings: &[Finding], model: &str) -> String {
-    request_body(question, &build_context(snap, findings), model).to_string()
+pub fn request_json(
+    question: &str,
+    snap: &Snapshot,
+    findings: &[Finding],
+    storage: Option<&Storage>,
+    model: &str,
+) -> String {
+    request_body(question, &build_context(snap, findings, storage), model).to_string()
 }
 
 /// Where the request goes.
@@ -77,25 +99,32 @@ pub fn endpoint() -> String {
 }
 
 /// `fat ask --dry-run`: the request body that would be sent, and nothing is sent.
-pub fn dry_run(question: &str, snap: &Snapshot, findings: &[Finding], cfg: &crate::config::AskCfg) -> (String, String) {
+pub fn dry_run(
+    question: &str,
+    snap: &Snapshot,
+    findings: &[Finding],
+    storage: Option<&Storage>,
+    cfg: &crate::config::AskCfg,
+) -> (String, String) {
     let key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.trim().is_empty());
     let note = match (key.is_some(), cfg.enabled) {
         (true, true) => format!("dry run: this body would be POSTed to {} (headers x-api-key, anthropic-version {API_VERSION}); nothing was sent", endpoint()),
         (_, false) => "dry run: [ask] enabled = false, so `fat ask` answers offline and sends nothing; this is what it would send if enabled".to_string(),
         (false, true) => "dry run: ANTHROPIC_API_KEY is not set, so `fat ask` answers offline and sends nothing; this is what it would send with a key".to_string(),
     };
-    (request_json(question, snap, findings, &cfg.model), note)
+    (request_json(question, snap, findings, storage, &cfg.model), note)
 }
 
 fn call_claude(
     question: &str,
     snap: &Snapshot,
     findings: &[Finding],
+    storage: Option<&Storage>,
     model: &str,
     key: &str,
 ) -> Result<String, String> {
     // Sent as these exact bytes, so `fat ask --dry-run` shows precisely what leaves the machine.
-    let body = request_json(question, snap, findings, model);
+    let body = request_json(question, snap, findings, storage, model);
     let url = endpoint();
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(90)).build();
     let resp = agent
@@ -566,6 +595,12 @@ fn proc_json_in(snap: &Snapshot, containers: &[crate::model::Container], p: &Pro
     if cmd_len > 0 && !p.cmd.is_empty() {
         v["cmd"] = json!(trunc(&redact_cmd(&p.cmd), cmd_len));
     }
+    if p.disk_write_bps > 0 {
+        v["disk_w_kbps"] = json!(p.disk_write_bps / 1024);
+    }
+    if p.disk_read_bps > 0 {
+        v["disk_r_kbps"] = json!(p.disk_read_bps / 1024);
+    }
     if p.status == "T" {
         v["stopped"] = json!(true);
     }
@@ -587,7 +622,13 @@ fn top_by<F: Fn(&Proc) -> f64>(snap: &Snapshot, n: usize, key: F) -> Vec<&Proc> 
     v
 }
 
-fn context_with(snap: &Snapshot, findings: &[Finding], scale: usize, cmd_len: usize) -> Value {
+fn context_with(
+    snap: &Snapshot,
+    findings: &[Finding],
+    storage: Option<&Storage>,
+    scale: usize,
+    cmd_len: usize,
+) -> Value {
     let s = &snap.system;
     let lim = |n: usize| (n * scale / 4).max(1);
     let list = |ps: Vec<&Proc>| ps.into_iter().map(|p| proc_json(snap, p, cmd_len)).collect::<Vec<_>>();
@@ -653,25 +694,253 @@ fn context_with(snap: &Snapshot, findings: &[Finding], scale: usize, cmd_len: us
     if !s.power_source.is_empty() {
         v["system"]["power_source"] = json!(s.power_source);
     }
+    if let Some(st) = storage {
+        v["storage"] = storage_json(st, scale);
+    }
     v
 }
 
 /// Compact JSON digest of the snapshot, kept under ~20KB by shrinking lists if needed.
 /// Every string in it is redacted (secrets, home directory, user name) before it is measured.
-pub fn build_context(snap: &Snapshot, findings: &[Finding]) -> String {
+pub fn build_context(snap: &Snapshot, findings: &[Finding], storage: Option<&Storage>) -> String {
     let (home, user) = identity();
     let render = |mut v: Value| {
         redact_value(&mut v, home.as_deref(), user.as_deref());
         v.to_string()
     };
     for (scale, cmd_len) in [(4, 80), (4, 40), (3, 0), (2, 0), (1, 0)] {
-        let s = render(context_with(snap, findings, scale, cmd_len));
+        let s = render(context_with(snap, findings, storage, scale, cmd_len));
         if s.len() <= MAX_CONTEXT_BYTES {
             return s;
         }
     }
-    let s = render(context_with(snap, &findings[..findings.len().min(3)], 1, 0));
+    let s = render(context_with(snap, &findings[..findings.len().min(3)], storage, 1, 0));
     s.chars().take(MAX_CONTEXT_BYTES).collect()
+}
+
+// ---------- storage evidence ----------
+
+/// What fat knows about storage when a question is about disk space or writes: the volumes
+/// and the growth report (which paths grew in the window, and who wrote them).
+#[derive(Debug, Clone, Default)]
+pub struct Storage {
+    pub window_ms: i64,
+    /// Growth limited to this directory, when the question named one.
+    pub under: Option<String>,
+    pub volumes: Vec<Volume>,
+    pub growth: Growth,
+}
+
+/// Whether a question is about storage (space, writes, a path): worth gathering [`Storage`].
+pub fn wants_storage(question: &str) -> bool {
+    if topics(question).contains(&Topic::Disk) || path_in(question).is_some() {
+        return true;
+    }
+    let q = question.to_ascii_lowercase();
+    let words: Vec<&str> = q.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let keys =
+        ["space", "full", "fill", "grow", "log", "file", "folder", "dir", "eat", "size", "bigger", "quota", "inode"];
+    words.iter().any(|w| keys.iter().any(|k| w.starts_with(k)))
+}
+
+/// The first absolute path in the question that is (or is inside) an existing directory.
+pub fn path_in(question: &str) -> Option<String> {
+    question.split_whitespace().find_map(|tok| {
+        let t =
+            tok.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '(' | ')' | ',' | '?' | '!' | ';' | ':' | '.'));
+        if !t.starts_with('/') {
+            return None;
+        }
+        let mut p = std::path::Path::new(t);
+        loop {
+            if p.is_dir() {
+                return Some(p.to_string_lossy().into_owned());
+            }
+            p = p.parent()?;
+        }
+    })
+}
+
+/// A window the question names ("last 2 hours", "past 30 min", "today"), capped at 7 days.
+pub fn window_in(question: &str) -> Option<i64> {
+    const MIN: i64 = 60_000;
+    let q = question.to_ascii_lowercase();
+    let words: Vec<&str> = q.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let unit = |w: &str| -> Option<i64> {
+        match w {
+            "s" | "sec" | "secs" | "second" | "seconds" => Some(1_000),
+            "m" | "min" | "mins" | "minute" | "minutes" => Some(MIN),
+            "h" | "hr" | "hrs" | "hour" | "hours" => Some(60 * MIN),
+            "d" | "day" | "days" => Some(24 * 60 * MIN),
+            "w" | "week" | "weeks" => Some(7 * 24 * 60 * MIN),
+            _ => None,
+        }
+    };
+    let cap = |ms: i64| Some(ms.clamp(MIN, 7 * 24 * 60 * MIN));
+    for (i, w) in words.iter().enumerate() {
+        // "10m", "2h"
+        let digits = w.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0
+            && digits < w.len()
+            && let (Ok(n), Some(u)) = (w[..digits].parse::<i64>(), unit(&w[digits..]))
+        {
+            return cap(n * u);
+        }
+        // "10 minutes", "an hour", "last day"
+        if let Some(u) = unit(w) {
+            let n = i.checked_sub(1).and_then(|j| words[j].parse::<i64>().ok());
+            if n.is_some() || (w.len() > 1 && i > 0 && matches!(words[i - 1], "an" | "a" | "last" | "past" | "one")) {
+                return cap(n.unwrap_or(1) * u);
+            }
+        }
+        if matches!(*w, "today" | "yesterday") {
+            return cap(24 * 60 * MIN);
+        }
+    }
+    None
+}
+
+/// Gather [`Storage`] for a question: volumes plus a growth report for the named window and
+/// directory. Takes about two seconds (process write rates need a few samples).
+pub fn gather_storage(question: &str, history_path: Option<&str>) -> Storage {
+    let under = path_in(question);
+    let window_ms = window_in(question).unwrap_or(crate::fs::DEFAULT_WINDOW_MS);
+    let history = crate::history::History::open_read_only(history_path).ok();
+    let mut vols = crate::fs::volumes::Volumes::new();
+    if let Some(h) = &history {
+        h.seed_volumes(&mut vols, crate::model::now_ms());
+    }
+    let _ = vols.sample();
+    let mut tracker = crate::fs::growth::Tracker::new();
+    let mut c = crate::collect::Collector::new();
+    tracker.observe(&c.sample());
+    for _ in 0..2 {
+        std::thread::sleep(Duration::from_millis(800));
+        tracker.observe(&c.sample());
+    }
+    let volumes = vols.sample();
+    let scanner = crate::fs::scan::Scanner::new();
+    let growth = tracker.report(window_ms, under.as_deref(), history.as_ref(), Some(&scanner));
+    Storage { window_ms, under, volumes, growth }
+}
+
+/// [`Storage`] from a growth report fat already has (the TUI's Fs tab), when it is recent
+/// (`max_age_ms`), spans the question's window, and covers the question's directory. Growers
+/// outside that directory are dropped. None means gather a fresh one.
+pub fn reuse_storage(
+    question: &str,
+    volumes: Vec<Volume>,
+    growth: Option<Growth>,
+    now: crate::model::Ts,
+    max_age_ms: i64,
+) -> Option<Storage> {
+    let g = growth?;
+    let under = path_in(question);
+    let window_ms = window_in(question).unwrap_or(crate::fs::DEFAULT_WINDOW_MS);
+    let root = if g.root.is_empty() { "/" } else { g.root.trim_end_matches('/') };
+    let inside = |p: &str, dir: &str| dir.is_empty() || p == dir || p.starts_with(&format!("{dir}/"));
+    let want = under.as_deref().map(|u| u.trim_end_matches('/')).unwrap_or("");
+    let covers = root.is_empty() || inside(want, root) || (want.is_empty() && root == "/");
+    if now - g.to > max_age_ms || g.to - g.from + 1_000 < window_ms || !covers {
+        return None;
+    }
+    let mut g = g;
+    if !want.is_empty() {
+        g.growers.retain(|x| inside(&x.path, want));
+    }
+    Some(Storage { window_ms, under, volumes, growth: g })
+}
+
+fn mib(b: i64) -> f64 {
+    (b as f64 / 1_048_576.0 * 10.0).round() / 10.0
+}
+
+fn gib(b: u64) -> f64 {
+    (b as f64 / 1_073_741_824.0 * 10.0).round() / 10.0
+}
+
+fn storage_json(st: &Storage, scale: usize) -> Value {
+    let lim = |n: usize| (n * scale / 4).max(1);
+    let g = &st.growth;
+    json!({
+        "window_min": st.window_ms / 60_000,
+        "under": st.under,
+        "volumes": st.volumes.iter().filter(|v| !v.hidden).take(lim(10)).map(|v| {
+            let mut o = json!({
+                "mount": v.mount, "device": v.device, "fstype": v.fstype,
+                "used_gb": gib(v.used), "total_gb": gib(v.total), "avail_gb": gib(v.avail),
+                "read_kbps": v.read_bps / 1024, "write_kbps": v.write_bps / 1024,
+            });
+            if let Some(f) = v.fill_bps {
+                o["fill_kbps"] = json!((f / 1024.0).round());
+            }
+            if let Some(e) = v.eta_full_s {
+                o["eta_full_h"] = json!((e as f64 / 3600.0 * 10.0).round() / 10.0);
+            }
+            if v.inodes_total > 0 {
+                o["inodes_used_pct"] = json!((v.inodes_used as f64 * 1000.0 / v.inodes_total as f64).round() / 10.0);
+            }
+            if v.remote {
+                o["remote"] = json!(true);
+            }
+            if v.read_only {
+                o["read_only"] = json!(true);
+            }
+            if !v.note.is_empty() {
+                o["note"] = json!(trunc(&v.note, 120));
+            }
+            o
+        }).collect::<Vec<_>>(),
+        "used_delta_mb": g.volumes.iter().map(|(m, d)| json!({"mount": m, "delta_mb": mib(*d)})).collect::<Vec<_>>(),
+        "growers": g.growers.iter().take(lim(15)).map(|x| {
+            let mut o = json!({
+                "path": x.path, "delta_mb": mib(x.delta), "size_mb": mib(x.size as i64),
+                "evidence": x.evidence,
+                "writers": x.writers.iter().take(3).map(|(pid, name, bps)| json!({"pid": pid, "name": trunc(name, 40), "w_kbps": bps / 1024})).collect::<Vec<_>>(),
+            });
+            if x.files_touched > 0 {
+                o["files_touched"] = json!(x.files_touched);
+            }
+            if x.other {
+                o["other_under"] = json!(true);
+            }
+            o
+        }).collect::<Vec<_>>(),
+        "writers": g.writers.iter().take(lim(10)).map(|(pid, name, b)| json!({"pid": pid, "name": trunc(name, 40), "written_mb": mib(*b as i64)})).collect::<Vec<_>>(),
+        "deleted_open": g.deleted_open.iter().take(lim(5)).map(|(pid, name, path, b)| json!({"pid": pid, "name": trunc(name, 40), "path": trunc(path, 120), "mb": mib(*b as i64)})).collect::<Vec<_>>(),
+        "notes": g.notes.iter().take(6).map(|n| trunc(n, 200)).collect::<Vec<_>>(),
+    })
+}
+
+/// The offline answer's storage part: what grew, who wrote, what is held by deleted files.
+fn storage_section(out: &mut Vec<String>, st: &Storage) {
+    let g = &st.growth;
+    let mins = (st.window_ms / 60_000).max(1);
+    let under = st.under.as_deref().unwrap_or("/");
+    let growers: Vec<_> = g.growers.iter().filter(|x| x.delta != 0).take(8).collect();
+    if growers.is_empty() {
+        out.push(format!("No path under {under} measurably changed size in the last {mins} min."));
+    } else {
+        out.push(format!("Changed under {under} in the last {mins} min:"));
+        for x in growers {
+            let who = x.writers.first().map(|(pid, name, _)| format!("  ({name}, pid {pid})")).unwrap_or_default();
+            let sign = if x.delta >= 0 { "+" } else { "-" };
+            let other = if x.other { "other under " } else { "" };
+            out.push(format!("  {sign}{:<9} {other}{}{who}", human(x.delta.unsigned_abs()), x.path));
+        }
+    }
+    if !g.writers.is_empty() {
+        out.push("Wrote the most in that window:".to_string());
+        for (pid, name, b) in g.writers.iter().take(5) {
+            out.push(format!("  {:<9} pid {pid:<7} {name}", human(*b)));
+        }
+    }
+    for (pid, name, path, b) in g.deleted_open.iter().take(3) {
+        out.push(format!("  {} held by deleted {path} (pid {pid} {name})", human(*b)));
+    }
+    for n in g.notes.iter().take(3) {
+        out.push(format!("  note: {n}"));
+    }
 }
 
 // ---------- offline answerer ----------
@@ -731,7 +1000,7 @@ fn proc_line(p: &Proc, metric: String) -> String {
 }
 
 /// Rule-based answer from findings + top consumers.
-pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding]) -> String {
+pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding], storage: Option<&Storage>) -> String {
     let s = &snap.system;
     let mut topics = topics(question);
     let overview = topics.is_empty();
@@ -848,6 +1117,9 @@ pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding]) -> 
                     top_by(snap, 5, |p| (p.disk_read_bps + p.disk_write_bps) as f64),
                     |p| format!("r {}/s w {}/s", human(p.disk_read_bps), human(p.disk_write_bps)),
                 );
+                if let Some(st) = storage {
+                    storage_section(&mut out, st);
+                }
             }
             Topic::Network => {
                 out.push(format!("Network in {}/s, out {}/s.", human(s.net_rx_bps), human(s.net_tx_bps)));
@@ -998,7 +1270,7 @@ mod tests {
 
     #[test]
     fn context_is_compact_and_limited() {
-        let ctx = build_context(&snap(), &findings());
+        let ctx = build_context(&snap(), &findings(), None);
         assert!(ctx.len() <= MAX_CONTEXT_BYTES, "{}", ctx.len());
         let v: Value = serde_json::from_str(&ctx).unwrap();
         assert_eq!(v["top_cpu"].as_array().unwrap().len(), 25);
@@ -1020,7 +1292,7 @@ mod tests {
         }
         let many: Vec<Finding> =
             (0..50).map(|_| Finding { detail: "z".repeat(400), ..findings()[0].clone() }).collect();
-        assert!(build_context(&s, &many).len() <= MAX_CONTEXT_BYTES);
+        assert!(build_context(&s, &many, None).len() <= MAX_CONTEXT_BYTES);
     }
 
     fn linux_snap() -> Snapshot {
@@ -1048,7 +1320,7 @@ mod tests {
 
     #[test]
     fn context_carries_linux_fields_compactly() {
-        let ctx = build_context(&linux_snap(), &findings());
+        let ctx = build_context(&linux_snap(), &findings(), None);
         let v: Value = serde_json::from_str(&ctx).unwrap();
         assert_eq!(v["system"]["psi"]["cpu_some"], 23.0);
         assert_eq!(v["system"]["temp_c"], 81.0);
@@ -1063,7 +1335,7 @@ mod tests {
         }
         assert_eq!(v["containers"][0]["procs"], 1);
         // macOS digest is unchanged: no Linux keys
-        let m: Value = serde_json::from_str(&build_context(&snap(), &findings())).unwrap();
+        let m: Value = serde_json::from_str(&build_context(&snap(), &findings(), None)).unwrap();
         assert!(
             m["system"].get("psi").is_none()
                 && m["system"].get("temp_c").is_none()
@@ -1084,16 +1356,16 @@ mod tests {
     #[test]
     fn offline_linux_answers_use_psi_and_containers() {
         let s = linux_snap();
-        let a = offline_answer("why is the cpu so slow", &s, &[]);
+        let a = offline_answer("why is the cpu so slow", &s, &[], None);
         assert!(a.contains("CPU pressure") && a.contains("23.0%") && a.contains("heavy contention"), "{a}");
         assert!(a.contains("81°C"), "{a}");
-        let a = offline_answer("battery power?", &s, &[]);
+        let a = offline_answer("battery power?", &s, &[], None);
         assert!(a.contains("RAPL") && a.contains("61.0 W"), "{a}");
-        let a = offline_answer("which docker container is busy", &s, &[]);
+        let a = offline_answer("which docker container is busy", &s, &[], None);
         assert!(a.contains("api-1") && a.contains("Host processes by container"), "{a}");
         assert!(topics("is a pod hogging io").contains(&Topic::Containers));
         // macOS answers keep their wording
-        let m = offline_answer("battery power?", &snap(), &[]);
+        let m = offline_answer("battery power?", &snap(), &[], None);
         assert!(m.contains("Estimated process power") && !m.contains("pressure:"));
     }
 
@@ -1186,7 +1458,7 @@ mod tests {
             action: Some("pause 500".into()),
         }];
         let q = format!("why is my key {} slow", secrets[0]);
-        let body = request_json(&q, &s, &f, "claude-opus-5-5");
+        let body = request_json(&q, &s, &f, None, "claude-opus-5-5");
         for sec in secrets {
             if let Some(i) = body.find(sec) {
                 panic!("{sec} leaked into the request: …{}…", &body[i.saturating_sub(120)..(i + 40).min(body.len())]);
@@ -1195,7 +1467,7 @@ mod tests {
         // Still useful: names, pids, the question's intent.
         assert!(body.contains("server.js") && body.contains(r#"pid\":500"#) && body.contains("slow"), "{body}");
         // dry run prints exactly that body and sends nothing (no key in tests).
-        let (dry, note) = dry_run(&q, &s, &f, &crate::config::AskCfg::default());
+        let (dry, note) = dry_run(&q, &s, &f, None, &crate::config::AskCfg::default());
         assert_eq!(dry, body);
         assert!(note.contains("dry run"), "{note}");
     }
@@ -1265,21 +1537,133 @@ mod tests {
     #[test]
     fn offline_answers() {
         let s = snap();
-        let a = offline_answer("why is it slow", &s, &findings());
+        let a = offline_answer("why is it slow", &s, &findings(), None);
         assert!(a.contains("node is burning"));
         assert!(a.contains("fat pause 500"));
         assert!(a.contains("Top CPU"));
         assert!(a.trim_end().ends_with(KEY_HINT));
-        let p = offline_answer("any orphan ports?", &s, &[]);
+        let p = offline_answer("any orphan ports?", &s, &[], None);
         assert!(p.contains("5173") && p.contains("orphaned"));
-        let o = offline_answer("what's up", &s, &[]);
+        let o = offline_answer("what's up", &s, &[], None);
         assert!(o.contains("Top CPU") && o.contains("Top memory"));
     }
 
     #[test]
     fn ask_without_key_is_offline() {
         let cfg = crate::config::AskCfg { enabled: false, ..Default::default() };
-        let a = ask("battery?", &snap(), &[], &cfg);
+        let a = ask("battery?", &snap(), &[], None, &cfg);
         assert!(a.contains(KEY_HINT));
+    }
+
+    #[test]
+    fn storage_questions_are_recognized() {
+        for q in [
+            "what writes all the time under /var",
+            "what is eating my space",
+            "disk filling up?",
+            "why is / full",
+            "which logs grow",
+        ] {
+            assert!(wants_storage(q), "{q}");
+        }
+        for q in ["why is the fan loud", "which port is 8080", "battery?"] {
+            assert!(!wants_storage(q), "{q}");
+        }
+        let tmp = std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string();
+        assert_eq!(path_in(&format!("what writes under {tmp}?")).as_deref(), Some(tmp.as_str()));
+        assert_eq!(path_in(&format!("growth in `{tmp}/does/not/exist`")).as_deref(), Some(tmp.as_str()));
+        assert_eq!(path_in("what is eating my space"), None);
+        assert_eq!(window_in("in the last 2 hours"), Some(2 * 3_600_000));
+        assert_eq!(window_in("past 30 min"), Some(30 * 60_000));
+        assert_eq!(window_in("growth in 10m"), Some(10 * 60_000));
+        assert_eq!(window_in("the last hour"), Some(3_600_000));
+        assert_eq!(window_in("since yesterday"), Some(24 * 3_600_000));
+        assert_eq!(window_in("in 30 days"), Some(7 * 24 * 3_600_000), "capped at 7 days");
+        assert_eq!(window_in("what writes under /var"), None);
+        assert_eq!(window_in("pid 1810 at 3 am"), None);
+    }
+
+    #[test]
+    fn storage_goes_into_the_digest_and_the_offline_answer() {
+        use crate::fs::{Evidence, Grower};
+        let st = Storage {
+            window_ms: 600_000,
+            under: Some("/var".into()),
+            volumes: vec![Volume {
+                mount: "/".into(),
+                total: 100 << 30,
+                used: 60 << 30,
+                avail: 40 << 30,
+                write_bps: 700 << 10,
+                fill_bps: Some(2048.0),
+                ..Default::default()
+            }],
+            growth: Growth {
+                growers: vec![Grower {
+                    path: "/var/lib/prometheus/wal".into(),
+                    delta: 300 << 20,
+                    size: 2 << 30,
+                    writers: vec![(1810, "prometheus".into(), 500 << 10)],
+                    evidence: vec![Evidence::Watch, Evidence::OpenFiles],
+                    ..Default::default()
+                }],
+                writers: vec![(1810, "prometheus".into(), 310 << 20)],
+                notes: vec!["fanotify needs root".into()],
+                ..Default::default()
+            },
+        };
+        let mut s = snap();
+        s.procs[0].disk_write_bps = 512 << 10;
+        let ctx: Value = serde_json::from_str(&build_context(&s, &[], Some(&st))).unwrap();
+        let g = &ctx["storage"]["growers"][0];
+        assert_eq!(g["path"], "/var/lib/prometheus/wal");
+        assert_eq!(g["delta_mb"], 300.0);
+        assert_eq!(g["writers"][0]["pid"], 1810);
+        assert_eq!(g["evidence"], json!(["watch", "open_files"]));
+        assert_eq!(ctx["storage"]["under"], "/var");
+        assert_eq!(ctx["storage"]["volumes"][0]["fill_kbps"], 2.0);
+        assert_eq!(ctx["storage"]["writers"][0]["written_mb"], 310.0);
+        assert_eq!(ctx["top_disk"][0]["disk_w_kbps"], 512);
+        assert!(!build_context(&s, &[], None).contains("\"storage\""));
+        let a = offline_answer("what writes under /var", &s, &[], Some(&st));
+        assert!(a.contains("/var/lib/prometheus/wal") && a.contains("prometheus, pid 1810"), "{a}");
+        assert!(a.contains("note: fanotify needs root"), "{a}");
+    }
+
+    #[test]
+    fn a_fresh_tui_report_is_reused_when_it_covers_the_question() {
+        use crate::fs::Grower;
+        let g = |root: &str, from: i64, to: i64| Growth {
+            from,
+            to,
+            root: root.into(),
+            growers: vec![
+                Grower { path: "/var/lib/x".into(), delta: 1, ..Default::default() },
+                Grower { path: "/home/u/y".into(), delta: 1, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let now = 10_000_000;
+        let tmp = std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string();
+        let st =
+            reuse_storage("what is eating my space", vec![], Some(g("/", now - 605_000, now - 5_000)), now, 120_000)
+                .unwrap();
+        assert_eq!(st.growth.growers.len(), 2);
+        // Narrowed to the directory the question names.
+        let q = format!("what writes under {tmp}");
+        let mut gr = g("/", now - 600_000, now);
+        gr.growers.push(Grower { path: format!("{tmp}/a"), delta: 1, ..Default::default() });
+        let st = reuse_storage(&q, vec![], Some(gr), now, 120_000).unwrap();
+        assert_eq!(st.growth.growers.iter().map(|x| x.path.clone()).collect::<Vec<_>>(), vec![format!("{tmp}/a")]);
+        // Stale, too short a window, or a report for another directory: gather afresh.
+        assert!(
+            reuse_storage("disk space?", vec![], Some(g("/", now - 900_000, now - 300_000)), now, 120_000).is_none()
+        );
+        assert!(
+            reuse_storage("disk space in the last 2 hours", vec![], Some(g("/", now - 600_000, now)), now, 120_000)
+                .is_none()
+        );
+        assert!(reuse_storage(&q, vec![], Some(g("/home", now - 600_000, now)), now, 120_000).is_none());
+        assert!(reuse_storage("disk?", vec![], None, now, 120_000).is_none());
     }
 }

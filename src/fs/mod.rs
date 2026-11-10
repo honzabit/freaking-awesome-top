@@ -168,6 +168,9 @@ pub struct Growth {
     pub deleted_open: Vec<(u32, String, String, u64)>,
     /// Human notes: what evidence was unavailable and why (e.g. "fanotify needs root").
     pub notes: Vec<String>,
+    /// The directory the report covers ("/" for the whole machine); empty in older reports.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub root: String,
 }
 
 /// Default growth window.

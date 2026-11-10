@@ -19,6 +19,7 @@
 //! degrades to a status message instead of tearing down the terminal.
 
 pub mod app;
+pub mod markdown;
 pub mod server;
 mod server_ui;
 pub mod ui;
@@ -1074,10 +1075,21 @@ impl Ctx {
                 let snap = app.live.clone().unwrap_or_default();
                 let findings = app.findings.clone();
                 let ask_cfg = self.cfg.ask.clone();
+                let hist_path = self.cfg.history_path.clone();
                 let tx = self.tx.clone();
+                // The Fs tab's growth report, when it has one: reused if fresh, so a disk
+                // question doesn't wait for a second FSEvents replay.
+                let facts = self.fs_shared.facts();
+                let now = app.now;
                 thread::spawn(move || {
-                    let ans = guarded(|| crate::ask::ask(&q, &snap, &findings, &ask_cfg))
-                        .unwrap_or_else(|e| format!("ask is unavailable right now ({e})."));
+                    let ans = guarded(|| {
+                        let st = crate::ask::wants_storage(&q).then(|| {
+                            crate::ask::reuse_storage(&q, facts.volumes, facts.growth, now, 120_000)
+                                .unwrap_or_else(|| crate::ask::gather_storage(&q, hist_path.as_deref()))
+                        });
+                        crate::ask::ask(&q, &snap, &findings, st.as_ref(), &ask_cfg)
+                    })
+                    .unwrap_or_else(|e| format!("ask is unavailable right now ({e})."));
                     let _ = tx.send(Msg::Answer(id, ans));
                 });
             }

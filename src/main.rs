@@ -877,12 +877,14 @@ fn main() -> Result<()> {
             let s = sample_with(true);
             let h = history::History::open_read_only(cfg.history_path.as_deref()).ok();
             let f = blame::diagnose(&s, h.as_ref());
+            // Disk-space and write questions get the growth report: which paths, which writers.
+            let st = ask::wants_storage(&q).then(|| ask::gather_storage(&q, cfg.history_path.as_deref()));
             if dry_run {
-                let (body, note) = ask::dry_run(&q, &s, &f, &cfg.ask);
+                let (body, note) = ask::dry_run(&q, &s, &f, st.as_ref(), &cfg.ask);
                 eprintln!("{note}");
                 println!("{body}");
             } else {
-                println!("{}", ask::ask(&q, &s, &f, &cfg.ask));
+                println!("{}", ask::ask(&q, &s, &f, st.as_ref(), &cfg.ask));
             }
         }
         // --- recorder-export ---
@@ -1195,6 +1197,7 @@ mod tests {
             writers: vec![(42, "node".into(), 2 << 30)],
             deleted_open: vec![(9, "java".into(), "/tmp/old.log".into(), 3 << 30)],
             notes: vec!["fanotify needs root".into()],
+            ..Default::default()
         };
         let out = fmt_growth(&g, 600_000, 5);
         assert!(out.contains("last 10m") && out.contains("volume /: +3.0G"), "{out}");
