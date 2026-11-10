@@ -95,6 +95,7 @@ fat mcp                     # MCP server on stdio
 | `s` · `+`/`-` | in Timeline (`4`): jump to the next spike · zoom the window (5m … 24h) |
 | `L` / `Esc` | back to live |
 | `?` | ask in plain language: opens the Ask tab on a new thread |
+| `,` | settings (an overlay on any view): see below |
 | `Enter` / `i` · `n` · `↑↓` · `d` | in Ask: type a follow-up in the open thread · new thread · open another thread · delete one (`Esc` leaves the input line, or stops waiting for an answer, which is still saved) |
 | `h` | help |
 | `q` / `Ctrl-C` | quit |
@@ -1088,6 +1089,26 @@ URLs (`user:pass@`), and long hex or base64 blobs; your home directory becomes `
 `fat ask --dry-run QUESTION` prints exactly the body that would be sent, and where, and sends nothing. Without a
 model, `ask` answers offline from rules. Every answer says where the question went (`→ ollama · qwen3:32b ·
 http://…` on stderr, in the TUI's ask box, and as `via` in the MCP result).
+
+### Settings in the TUI (`,`)
+
+`,` opens the settings screen from any view. It shows every setting with its value and where that value comes
+from: the default, the config file, or an environment variable (which wins, and can't be changed there).
+
+- **Ask: the model:** provider, server URL, model, key variable, local only, detail, memory, thread retention,
+  digest size, Ollama context and timeout. The key itself is never shown or stored: only whether the variable
+  holding it is set.
+  - `t` sends a tiny "reply OK" question to the configured model and shows how long it took, or why it failed.
+    Nothing about the machine is sent.
+  - `m` lists the server's models (Ollama, OpenAI-compatible servers, or the Claude API) to pick from, chat
+    models first.
+- **Recording:** history retention and sample interval (a running `fat record` picks them up when restarted).
+- **Other settings** (profile, fleet limits, which actions agents may take) are shown read-only, with the key to
+  edit in the file. Letting agents act is deliberately not a toggle.
+
+`⏎` toggles, cycles or edits; `r` removes the value from the file so the default applies. Changes are written to
+your `config.toml` at once, keeping its comments and layout, and only if the result is still a valid config; ask
+uses them immediately.
 
 ### Threads
 

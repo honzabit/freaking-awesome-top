@@ -1784,11 +1784,159 @@ fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// The settings overlay: grouped settings with their value and where it comes from.
+fn draw_settings(f: &mut Frame, app: &App, ui: &crate::tui::app::SettingsUi, area: Rect) {
+    use crate::settings::{Kind, Source};
+    let w = area.width.saturating_sub(4).min(110);
+    let h = area.height.saturating_sub(2);
+    let r = centered(w, h, area);
+    f.render_widget(Clear, r);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Line::styled(" Settings ", Style::default().bold()))
+        .title(Line::styled(format!(" {} ", clip(&ui.path, (w as usize).saturating_sub(16))), dim()).right_aligned())
+        .title_bottom(Line::styled(
+            if ui.editing.is_some() {
+                " ⏎ save · Esc cancel · Ctrl-U clear "
+            } else if ui.picker.is_some() {
+                " ↑↓ choose · ⏎ use this model · Esc back "
+            } else {
+                " ↑↓ move · ⏎ change · r reset · t test model · m pick model · Esc close "
+            },
+            dim(),
+        ));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let [list, foot] = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(inner);
+
+    let label_w = 26usize;
+    let src_w = 22usize;
+    let val_w = (list.width as usize).saturating_sub(label_w + src_w + 3).max(8);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut sel_line = 0usize;
+    let mut group = "";
+    for (i, fd) in ui.fields.iter().enumerate() {
+        if fd.group() != group {
+            group = fd.group();
+            if !lines.is_empty() {
+                lines.push(Line::raw(""));
+            }
+            lines.push(Line::styled(group.to_string(), Style::default().fg(ACCENT).bold()));
+            if fd.section == "ask" {
+                lines.push(Line::styled(format!("  key: {}", ui.key_status), dim()));
+                lines.push(Line::styled(format!("  now: {}", crate::llm::destination(&ask_cfg_of(ui))), dim()));
+            }
+        }
+        let selected = i == ui.sel;
+        if selected {
+            sel_line = lines.len();
+        }
+        let value = match (&ui.editing, selected) {
+            (Some(input), true) => format!("{input}▏"),
+            _ => match (&fd.kind, fd.value.as_str()) {
+                (Kind::Bool, "true") => "on".to_string(),
+                (Kind::Bool, _) => "off".to_string(),
+                (Kind::Text, "") => "—".to_string(),
+                (Kind::Number(..), "0") if matches!(fd.key, "context_bytes" | "num_ctx" | "timeout_s") => {
+                    "auto".to_string()
+                }
+                (_, v) => v.to_string(),
+            },
+        };
+        let src = match &fd.source {
+            Source::Default => "default".to_string(),
+            Source::File => "config file".to_string(),
+            Source::Env(v) => format!("env {v}"),
+        };
+        let val_style = if !fd.editable() {
+            dim()
+        } else if ui.editing.is_some() && selected {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().bold()
+        };
+        let mut line = Line::from(vec![
+            Span::raw(format!("  {:<width$}", clip(fd.label, label_w - 2), width = label_w - 2)),
+            Span::styled(format!(" {:<width$}", clip_end(&value, val_w), width = val_w), val_style),
+            Span::styled(format!(" {:>width$}", clip(&src, src_w), width = src_w), dim()),
+        ]);
+        if selected {
+            line = line.style(Style::default().bg(Color::DarkGray));
+        }
+        lines.push(line);
+    }
+    let visible = list.height as usize;
+    let top = sel_line.saturating_sub(visible.saturating_sub(3)).min(lines.len().saturating_sub(visible));
+    f.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), list);
+
+    let mut foot_lines = Vec::new();
+    if let Some(fd) = ui.fields.get(ui.sel) {
+        foot_lines.push(Line::styled(fd.help.to_string(), dim()));
+    }
+    if let Some(b) = &ui.busy {
+        let spin = SPINNER[(app.now / 100) as usize % SPINNER.len()];
+        foot_lines.push(Line::styled(format!("{spin} {b}"), Style::default().fg(ACCENT)));
+    } else if let Some((text, err)) = &ui.note {
+        let st = if *err { Style::default().fg(Color::Red) } else { Style::default().fg(Color::Green) };
+        foot_lines.push(Line::styled(text.clone(), st));
+    }
+    f.render_widget(Paragraph::new(foot_lines).wrap(Wrap { trim: true }), foot);
+
+    if let Some((models, i)) = &ui.picker {
+        let ph = (models.len() as u16 + 2).min(r.height.saturating_sub(4)).max(3);
+        let pw = models.iter().map(|m| m.chars().count()).max().unwrap_or(10).clamp(20, 60) as u16 + 4;
+        let pr = centered(pw.min(r.width.saturating_sub(4)), ph, r);
+        f.render_widget(Clear, pr);
+        let items: Vec<ListItem> = models.iter().map(|m| ListItem::new(m.clone())).collect();
+        let mut state = ratatui::widgets::ListState::default();
+        state.select(Some(*i));
+        f.render_stateful_widget(
+            List::new(items)
+                .block(
+                    Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)).title(" Models "),
+                )
+                .highlight_style(Style::default().bg(Color::DarkGray).bold()),
+            pr,
+            &mut state,
+        );
+    }
+}
+
+/// The ask settings the overlay currently shows (for the "now:" line).
+fn ask_cfg_of(ui: &crate::tui::app::SettingsUi) -> crate::config::AskCfg {
+    let mut a = crate::config::AskCfg::default();
+    for fd in &ui.fields {
+        if fd.section != "ask" {
+            continue;
+        }
+        let v = fd.value.clone();
+        match fd.key {
+            "enabled" => a.enabled = v == "true",
+            "provider" => a.provider = v,
+            "url" => a.url = v,
+            "model" => a.model = v,
+            "key_env" => a.key_env = v,
+            "local_only" => a.local_only = v == "true",
+            "detail" => a.detail = v,
+            _ => {}
+        }
+    }
+    a
+}
+
+/// `s` shortened to `n` columns, keeping its end (where a URL or model name differs).
+fn clip_end(s: &str, n: usize) -> String {
+    let c = s.chars().count();
+    if c <= n { s.to_string() } else { format!("…{}", s.chars().skip(c - n + 1).collect::<String>()) }
+}
+
 fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
     match &app.modal {
         Modal::None | Modal::Filter => {}
         Modal::Help => draw_help(f, area),
         Modal::Log => draw_log(f, app, area),
+        Modal::Settings(ui) => draw_settings(f, app, ui, area),
         Modal::Confirm { prompt, .. } => {
             let r = centered(64.min(area.width.saturating_sub(2)), 6, area);
             let t = Text::from(vec![
@@ -1874,6 +2022,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("L / Esc", "return to live"),
     ("?", "ask in plain language: a new thread in the Ask tab"),
+    (",", "settings: the model ask uses (test it, pick a model), recording, and where each value comes from"),
     ("Ask: ⏎ n ↑↓ d", "follow up in this thread · new thread · open another · delete (Esc leaves the input)"),
     ("h", "this help"),
     ("q / Ctrl-C", "quit"),
@@ -2377,6 +2526,42 @@ mod tests {
             }
             a.tab = Tab::Procs;
             a.ask = Default::default();
+            // Settings overlay: values, sources, editing and the model picker.
+            let fields = crate::settings::fields(&crate::config::Config::default(), "", &|k: &str| {
+                (k == "FAT_ASK_URL").then(|| "http://10.0.0.5:11434".to_string())
+            });
+            let mut ui = crate::tui::app::SettingsUi {
+                fields,
+                path: "/home/u/.config/fat/config.toml".into(),
+                ..Default::default()
+            };
+            ui.key_status = "ANTHROPIC_API_KEY: set ✓".into();
+            a.modal = Modal::Settings(Box::new(ui.clone()));
+            let out = render(&mut a, w, h);
+            if h >= 30 && w >= 100 {
+                assert!(
+                    out.contains("Settings") && out.contains("Ask: the model") && out.contains("Provider"),
+                    "{out}"
+                );
+                assert!(out.contains("env FAT_ASK_URL") && out.contains("default"), "{out}");
+                assert!(out.contains("ANTHROPIC_API_KEY: set"), "{out}");
+                assert!(!out.contains("sk-"), "{out}");
+            }
+            ui.editing = Some("qwen3:32".into());
+            ui.sel = ui.fields.iter().position(|f| f.key == "model").unwrap();
+            a.modal = Modal::Settings(Box::new(ui.clone()));
+            let out = render(&mut a, w, h);
+            if h >= 30 && w >= 100 {
+                assert!(out.contains("qwen3:32▏"), "{out}");
+            }
+            ui.editing = None;
+            ui.picker = Some((vec!["llama3.3:70b".into(), "qwen3:32b".into()], 1));
+            a.modal = Modal::Settings(Box::new(ui));
+            let out = render(&mut a, w, h);
+            if h >= 24 {
+                assert!(out.contains("Models") && out.contains("qwen3:32b"), "{out}");
+            }
+            a.modal = Modal::None;
         }
     }
 

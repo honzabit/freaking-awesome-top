@@ -14,6 +14,7 @@ mod llm;
 mod mcp;
 mod model;
 mod server;
+mod settings;
 mod sys;
 mod threads;
 mod tui;

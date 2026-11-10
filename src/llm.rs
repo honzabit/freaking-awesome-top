@@ -69,7 +69,7 @@ pub fn settings(cfg: &AskCfg) -> AskCfg {
     settings_with(cfg, |k| std::env::var(k).ok())
 }
 
-fn settings_with(cfg: &AskCfg, env: impl Fn(&str) -> Option<String>) -> AskCfg {
+pub fn settings_with(cfg: &AskCfg, env: impl Fn(&str) -> Option<String>) -> AskCfg {
     let mut c = cfg.clone();
     let get = |k: &str| env(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     if let Some(v) = get("FAT_ASK_PROVIDER") {
@@ -232,14 +232,65 @@ impl Endpoint {
         }
     }
 
-    /// POST `body` and return the answer text.
-    pub fn send(&self, body: &str, extra_headers: &[(&str, &str)]) -> Result<String, String> {
-        let who = self.describe();
-        let mut b = ureq::AgentBuilder::new().timeout(self.timeout).redirects(0);
+    fn agent(&self, timeout: Duration) -> ureq::Agent {
+        let mut b = ureq::AgentBuilder::new().timeout(timeout).redirects(0);
         if self.local_only {
             b = b.resolver(LocalOnly);
         }
-        let mut req = b.build().post(&self.url).set("content-type", "application/json");
+        b.build()
+    }
+
+    fn transport_error(&self, t: &ureq::Transport) -> String {
+        let why = t.to_string();
+        if self.local_only && why.contains(LOCAL_ONLY_REFUSAL) {
+            format!(
+                "refused to send: {} resolves outside private networks and [ask] local_only is set",
+                origin(&self.url)
+            )
+        } else {
+            format!("Could not reach {}: {why}", self.describe())
+        }
+    }
+
+    /// Where the server lists its models.
+    pub fn models_url(&self) -> String {
+        match self.provider {
+            Provider::Ollama => format!("{}/api/tags", self.url.trim_end_matches("/api/chat")),
+            Provider::OpenAi => format!("{}/models", self.url.trim_end_matches("/chat/completions")),
+            Provider::Anthropic => format!("{}/models", self.url.trim_end_matches("/messages")),
+        }
+    }
+
+    /// The models the server offers, sorted.
+    pub fn models(&self) -> Result<Vec<String>, String> {
+        let mut req = self.agent(Duration::from_secs(15)).get(&self.models_url());
+        if let Some(k) = &self.key {
+            req = match self.provider {
+                Provider::Anthropic => req.set("x-api-key", k),
+                _ => req.set("authorization", &format!("Bearer {k}")),
+            };
+        }
+        if self.provider == Provider::Anthropic {
+            req = req.set("anthropic-version", "2023-06-01");
+        }
+        let v: Value = match req.call() {
+            Ok(r) => r.into_json().map_err(|e| format!("unreadable model list: {e}"))?,
+            Err(ureq::Error::Status(code, r)) => {
+                return Err(status_message(&self.describe(), code, &r.into_string().unwrap_or_default()));
+            }
+            Err(ureq::Error::Transport(t)) => return Err(self.transport_error(&t)),
+        };
+        let names = parse_models(&v);
+        if names.is_empty() {
+            return Err(format!("{} lists no models", origin(&self.url)));
+        }
+        Ok(names)
+    }
+
+    /// POST `body` and return the answer text.
+    pub fn send(&self, body: &str, extra_headers: &[(&str, &str)]) -> Result<String, String> {
+        let who = self.describe();
+        let mut req = self.agent(self.timeout).post(&self.url).set("content-type", "application/json");
         if let Some(k) = &self.key {
             req = match self.provider {
                 Provider::Anthropic => req.set("x-api-key", k),
@@ -265,17 +316,7 @@ impl Endpoint {
                     _ => status_message(&who, code, &text),
                 })
             }
-            Err(ureq::Error::Transport(t)) => {
-                let why = t.to_string();
-                if self.local_only && why.contains(LOCAL_ONLY_REFUSAL) {
-                    Err(format!(
-                        "refused to send: {} resolves outside private networks and [ask] local_only is set",
-                        origin(&self.url)
-                    ))
-                } else {
-                    Err(format!("Could not reach {who}: {why}"))
-                }
-            }
+            Err(ureq::Error::Transport(t)) => Err(self.transport_error(&t)),
         }
     }
 }
@@ -288,6 +329,26 @@ pub fn destination(cfg: &AskCfg) -> String {
         Ok(ep) => format!("offline ({} is not set)", ep.key_env),
         Err(e) => format!("offline ({e})"),
     }
+}
+
+/// Send a tiny question to the configured model: how long it took and what it said, or why
+/// it failed. Nothing about the machine is sent.
+pub fn test_connection(cfg: &AskCfg) -> Result<(Duration, String), String> {
+    let ep = resolve(cfg)?;
+    if !ep.usable() {
+        return Err(format!("{} is not set", ep.key_env));
+    }
+    let msgs = vec![json!({"role": "user", "content": "Reply with exactly: OK"})];
+    let (body, headers): (Value, &[(&str, &str)]) = match ep.provider {
+        Provider::Anthropic => (
+            json!({"model": ep.model, "max_tokens": 16, "system": "You are a connectivity check.", "messages": msgs}),
+            &[("anthropic-version", "2023-06-01")],
+        ),
+        _ => (ep.body("You are a connectivity check.", msgs), &[]),
+    };
+    let t0 = std::time::Instant::now();
+    let reply = ep.send(&body.to_string(), headers)?;
+    Ok((t0.elapsed(), reply.chars().take(60).collect()))
 }
 
 /// scheme://host[:port], credentials dropped.
@@ -379,6 +440,25 @@ fn parse_ollama(v: &Value) -> Result<String, String> {
     let text = v.pointer("/message/content").and_then(Value::as_str).unwrap_or("");
     let truncated = v.get("done_reason").and_then(Value::as_str) == Some("length");
     finish(text, truncated, "ollama")
+}
+
+/// Model names from an Ollama /api/tags (`models[].name`) or OpenAI / Anthropic /models
+/// (`data[].id`) response: chat models first (embedding models can't answer), then by name.
+fn parse_models(v: &Value) -> Vec<String> {
+    let mut out: Vec<(bool, String)> = Vec::new();
+    for (list, key) in [("models", "name"), ("data", "id")] {
+        for m in v.get(list).and_then(Value::as_array).into_iter().flatten() {
+            let Some(name) = m.get(key).and_then(Value::as_str) else { continue };
+            let family = m.pointer("/details/family").and_then(Value::as_str).unwrap_or("");
+            let lower = name.to_ascii_lowercase();
+            let embedding =
+                family.contains("bert") || lower.contains("embed") || lower.contains("gte-") || lower.contains("bge-");
+            out.push((embedding, name.to_string()));
+        }
+    }
+    out.sort_by_key(|(e, n)| (*e, n.to_ascii_lowercase()));
+    out.dedup_by(|a, b| a.1 == b.1);
+    out.into_iter().map(|(_, n)| n).collect()
 }
 
 fn status_message(who: &str, code: u16, body: &str) -> String {
@@ -492,6 +572,30 @@ mod tests {
         let ep = resolve_with(&c, no_env).unwrap();
         assert_eq!(ep.describe(), "openai · m · https://llm.example:8443 · local only");
         assert_eq!(origin("http://127.0.0.1:11434/api/chat"), "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn model_lists() {
+        let ep = |p: &str, url: &str| resolve_with(&cfg(p, url, "m"), no_env).unwrap();
+        assert_eq!(ep("ollama", "http://h:11434").models_url(), "http://h:11434/api/tags");
+        assert_eq!(ep("openai", "http://h:1234").models_url(), "http://h:1234/v1/models");
+        assert_eq!(ep("openai", "https://h/x/v1/chat/completions").models_url(), "https://h/x/v1/models");
+        assert_eq!(
+            resolve_with(&AskCfg::default(), no_env).unwrap().models_url(),
+            "https://api.anthropic.com/v1/models"
+        );
+        let o = json!({"models": [
+            {"name": "qwen3:32b", "details": {"family": "qwen3"}},
+            {"name": "HuTangZhu/gte-small-zh:latest", "details": {"family": "bert"}},
+            {"name": "nomic-embed-text:latest"},
+            {"name": "Llama3.3:70b"},
+        ]});
+        assert_eq!(
+            parse_models(&o),
+            vec!["Llama3.3:70b", "qwen3:32b", "HuTangZhu/gte-small-zh:latest", "nomic-embed-text:latest"]
+        );
+        let a = json!({"object": "list", "data": [{"id": "local-m"}]});
+        assert_eq!(parse_models(&a), vec!["local-m"]);
     }
 
     #[test]

@@ -129,6 +129,18 @@ pub enum Command {
     /// Load one thread's turns.
     OpenThread(i64),
     DeleteThread(i64),
+    /// Open the settings overlay (built from the config the app runs with).
+    OpenSettings,
+    /// Set `section.key` in the config file (None: remove it, so the default applies).
+    SetSetting {
+        section: &'static str,
+        key: &'static str,
+        value: Option<String>,
+    },
+    /// Send a tiny question to the configured model.
+    SettingsTest,
+    /// List the configured server's models.
+    SettingsModels,
     RefreshLog,
     RefreshTimeline {
         from: Ts,
@@ -194,8 +206,27 @@ pub enum Modal {
         start: u64,
     },
     Help,
+    /// The settings screen (`,`).
+    Settings(Box<SettingsUi>),
     /// The action journal (`a`): most recent first, `u`/⏎ undo.
     Log,
+}
+
+/// The settings overlay: every setting, its value and where it comes from.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SettingsUi {
+    pub fields: Vec<crate::settings::Field>,
+    pub sel: usize,
+    /// Text being typed for the selected field.
+    pub editing: Option<String>,
+    /// Models offered by the server, and the highlighted one.
+    pub picker: Option<(Vec<String>, usize)>,
+    /// Last result: (message, is_error).
+    pub note: Option<(String, bool)>,
+    /// A background check is running ("testing…").
+    pub busy: Option<String>,
+    pub path: String,
+    pub key_status: String,
 }
 
 /// The Ask tab: past threads on the left, the open thread on the right, an input line below.
@@ -1559,6 +1590,7 @@ impl App {
             Modal::None => Vec::new(),
             Modal::Help => Vec::new(), // any key closes
             Modal::Log => self.on_log_key(k),
+            Modal::Settings(ui) => self.on_settings_key(*ui, k),
             Modal::Filter => {
                 match k.code {
                     KeyCode::Esc => self.set_active_filter(String::new()),
@@ -1622,6 +1654,111 @@ impl App {
                     Vec::new()
                 }
             },
+        }
+    }
+
+    fn on_settings_key(&mut self, mut ui: SettingsUi, k: KeyEvent) -> Vec<Command> {
+        let mut cmds = Vec::new();
+        let n = ui.fields.len();
+        if let Some(mut input) = ui.editing.take() {
+            match k.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    if let Some(f) = ui.fields.get(ui.sel) {
+                        cmds.push(Command::SetSetting { section: f.section, key: f.key, value: Some(input) });
+                    }
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    ui.editing = Some(input);
+                }
+                KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => ui.editing = Some(String::new()),
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    ui.editing = Some(input);
+                }
+                _ => ui.editing = Some(input),
+            }
+        } else if let Some((models, mut i)) = ui.picker.take() {
+            match k.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    if let Some(m) = models.get(i) {
+                        cmds.push(Command::SetSetting { section: "ask", key: "model", value: Some(m.clone()) });
+                    }
+                }
+                code => {
+                    list_nav(&mut i, models.len(), code);
+                    ui.picker = Some((models, i));
+                }
+            }
+        } else {
+            match k.code {
+                KeyCode::Esc | KeyCode::Char(',') | KeyCode::Char('q') => return Vec::new(),
+                KeyCode::Up | KeyCode::Char('k') => ui.sel = ui.sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => ui.sel = (ui.sel + 1).min(n.saturating_sub(1)),
+                KeyCode::Home | KeyCode::Char('g') => ui.sel = 0,
+                KeyCode::End | KeyCode::Char('G') => ui.sel = n.saturating_sub(1),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(f) = ui.fields.get(ui.sel) {
+                        use crate::settings::{Kind, Source};
+                        match (&f.kind, &f.source) {
+                            (_, Source::Env(var)) => {
+                                ui.note =
+                                    Some((format!("{} is set by {var}; unset it to change this here", f.label), true));
+                            }
+                            (Kind::ReadOnly, _) => ui.note = Some((format!("not editable here: {}", f.help), false)),
+                            (Kind::Bool, _) => {
+                                let v = if f.value == "true" { "false" } else { "true" };
+                                cmds.push(Command::SetSetting {
+                                    section: f.section,
+                                    key: f.key,
+                                    value: Some(v.into()),
+                                });
+                            }
+                            (Kind::Choice(opts), _) => {
+                                let i = opts.iter().position(|o| *o == f.value).map_or(0, |i| (i + 1) % opts.len());
+                                cmds.push(Command::SetSetting {
+                                    section: f.section,
+                                    key: f.key,
+                                    value: Some(opts[i].to_string()),
+                                });
+                            }
+                            _ => ui.editing = Some(f.value.clone()),
+                        }
+                    }
+                }
+                KeyCode::Char('r') => {
+                    if let Some(f) = ui.fields.get(ui.sel) {
+                        if f.editable() && f.source == crate::settings::Source::File {
+                            cmds.push(Command::SetSetting { section: f.section, key: f.key, value: None });
+                        } else if f.editable() {
+                            ui.note = Some((format!("{} already uses its default", f.label), false));
+                        }
+                    }
+                }
+                KeyCode::Char('t') if ui.busy.is_none() => {
+                    ui.busy = Some("testing the model…".into());
+                    ui.note = None;
+                    cmds.push(Command::SettingsTest);
+                }
+                KeyCode::Char('m') if ui.busy.is_none() => {
+                    ui.busy = Some("asking the server for its models…".into());
+                    ui.note = None;
+                    cmds.push(Command::SettingsModels);
+                }
+                _ => {}
+            }
+        }
+        self.modal = Modal::Settings(Box::new(ui));
+        cmds
+    }
+
+    /// The settings overlay, if open.
+    pub fn settings_ui(&mut self) -> Option<&mut SettingsUi> {
+        match &mut self.modal {
+            Modal::Settings(ui) => Some(ui),
+            _ => None,
         }
     }
 
@@ -1816,6 +1953,7 @@ impl App {
                 return Vec::new();
             }
             KeyCode::Char('?') => return self.ask_new(),
+            KeyCode::Char(',') => return vec![Command::OpenSettings],
             KeyCode::Char('L') => {
                 self.go_live();
                 return Vec::new();

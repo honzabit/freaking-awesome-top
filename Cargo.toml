@@ -23,4 +23,6 @@ serde_json = "1.0.154"
 # No "multithread": rayon worker spin cost ~4% of a core per 2s sample on 1k procs.
 sysinfo = { version = "0.33", default-features = false, features = ["system", "user"] }
 toml = "0.8"
+# Settings screen: edit config.toml keeping comments and layout (same project as toml).
+toml_edit = "0.22"
 ureq = { version = "2", features = ["json"] }

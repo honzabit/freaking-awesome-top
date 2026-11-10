@@ -34,7 +34,7 @@ use crate::history::History;
 use crate::history::Point;
 use crate::model::{Container, Explanation, Finding, Snapshot, Ts, now_ms};
 use crate::server::{FleetHost, FleetSummary, Incident};
-use app::{App, Command};
+use app::{App, Command, Modal};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -69,6 +69,9 @@ enum Msg {
     FleetFailed(String),
     FleetDrill(String, Result<(Box<Snapshot>, Vec<Finding>), String>),
     Answer(u64, Box<crate::threads::Asked>),
+    /// Settings: a check's result (message, is_error).
+    SettingsNote(String, bool),
+    SettingsModels(Result<Vec<String>, String>),
     /// None = no recorded history for this window (fall back to the in-memory ring).
     Timeline(Option<(Vec<Point>, Vec<Ts>)>),
     Past(Ts, Option<Box<Snapshot>>),
@@ -918,6 +921,20 @@ struct Ctx {
     transport: Arc<dyn Transport>,
     /// Where ask threads are kept (None: not kept, as in tests).
     threads_path: Option<std::path::PathBuf>,
+    /// The config file the settings screen edits (None: read-only, as in tests).
+    settings_path: Option<std::path::PathBuf>,
+}
+
+/// The settings overlay for `cfg`, reading `path` to tell file values from defaults.
+fn settings_ui(cfg: &Config, path: Option<&std::path::Path>) -> app::SettingsUi {
+    let text = path.and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let env = |k: &str| std::env::var(k).ok();
+    app::SettingsUi {
+        fields: crate::settings::fields(cfg, &text, &env),
+        path: path.map(|p| p.display().to_string()).unwrap_or_default(),
+        key_status: crate::settings::key_status(cfg, &env),
+        ..Default::default()
+    }
 }
 
 impl Ctx {
@@ -1125,6 +1142,72 @@ impl Ctx {
                     app.set_thread(id, t);
                 }
             }
+            Command::OpenSettings => {
+                let mut ui = settings_ui(&self.cfg, self.settings_path.as_deref());
+                ui.note = Some(("⏎ change · r reset to default · t test the model · m pick a model".into(), false));
+                app.modal = Modal::Settings(Box::new(ui));
+            }
+            Command::SetSetting { section, key, value } => {
+                let Some(path) = self.settings_path.clone() else { return };
+                let fields = settings_ui(&self.cfg, Some(&path)).fields;
+                let result = match (fields.iter().find(|f| f.section == section && f.key == key), value) {
+                    (None, _) => Err(format!("unknown setting {section}.{key}")),
+                    (Some(f), Some(v)) => crate::settings::parse_input(f, &v).map(Some),
+                    (Some(_), None) => Ok(None),
+                }
+                .and_then(|v| crate::settings::write(&path, section, key, v).map_err(|e| format!("{e:#}")));
+                let (note, cfg) = match result {
+                    Ok(cfg) => {
+                        let what = if key.is_empty() { section } else { key };
+                        let mut msg = format!("saved {what} to {}", path.display());
+                        if section == "ask"
+                            && let Err(e) = crate::llm::resolve(&cfg.ask)
+                        {
+                            msg = format!("saved; but ask can't use it yet: {e}");
+                        }
+                        (Some((msg, false)), Some(cfg))
+                    }
+                    Err(e) => (Some((e, true)), None),
+                };
+                if let Some(cfg) = cfg {
+                    // Live from now on: ask, the destination shown, the next settings view.
+                    self.cfg.ask = cfg.ask;
+                    self.cfg.history_days = cfg.history_days;
+                    app.ask_dest = crate::llm::destination(&self.cfg.ask);
+                }
+                let sel = app.settings_ui().map_or(0, |u| u.sel);
+                let mut ui = settings_ui(&self.cfg, Some(&path));
+                ui.sel = sel.min(ui.fields.len().saturating_sub(1));
+                ui.note = note;
+                app.modal = Modal::Settings(Box::new(ui));
+            }
+            Command::SettingsTest => {
+                let ask = self.cfg.ask.clone();
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    let msg = match guarded(|| crate::llm::test_connection(&ask)) {
+                        Ok(Ok((took, reply))) => (
+                            format!(
+                                "✓ {} answered in {:.1}s: {reply}",
+                                crate::llm::destination(&ask),
+                                took.as_secs_f64()
+                            ),
+                            false,
+                        ),
+                        Ok(Err(e)) => (format!("✗ {e}"), true),
+                        Err(e) => (format!("✗ {e}"), true),
+                    };
+                    let _ = tx.send(Msg::SettingsNote(msg.0, msg.1));
+                });
+            }
+            Command::SettingsModels => {
+                let ask = self.cfg.ask.clone();
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    let r = guarded(|| crate::llm::resolve(&ask).and_then(|ep| ep.models())).unwrap_or_else(Err);
+                    let _ = tx.send(Msg::SettingsModels(r));
+                });
+            }
             Command::DeleteThread(id) => {
                 if let Some(p) = &self.threads_path {
                     match guarded(|| crate::threads::Store::open(p).and_then(|s| s.delete(id))) {
@@ -1172,6 +1255,26 @@ fn apply_msg(app: &mut App, msg: Msg) {
         Msg::FleetFailed(e) => app.fleet_failed(e),
         Msg::FleetDrill(name, r) => app.set_fleet_drill(&name, r.map(|(s, f)| (*s, f))),
         Msg::Answer(id, a) => app.answered(id, *a),
+        Msg::SettingsNote(text, err) => {
+            if let Some(ui) = app.settings_ui() {
+                ui.busy = None;
+                ui.note = Some((text, err));
+            }
+        }
+        Msg::SettingsModels(r) => {
+            if let Some(ui) = app.settings_ui() {
+                ui.busy = None;
+                match r {
+                    Ok(models) => {
+                        let cur =
+                            ui.fields.iter().find(|f| f.key == "model").map(|f| f.value.clone()).unwrap_or_default();
+                        let i = models.iter().position(|m| *m == cur).unwrap_or(0);
+                        ui.picker = Some((models, i));
+                    }
+                    Err(e) => ui.note = Some((e, true)),
+                }
+            }
+        }
         Msg::Timeline(Some((pts, spikes))) => app.set_timeline(pts, spikes),
         Msg::Timeline(None) => app.use_ring_timeline(),
         Msg::Past(ts, snap) => app.set_past(ts, snap.map(|s| *s)),
@@ -1274,6 +1377,7 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
         inventory,
         transport,
         threads_path: Some(crate::threads::default_path()),
+        settings_path: Some(Config::path()),
     };
     // Nothing else runs before the first frame: the journal is read when the action log (`a`)
     // opens or an action runs, samples arrive from the sampler thread.
@@ -1325,6 +1429,7 @@ mod tests {
             inventory: Arc::default(),
             transport: Arc::new(fanout::LocalTransport { program: "true".into(), prefix: vec![] }),
             threads_path: None,
+            settings_path: None,
         };
         let mut app = App::new(1000);
         ctx.exec(&mut app, Command::RefreshTimeline { from: 0, to: 1 });
@@ -1334,6 +1439,70 @@ mod tests {
         // Note: Act/Undo are intentionally not exercised here — they would signal real pids.
         assert!(!app.quit);
         assert!(app.why.is_some(), "explain without history still answers inline");
+    }
+
+    #[test]
+    fn settings_save_to_the_config_file_and_apply_live() {
+        let dir = std::env::temp_dir().join(format!("fat-tui-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "# mine\n[ask]\nprovider = \"anthropic\" # for now\n").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut ctx = Ctx {
+            cfg: Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap(),
+            hist: None,
+            actions: None,
+            actions_failed: false,
+            tx,
+            fs_shared: Arc::default(),
+            fs: None,
+            inventory: Arc::default(),
+            transport: Arc::new(fanout::LocalTransport { program: "true".into(), prefix: vec![] }),
+            threads_path: None,
+            settings_path: Some(path.clone()),
+        };
+        let mut app = App::new(1000);
+        ctx.exec(&mut app, Command::OpenSettings);
+        assert!(matches!(app.modal, Modal::Settings(_)));
+        // Choices cycle and save at once.
+        let ui = app.settings_ui().unwrap();
+        ui.sel = ui.fields.iter().position(|f| f.key == "provider").unwrap();
+        let cmds = app.on_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter));
+        assert_eq!(cmds, vec![Command::SetSetting { section: "ask", key: "provider", value: Some("openai".into()) }]);
+        for c in cmds {
+            ctx.exec(&mut app, c);
+        }
+        assert_eq!(ctx.cfg.ask.provider, "openai", "applied live");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("provider = \"openai\" # for now") && text.contains("# mine"), "{text}");
+        let ui = app.settings_ui().unwrap();
+        let note = ui.note.clone().unwrap();
+        assert!(!note.1 && note.0.contains("needs url"), "saved, with a warning that ask can't use it yet: {note:?}");
+        // Bad input is refused with a reason; the file stays as it was.
+        ctx.exec(&mut app, Command::SetSetting { section: "ask", key: "url", value: Some("llm:1234".into()) });
+        let ui = app.settings_ui().unwrap();
+        assert!(ui.note.as_ref().is_some_and(|(t, e)| *e && t.contains("http://")));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        ctx.exec(
+            &mut app,
+            Command::SetSetting { section: "ask", key: "url", value: Some("http://127.0.0.1:1".into()) },
+        );
+        ctx.exec(&mut app, Command::SetSetting { section: "ask", key: "model", value: Some("m".into()) });
+        assert_eq!(app.ask_dest, "openai · m · http://127.0.0.1:1");
+        // Reset removes the key; the default applies again.
+        ctx.exec(&mut app, Command::SetSetting { section: "ask", key: "model", value: None });
+        assert!(ctx.cfg.ask.model.is_empty());
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("model ="));
+        // Read-only rows explain instead of editing.
+        let ui = app.settings_ui().unwrap();
+        ui.sel = ui.fields.iter().position(|f| f.key == "allow_actions").unwrap();
+        assert!(app.on_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter)).is_empty());
+        assert!(app.settings_ui().unwrap().note.as_ref().unwrap().0.contains("allow_actions"));
+        // Esc closes.
+        app.on_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Esc));
+        assert_eq!(app.modal, Modal::None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
