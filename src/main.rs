@@ -1,4 +1,4 @@
-//! fat — Fucking Awesome Top. A process monitor for humans and agents.
+//! fat — Freaking Awesome Top. A process monitor for humans and agents.
 //! OWNER: integration (lead). Subcommands are thin wrappers over modules.
 
 mod actions;
@@ -21,7 +21,7 @@ use clap::{Parser, Subcommand};
 use model::{ActionKind, Budget, Snapshot};
 
 #[derive(Parser)]
-#[command(name = "fat", version, about = "Fucking Awesome Top — what is my machine doing, why, and for whom?")]
+#[command(name = "fat", version, about = "Freaking Awesome Top — what is my machine doing, why, and for whom?")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,

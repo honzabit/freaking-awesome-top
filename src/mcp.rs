@@ -31,7 +31,7 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 
-const INSTRUCTIONS: &str = "fat (Fucking Awesome Top) is a live process monitor for this machine. \
+const INSTRUCTIONS: &str = "fat (Freaking Awesome Top) is a live process monitor for this machine. \
 Use it to answer 'what is my machine doing, why, and what can I safely do about it'. \
 Start with `doctor` (ranked findings) or `snapshot` (system totals + top processes; sort by cpu/mem/power/net/disk). \
 Use `why {pid}` for a blame chain explaining why a process exists and what it costs, `process {pid}` for full details, \

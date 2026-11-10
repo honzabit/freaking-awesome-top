@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 # rusqlite 0.41 (bundled SQLite 3.54)
 rust-version = "1.89"
-# Not on crates.io until a license is chosen (deny.toml skips the license check for
-# unpublished crates; set `license` and drop this line together).
-publish = false
+description = "Freaking Awesome Top: what is my machine (or fleet) doing, why, and for whom? For humans and agents."
+license = "MIT"
+repository = "https://github.com/honzabit/freaking-awesome-top"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"

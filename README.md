@@ -1,4 +1,4 @@
-# fat — Fucking Awesome Top
+# fat — Freaking Awesome Top
 
 **fat is best at answering "why is my machine slow, hot or full, and what can I safely do about it?"**
 - `fat` opens instantly on your processes sorted by CPU, with CPU, memory, power and thermal gauges on top.
@@ -13,13 +13,13 @@ cgroup v2 recommended). On Linux it reads procfs and sysfs directly. It never ne
 
 ## Install
 
-Prebuilt binaries are on the GitHub releases page for Linux (x86_64, aarch64; fully static, any distribution) and
+Prebuilt binaries are on the [releases page](https://github.com/honzabit/freaking-awesome-top/releases) for Linux (x86_64, aarch64; fully static, any distribution) and
 macOS (Apple silicon, Intel). Each release has a `SHA256SUMS` file and a signed build-provenance attestation, so
 you can check a download came from this repository's release workflow:
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing          # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
-gh attestation verify fat-<version>-<target>.tar.gz --repo <owner>/<repo>
+gh attestation verify fat-<version>-<target>.tar.gz --repo honzabit/freaking-awesome-top
 tar -xzf fat-<version>-<target>.tar.gz && install -m 755 fat-<version>-<target>/fat ~/.local/bin/
 ```
 
@@ -1092,3 +1092,7 @@ answers offline from rules.
 - Remote hosts are shown as summary rows. You can't browse a remote process tree yet.
 - A non-root user can raise nice but can't lower it again, so a renice can't be undone without root. On Linux,
   `RLIMIT_NICE` or `CAP_SYS_NICE` lifts this.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
