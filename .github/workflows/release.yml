@@ -1,0 +1,129 @@
+# Pushing a tag vX.Y.Z (matching Cargo.toml's version) builds every release binary, signs each
+# with a GitHub build-provenance attestation (Sigstore, keyless: no key to keep or leak), writes
+# SHA256SUMS, and opens a DRAFT GitHub release. Nothing is published until a maintainer reviews
+# the draft and publishes it.
+#
+# Verify a download:
+#   sha256sum -c SHA256SUMS --ignore-missing
+#   gh attestation verify fat-<version>-<target>.tar.gz --repo <owner>/<repo>
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  check:
+    name: tag matches Cargo.toml
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: check
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.check.outputs.version }}
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+      - run: rustup toolchain install stable --profile minimal -t "$TARGET" && rustup default stable
+      - name: build (static Linux)
+        if: contains(matrix.target, 'linux-musl')
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq musl-tools
+          FAT_STATIC_VIA=cargo scripts/build-static.sh "$TARGET"
+          cp "dist/fat-$VERSION-$TARGET" fat
+      - name: build (macOS)
+        if: contains(matrix.target, 'apple-darwin')
+        run: |
+          cargo build --release --locked --target "$TARGET"
+          cp "target/$TARGET/release/fat" fat
+      - name: smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          file fat
+          # Run what this runner can run natively (the x86_64 macOS build is cross-built here).
+          if [ "$TARGET" != x86_64-apple-darwin ]; then ./fat --version | grep -qx "fat $VERSION"; ./fat snapshot > /dev/null; fi
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="fat-$VERSION-$TARGET"
+          mkdir "$name"
+          cp fat README.md "$name/"
+          for f in LICENSE* CHANGELOG.md; do [ -e "$f" ] && cp "$f" "$name/"; done
+          tar -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fat-${{ matrix.target }}
+          path: fat-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: fat-*
+          merge-multiple: true
+      - run: sha256sum fat-*.tar.gz | tee SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            fat-*.tar.gz
+            SHA256SUMS
+      - name: create draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" fat-*.tar.gz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "fat $VERSION" --generate-notes

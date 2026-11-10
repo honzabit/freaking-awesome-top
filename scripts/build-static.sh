@@ -52,7 +52,7 @@ envname() { echo "$1" | tr 'a-z-' 'A-Z_'; }
 via_zigbuild() {
     have cargo-zigbuild || return 1
     rustup target list --installed 2>/dev/null | grep -qx "$1" || { echo "  zigbuild: rustup target $1 not installed (rustup target add $1)" >&2; return 1; }
-    cargo zigbuild --release --target "$1" && cp "target/$1/release/fat" "$2"
+    cargo zigbuild --release --locked --target "$1" && cp "target/$1/release/fat" "$2"
 }
 
 via_cargo() {
@@ -70,7 +70,7 @@ via_cargo() {
     fi
     E=$(envname "$t")
     env "CC_$(echo "$t" | tr '-' '_')=$cc" "CARGO_TARGET_${E}_LINKER=$cc" \
-        cargo build --release --target "$t" && cp "target/$t/release/fat" "$2"
+        cargo build --release --locked --target "$t" && cp "target/$t/release/fat" "$2"
 }
 
 via_docker() {

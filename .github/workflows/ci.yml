@@ -1,0 +1,101 @@
+# Checks every push and pull request: formatting, lints, tests on Linux (x86_64, aarch64) and
+# macOS, dependency audit, and the static Linux binaries actually running on a libc-free system.
+# Third-party actions are pinned by commit; the comment names the release.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal -c rustfmt,clippy && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal -c clippy && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test --locked
+      - name: clippy (platform-specific code)
+        if: matrix.os != 'ubuntu-24.04'
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: smoke (read-only commands, unprivileged)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release
+          f=target/release/fat
+          $f --version
+          $f snapshot
+          $f snapshot --json > /dev/null
+          $f ports
+          $f doctor
+          if [ "$(uname -s)" = Linux ]; then
+            $f services
+            $f kernel
+          fi
+
+  deny:
+    name: dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans licenses sources
+
+  static:
+    name: static ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal -t ${{ matrix.target }} && rustup default stable
+      - run: sudo apt-get update -q && sudo apt-get install -yq musl-tools
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - run: FAT_STATIC_VIA=cargo scripts/build-static.sh ${{ matrix.target }}
+      - name: runs with no libc on the system
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=$(ls dist/fat-*-${{ matrix.target }})
+          file "$bin" | grep -q 'statically linked\|static-pie linked'
+          docker run --rm -v "$PWD/dist:/d:ro" busybox:stable sh -c "
+            /d/$(basename "$bin") --version &&
+            /d/$(basename "$bin") snapshot &&
+            /d/$(basename "$bin") kernel"

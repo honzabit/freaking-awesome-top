@@ -13,9 +13,21 @@ cgroup v2 recommended). On Linux it reads procfs and sysfs directly. It never ne
 
 ## Install
 
+Prebuilt binaries are on the GitHub releases page for Linux (x86_64, aarch64; fully static, any distribution) and
+macOS (Apple silicon, Intel). Each release has a `SHA256SUMS` file and a signed build-provenance attestation, so
+you can check a download came from this repository's release workflow:
+
 ```sh
-cargo install --path .
-# or: cargo build --release && cp target/release/fat ~/.local/bin/
+sha256sum -c SHA256SUMS --ignore-missing          # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
+gh attestation verify fat-<version>-<target>.tar.gz --repo <owner>/<repo>
+tar -xzf fat-<version>-<target>.tar.gz && install -m 755 fat-<version>-<target>/fat ~/.local/bin/
+```
+
+From source (Rust 1.89+ and a C compiler; SQLite is bundled):
+
+```sh
+cargo install --locked --path .
+# or: cargo build --release --locked && cp target/release/fat ~/.local/bin/
 ```
 
 ## Quick tour
@@ -785,7 +797,7 @@ other users' processes unless you are root, and they never touch pid 1, kernel t
 ### Install
 
 ```sh
-# needs Rust 1.85+ and a C compiler (SQLite is bundled); no other system libraries
+# needs Rust 1.89+ and a C compiler (SQLite is bundled); no other system libraries
 cargo install --path .
 # or build once and copy the binary to other machines of the same arch and libc
 cargo build --release && install -m755 target/release/fat ~/.local/bin/   # Debian/Ubuntu: apt install build-essential

@@ -12,7 +12,7 @@ use crate::tui::ui::{ACCENT, SEL_BG, centered, num, psi_spans, scroll_into_view}
 use crate::tui::widgets::*;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
