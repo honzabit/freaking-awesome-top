@@ -298,29 +298,55 @@ pub fn render_with(snap: &Snapshot, extra: &ExportExtra, findings: Option<&[crat
 
 /// Largest request head accepted; /metrics needs nothing more than a request line.
 const MAX_REQUEST: usize = 8 * 1024;
-/// Per-connection read/write timeout: a stalled client cannot hold the single thread longer.
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Whole-request deadline from accept: reading the request and writing the reply. A client that
+/// trickles bytes cannot hold a connection longer than this, however slowly it sends.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+/// Connections served at once, each on its own short-lived thread; further connections are
+/// closed at once. A scrape takes milliseconds, so a few slow or idle clients cannot starve
+/// Prometheus, and the thread count stays small whatever connects.
+const MAX_CONNS: usize = 8;
 
 /// Bind `addr` and serve `latest` from a background thread; returns the bound address (port 0
 /// allowed for tests). Err if the bind fails (address in use, permission).
 pub fn serve(addr: SocketAddr, latest: LatestSnapshot) -> anyhow::Result<SocketAddr> {
     let listener = TcpListener::bind(addr).map_err(|e| anyhow::anyhow!("binding {addr} for metrics: {e}"))?;
     let local = listener.local_addr()?;
+    let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::Builder::new().name("fat-export".into()).spawn(move || {
+        use std::sync::atomic::Ordering;
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            let _ = handle(stream, &latest);
+            if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
+                active.fetch_sub(1, Ordering::SeqCst);
+                drop(stream);
+                continue;
+            }
+            let (latest, active2) = (latest.clone(), active.clone());
+            let spawned = std::thread::Builder::new().name("fat-export-conn".into()).spawn(move || {
+                let _ = handle(stream, &latest);
+                active2.fetch_sub(1, Ordering::SeqCst);
+            });
+            if spawned.is_err() {
+                active.fetch_sub(1, Ordering::SeqCst);
+            }
         }
     })?;
     Ok(local)
 }
 
 fn handle(mut stream: TcpStream, latest: &LatestSnapshot) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    let deadline = std::time::Instant::now() + REQUEST_DEADLINE;
+    let left = || {
+        deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline"))
+    };
+    stream.set_write_timeout(Some(REQUEST_DEADLINE))?;
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") && !buf.windows(2).any(|w| w == b"\n\n") {
+        stream.set_read_timeout(Some(left()?))?;
         let n = stream.read(&mut chunk)?;
         if n == 0 {
             break;
@@ -628,6 +654,48 @@ fat_findings{severity="crit"} 0
         let _ = s.read_to_string(&mut out);
         assert!(out.starts_with("HTTP/1.1 431"), "{out}");
         assert!(get("/", "GET").starts_with("HTTP/1.1 200"));
+    }
+
+    /// Clients that trickle bytes (or say nothing) neither block a scrape nor hold their
+    /// connection past the request deadline.
+    #[test]
+    fn slow_clients_do_not_block_scrapes() {
+        let latest: LatestSnapshot = Default::default();
+        *latest.write().unwrap() = Some(std::sync::Arc::new(snap()));
+        let addr = serve("127.0.0.1:0".parse().unwrap(), latest).unwrap();
+        let mut slow: Vec<TcpStream> = (0..3).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        for s in &mut slow {
+            s.write_all(b"G").unwrap();
+        }
+        let t = std::time::Instant::now();
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        write!(s, "GET /metrics HTTP/1.1\r\n\r\n").unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert!(t.elapsed() < Duration::from_secs(2), "scrape waited {:?}", t.elapsed());
+        // The trickling client is cut off at the deadline even though it keeps sending.
+        let t = std::time::Instant::now();
+        let c = &mut slow[0];
+        c.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut closed = false;
+        while t.elapsed() < REQUEST_DEADLINE + Duration::from_secs(3) {
+            let _ = c.write_all(b"X");
+            let mut b = [0u8; 16];
+            match c.read(&mut b) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+                _ => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        assert!(closed, "slow client still connected after {:?}", t.elapsed());
     }
 
     #[test]

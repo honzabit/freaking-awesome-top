@@ -74,6 +74,43 @@ fn parse_oom_variants() {
     assert!(parse_oom(&["nothing here"]).is_none());
 }
 
+/// Kernels before 4.19 log no oom-kill: line: the memcg and constraint come from "Task in ...
+/// killed as a result of limit of ..." and the "Memory cgroup out of memory:" prefix, so a
+/// cgroup-limit kill is not explained as "host out of memory".
+#[test]
+fn legacy_memcg_oom_report() {
+    let boot = 1_700_000_000_000;
+    let mut asm = OomAssembler::default();
+    assert!(asm.feed("4,100,5000,-;java invoked oom-killer: gfp_mask=0x14000c0(GFP_KERNEL), nodemask=(null), order=0, oom_score_adj=0", boot).is_none());
+    assert!(asm.feed("6,104,5000,-;Task in /system.slice/java.service killed as a result of limit of /system.slice/java.service", boot).is_none());
+    assert!(asm.feed("6,105,5000,-;memory: usage 65536kB, limit 65536kB, failcnt 12", boot).is_none());
+    assert!(asm.feed("3,106,5000,-;Memory cgroup out of memory: Kill process 1234 (java) score 999 or sacrifice child", boot).is_none());
+    let e = asm
+        .feed("3,107,5000,-;Killed process 1234 (java) total-vm:2000kB, anon-rss:1000kB, file-rss:0kB, shmem-rss:0kB", boot)
+        .expect("oom event");
+    assert_eq!(e.extra["constraint"], "CONSTRAINT_MEMCG");
+    assert_eq!(e.extra["memcg"], "/system.slice/java.service");
+    assert_eq!(e.extra["task_memcg"], "/system.slice/java.service");
+    assert_eq!(e.unit.as_deref(), Some("java.service"));
+    assert!(e.detail.contains("hit its memory limit") && !e.detail.contains("host out of memory"), "{}", e.detail);
+    // A host-wide OOM on the same kernels stays "host out of memory".
+    let mut asm = OomAssembler::default();
+    assert!(asm.feed("4,200,5000,-;app invoked oom-killer: gfp_mask=0x14200ca, order=0, oom_score_adj=0", boot).is_none());
+    assert!(asm.feed("3,201,5000,-;Out of memory: Kill process 77 (app) score 900 or sacrifice child", boot).is_none());
+    let e = asm.feed("3,202,5000,-;Killed process 77 (app) total-vm:100kB, anon-rss:50kB, file-rss:0kB, shmem-rss:0kB", boot).unwrap();
+    assert_eq!(e.extra["constraint"], "CONSTRAINT_NONE");
+    assert!(e.detail.contains("host out of memory"), "{}", e.detail);
+}
+
+/// SCSI and older buffer I/O errors name the block device, so they join the disk's other events.
+#[test]
+fn disk_error_device_names() {
+    let k = |r: &str| parse_kmsg_record(r, 0).unwrap();
+    assert_eq!(k("3,100,5000,-;sd 2:0:0:0: [sdb] tag#0 FAILED Result: hostbyte=DID_OK driverbyte=DRIVER_SENSE").subject, "disk:sdb");
+    assert_eq!(k("3,102,5000,-;Buffer I/O error on device sdb1, logical block 0").subject, "disk:sdb1");
+    assert_eq!(k("3,103,5000,-;Buffer I/O error on dev dm-0, logical block 0, async page read").subject, "disk:dm-0");
+}
+
 #[test]
 fn kmsg_classification() {
     let boot = 0;
@@ -392,4 +429,31 @@ fn bench_kernel_sample() {
     let (u, _) = ephemeral_usage(&[&tcp], (32768, 60999));
     println!("ephemeral scan of 100k sockets ({} MB): {:.1} ms, used {u}", tcp.len() / 1_000_000, t.elapsed().as_secs_f64() * 1e3);
     assert_eq!(u, 25_000);
+}
+
+/// A worker thread stuck in D under a sleeping main thread (thread-pool servers) is found:
+/// /proc/stat counts it, /proc/<pid>/stat does not show it.
+#[test]
+fn dstate_worker_thread_found() {
+    let r = Root::new("dthread");
+    let cfg = ServerCfg { dstate_min_s: 5, ..Default::default() };
+    let mut ks = KernelSampler::with_root(&cfg, &r.0, false);
+    r.put("proc/stat", "cpu  1 0 1 10 0 0 0 0 0 0\nprocs_running 1\nprocs_blocked 1\n");
+    r.put("proc/99/stat", "99 (java) S 1 99 99 0 -1 0 0 0 0 0 0 0 0 0 20 0 3 0 4000 1 1");
+    r.put("proc/99/task/99/stat", "99 (java) S 1 99 99 0 -1 0 0 0 0 0 0 0 0 0 20 0 3 0 4000 1 1");
+    r.put("proc/99/task/101/stat", "101 (io-worker) D 1 99 99 0 -1 0 0 0 0 0 0 0 0 0 20 0 3 0 4100 1 1");
+    r.put("proc/99/task/101/wchan", "io_schedule");
+    r.put("proc/99/task/102/stat", "102 (gc) S 1 99 99 0 -1 0 0 0 0 0 0 0 0 0 20 0 3 0 4200 1 1");
+    let units = vec![Unit { name: "app.service".into(), cgroup: "/system.slice/app.service".into(), ..Default::default() }];
+    let procs = vec![Proc { pid: 99, name: "java".into(), status: "S".into(), threads: 3, cgroup: "/system.slice/app.service".into(), ..Default::default() }];
+    let k = ks.sample_at(&procs, &units, 1_000_000, None);
+    assert!(k.d_state.is_empty(), "not yet blocked long enough");
+    let k = ks.sample_at(&procs, &units, 1_010_000, Some(10.0));
+    assert_eq!(k.d_state, vec![DStateProc { pid: 99, name: "java".into(), wchan: "io_schedule".into(), seconds: 10, unit: Some("app.service".into()) }]);
+    let ev = ks.drain_events();
+    assert_eq!(ev.iter().filter(|e| e.kind == EventKind::HungTask).count(), 1, "{ev:?}");
+    // Nothing more blocked than found: no thread walk.
+    r.put("proc/stat", "cpu  1 0 1 10 0 0 0 0 0 0\nprocs_running 1\nprocs_blocked 0\n");
+    let k = ks.sample_at(&procs, &units, 1_020_000, Some(10.0));
+    assert!(k.d_state.is_empty());
 }

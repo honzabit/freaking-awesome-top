@@ -1009,6 +1009,8 @@ fn snapshot_value(snap: &Snapshot, containers: &[Container], sort: &str, limit: 
         .into_iter()
         .map(|p| {
             let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
+            // Secrets in command lines (other users' too) never go to the agent.
+            v["cmd"] = json!(crate::ask::redact_cmd(&p.cmd));
             if let Some(c) = p.container.as_deref().and_then(|id| crate::fleet::find_container(containers, id))
                 && !c.name.is_empty()
             {
@@ -1063,8 +1065,10 @@ fn tool_process(state: &mut State, args: &Value) -> Result<Value> {
     let ports: Vec<_> = snap.ports.iter().filter(|x| x.pid == pid).collect();
     let containers = if p.container.is_some() && snap.containers.is_empty() { crate::fleet::containers() } else { snap.containers.clone() };
     let container = p.container.as_deref().and_then(|id| crate::fleet::find_container(&containers, id));
+    let mut process = serde_json::to_value(p)?;
+    process["cmd"] = json!(crate::ask::redact_cmd(&p.cmd));
     Ok(json!({
-        "process": p,
+        "process": process,
         "container_info": container,
         "ancestors": ancestors,
         "children_count": children,
@@ -1278,7 +1282,7 @@ fn kill_preview(state: &mut State, kind: ActionKind, pid: u32, args: &Value) -> 
     let signal = if kind == ActionKind::Kill { "SIGKILL" } else { "SIGTERM" };
     let mut v = json!({
         "preview": true,
-        "would_signal": { "pid": pid, "name": p.name, "cmd": p.cmd, "user": p.user, "start_time": pv.start_time.unwrap_or(p.start_time), "signal": signal, "tree": kind == ActionKind::KillTree },
+        "would_signal": { "pid": pid, "name": p.name, "cmd": crate::ask::redact_cmd(&p.cmd), "user": p.user, "start_time": pv.start_time.unwrap_or(p.start_time), "signal": signal, "tree": kind == ActionKind::KillTree },
         "ancestors": snap.ancestors(pid).iter().map(|a| json!({ "pid": a.pid, "name": a.name })).collect::<Vec<_>>(),
         "undoable": false,
     });
@@ -1677,6 +1681,15 @@ fn tool_fs_growth(state: &mut State, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Secrets in command lines never reach the agent through snapshot results.
+    #[test]
+    fn snapshot_cmd_is_redacted() {
+        let snap = Snapshot { procs: vec![Proc { pid: 9, name: "psql".into(), cmd: "psql postgres://app:s3cretpw@db-01/app".into(), cpu: 5.0, ..Default::default() }], ..Default::default() };
+        let v = snapshot_value(&snap, &[], "cpu", 10, None, None);
+        let c = v["procs"][0]["cmd"].as_str().unwrap();
+        assert!(!c.contains("s3cretpw") && c.contains("psql"), "{c}");
+    }
 
     fn call(state: &mut State, line: &str) -> Value {
         serde_json::from_str(&handle_line(state, line).expect("response")).unwrap()

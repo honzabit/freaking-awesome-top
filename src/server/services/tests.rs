@@ -396,3 +396,76 @@ fn oom_from_systemd_result() {
     assert!(f.detail.ends_with("(oom-kill, signal 9)"), "{}", f.detail);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// One OOM kill seen first in the cgroup's memory.events and then as systemd's Result=oom-kill
+/// is one oom_kill event; `systemctl reset-failed` afterwards is cleanup, not a second failure.
+#[test]
+fn oom_counted_once_and_reset_failed_is_quiet() {
+    let root = fixture("oomonce");
+    let cg = "/system.slice/job.service";
+    unit_dir(&root, cg, 0, 0, 0, 1 << 20, 0);
+    let sd = Arc::new(Mutex::new(FakeSd {
+        list: "job.service loaded active running Job\n".into(),
+        show: show_block("job.service", "active", "running", "success", 0, 10, cg),
+        ..Default::default()
+    }));
+    let mut s = Services::with_sources(&cfg(), CgMode::V2(root.clone()), Some(runner(sd.clone())), runtime::Resolver::with_roots(&root, vec![], vec![]));
+    let procs = vec![proc(10, 1, cg)];
+    s.sample_at(&procs, 0, 0);
+    assert!(s.drain_events().is_empty());
+    // The kernel kills a process in the unit: memory.events counts it, the unit is still up.
+    unit_dir(&root, cg, 0, 0, 0, 1 << 20, 1);
+    s.sample_at(&procs, 1000, 1000);
+    let ev = s.drain_events();
+    assert_eq!(ev.iter().filter(|e| e.kind == EventKind::OomKill).count(), 1, "{ev:?}");
+    // systemd stops it (OOMPolicy=stop) a sample later: failed, Result=oom-kill.
+    let _ = std::fs::remove_dir_all(root.join(cg.trim_start_matches('/')));
+    {
+        let mut g = sd.lock().unwrap();
+        g.list = "job.service loaded failed failed Job\n".into();
+        g.show = show_block("job.service", "failed", "failed", "oom-kill", 0, 0, "");
+    }
+    s.sample_at(&[], 2000, 2000);
+    let ev = s.drain_events();
+    assert!(!ev.iter().any(|e| e.kind == EventKind::OomKill), "same kill, not again: {ev:?}");
+    assert!(ev.iter().any(|e| e.kind == EventKind::UnitFailed), "{ev:?}");
+    // reset-failed: the unit leaves the list.
+    {
+        let mut g = sd.lock().unwrap();
+        g.list = String::new();
+        g.show = String::new();
+    }
+    s.sample_at(&[], 3000, 3000);
+    let ev = s.drain_events();
+    assert!(!ev.iter().any(|e| e.kind == EventKind::UnitFailed), "cleanup is not a failure: {ev:?}");
+    // Started again and OOM-killed between samples: systemd's result is a new kill.
+    {
+        let mut g = sd.lock().unwrap();
+        g.list = "job.service loaded active running Job\n".into();
+        g.show = show_block("job.service", "active", "running", "success", 0, 11, cg);
+    }
+    unit_dir(&root, cg, 0, 0, 0, 1 << 20, 0);
+    s.sample_at(&[proc(11, 1, cg)], 4000, 4000);
+    s.drain_events();
+    let _ = std::fs::remove_dir_all(root.join(cg.trim_start_matches('/')));
+    {
+        let mut g = sd.lock().unwrap();
+        g.list = "job.service loaded failed failed Job\n".into();
+        g.show = show_block("job.service", "failed", "failed", "oom-kill", 0, 0, "");
+    }
+    s.sample_at(&[], 5000, 5000);
+    let ev = s.drain_events();
+    assert_eq!(ev.iter().filter(|e| e.kind == EventKind::OomKill).count(), 1, "{ev:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `fat services --failed` on a healthy host says so, with the real unit count.
+#[test]
+fn render_filtered_empty_and_counts() {
+    let t = render_filtered(&[], 94, "failed or flapping units", &[]);
+    assert_eq!(t, "no failed or flapping units (94 units in all)\n");
+    let u = vec![Unit { name: "a.service".into(), state: "failed".into(), ..Default::default() }];
+    let t = render_filtered(&u, 94, "failed or flapping units", &[]);
+    assert!(t.starts_with("1 failed or flapping units of 94 units\n1 units: 0 active, 1 failed"), "{t}");
+    assert_eq!(render_filtered(&u, 1, "", &[]), render(&u, &[]));
+}

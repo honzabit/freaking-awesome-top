@@ -48,6 +48,129 @@ pub trait Recorded {
     fn volume_series(&self, mount: &str, from: Ts, to: Ts) -> Result<Vec<(Ts, u64, u64)>>;
     /// Bytes written per process in [from, to], largest first.
     fn proc_writes(&self, from: Ts, to: Ts) -> Result<Vec<(u32, String, u64)>>;
+    /// `Some(ts)` when this source is one live snapshot taken at `ts` (no history): its unit
+    /// and process data describe that moment only, whatever ts they are asked for.
+    fn live_at(&self) -> Option<Ts> {
+        None
+    }
+    /// Timestamps of the samples in [from, to], oldest first. The default knows only
+    /// [`Recorded::bounds`]: the overlap's two ends.
+    fn sample_times(&self, from: Ts, to: Ts) -> Result<Vec<Ts>> {
+        Ok(match self.bounds()? {
+            Some((a, b)) if b >= from && a <= to => {
+                let (a, b) = (a.max(from), b.min(to));
+                if a == b { vec![a] } else { vec![a, b] }
+            }
+            _ => vec![],
+        })
+    }
+}
+
+/// A source plus events from elsewhere (the kernel log, live state) for the spans it did not
+/// record.
+struct WithExtra<'a> {
+    inner: &'a dyn Recorded,
+    extra: Vec<Event>,
+}
+
+impl Recorded for WithExtra<'_> {
+    fn events(&self, from: Ts, to: Ts, kinds: &[EventKind], limit: usize) -> Result<Vec<Event>> {
+        let mut v = self.inner.events(from, to, kinds, limit)?;
+        v.extend(self.extra.iter().filter(|e| e.ts >= from && e.ts <= to && (kinds.is_empty() || kinds.contains(&e.kind))).cloned());
+        let mut v = dedup_sorted(v);
+        let n = v.len();
+        v.drain(..n.saturating_sub(limit));
+        Ok(v)
+    }
+    fn units_at(&self, ts: Ts) -> Result<Vec<Unit>> {
+        self.inner.units_at(ts)
+    }
+    fn unit_series(&self, name: &str, from: Ts, to: Ts) -> Result<Vec<UnitPoint>> {
+        self.inner.unit_series(name, from, to)
+    }
+    fn kernel_series(&self, from: Ts, to: Ts, max_points: usize) -> Result<Vec<(Ts, Kernel)>> {
+        self.inner.kernel_series(from, to, max_points)
+    }
+    fn snapshot_at(&self, ts: Ts) -> Result<Option<Snapshot>> {
+        self.inner.snapshot_at(ts)
+    }
+    fn bounds(&self) -> Result<Option<(Ts, Ts)>> {
+        self.inner.bounds()
+    }
+    fn spikes(&self, from: Ts, to: Ts) -> Result<Vec<Point>> {
+        self.inner.spikes(from, to)
+    }
+    fn volume_mounts(&self) -> Result<Vec<String>> {
+        self.inner.volume_mounts()
+    }
+    fn volume_series(&self, mount: &str, from: Ts, to: Ts) -> Result<Vec<(Ts, u64, u64)>> {
+        self.inner.volume_series(mount, from, to)
+    }
+    fn proc_writes(&self, from: Ts, to: Ts) -> Result<Vec<(u32, String, u64)>> {
+        self.inner.proc_writes(from, to)
+    }
+    fn live_at(&self) -> Option<Ts> {
+        self.inner.live_at()
+    }
+    fn sample_times(&self, from: Ts, to: Ts) -> Result<Vec<Ts>> {
+        self.inner.sample_times(from, to)
+    }
+}
+
+/// A span without recorder samples longer than this is a hole: three server sample intervals,
+/// at least two minutes (a recorder restart or a slow sample is not a hole).
+fn hole_ms(cfg: &ServerCfg) -> Ts {
+    (3 * cfg.record_interval_ms).max(120_000) as Ts
+}
+
+/// Spans of [from, to] with no sample for longer than `max_gap`. None when the source has no
+/// sample in the window at all.
+fn coverage_holes(src: &dyn Recorded, from: Ts, to: Ts, now: Ts, max_gap: Ts) -> Option<Vec<(Ts, Ts)>> {
+    // Samples just outside the window decide whether its edges are holes: a recorder that
+    // stopped 30 s before `to` left a hole even though the window ends before max_gap passed.
+    let ts = src.sample_times(from - max_gap, to + max_gap).ok()?;
+    if !ts.iter().any(|&t| t >= from && t <= to) {
+        return None;
+    }
+    // Nothing can be recorded after `now`: a recorder whose last sample is recent has no hole.
+    let (lo, hi) = (from - max_gap, (to + max_gap).min(now.max(to)));
+    let mut holes = Vec::new();
+    let mut prev = lo;
+    for &t in ts.iter().chain(std::iter::once(&hi)) {
+        if t - prev > max_gap {
+            let (a, b) = (prev.max(from), t.min(to));
+            if b - a >= 1000 {
+                holes.push((a, b));
+            }
+        }
+        prev = prev.max(t);
+    }
+    Some(holes)
+}
+
+/// One gap note per hole.
+fn hole_notes(holes: &[(Ts, Ts)], to: Ts, now: Ts) -> Vec<String> {
+    holes
+        .iter()
+        .map(|&(a, b)| {
+            let tail = if b >= to { " (is `fat record` still running?)" } else { "" };
+            format!("no recorder samples between {} and {}{tail}: only the kernel log and live state cover that span", fmt_ts(a, now), fmt_ts(b, now))
+        })
+        .collect()
+}
+
+/// Kernel-log (and live) events inside `holes`, each widened by `slack` on both sides: the
+/// sample just before a hole may not have recorded the events of its interval (the recorder
+/// stopped or crashed). Events the recorder did keep are the same (ts, kind, subject) and are
+/// merged away by the caller.
+fn hole_events(holes: &[(Ts, Ts)], slack: Ts, live: &[Event], kmsg: Result<Vec<Event>>, gaps: &mut Vec<String>) -> Vec<Event> {
+    let inside = |e: &Event| holes.iter().any(|&(a, b)| e.ts >= a - slack && e.ts <= b + slack);
+    let mut v: Vec<Event> = live.iter().filter(|e| inside(e)).cloned().collect();
+    match kmsg {
+        Ok(k) => v.extend(k.into_iter().filter(inside)),
+        Err(e) => gaps.push(format!("kernel log unreadable: {e:#}")),
+    }
+    v
 }
 
 impl Recorded for History {
@@ -80,6 +203,9 @@ impl Recorded for History {
     }
     fn proc_writes(&self, from: Ts, to: Ts) -> Result<Vec<(u32, String, u64)>> {
         History::proc_writes(self, from, to)
+    }
+    fn sample_times(&self, from: Ts, to: Ts) -> Result<Vec<Ts>> {
+        History::sample_times(self, from, to)
     }
 }
 
@@ -133,6 +259,9 @@ impl Recorded for Live<'_> {
     fn proc_writes(&self, _: Ts, _: Ts) -> Result<Vec<(u32, String, u64)>> {
         Ok(vec![])
     }
+    fn live_at(&self) -> Option<Ts> {
+        Some(self.snap.ts)
+    }
 }
 
 fn point_of(ts: Ts, u: &Unit) -> UnitPoint {
@@ -185,6 +314,13 @@ pub fn timeline_of(src: &dyn Recorded, from: Ts, to: Ts, kinds: &[EventKind]) ->
         }
     }
     Ok(dedup_sorted(v))
+}
+
+/// `a` and `b` merged oldest first, one event per (second, kind, subject): the same kernel-log
+/// line read from the recorder and from /dev/kmsg counts once.
+pub fn merge_events(mut a: Vec<Event>, b: Vec<Event>) -> Vec<Event> {
+    a.extend(b);
+    dedup_sorted(a)
 }
 
 fn dedup_sorted(mut v: Vec<Event>) -> Vec<Event> {
@@ -331,16 +467,23 @@ pub fn what_happened_with(
     }
     let (from, to) = if explicit { (at - window_ms, (at + window_ms / 3).min(now)) } else { (now - window_ms, now) };
 
-    // Prefer the recorder when it has samples in the window.
-    let covered = src.and_then(|s| s.bounds().ok().flatten()).filter(|&(a, b)| b >= from && a <= to);
-    if let (Some(s), Some((oldest, newest))) = (src, covered) {
-        let mut inc = analyze(s, cfg, at, explicit, from, to, None)?;
-        if oldest > from + 60_000 {
-            inc.gaps.push(format!("recorder data starts at {}; nothing recorded before that", fmt_ts(oldest, now)));
-        }
-        if newest < to - 120_000 {
-            inc.gaps.push(format!("recorder data ends at {} (is `fat record` still running?)", fmt_ts(newest, now)));
-        }
+    // Prefer the recorder when it has samples in the window. Spans it did not record (before
+    // it started, after it stopped, a restart, a short TUI session in an old DB) are filled
+    // from the kernel log and live state, and each one is named in the gaps.
+    let covered = src.and_then(|s| Some((s, coverage_holes(s, from, to, now, hole_ms(cfg))?)));
+    if let Some((s, holes)) = covered {
+        let newest = s.sample_times(from, to).ok().and_then(|t| t.last().copied()).unwrap_or(to);
+        let mut gaps = hole_notes(&holes, to, now);
+        let extra = if holes.is_empty() {
+            vec![]
+        } else {
+            let slack = hole_ms(cfg);
+            let k = if cfg.kmsg { kmsg(holes[0].0 - slack).or_else(|e| if cfg!(target_os = "linux") { Err(e) } else { Ok(vec![]) }) } else { Ok(vec![]) };
+            hole_events(&holes, slack, &live_events(live, cfg), k, &mut gaps)
+        };
+        let merged = WithExtra { inner: s, extra };
+        let mut inc = analyze(&merged, cfg, at, explicit, from, to, None)?;
+        inc.gaps.extend(gaps);
         if !explicit && newest < now - 120_000 {
             // Current failures the recorder has not seen.
             let live_only: Vec<Event> =
@@ -371,13 +514,12 @@ pub fn what_happened_with(
         },
     }
     let mut events = live_events(live, cfg);
-    if cfg.kmsg && cfg!(target_os = "linux") {
+    if cfg.kmsg {
         match kmsg(from) {
             Ok(k) => events.extend(k),
+            Err(_) if !cfg!(target_os = "linux") => gaps.push("no kernel log on this OS".into()),
             Err(e) => gaps.push(format!("kernel log unreadable: {e:#}")),
         }
-    } else if !cfg!(target_os = "linux") {
-        gaps.push("no kernel log on this OS".into());
     }
     if explicit && now - at > window_ms {
         gaps.push(format!("{} is in the past and only the kernel log covers it; unit and resource data are from now", fmt_ts(at, now)));
@@ -633,23 +775,37 @@ pub fn events_report(cfg: &crate::config::Config, from: Ts, kinds: &[EventKind],
     let mut gaps = Vec::new();
     let hist = crate::history::History::open_read_only(cfg.history_path.as_deref());
     if let Ok(h) = &hist {
-        match h.bounds() {
-            Ok(Some((a, b))) if b >= from => {
+        match coverage_holes(h, from, now, now, hole_ms(&cfg.server)) {
+            Some(holes) => {
                 let mut v = timeline(h, from, now, kinds).unwrap_or_else(|e| {
                     gaps.push(format!("recorder query failed: {e:#}"));
                     vec![]
                 });
-                if a > from + 60_000 {
-                    gaps.push(format!("recorder data starts at {}", fmt_ts(a, now)));
-                }
-                if b < now - 120_000 {
-                    gaps.push(format!("recorder data ends at {} (is `fat record` running?)", fmt_ts(b, now)));
+                let mut source = "recorder";
+                if !holes.is_empty() {
+                    // The recorder missed part of the window: the kernel log and live state
+                    // cover those spans, so an OOM kill there is not silently lost.
+                    gaps.extend(hole_notes(&holes, now, now));
+                    let live = live_server_snapshot(cfg);
+                    let slack = hole_ms(&cfg.server);
+                    let k = if cfg.server.kmsg && cfg!(target_os = "linux") { super::kernel::read_kmsg_since(Some(holes[0].0 - slack)) } else { Ok(vec![]) };
+                    let extra = hole_events(&holes, slack, &live_events(&live, &cfg.server), k, &mut gaps);
+                    // A live failed unit the recorder already logged is the same failure.
+                    let known: HashSet<(EventKind, String)> = v.iter().map(|e| (e.kind, e.subject.clone())).collect();
+                    v.extend(
+                        extra
+                            .into_iter()
+                            .filter(|e| kinds.is_empty() || kinds.contains(&e.kind))
+                            .filter(|e| e.source != "sampler" || !known.contains(&(e.kind, e.subject.clone()))),
+                    );
+                    v = dedup_sorted(v);
+                    source = "recorder+kmsg";
                 }
                 let n = v.len();
                 v.drain(..n.saturating_sub(limit));
-                return ("recorder".into(), v, gaps);
+                return (source.into(), v, gaps);
             }
-            _ => gaps.push("the flight recorder has nothing for this window (start it with `fat record --server`)".into()),
+            None => gaps.push("the flight recorder has nothing for this window (start it with `fat record --server`)".into()),
         }
     } else {
         gaps.push("no flight recorder database (start one with `fat record --server`)".into());
@@ -680,7 +836,11 @@ pub fn cli_events(cfg: &crate::config::Config, since: &str, kinds: &[String], js
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-    let src = if source == "recorder" { "the flight recorder" } else { "the live state and kernel log" };
+    let src = match source.as_str() {
+        "recorder" => "the flight recorder",
+        "recorder+kmsg" => "the flight recorder, plus the kernel log and live state where it has no samples",
+        _ => "the live state and kernel log",
+    };
     println!("{} event{} since {} (from {src})", ev.len(), if ev.len() == 1 { "" } else { "s" }, fmt_ts(from, now));
     let skip = ev.len().saturating_sub(CLI_EVENT_ROWS);
     if skip > 0 {
@@ -1155,6 +1315,17 @@ fn failed_text(u: &Unit) -> String {
 
 /// Units nearest before `ts` (the recorder returns the nearest sample; try a little earlier
 /// first so an OOM victim is seen while it still held memory).
+/// Live data within this much of an event count as "at that time": two recorder intervals,
+/// at least 10 s (one live sample's own spread).
+fn live_fresh_ms(cfg: &ServerCfg) -> Ts {
+    (2 * cfg.record_interval_ms).max(10_000) as Ts
+}
+
+/// True when the source is one live snapshot taken too far from `ts` to describe it.
+fn live_stale(cx: &Cx, ts: Ts) -> bool {
+    cx.src.live_at().is_some_and(|t| (t - ts).abs() > live_fresh_ms(cx.cfg))
+}
+
 fn units_before(cx: &Cx, ts: Ts) -> Vec<Unit> {
     for back in [2_000, 0, -5_000] {
         if let Ok(u) = cx.src.units_at(ts - back)
@@ -1167,6 +1338,10 @@ fn units_before(cx: &Cx, ts: Ts) -> Vec<Unit> {
 }
 
 fn snapshot_before(cx: &Cx, ts: Ts) -> Option<Snapshot> {
+    // A live snapshot says nothing about processes at another time.
+    if live_stale(cx, ts) {
+        return None;
+    }
     for back in [2_000, 10_000, 0] {
         if let Ok(Some(s)) = cx.src.snapshot_at(ts - back)
             && (s.ts <= ts || back == 0)
@@ -1358,6 +1533,10 @@ struct Riser {
 
 /// Units ranked by how much `r` rose from before `onset` to the peak in [onset, until].
 fn risers(cx: &Cx, onset: Ts, until: Ts, r: Res) -> Vec<Riser> {
+    // One live snapshot taken at another time shows no rise at all, only today's values.
+    if live_stale(cx, until) {
+        return vec![];
+    }
     let mut cand: Vec<Unit> = units_before(cx, until);
     for u in units_before(cx, onset) {
         if !cand.iter().any(|c| c.name == u.name) {
@@ -1460,7 +1639,22 @@ fn explain_oom(cx: &Cx, f: &Event, st: &mut Story) {
     let lo = (f.ts - CAUSE_LOOKBACK_MS).max(cx.from);
     let mut by_mem: Vec<&Unit> = units.iter().filter(|u| u.mem > 0).collect();
     by_mem.sort_by_key(|u| std::cmp::Reverse(u.mem));
-    let snap = snapshot_before(cx, f.ts);
+    let mut snap = snapshot_before(cx, f.ts);
+    // Without recorder data for the kill, unit and process memory are today's values: shown as
+    // such, never as "just before" the kill and never as a culprit.
+    if let Some(live_ts) = cx.src.live_at()
+        && live_stale(cx, f.ts)
+    {
+        if !by_mem.is_empty() {
+            st.evidence.push(format!(
+                "memory by unit now ({}, not at the kill): {}",
+                fmt_ts(live_ts, cx.now),
+                by_mem.iter().take(TOP_N).map(|u| format!("{} {}", u.name, human_bytes(u.mem))).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        by_mem.clear();
+        snap = None;
+    }
     let mem_total = snap.as_ref().map(|s| s.system.mem_total).unwrap_or(0);
     let share = |b: u64| if mem_total > 0 { format!(" ({:.0}% of RAM)", b as f64 * 100.0 / mem_total as f64) } else { String::new() };
 
@@ -2381,6 +2575,70 @@ mod tests {
         fn proc_writes(&self, _: Ts, _: Ts) -> Result<Vec<(u32, String, u64)>> {
             Ok(self.writes.clone())
         }
+        fn sample_times(&self, from: Ts, to: Ts) -> Result<Vec<Ts>> {
+            let mut ts: Vec<Ts> = self.units.iter().map(|x| x.0).chain(self.kernel.iter().map(|x| x.0)).filter(|t| *t >= from && *t <= to).collect();
+            ts.sort_unstable();
+            ts.dedup();
+            Ok(ts)
+        }
+    }
+
+    fn kmsg_oom(ts: Ts, constraint: &str) -> Event {
+        let mut e = ev(ts, EventKind::OomKill, Severity::Crit, None, "OOM killer killed python3 (pid 4242)");
+        e.subject = "pid:4242".into();
+        e.pid = Some(4242);
+        e.source = "kmsg".into();
+        e.extra = BTreeMap::from([("victim".into(), "python3".into()), ("constraint".into(), constraint.into())]);
+        e
+    }
+
+    /// The recorder's overall span covers the window but it has no samples inside it (an old
+    /// DB plus a short TUI session): the kernel log fills the hole, which is named.
+    #[test]
+    fn recorder_hole_falls_back_to_kernel_log() {
+        let mut m = Mem::default();
+        m.units.push((T0 - 24 * 60 * MIN, vec![unit("old.service", GB, 0, 1.0)]));
+        m.units.push((T0 + 30 * MIN, vec![unit("now.service", GB, 0, 1.0)]));
+        let kill = T0 + 10 * MIN;
+        let live = sys_snap(T0 + 30 * MIN, vec![]);
+        let inc = what_happened_with(Some(&m), &live, Some(kill), 15 * MIN, &ServerCfg::default(), |_| Ok(vec![kmsg_oom(kill, "CONSTRAINT_NONE")])).unwrap();
+        assert!(inc.events.iter().any(|e| e.kind == EventKind::OomKill), "{inc:#?}");
+        assert!(inc.headline.contains("OOM"), "{}", inc.headline);
+        assert!(inc.gaps.iter().any(|g| g.contains("has no samples between")), "{:?}", inc.gaps);
+        // One sample inside the window, after the kill: the recorder is used and the hole
+        // before it comes from the kernel log.
+        m.units.push((T0 + 14 * MIN, vec![unit("now.service", GB, 0, 1.0)]));
+        let inc = what_happened_with(Some(&m), &live, Some(kill), 15 * MIN, &ServerCfg::default(), |_| Ok(vec![kmsg_oom(kill, "CONSTRAINT_NONE")])).unwrap();
+        assert!(inc.events.iter().any(|e| e.kind == EventKind::OomKill), "{inc:#?}");
+        assert!(inc.gaps.iter().any(|g| g.contains("no recorder samples between")), "{:?}", inc.gaps);
+    }
+
+    /// A recorder that stopped shortly before the end of an explicit window leaves a hole there;
+    /// one still running (last sample a few seconds ago) does not.
+    #[test]
+    fn coverage_holes_at_window_edges() {
+        let mut m = Mem::default();
+        for i in 0..=20 {
+            m.units.push((T0 + i * 5 * S, vec![]));
+        }
+        let gap = 120 * S;
+        assert_eq!(coverage_holes(&m, T0, T0 + 150 * S, T0 + 60 * MIN, gap), Some(vec![(T0 + 100 * S, T0 + 150 * S)]));
+        assert_eq!(coverage_holes(&m, T0 + 50 * S, T0 + 104 * S, T0 + 104 * S, gap), Some(vec![]));
+        assert_eq!(coverage_holes(&m, T0 + 200 * S, T0 + 300 * S, T0 + 60 * MIN, gap), None);
+    }
+
+    /// Live fallback: today's unit memory is never presented as "just before" a past OOM kill,
+    /// nor blamed for it.
+    #[test]
+    fn live_fallback_does_not_blame_current_units_for_past_oom() {
+        let mut live = sys_snap(T0 + 60 * MIN, vec![Proc { pid: 9, name: "bigproc".into(), mem: 4 * GB, ..Default::default() }]);
+        live.units = vec![unit("big-now.service", 4 * GB, 0, 1.0)];
+        let kill = T0;
+        let inc = what_happened_with(None, &live, Some(kill), 15 * MIN, &ServerCfg::default(), |_| Ok(vec![kmsg_oom(kill, "CONSTRAINT_NONE")])).unwrap();
+        assert!(!inc.evidence.iter().any(|e| e.contains("just before")), "{:?}", inc.evidence);
+        assert!(inc.evidence.iter().any(|e| e.contains("not at the kill")), "{:?}", inc.evidence);
+        assert!(!inc.culprits.iter().any(|c| c.name == "big-now.service" || c.name == "bigproc"), "{:?}", inc.culprits);
+        assert!(!inc.headline.contains("big-now.service"), "{}", inc.headline);
     }
 
     fn unit(name: &str, mem: u64, io: u64, cpu: f32) -> Unit {

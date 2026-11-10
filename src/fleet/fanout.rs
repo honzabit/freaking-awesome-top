@@ -31,6 +31,9 @@ pub const REMOTE_ACTIONS: &[&str] = &["pause", "resume", "renice", "undo"];
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RemoteOut {
     pub ok: bool,
+    /// Exit code of the local command (ssh: 255 = ssh itself failed, anything else came from
+    /// the remote command). None when killed by a signal or unknown.
+    pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
     pub latency_ms: u64,
@@ -103,7 +106,7 @@ impl SshTransport {
         }
         v.push("--".into());
         v.push(dest.to_string());
-        v.push(remote_command(t.fat_path.as_deref(), args));
+        v.push(remote_command_with_deadline(t.fat_path.as_deref(), args, Some(self.cfg.command_timeout_s.max(1))));
         Ok(v)
     }
 }
@@ -163,7 +166,25 @@ fn control_dir() -> Option<std::path::PathBuf> {
 /// as-is (unquoted, so `~/bin/fat` or `sudo -n fat` work); otherwise a POSIX `sh -c` probe
 /// tries PATH and the usual install dirs, because non-interactive ssh shells often have a
 /// minimal PATH. `sh -c` keeps it independent of the remote login shell's syntax.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn remote_command(fat_path: Option<&str>, args: &[String]) -> String {
+    remote_command_with_deadline(fat_path, args, None)
+}
+
+/// [`remote_command`] that also tells the remote fat to end itself after `deadline_s`
+/// (`FAT_DEADLINE_S`, read at startup): the local timeout kills only the local ssh, and a
+/// remote command without a terminal is not signalled when its session goes away. `env` keeps
+/// it independent of the login shell; a fat older than this or a `fat_path` through sudo
+/// (which resets the environment) ignores it.
+pub fn remote_command_with_deadline(fat_path: Option<&str>, args: &[String], deadline_s: Option<u64>) -> String {
+    let env = deadline_s.map(|d| format!("env {DEADLINE_ENV}={d} ")).unwrap_or_default();
+    format!("{env}{}", remote_command_plain(fat_path, args))
+}
+
+/// Environment variable carrying a fleet command's self-deadline in seconds.
+pub const DEADLINE_ENV: &str = "FAT_DEADLINE_S";
+
+fn remote_command_plain(fat_path: Option<&str>, args: &[String]) -> String {
     let q: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
     match fat_path.map(str::trim).filter(|p| !p.is_empty()) {
         Some(p) => format!("{p} {}", q.join(" ")),
@@ -271,7 +292,7 @@ fn run_capped(mut cmd: Command, input: Option<&str>, timeout: Duration, max: usi
         }
     }
     let (Some(status), Some(stdout)) = (status, stdout) else { unreachable!("loop exits only with both") };
-    Ok(RemoteOut { ok: status.success(), stdout: String::from_utf8_lossy(&stdout).into_owned(), stderr: stderr.unwrap_or_default(), latency_ms: start.elapsed().as_millis() as u64 })
+    Ok(RemoteOut { ok: status.success(), code: status.code(), stdout: String::from_utf8_lossy(&stdout).into_owned(), stderr: stderr.unwrap_or_default(), latency_ms: start.elapsed().as_millis() as u64 })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -337,10 +358,26 @@ pub fn error_kind(err: &str) -> &str {
     err.split(':').next().unwrap_or("").trim()
 }
 
-/// Classify a failed remote run from ssh's exit status and stderr.
+/// ssh's own exit status for its errors (connect, auth, host key); the remote command's status
+/// is passed through otherwise.
+const SSH_ERROR_EXIT: i32 = 255;
+
+/// Classify a failed remote run from ssh's exit status and stderr. Connection-level kinds
+/// (host key, auth, unreachable) need ssh's own exit status: a remote "Permission denied" or
+/// "connection refused" printed by the shell or by fat is the remote command failing.
 fn classify(out: &RemoteOut) -> Kind {
     let e = out.stderr.to_ascii_lowercase();
     let has = |s: &str| e.contains(s);
+    let ssh_failed = out.code.is_none_or(|c| c == SSH_ERROR_EXIT);
+    if !ssh_failed {
+        return if out.code == Some(127) || has("fat: command not found") || has("fat: not found") {
+            Kind::FatMissing
+        } else if is_unknown_arg(&e) {
+            Kind::Version
+        } else {
+            Kind::Remote
+        };
+    }
     if has("host key verification failed") || has("remote host identification has changed") || has("no matching host key") {
         Kind::HostKey
     } else if has("permission denied") || has("too many authentication failures") || has("no supported authentication") {
@@ -421,11 +458,52 @@ pub fn poll(targets: &[Target], cfg: &FleetCfg, tr: &dyn Transport, on_result: &
 /// (summaries over large fleets do not need them; dropping them bounds memory).
 pub fn poll_detailed(targets: &[Target], cfg: &FleetCfg, tr: &dyn Transport, keep_snaps: bool, on_result: &(dyn Fn(&FleetHost) + Sync)) -> Vec<Polled> {
     let timeout = Duration::from_secs(cfg.command_timeout_s.max(1));
+    let backoff = Duration::from_secs(cfg.timeout_backoff_s);
     fan_out(targets, cfg.concurrency, |t| {
-        let p = poll_one(t, tr, timeout, keep_snaps);
+        let p = match backoff_until(&t.name, backoff) {
+            Some(left) => Polled {
+                host: host_row(
+                    t,
+                    Err(&format!(
+                        "{}: not polled: its last poll timed out; next try in {}s (fleet.timeout_backoff_s)",
+                        Kind::Timeout.as_str(),
+                        left.as_secs().max(1)
+                    )),
+                    0,
+                ),
+                ..Default::default()
+            },
+            None => {
+                let p = poll_one(t, tr, timeout, keep_snaps);
+                note_poll(&t.name, &p.host);
+                p
+            }
+        };
         on_result(&p.host);
         p
     })
+}
+
+/// When each host's last poll timed out (this process): see `FleetCfg::timeout_backoff_s`.
+static TIMED_OUT: Mutex<BTreeMap<String, Instant>> = Mutex::new(BTreeMap::new());
+
+/// Time left before `host` may be polled again, if its last poll timed out within `backoff`.
+fn backoff_until(host: &str, backoff: Duration) -> Option<Duration> {
+    if backoff.is_zero() {
+        return None;
+    }
+    let g = TIMED_OUT.lock().ok()?;
+    let at = g.get(host)?;
+    backoff.checked_sub(at.elapsed()).filter(|d| !d.is_zero())
+}
+
+fn note_poll(host: &str, row: &FleetHost) {
+    let Ok(mut g) = TIMED_OUT.lock() else { return };
+    if row.error.as_deref().is_some_and(|e| error_kind(e) == Kind::Timeout.as_str()) {
+        g.insert(host.to_string(), Instant::now());
+    } else {
+        g.remove(host);
+    }
 }
 
 fn sargs(a: &[&str]) -> Vec<String> {
@@ -584,22 +662,35 @@ pub fn health_score(snap: &Snapshot, findings: &[Finding]) -> u8 {
     100u32.saturating_sub(p) as u8
 }
 
-/// Grouping key for a finding title: digit runs become "#", so "Disk / is 93% full" and
-/// "Disk / is 95% full" aggregate while different mounts/processes stay apart.
+/// Grouping key for a finding title: numbers that are values become "#", so "Disk / is 93%
+/// full" and "Disk / is 95% full" aggregate. Digits that are part of a name (directly after a
+/// letter, digit, `@`, `_`, `-` or `/`: /data1, nvme0n1, sdb1, postgresql@14-main) are kept, so
+/// different mounts, devices and units stay apart.
 pub fn title_key(title: &str) -> String {
     let mut out = String::with_capacity(title.len());
     let mut in_num = false;
+    let mut in_name = false;
+    let mut prev: Option<char> = None;
     for ch in title.chars() {
-        let numeric = ch.is_ascii_digit() || (in_num && (ch == '.' || ch == ','));
-        if numeric {
-            if !in_num {
-                out.push('#');
+        if ch.is_ascii_digit() || (in_num && (ch == '.' || ch == ',')) {
+            if !in_num && !in_name {
+                let name_part = prev.is_some_and(|p| p.is_alphanumeric() || matches!(p, '@' | '_' | '-' | '/'));
+                if name_part {
+                    in_name = true;
+                } else {
+                    in_num = true;
+                    out.push('#');
+                }
             }
-            in_num = true;
+            if in_name {
+                out.push(ch);
+            }
         } else {
             in_num = false;
+            in_name = false;
             out.push(ch);
         }
+        prev = Some(ch);
     }
     out
 }
@@ -612,7 +703,8 @@ pub fn summarize(rows: Vec<FleetHost>, findings: &[(String, Vec<Finding>)], max_
     let health: BTreeMap<&str, u8> = rows.iter().map(|r| (r.name.as_str(), r.health)).collect();
     // key -> (severity, hosts with their own severity)
     // key -> (severity, hosts with their own severity, the original title while all agree)
-    type Group = (Severity, Vec<(Severity, String)>, Option<String>);
+    // ...plus each host's own title (values intact) for the worst-host example.
+    type Group = (Severity, Vec<(Severity, String, String)>, Option<String>);
     let mut groups: BTreeMap<String, Group> = BTreeMap::new();
     for (host, fs) in findings {
         let mut seen = std::collections::HashSet::new();
@@ -624,7 +716,7 @@ pub fn summarize(rows: Vec<FleetHost>, findings: &[(String, Vec<Finding>)], max_
             let sev = Severity::parse(&f.severity);
             let e = groups.entry(key).or_insert_with(|| (sev, vec![], Some(f.title.clone())));
             e.0 = e.0.max(sev);
-            e.1.push((sev, host.clone()));
+            e.1.push((sev, host.clone(), f.title.clone()));
             if e.2.as_deref() != Some(f.title.as_str()) {
                 e.2 = None;
             }
@@ -648,17 +740,18 @@ pub fn summarize(rows: Vec<FleetHost>, findings: &[(String, Vec<Finding>)], max_
         .into_iter()
         .map(|(key, (severity, mut hosts, same))| {
             // Identical titles everywhere are shown verbatim; differing numbers become "#".
-            let title = same.unwrap_or(key);
+            let title = same.clone().unwrap_or(key);
             hosts.sort_by(|a, b| b.0.cmp(&a.0).then(health.get(a.1.as_str()).cmp(&health.get(b.1.as_str()))).then(a.1.cmp(&b.1)));
             let count = hosts.len();
-            FleetFinding { title, severity, count, hosts: cap(hosts.into_iter().map(|h| h.1).collect()) }
+            let worst = if same.is_none() { hosts.first().map(|h| format!("{}: {}", h.1, h.2)).unwrap_or_default() } else { String::new() };
+            FleetFinding { title, severity, count, hosts: cap(hosts.into_iter().map(|h| h.1).collect()), worst }
         })
         .collect();
     for (kind, hosts) in errs {
-        out.push(FleetFinding { title: format!("not polled: {kind}"), severity: Severity::Warn, count: hosts.len(), hosts: cap(hosts) });
+        out.push(FleetFinding { title: format!("not polled: {kind}"), severity: Severity::Warn, count: hosts.len(), hosts: cap(hosts), ..Default::default() });
     }
     if !skew.is_empty() {
-        out.push(FleetFinding { title: format!("fat version differs from this one ({mine})"), severity: Severity::Info, count: skew.len(), hosts: cap(skew) });
+        out.push(FleetFinding { title: format!("fat version differs from this one ({mine})"), severity: Severity::Info, count: skew.len(), hosts: cap(skew), ..Default::default() });
     }
     out.sort_by(|a, b| b.severity.cmp(&a.severity).then(b.count.cmp(&a.count)).then(a.title.cmp(&b.title)));
     let mut hosts = rows;
@@ -849,7 +942,7 @@ mod tests {
         assert!(v.contains(&"Port=2222".into()) && v.contains(&"BatchMode=yes".into()) && v.contains(&"-C".into()));
         assert!(!v.iter().any(|a| a.contains("ProxyJump") || a.contains("ProxyCommand")));
         let dd = v.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&v[dd + 1..], &["web-01".to_string(), "/opt/fat snapshot --json".to_string()]);
+        assert_eq!(&v[dd + 1..], &["web-01".to_string(), "env FAT_DEADLINE_S=20 /opt/fat snapshot --json".to_string()]);
         cfg.control_master = false;
         cfg.compress = false;
         let v = SshTransport { cfg }.argv(&target("db-01"), &sargs(&["doctor"])).unwrap(); // no ControlPath dir is made
@@ -907,6 +1000,40 @@ mod tests {
         assert_eq!(k("error: unexpected argument '--fast' found"), Kind::Version);
         assert_eq!(k("Error: database is locked"), Kind::Remote);
         assert_eq!(error_kind("auth: Permission denied"), "auth");
+        // ssh's own failures exit 255; anything else is the remote command's status, so a
+        // remote EACCES is not an ssh key problem.
+        let kc = |e: &str, code: i32| classify(&RemoteOut { stderr: e.into(), code: Some(code), ..Default::default() });
+        assert_eq!(kc("me@web-01: Permission denied (publickey).", 255), Kind::Auth);
+        assert_eq!(kc("sh: 1: /opt/fat/bin/fat: Permission denied", 126), Kind::Remote);
+        assert_eq!(kc("Error: opening /var/lib/fat/history.db: Permission denied", 1), Kind::Remote);
+        assert_eq!(kc("Error: connection refused by the remote service", 1), Kind::Remote);
+        assert_eq!(kc("sh: 1: /opt/fat/bin/fat: not found", 127), Kind::FatMissing);
+        assert_eq!(kc("error: unexpected argument '--fast' found", 2), Kind::Version);
+        assert_eq!(kc("ssh: connect to host 10.0.0.9 port 22: Connection refused", 255), Kind::Unreachable);
+    }
+
+    /// A host whose poll timed out is not polled again until the backoff passes, so stuck
+    /// remote fats do not pile up; the remote command carries its own deadline.
+    #[test]
+    fn timed_out_host_backs_off() {
+        let slow = LocalTransport { program: "sh".into(), prefix: vec!["-c".into(), "sleep 30".into(), "x".into()] };
+        let cfg = FleetCfg { command_timeout_s: 1, timeout_backoff_s: 60, ..Default::default() };
+        let t = vec![target("backoff-test-01")];
+        let r = poll_detailed(&t, &cfg, &slow, false, &|_| {});
+        assert_eq!(error_kind(r[0].host.error.as_deref().unwrap()), "timeout");
+        let t0 = Instant::now();
+        let r = poll_detailed(&t, &cfg, &slow, false, &|_| {});
+        let e = r[0].host.error.as_deref().unwrap();
+        assert!(e.starts_with("timeout: not polled") && t0.elapsed() < Duration::from_millis(500), "{e}");
+        // Backoff off: polled again.
+        let cfg0 = FleetCfg { timeout_backoff_s: 0, ..cfg };
+        let t0 = Instant::now();
+        let r = poll_detailed(&t, &cfg0, &slow, false, &|_| {});
+        assert!(t0.elapsed() >= Duration::from_millis(900), "{:?}", r[0].host.error);
+        let c = remote_command_with_deadline(None, &sargs(&["doctor"]), Some(20));
+        assert!(c.starts_with("env FAT_DEADLINE_S=20 sh -c "), "{c}");
+        let ssh = SshTransport { cfg: FleetCfg { command_timeout_s: 7, ..Default::default() } };
+        assert!(ssh.argv(&target("web-01"), &sargs(&["doctor"])).unwrap().last().unwrap().starts_with("env FAT_DEADLINE_S=7 "));
     }
 
     #[test]
@@ -1013,6 +1140,21 @@ esac"#,
         assert!(sum.findings.iter().any(|f| f.title == "not polled: auth"));
         assert_eq!(summarize(vec![], &[("a".into(), vec![f("warn", "t")]), ("b".into(), vec![f("warn", "t")])], 1).findings[0].hosts.len(), 1);
         assert_eq!(title_key("node on :3000 uses 1,234.5 MB"), "node on :# uses # MB");
+        assert_eq!(sum.findings[0].worst, "web-02: Disk / is 98% full", "the merged line keeps the worst value");
+        // Names with digits stay apart; values merge.
+        assert_eq!(title_key("Disk /data1 is 97% full"), "Disk /data1 is #% full");
+        assert_ne!(title_key("Disk /data1 is 97% full"), title_key("Disk /data2 is 91% full"));
+        assert_eq!(title_key("nvme0n1 await 120 ms"), "nvme0n1 await # ms");
+        assert_eq!(title_key("postgresql@14-main.service failed"), "postgresql@14-main.service failed");
+        assert_eq!(title_key("390 zombie processes"), "# zombie processes");
+        assert_eq!(title_key("Disk writes at 120M/s"), "Disk writes at #M/s");
+        let d = summarize(
+            vec![],
+            &[("a".into(), vec![f("crit", "Disk /data1 is 97% full")]), ("b".into(), vec![f("warn", "Disk /data2 is 91% full")])],
+            10,
+        );
+        assert_eq!(d.findings.len(), 2, "{:?}", d.findings);
+        assert!(d.findings.iter().all(|x| x.worst.is_empty()), "verbatim titles need no example");
     }
 
     #[test]

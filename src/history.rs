@@ -589,7 +589,8 @@ impl History {
         &self.path
     }
 
-    fn resolve(path: Option<&str>) -> PathBuf {
+    /// The DB path `path` (or the default) resolves to.
+    pub fn resolve(path: Option<&str>) -> PathBuf {
         match path {
             Some(p) if !p.is_empty() => PathBuf::from(expand_tilde(p)),
             _ => Self::default_path(),
@@ -614,44 +615,115 @@ impl History {
         }
     }
 
-    /// Open (create) the DB. None path -> [`History::default_path`]. Older databases gain the
-    /// server tables in place (additive, no data loss). When the schema is already current the
-    /// open performs no write, so readers of a DB they cannot write (another user's recorder)
-    /// still work.
+    /// Open (create) the DB. None path -> [`History::default_path`]. Older databases of the
+    /// current schema gain missing tables in place (additive, no data loss). When the schema is
+    /// already current the open performs no write, so readers of a DB they cannot write (another
+    /// user's recorder) still work.
+    ///
+    /// A database written by a different fat version (another `user_version`) is never touched:
+    /// this returns Err, so a mismatched CLI (rolling upgrade, an older binary first on PATH)
+    /// cannot destroy a recorder's history. Only [`History::open_recorder`] with `may_reset`
+    /// starts over, and it keeps the old file.
     pub fn open(path: Option<&str>) -> anyhow::Result<History> {
-        let path = Self::resolve(path);
-        if let Some(dir) = path.parent()
-            && !dir.as_os_str().is_empty()
-            && !dir.exists()
-        {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        let conn = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        conn.busy_timeout(Duration::from_secs(2))?;
-        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;")?;
+        Self::open_inner(Self::resolve(path), false)
+    }
+
+    /// Open for recording. With `may_reset`, a database of another schema version is moved
+    /// aside to `<db>.schema-v<N>` (kept, never deleted) and a fresh one is created, but only
+    /// while no other process holds the writer lease. Without it this is [`History::open`].
+    pub fn open_recorder(path: Option<&str>, may_reset: bool) -> anyhow::Result<History> {
+        Self::open_inner(Self::resolve(path), may_reset)
+    }
+
+    /// (user_version, number of our tables) of an open connection.
+    fn schema_of(conn: &Connection) -> anyhow::Result<(i64, i64)> {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let tables: i64 = conn.query_row(
             &format!("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ({})", ALL_TABLES),
             [],
             |r| r.get(0),
         )?;
+        Ok((version, tables))
+    }
+
+    fn open_inner(path: PathBuf, may_reset: bool) -> anyhow::Result<History> {
+        if let Some(dir) = path.parent()
+            && !dir.as_os_str().is_empty()
+            && !dir.exists()
+        {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let mut conn = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(2))?;
+        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;")?;
+        let (mut version, mut tables) = Self::schema_of(&conn)?;
+        // An empty file (fresh, or user_version 0 with none of our tables) is ours to set up.
+        let foreign = version != SCHEMA_VERSION && !(version == 0 && tables == 0);
+        if foreign {
+            if !may_reset {
+                anyhow::bail!(
+                    "{} was written by a different fat version (schema v{version}; this fat uses v{SCHEMA_VERSION}); \
+                     left untouched. Use the matching fat, or point history_path elsewhere",
+                    path.display()
+                );
+            }
+            drop(conn);
+            let kept = Self::move_aside(&path, version)?;
+            eprintln!(
+                "fat: {} had schema v{version} (this fat uses v{SCHEMA_VERSION}); kept it as {} and started a new one",
+                path.display(),
+                kept.display()
+            );
+            conn = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
+            conn.busy_timeout(Duration::from_secs(2))?;
+            conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;")?;
+            (version, tables) = Self::schema_of(&conn)?;
+        }
         if version != SCHEMA_VERSION || tables != ALL_TABLES_N {
             // auto_vacuum must be set before the first table is created to take effect.
             conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL;")?;
-            if version != SCHEMA_VERSION {
-                // Pre-release layouts are not migrated; start fresh.
-                conn.execute_batch(
-                    "DROP TABLE IF EXISTS system; DROP TABLE IF EXISTS changes; DROP TABLE IF EXISTS keyframes;
-                     DROP TABLE IF EXISTS proc_info; DROP TABLE IF EXISTS procs;
-                     DROP TABLE IF EXISTS volume_ids; DROP TABLE IF EXISTS volumes;
-                     DROP TABLE IF EXISTS fs_snaps; DROP TABLE IF EXISTS fs_dirs;",
-                )?;
-            }
             conn.execute_batch(SCHEMA).context("creating history schema")?;
             conn.execute_batch(SERVER_SCHEMA).context("creating server history schema")?;
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         }
         Ok(Self::with_conn(conn, path, false))
+    }
+
+    /// Rename `db` (and its -wal/-shm) to `<db>.schema-v<version>[.N]`, holding the writer lease
+    /// so a recorder still writing to it is never pulled from under. Returns the new name.
+    fn move_aside(db: &Path, version: i64) -> anyhow::Result<PathBuf> {
+        use std::os::fd::AsRawFd;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(writer_lock_path(db))
+            .with_context(|| format!("locking {}", db.display()))?;
+        // SAFETY: flock on a valid fd we own; LOCK_NB makes it fail instead of blocking.
+        anyhow::ensure!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            "{} has schema v{version} and another fat is recording to it; left untouched",
+            db.display()
+        );
+        let base = format!("{}.schema-v{version}", db.display());
+        let mut dest = PathBuf::from(&base);
+        let mut n = 1;
+        while dest.exists() {
+            dest = PathBuf::from(format!("{base}.{n}"));
+            n += 1;
+        }
+        std::fs::rename(db, &dest).with_context(|| format!("renaming {} to {}", db.display(), dest.display()))?;
+        for ext in ["-wal", "-shm"] {
+            let mut from = db.as_os_str().to_owned();
+            from.push(ext);
+            let mut to = dest.as_os_str().to_owned();
+            to.push(ext);
+            if Path::new(&from).exists() {
+                let _ = std::fs::rename(&from, &to);
+            }
+        }
+        Ok(dest)
     }
 
     /// Open an existing DB strictly read-only: no schema changes, no writer lease, no file
@@ -666,6 +738,12 @@ impl History {
         )
         .with_context(|| format!("opening {} read-only", path.display()))?;
         conn.busy_timeout(Duration::from_millis(500))?;
+        let (version, _) = Self::schema_of(&conn)?;
+        anyhow::ensure!(
+            version == SCHEMA_VERSION,
+            "{} was written by a different fat version (schema v{version}; this fat reads v{SCHEMA_VERSION})",
+            path.display()
+        );
         Ok(Self::with_conn(conn, path, true))
     }
 
@@ -1053,6 +1131,13 @@ impl History {
             (Some(a), Some(b)) => Some((a, b)),
             _ => None,
         })
+    }
+
+    /// Timestamps of the samples in [from, to], oldest first (finding holes in coverage).
+    pub fn sample_times(&self, from: Ts, to: Ts) -> anyhow::Result<Vec<Ts>> {
+        let mut st = self.conn.prepare_cached("SELECT ts FROM system WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts")?;
+        let v = st.query_map([from, to], |r| r.get::<_, Ts>(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(v)
     }
 
     /// Number of recorded samples.
@@ -2750,7 +2835,7 @@ pub fn record_with(cfg: &crate::config::Config, opts: &crate::server::export::Re
         let dir = Path::new(SYSTEM_DB).parent()?;
         (server && cfg!(target_os = "linux") && root && std::fs::create_dir_all(dir).is_ok()).then(|| SYSTEM_DB.to_string())
     });
-    let mut hist = History::open(path.as_deref())?;
+    let mut hist = History::open_recorder(path.as_deref(), true)?;
     hist.set_server_limits(&cfg.server);
     install_stop_handlers();
     STOP.store(false, Ordering::SeqCst);
@@ -4216,5 +4301,48 @@ mod tests {
         } else {
             eprintln!("kept {}", path.display());
         }
+    }
+
+    /// A DB of another schema version (another fat on PATH, a rolling upgrade) must never be
+    /// dropped by a reader: open and open_read_only refuse; only the recorder moves it aside,
+    /// keeping its data, and only when nobody else holds the writer lease.
+    #[test]
+    fn foreign_schema_is_never_dropped() {
+        let path = tmp_db("foreign");
+        let p = path.to_str().unwrap();
+        let now = crate::model::now_ms();
+        {
+            let mut h = History::open(Some(p)).unwrap();
+            let mut rng = Rng(3);
+            h.record(&server_snap(now, 3, 5, &mut rng)).unwrap();
+            h.conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1)).unwrap();
+        }
+        let rows = |p: &Path| -> i64 {
+            let c = Connection::open(p).unwrap();
+            c.query_row("SELECT count(*) FROM system", [], |r| r.get(0)).unwrap()
+        };
+        assert!(History::open(Some(p)).is_err(), "plain open refuses a foreign schema");
+        assert!(History::open_read_only(Some(p)).is_err());
+        assert!(History::open_recorder(Some(p), false).is_err());
+        assert_eq!(rows(&path), 1, "data untouched");
+        // A live writer (lease held) blocks the reset too.
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(writer_lock_path(&path)).unwrap();
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: flock on a valid fd we own.
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        }
+        assert!(History::open_recorder(Some(p), true).is_err());
+        drop(lock);
+        let h = History::open_recorder(Some(p), true).unwrap();
+        let kept = PathBuf::from(format!("{}.schema-v{}", p, SCHEMA_VERSION + 1));
+        assert!(kept.exists(), "old DB kept aside");
+        assert_eq!(rows(&kept), 1, "old data preserved");
+        assert_eq!(h.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        drop(h);
+        assert!(History::open_read_only(Some(p)).is_ok());
+        cleanup(&path);
+        cleanup(&kept);
+        let _ = std::fs::remove_file(writer_lock_path(&path));
     }
 }

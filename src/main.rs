@@ -609,7 +609,7 @@ fn run_fs(a: FsArgs, cfg: &config::Config) -> Result<()> {
         let mut v = fs::volumes::Volumes::new();
         // FILL/10m and the ETA come from recorded volume use (`fat record` or a TUI); two
         // samples a second apart are too close for a rate.
-        if let Ok(h) = history::History::open(cfg.history_path.as_deref()) {
+        if let Ok(h) = history::History::open_read_only(cfg.history_path.as_deref()) {
             h.seed_volumes(&mut v, now);
         }
         let _ = v.sample();
@@ -644,7 +644,7 @@ fn run_fs(a: FsArgs, cfg: &config::Config) -> Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(800));
             t.observe(&c.sample());
         }
-        let h = history::History::open(cfg.history_path.as_deref()).ok();
+        let h = history::History::open_read_only(cfg.history_path.as_deref()).ok();
         let sc = fs::scan::Scanner::new();
         let g = t.report(window_ms, under.as_deref(), h.as_ref(), Some(&sc));
         if a.json {
@@ -704,6 +704,14 @@ fn main() -> Result<()> {
     // SAFETY: setting a signal disposition to SIG_DFL at startup, before any threads exist.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    // Fleet polls set a self-deadline (see fleet::fanout::DEADLINE_ENV): a remote fat whose
+    // ssh client gave up must not keep running on the host. SIGALRM's default action ends it.
+    if let Some(s) = std::env::var(fleet::fanout::DEADLINE_ENV).ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|&s| s > 0) {
+        // SAFETY: alarm() has no preconditions; SIGALRM keeps its default disposition.
+        unsafe {
+            libc::alarm(s);
+        }
     }
     let cli = parse_cli();
     let cfg = config::Config::load();
@@ -773,7 +781,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Why { pid, json }) => {
             let s = sample_with(true);
-            let h = history::History::open(cfg.history_path.as_deref()).ok();
+            let h = history::History::open_read_only(cfg.history_path.as_deref()).ok();
             let e = blame::explain(&s, pid, h.as_ref());
             if json {
                 print_json(&e)?;
@@ -799,7 +807,7 @@ fn main() -> Result<()> {
             if cfg.containers && blame::hosts_containers(&s) {
                 s.containers = fleet::containers();
             }
-            let h = history::History::open(cfg.history_path.as_deref()).ok();
+            let h = history::History::open_read_only(cfg.history_path.as_deref()).ok();
             let f = blame::diagnose_with_fs(&s, h.as_ref(), &fs_facts(h.as_ref()));
             if json {
                 print_json(&f)?;
@@ -817,7 +825,7 @@ fn main() -> Result<()> {
         Some(Cmd::Ask { question, dry_run }) => {
             let q = question.join(" ");
             let s = sample_with(true);
-            let h = history::History::open(cfg.history_path.as_deref()).ok();
+            let h = history::History::open_read_only(cfg.history_path.as_deref()).ok();
             let f = blame::diagnose(&s, h.as_ref());
             if dry_run {
                 let (body, note) = ask::dry_run(&q, &s, &f, &cfg.ask);
@@ -837,7 +845,7 @@ fn main() -> Result<()> {
             history::record_with(&cfg, &server::export::RecordOpts { server: server_flag, export })?
         }
         Some(Cmd::History { since, at, spikes, json }) => {
-            let h = history::History::open(cfg.history_path.as_deref())?;
+            let h = history::History::open_read_only(cfg.history_path.as_deref())?;
             let now = model::now_ms();
             if let Some(at) = at {
                 match h.at(now - ago_ms(&at)?)? {

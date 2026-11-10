@@ -165,7 +165,7 @@ mod tests {
         assert_eq!(c.fleet.connect_timeout_s, 5, "unset keys keep their defaults");
         assert_eq!(c.fleet.groups["db"], vec!["db-*"]);
         assert_eq!(c.fleet.ssh_options, vec!["ServerAliveInterval=5"]);
-        assert!(c.fleet.control_master);
+        assert!(!c.fleet.control_master, "connection sharing is left to the ssh config by default");
     }
 
     #[test]

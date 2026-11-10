@@ -249,7 +249,7 @@ impl KernelSampler {
         }
         self.prev_net = net;
 
-        k.d_state = self.read_dstate(procs, now, &mut k.notes);
+        k.d_state = self.read_dstate(procs, k.procs_blocked, now, &mut k.notes);
         k.fs_errors = self.read_mounts_and_fs_errors(now);
         k.ro_remounts = self.ro_remounts.clone();
 
@@ -392,38 +392,88 @@ impl KernelSampler {
         res
     }
 
-    fn read_dstate(&mut self, procs: &[Proc], now: Ts, notes: &mut Vec<String>) -> Vec<DStateProc> {
+    fn read_dstate(&mut self, procs: &[Proc], blocked: u32, now: Ts, notes: &mut Vec<String>) -> Vec<DStateProc> {
         let mut seen = HashSet::new();
-        let mut out = Vec::new();
+        let mut out: Vec<DStateProc> = Vec::new();
         let mut new_long = Vec::new();
         let mut wchan_hidden = false;
-        // Proc.status maps Linux 'D' to "U"; confirm from /proc/<pid>/stat (also gives starttime
-        // so a recycled pid starts a new episode).
-        for p in procs.iter().filter(|p| p.status == "U" || p.status == "D") {
-            let Some(st) = self.read(&format!("proc/{}/stat", p.pid)) else { continue };
-            let Some((state, start)) = stat_state_start(&st) else { continue };
-            if state != 'D' {
-                continue;
-            }
-            let key = (p.pid, start);
+        // One task (main thread or worker thread) confirmed in D: track its episode by
+        // (tid, starttime) so a recycled tid starts a new one; report it under its process.
+        let mut task = |this: &mut Self, p: &Proc, dir: &str, start: u64, out: &mut Vec<DStateProc>, new_long: &mut Vec<DStateProc>| {
+            let tid: u32 = dir.rsplit('/').next().and_then(|t| t.parse().ok()).unwrap_or(p.pid);
+            let key = (tid, start);
             seen.insert(key);
-            let first = *self.dstate_first.entry(key).or_insert(now);
+            let first = *this.dstate_first.entry(key).or_insert(now);
             let secs = ((now - first).max(0) / 1000) as u64;
-            if secs < self.cfg.dstate_min_s {
-                continue;
+            if secs < this.cfg.dstate_min_s {
+                return;
             }
-            let wchan = self.read(&format!("proc/{}/wchan", p.pid)).map(|s| s.trim().to_string()).unwrap_or_default();
+            let wchan = this.read(&format!("{dir}/wchan")).map(|s| s.trim().to_string()).unwrap_or_default();
             let wchan = if wchan.is_empty() || wchan == "0" {
                 wchan_hidden = true;
                 String::new()
             } else {
                 wchan
             };
-            let d = DStateProc { pid: p.pid, name: p.name.clone(), wchan, seconds: secs, unit: self.unit_for_cgroup(&p.cgroup) };
-            if self.dstate_reported.insert(key) {
+            let d = DStateProc { pid: p.pid, name: p.name.clone(), wchan, seconds: secs, unit: this.unit_for_cgroup(&p.cgroup) };
+            // A process with several blocked threads is one row (its longest-blocked thread)
+            // and one event.
+            let fresh = this.dstate_reported.insert(key);
+            if let Some(x) = out.iter_mut().find(|x| x.pid == p.pid) {
+                if d.seconds > x.seconds {
+                    *x = d;
+                }
+                return;
+            }
+            if fresh && !new_long.iter().any(|x: &DStateProc| x.pid == p.pid) {
                 new_long.push(d.clone());
             }
             out.push(d);
+        };
+        // Proc.status maps Linux 'D' to "U"; confirm from /proc/<pid>/stat (also gives starttime
+        // so a recycled pid starts a new episode).
+        let mut found = 0u32;
+        for p in procs.iter().filter(|p| p.status == "U" || p.status == "D") {
+            let dir = format!("proc/{}", p.pid);
+            let Some(st) = self.read(&format!("{dir}/stat")) else { continue };
+            let Some((state, start)) = stat_state_start(&st) else { continue };
+            if state != 'D' {
+                continue;
+            }
+            found += 1;
+            task(self, p, &dir, start, &mut out, &mut new_long);
+        }
+        // /proc/stat counts every blocked task, threads included, but /proc/<pid>/stat shows
+        // only the main thread: a thread-pool server whose I/O threads are stuck while its main
+        // thread sleeps would be invisible. When the kernel counts more blocked tasks than found,
+        // walk the threads of multi-threaded processes, bounded by `dstate_max_thread_reads`.
+        if blocked > found {
+            let mut reads = 0usize;
+            let max = self.cfg.dstate_max_thread_reads;
+            let mut multi: Vec<&Proc> = procs.iter().filter(|p| p.threads > 1).collect();
+            multi.sort_by_key(|p| std::cmp::Reverse(p.threads));
+            'procs: for p in multi {
+                let Ok(rd) = fs::read_dir(self.p(&format!("proc/{}/task", p.pid))) else { continue };
+                for ent in rd.flatten() {
+                    let Some(tid) = ent.file_name().to_str().and_then(|t| t.parse::<u32>().ok()) else { continue };
+                    if tid == p.pid {
+                        continue; // the main thread was checked above
+                    }
+                    if reads >= max || found >= blocked {
+                        break 'procs;
+                    }
+                    reads += 1;
+                    let dir = format!("proc/{}/task/{tid}", p.pid);
+                    let Some(st) = self.read(&format!("{dir}/stat")) else { continue };
+                    if let Some(('D', start)) = stat_state_start(&st) {
+                        found += 1;
+                        task(self, p, &dir, start, &mut out, &mut new_long);
+                    }
+                }
+            }
+            if reads >= max && found < blocked {
+                notes.push(format!("{} blocked tasks, {found} found: thread scan stopped at server.dstate_max_thread_reads ({max})", blocked));
+            }
         }
         self.dstate_first.retain(|k, _| seen.contains(k));
         self.dstate_reported.retain(|k| seen.contains(k));
@@ -805,7 +855,7 @@ impl OomAssembler {
             self.lines.clear();
             self.victims.clear();
             self.lines.push(msg.to_string());
-        } else if msg.starts_with("oom-kill:") && self.lines.len() < 3 {
+        } else if (msg.starts_with("oom-kill:") || is_legacy_oom_line(msg)) && self.lines.len() < 4 {
             self.lines.push(msg.to_string());
         }
     }
@@ -827,8 +877,13 @@ impl OomAssembler {
             for l in &self.lines {
                 fold_oom_line(&mut ctx, l);
             }
-            info.constraint = ctx.constraint;
+            // The killed line's own prefix ("Memory cgroup out of memory: ...") is the fallback
+            // when the report carried no oom-kill: line (kernels before 4.19).
+            if !ctx.constraint.is_empty() {
+                info.constraint = ctx.constraint;
+            }
             info.memcg = ctx.memcg;
+            info.task_memcg = ctx.task_memcg;
             info.invoker = ctx.invoker;
             if info.victim_pid != 0 {
                 apply_oom(&mut e, &info);
@@ -863,6 +918,9 @@ fn apply_oom(e: &mut Event, o: &OomInfo) {
     e.extra.insert("victim_pid".into(), o.victim_pid.to_string());
     if !o.constraint.is_empty() {
         e.extra.insert("constraint".into(), o.constraint.clone());
+    }
+    if !o.task_memcg.is_empty() {
+        e.extra.insert("task_memcg".into(), o.task_memcg.clone());
     }
     if !o.memcg.is_empty() {
         e.extra.insert("memcg".into(), o.memcg.clone());
@@ -1015,8 +1073,23 @@ fn device_in(msg: &str) -> Option<String> {
     if let Some(d) = kv_after(msg, "(device ") {
         return Some(pick(d));
     }
+    // "Buffer I/O error on device sdb1" (older kernels) before "on dev sdb1".
+    if let Some(d) = kv_after(msg, "on device ") {
+        return Some(pick(d));
+    }
     if let Some(d) = kv_after(msg, "dev ") {
         return Some(pick(d));
+    }
+    // SCSI disk: "sd 2:0:0:0: [sdb] tag#0 FAILED Result: ..." names the block device in the
+    // first bracket (the H:C:T:L address is not a device).
+    if msg.starts_with("sd ")
+        && let Some(open) = msg.find('[')
+        && let Some(len) = msg[open + 1..].find(']')
+    {
+        let d = &msg[open + 1..open + 1 + len];
+        if !d.is_empty() && d.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Some(d.to_string());
+        }
     }
     for fs in ["EXT4-fs (", "XFS (", "EXT3-fs (", "BTRFS: device "] {
         if let Some(d) = kv_after(msg, fs) {
@@ -1189,6 +1262,11 @@ fn classify(level: u8, msg: &str, ts: Ts) -> Option<Event> {
     None
 }
 
+/// OOM report lines of kernels before 4.19 that carry the constraint and memcg.
+fn is_legacy_oom_line(msg: &str) -> bool {
+    msg.starts_with("Task in ") || msg.contains("Memory cgroup out of memory") || msg.starts_with("Out of memory")
+}
+
 /// Fold the lines of one OOM report (from "invoked oom-killer" to "Killed process") into OomInfo.
 pub fn parse_oom(lines: &[&str]) -> Option<OomInfo> {
     let mut o = OomInfo::default();
@@ -1205,6 +1283,28 @@ fn fold_oom_line(o: &mut OomInfo, l: &str) -> bool {
     if let Some((who, _)) = l.split_once(" invoked oom-killer") {
         o.invoker = Some(who.trim().to_string()).filter(|s| !s.is_empty());
         return false;
+    }
+    // Kernels before 4.19 (no oom-kill: line): "Task in /A killed as a result of limit of /B"
+    // (printed only for a memory-cgroup OOM) and the "Memory cgroup out of memory:" /
+    // "Out of memory:" prefix of the kill line say which limit was hit.
+    if let Some(rest) = l.trim().strip_prefix("Task in ") {
+        if let Some((task, limit)) = rest.split_once(" killed as a result of limit of ") {
+            o.task_memcg = task.trim().to_string();
+            if o.memcg.is_empty() {
+                o.memcg = limit.trim().to_string();
+            }
+            if o.constraint.is_empty() {
+                o.constraint = "CONSTRAINT_MEMCG".into();
+            }
+        }
+        return false;
+    }
+    if o.constraint.is_empty() {
+        if l.contains("Memory cgroup out of memory") {
+            o.constraint = "CONSTRAINT_MEMCG".into();
+        } else if l.contains("Out of memory:") || l.contains("Out of memory (oom_kill_allocating_task)") {
+            o.constraint = "CONSTRAINT_NONE".into();
+        }
     }
     if let Some(rest) = l.trim().strip_prefix("oom-kill:") {
         let (mut memcg, mut task_memcg, mut have) = (String::new(), String::new(), false);
@@ -1224,6 +1324,9 @@ fn fold_oom_line(o: &mut OomInfo, l: &str) -> bool {
                 }
                 _ => {}
             }
+        }
+        if !task_memcg.is_empty() {
+            o.task_memcg = task_memcg.clone();
         }
         o.memcg = if memcg.is_empty() { task_memcg } else { memcg };
         return have;

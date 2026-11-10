@@ -238,7 +238,10 @@ every user's `fat` reads it: `fat history`, `fat events`, `fat what-happened`, t
 `fat snapshot --fast` opens it read-only and returns the newest sample, so a fleet poll costs one SQLite read
 instead of a live sample. Readers need read access to the database and its `-wal`/`-shm` files. They are
 world-readable by default (umask 022). Process command lines in them are already visible in `/proc` to every user
-unless `/proc` is mounted with `hidepid`; on such hosts set `UMask=0077` in the unit and read as root.
+unless `/proc` is mounted with `hidepid`; on such hosts set `UMask=0077` in the unit and read as root. A fat
+of another version never changes that database: readers (`doctor`, `why`, `history`, `ask`, `fs`, the fleet's
+remote commands) open it read-only and refuse a schema they do not know, and only `fat record` replaces it, after
+moving the old file aside to `history.db.schema-v<N>`.
 
 Save this as `/etc/systemd/system/fat-record.service` (adjust the `ExecStart` path):
 
@@ -702,6 +705,8 @@ events. At most `max_units` units are kept, and inactive units are dropped first
 |---|---|---|
 | `unit_refresh_s` | 10 | list units, walk the cgroup tree and re-read limits this often |
 | `unit_full_refresh_s` | 300 | re-read every non-inactive unit's systemd properties this often |
+| `oom_dedup_s` | 120 | a cgroup or systemd OOM report within this long of a kernel-log kill in the same cgroup is the same kill, counted once |
+| `dstate_max_thread_reads` | 20000 | thread stat files read per sample to find blocked worker threads, only while `/proc/stat` counts more blocked tasks than the main-thread scan found |
 | `flap_restarts`, `flap_window_s` | 3, 600 | a unit with at least this many restarts within this window is flapping |
 | `throttle_warn_pct` | 25 | share of CPU periods throttled that raises a `throttle` event |
 | `exhaustion_warn` | 0.85 | share of `memory.max` or `pids.max` that raises an `exhaustion` event |
@@ -808,7 +813,8 @@ In Kubernetes the equivalent is a DaemonSet with `hostPID: true` and `hostNetwor
 
 ### Keep the flight recorder running
 
-See [Run the flight recorder always-on](#run-the-flight-recorder-always-on-optional) (systemd user unit).
+On a server, use the system unit in [Servers](#servers-system-wide-recorder-with-prometheus-export-linux). On a
+desktop, see [Run the flight recorder always-on](#run-the-flight-recorder-always-on-optional) (systemd user unit).
 
 ### What happened at 03:12, and who did it?
 
@@ -858,9 +864,9 @@ fat fleet hosts                             # the inventory, no network
 fleet: 120 hosts · 118 ok · 2 not polled · 2.1s (concurrency 64)
 
 findings across hosts:
-  CRIT  Disk /var is #% full: 3 hosts [web-07, web-12, db-02]
+  CRIT  Disk /var is #% full: 3 hosts [web-07, web-12, db-02] (worst: web-07: Disk /var is 99% full)
   warn  not polled: auth: 1 host [cache-03]
-  warn  postgres is writing #M/s: 2 hosts [db-01, db-02]
+  warn  postgres is writing #M/s: 2 hosts [db-01, db-02] (worst: db-01: postgres is writing 180M/s)
 
 outliers (far from their group's median):
   web-07               mem_pct                94  (group web median 41, z 6.2)
@@ -878,14 +884,24 @@ db-01                               fat=/opt/fat/bin/fat  groups=db
 
 **ssh.** fat runs your `ssh` and leaves everything about reaching a host (users, ports, keys, jump hosts, proxies,
 certificates) to your ssh config: the destination is passed verbatim and fat adds no proxy or routing options of
-its own. It adds `BatchMode=yes` (never prompts), `ConnectTimeout`, connection sharing (`ControlMaster=auto`,
-socket in `$XDG_RUNTIME_DIR/fat/ssh` or `~/.cache/fat/ssh`, `ControlPersist`) and `-C`; all of these are
-configurable, and `ssh_options` you set take precedence. The remote command is `fat snapshot --json --fast`:
+its own. It adds `BatchMode=yes` (never prompts), `ConnectTimeout` and `-C`; all of these are configurable, and
+`ssh_options` you set take precedence. Connection sharing is left to your ssh config unless you set
+`control_master = true`: fat then adds `ControlMaster=auto` (socket in `$XDG_RUNTIME_DIR/fat/ssh` or
+`~/.cache/fat/ssh`) and `ControlPersist`, which override your own multiplexing settings and keep one ssh process
+per polled host resident for `control_persist`, so its cost grows with inventory size. Each remote fat gets
+`FAT_DEADLINE_S=<command_timeout_s>` and ends itself then, since killing the local ssh does not stop it (a
+`fat_path` through sudo drops that variable). A host whose poll timed out is skipped for `timeout_backoff_s`, so a
+host whose `/proc` reads hang does not collect a stuck fat per refresh. The remote command is `fat snapshot --json --fast`:
 one SQLite read when the host runs the recorder, a ~0.6 s live sample otherwise. Older remote fats without
 `--fast` get a plain `fat snapshot --json`. Findings are computed locally, so every host gets this fat's rules.
 
+Numbers that are values are merged as `#` (names keep theirs: `/data1` and `/data2` stay apart), and the worst
+host's own line is shown with its value; `--json` has it in `worst`.
+
 **Errors are structured**: `unreachable`, `auth`, `host-key`, `fat-missing`, `version`, `timeout`, `too-large`,
-`bad-output`, `remote-error`, each with a hint. fat never accepts host keys for you.
+`bad-output`, `remote-error`, each with a hint. `auth`, `host-key` and `unreachable` are reported only when ssh
+itself failed (exit status 255); a "Permission denied" from the remote shell or fat is a `remote-error`. fat never
+accepts host keys for you.
 
 **Read-only.** The fleet runs only `snapshot`, `doctor`, `why`, `ports`, `services`, `kernel`, `events`,
 `what-happened`, `history` and `fs` on remote hosts. There are no fleet-wide actions. One reversible action on
@@ -908,7 +924,7 @@ they arrive. Every limit is a config value:
 concurrency           = 64      # parallel ssh sessions; bounded by your fd/process limits and sshd MaxStartups
 connect_timeout_s     = 5
 command_timeout_s     = 20      # per host: connect + run + transfer
-control_master        = true    # reuse connections between polls
+control_master        = false   # true: fat's own ControlMaster/ControlPersist (one resident ssh per polled host)
 control_persist       = "60s"
 compress              = true    # ssh -C
 ssh_options           = []      # e.g. ["ServerAliveInterval=5"]; yours win over fat's
@@ -924,6 +940,7 @@ max_hosts_per_finding = 10
 outlier_min_group     = 5
 outlier_z             = 3.5     # robust z-score (median absolute deviation)
 outlier_min_delta     = 20      # and at least this many points from the median
+timeout_backoff_s     = 300     # skip a host this long after its poll timed out (0 = never)
 
 [fleet.groups]                  # groups by glob, in addition to per-host groups
 web = ["web-*"]
@@ -944,44 +961,50 @@ scripts/build-static.sh x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 #    whichever is available; installs nothing.
 ```
 
-Plain ssh, any number of hosts (`hosts.txt` holds one ssh destination per line; parallelism is up to you):
+Build one binary per architecture you run. `uname -m` names differ from Rust target names on some architectures
+(`armv7l` is `armv7-unknown-linux-musleabihf`, `riscv64` is `riscv64gc-unknown-linux-musl`), so map them. Plain
+ssh, any number of hosts (`hosts.txt` holds one ssh destination per line; parallelism is up to you):
 
 ```sh
 v=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+triple() {  # uname -m -> the musl target build-static.sh names its output after
+  case "$1" in
+    x86_64|aarch64|i686|s390x) echo "$1-unknown-linux-musl" ;;
+    armv7l)  echo armv7-unknown-linux-musleabihf ;;
+    armv6l)  echo arm-unknown-linux-musleabihf ;;
+    riscv64) echo riscv64gc-unknown-linux-musl ;;
+    ppc64le) echo powerpc64le-unknown-linux-musl ;;
+    *) echo "no musl target known for $1" >&2; return 1 ;;
+  esac
+}
 while read -r h; do
-  arch=$(ssh -n "$h" uname -m) &&
-  scp -q "dist/fat-$v-$arch-unknown-linux-musl" "$h:/tmp/fat" &&
+  t=$(triple "$(ssh -n "$h" uname -m)") &&
+  scp -q "dist/fat-$v-$t" "$h:/tmp/fat" &&
   ssh -n "$h" 'sudo install -m755 /tmp/fat /usr/local/bin/fat && rm /tmp/fat'
 done < hosts.txt
 ```
 
-The recorder as a system service (optional; needed for `events`, `what-happened` and fast polls). Run as root it
-writes `/var/lib/fat/history.db`, which every local user's fat reads, so the account fleet logs in with sees it.
-E.g. `/etc/systemd/system/fat-record.service`:
-
-```ini
-[Unit]
-Description=fat flight recorder
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/fat record --server
-Restart=on-failure
-Nice=10
-# A guard at about twice the documented budget, not a tuning knob.
-MemoryHigh=128M
-
-[Install]
-WantedBy=multi-user.target
-```
+The recorder as a system service (optional; needed for `events`, `what-happened` and fast polls) is the hardened
+unit from [Servers](#servers-system-wide-recorder-with-prometheus-export-linux): save it as `fat-record.service` next
+to your playbook or loop and install it on every host. Run as root it writes `/var/lib/fat/history.db`, which every
+local user's fat reads, so the account fleet logs in with sees it. Drop `--export prometheus` from its `ExecStart`
+if nothing scrapes the hosts.
 
 The same with Ansible:
 
 ```yaml
 - hosts: all
   become: true
+  vars:
+    fat_target:   # ansible_architecture -> musl target (build-static.sh output names)
+      x86_64: x86_64-unknown-linux-musl
+      aarch64: aarch64-unknown-linux-musl
+      armv7l: armv7-unknown-linux-musleabihf
+      riscv64: riscv64gc-unknown-linux-musl
+      ppc64le: powerpc64le-unknown-linux-musl
+      s390x: s390x-unknown-linux-musl
   tasks:
-    - copy: { src: "dist/fat-{{ fat_version }}-{{ ansible_architecture }}-unknown-linux-musl", dest: /usr/local/bin/fat, mode: "0755" }
+    - copy: { src: "dist/fat-{{ fat_version }}-{{ fat_target[ansible_architecture] }}", dest: /usr/local/bin/fat, mode: "0755" }
     - copy: { src: fat-record.service, dest: /etc/systemd/system/fat-record.service }
     - systemd: { name: fat-record, enabled: true, state: restarted, daemon_reload: true }
 ```

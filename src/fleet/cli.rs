@@ -418,6 +418,11 @@ fn ago(ms: i64) -> String {
 }
 
 /// Text form of a fleet summary: headline, aggregated findings, outliers, host table.
+/// " (worst: web-03: Disk /var is 99% full)" when a merged line hides differing values.
+fn worst_note(f: &crate::server::FleetFinding) -> String {
+    if f.worst.is_empty() { String::new() } else { format!(" (worst: {})", f.worst) }
+}
+
 pub fn render_summary(s: &FleetSummary, outliers: &[FleetOutlier], sort: &str, top: usize, concurrency: usize) -> String {
     let mut o = String::new();
     o.push_str(&format!(
@@ -431,7 +436,7 @@ pub fn render_summary(s: &FleetSummary, outliers: &[FleetOutlier], sort: &str, t
     if !s.findings.is_empty() {
         o.push_str("\nfindings across hosts:\n");
         for f in &s.findings {
-            o.push_str(&format!("  {:<4}  {}: {} host{} [{}]\n", sev_word(f.severity), f.title, f.count, if f.count == 1 { "" } else { "s" }, host_list(&f.hosts, f.count)));
+            o.push_str(&format!("  {:<4}  {}: {} host{} [{}]{}\n", sev_word(f.severity), f.title, f.count, if f.count == 1 { "" } else { "s" }, host_list(&f.hosts, f.count), worst_note(f)));
         }
     }
     if !outliers.is_empty() {
@@ -479,7 +484,7 @@ fn render_doctor(p: &FleetPoll) -> String {
     let s = &p.summary;
     o.push_str(&format!("fleet doctor: {} hosts · {} ok · {} not polled · {:.1}s\n", s.total, s.ok, s.unreachable, s.elapsed_ms as f64 / 1000.0));
     for f in &s.findings {
-        o.push_str(&format!("  {:<4}  {}: {} [{}]\n", sev_word(f.severity), f.title, f.count, host_list(&f.hosts, f.count)));
+        o.push_str(&format!("  {:<4}  {}: {} [{}]{}\n", sev_word(f.severity), f.title, f.count, host_list(&f.hosts, f.count), worst_note(f)));
     }
     let health: std::collections::HashMap<&str, u8> = s.hosts.iter().map(|h| (h.name.as_str(), h.health)).collect();
     let mut per: Vec<&(String, Vec<Finding>)> = p.findings.iter().filter(|(_, f)| f.iter().any(|x| x.severity != "info")).collect();
@@ -694,7 +699,9 @@ fn exact_host(cfg: &Config, args: &Value) -> anyhow::Result<Target> {
 }
 
 /// MCP `host_snapshot`: one host's state, trimmed for an agent (top processes, failed units,
-/// kernel health, locally computed findings).
+/// kernel health, locally computed findings). Command lines are redacted (passwords, tokens,
+/// credentials in URLs) before they reach the agent: a remote fat usually sees every user's
+/// processes.
 pub fn mcp_host_snapshot(cfg: &Config, args: &Value) -> anyhow::Result<Value> {
     let t = exact_host(cfg, args)?;
     let tr = transport(&cfg.fleet);
@@ -708,7 +715,7 @@ pub fn mcp_host_snapshot(cfg: &Config, args: &Value) -> anyhow::Result<Value> {
     procs.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
     let mut by_mem: Vec<&crate::model::Proc> = s.procs.iter().collect();
     by_mem.sort_by_key(|p| std::cmp::Reverse(p.mem));
-    let slim = |p: &&crate::model::Proc| json!({ "pid": p.pid, "name": p.name, "user": p.user, "cpu": p.cpu, "mem": p.mem, "cmd": p.cmd.chars().take(200).collect::<String>() });
+    let slim = |p: &&crate::model::Proc| slim_proc(p);
     Ok(json!({
         "row": p.host,
         "system": s.system,
@@ -721,6 +728,12 @@ pub fn mcp_host_snapshot(cfg: &Config, args: &Value) -> anyhow::Result<Value> {
         "findings": p.findings,
         "meta": s.meta,
     }))
+}
+
+/// One process for an agent: identity, usage and its command line with secrets redacted
+/// (truncated after redaction would cut a secret's marker, so redact first).
+fn slim_proc(p: &crate::model::Proc) -> Value {
+    json!({ "pid": p.pid, "name": p.name, "user": p.user, "cpu": p.cpu, "mem": p.mem, "cmd": crate::ask::redact_cmd(&p.cmd).chars().take(200).collect::<String>() })
 }
 
 /// MCP `host_what_happened`.
@@ -749,6 +762,15 @@ pub fn mcp_host_what_happened(cfg: &Config, args: &Value) -> anyhow::Result<Valu
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// Remote command lines reach an agent only redacted.
+    #[test]
+    fn host_snapshot_procs_are_redacted() {
+        let p = crate::model::Proc { pid: 7, name: "mysql".into(), cmd: "mysql --password=hunter2 -h db-01".into(), ..Default::default() };
+        let v = slim_proc(&p);
+        let c = v["cmd"].as_str().unwrap();
+        assert!(!c.contains("hunter2") && c.contains("mysql"), "{c}");
+    }
 
     #[derive(Parser)]
     struct T {
@@ -811,7 +833,7 @@ mod tests {
             ok: 2,
             unreachable: 1,
             hosts: vec![h("web-01", 50, 10.0), h("web-02", 90, 80.0), FleetHost { name: "db-01".into(), error: Some("auth: denied".into()), ..Default::default() }],
-            findings: vec![crate::server::FleetFinding { title: "Disk / is #% full".into(), severity: Severity::Warn, count: 12, hosts: vec!["web-01".into(), "web-02".into()] }],
+            findings: vec![crate::server::FleetFinding { title: "Disk / is #% full".into(), severity: Severity::Warn, count: 12, hosts: vec!["web-01".into(), "web-02".into()], ..Default::default() }],
             ..Default::default()
         };
         let out = render_summary(&s, &[], "cpu", 0, 64);

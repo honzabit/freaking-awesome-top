@@ -128,6 +128,10 @@ struct Track {
     /// one emitted and the restarts seen since (emitted at most once per spike_cooldown_s).
     last_restart_ev: Option<Ts>,
     held_restarts: u32,
+    /// An OOM kill was already reported for this unit's current run (from its cgroup's
+    /// memory.events), so systemd's later Result=oom-kill for the same kill is not a second one.
+    /// Cleared when the unit starts again.
+    oom_this_run: bool,
     pids: HashSet<u32>,
     first_seen: Ts,
     last_seen: Ts,
@@ -429,12 +433,15 @@ impl Services {
                 e.value = Some(n as f64);
                 departed.push(e);
             }
+            // A unit last seen failed leaves the list when it is cleaned up (`systemctl
+            // reset-failed`, garbage collection of a transient unit): its failure was recorded
+            // when it entered the failed state, so the cleanup is not another event.
             if let Some(last) = &t.last
                 && !baseline
+                && last.state != "failed"
                 && (last.kind != UnitKind::Systemd || !last.name.ends_with(".scope"))
             {
-                let (kind, sev, verb) = if last.state == "failed" { (EventKind::UnitFailed, Severity::Warn, "failed") } else { (EventKind::UnitStop, Severity::Info, "went away") };
-                departed.push(event(now, kind, sev, last, format!("{} {verb}", last.name), "cgroup"));
+                departed.push(event(now, EventKind::UnitStop, Severity::Info, last, format!("{} went away", last.name), "cgroup"));
             }
         }
         self.pending.extend(departed);
@@ -724,13 +731,18 @@ impl Services {
             // A unit killed by the OOM killer usually dies between two samples and its cgroup
             // (with memory.events) goes with it; systemd still reports Result=oom-kill.
             let result_oom = u.result == "oom-kill" && (restarted > 0 || (u.state == "failed" && prev_state != "failed"));
-            if !cgroup_oom && result_oom {
+            if !cgroup_oom && result_oom && !t.oom_this_run {
                 let lim = u.mem_limit.map(|l| format!(" (limit {})", human(l))).unwrap_or_default();
                 let mut e = event(now, EventKind::OomKill, Severity::Crit, u, format!("{} was OOM-killed{lim}", u.name), src);
                 e.extra.insert("cgroup".into(), u.cgroup.clone());
                 ev.push(e);
             }
+            // The kill result_oom reports belongs to the run that ended; a new run starts clean.
+            if result_oom || restarted > 0 || (matches!(u.state.as_str(), "active" | "activating") && prev_state != u.state) {
+                t.oom_this_run = false;
+            }
             if cgroup_oom {
+                t.oom_this_run = true;
                 let n = u.oom_kills - t.oom_kills;
                 let lim = u.mem_limit.map(|l| format!(" of its {} limit", human(l))).unwrap_or_default();
                 let mut e = event(now, EventKind::OomKill, Severity::Crit, u, format!("{n} process(es) OOM-killed in {} (memory {}{lim})", u.name, human(u.mem.max(u.mem_peak.unwrap_or(0)))), "cgroup");
@@ -1324,13 +1336,36 @@ pub fn cli(cfg: &ServerCfg, failed: bool, kind: Option<&str>, json: bool) -> any
         None => None,
     };
     let (units, notes) = sample_once(cfg);
+    let total = units.len();
     let units = filter(units, failed, kind);
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "units": units, "notes": notes }))?);
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "units": units, "total_units": total, "notes": notes }))?);
     } else {
-        print!("{}", render(&units, &notes));
+        let what = match (failed, kind) {
+            (true, Some(k)) => format!("failed or flapping {} units", k.as_str()),
+            (true, None) => "failed or flapping units".to_string(),
+            (false, Some(k)) => format!("{} units", k.as_str()),
+            (false, None) => String::new(),
+        };
+        print!("{}", render_filtered(&units, total, &what, &notes));
     }
     Ok(())
+}
+
+/// [`render`] of a filtered list: says what was filtered out of how many, and prints no empty
+/// table, so "nothing failed" never reads as "fat found no units".
+pub fn render_filtered(units: &[Unit], total: usize, what: &str, notes: &[String]) -> String {
+    if what.is_empty() {
+        return render(units, notes);
+    }
+    if units.is_empty() {
+        let mut out = format!("no {what} ({total} units in all)\n");
+        for n in notes {
+            out.push_str(&format!("note: {n}\n"));
+        }
+        return out;
+    }
+    format!("{} {what} of {total} units\n{}", units.len(), render(units, notes))
 }
 
 #[cfg(test)]

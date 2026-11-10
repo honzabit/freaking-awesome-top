@@ -1021,8 +1021,8 @@ pub(crate) mod tests {
             unreachable: hosts.iter().filter(|h| !h.ok).count(),
             hosts,
             findings: vec![
-                FleetFinding { title: "disk /var almost full".into(), severity: Severity::Crit, count: crit.len(), hosts: crit },
-                FleetFinding { title: "a unit is flapping".into(), severity: Severity::Warn, count: 2, hosts: vec!["web-0001".into(), "web-0002".into()] },
+                FleetFinding { title: "disk /var almost full".into(), severity: Severity::Crit, count: crit.len(), hosts: crit, ..Default::default() },
+                FleetFinding { title: "a unit is flapping".into(), severity: Severity::Warn, count: 2, hosts: vec!["web-0001".into(), "web-0002".into()], ..Default::default() },
             ],
         };
         a.fleet_done(summary);

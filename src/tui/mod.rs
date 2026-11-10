@@ -266,7 +266,11 @@ fn spawn_sampler(cfg: Config, profile: crate::server::Profile, tx: Sender<Msg>, 
                 return;
             }
         };
-        let mut hist = guarded(|| History::open(cfg.history_path.as_deref())).ok().and_then(Result::ok);
+        // The TUI may start over a per-user DB of another fat version (kept aside), never the
+        // shared system recorder's.
+        let may_reset = History::resolve(cfg.history_path.as_deref()) != std::path::Path::new(crate::history::SYSTEM_DB);
+        let mut hist =
+            guarded(|| History::open_recorder(cfg.history_path.as_deref(), may_reset)).ok().and_then(Result::ok);
         if server.is_some()
             && let Some(h) = hist.as_mut()
         {
@@ -373,7 +377,30 @@ fn finding_starts(findings: &[Finding], snap: &Snapshot) -> HashMap<u32, u64> {
 /// How long a spikes scan for the same zoom span is reused (spikes() reads every raw row).
 const SPIKES_TTL: Duration = Duration::from_secs(30);
 
-fn spawn_history(hist: Option<History>, tx: Sender<Msg>) -> Sender<HistReq> {
+/// Kernel-log events the Events tab and the OOM/24h header merge with the recorder's, so a
+/// TUI without a system recorder still shows the OOM kills `fat kernel` lists. Re-read at most
+/// every [`KMSG_TTL`].
+struct KernelLogCache {
+    read: Box<dyn Fn(Ts) -> anyhow::Result<Vec<crate::server::Event>> + Send>,
+    /// (read at, since, events)
+    cached: Option<(Instant, Ts, Vec<crate::server::Event>)>,
+}
+
+const KMSG_TTL: Duration = Duration::from_secs(30);
+
+impl KernelLogCache {
+    fn events(&mut self, from: Ts, to: Ts) -> Vec<crate::server::Event> {
+        let fresh = self.cached.as_ref().is_some_and(|(at, since, _)| at.elapsed() < KMSG_TTL && *since <= from);
+        if !fresh {
+            let since = from.min(now_ms() - 86_400_000);
+            let got = guarded(|| (self.read)(since)).ok().and_then(Result::ok).unwrap_or_default();
+            self.cached = Some((Instant::now(), since, got));
+        }
+        self.cached.as_ref().map(|(_, _, v)| v.iter().filter(|e| e.ts >= from && e.ts <= to).cloned().collect()).unwrap_or_default()
+    }
+}
+
+fn spawn_history(hist: Option<History>, tx: Sender<Msg>, mut klog: Option<KernelLogCache>) -> Sender<HistReq> {
     let (req_tx, req_rx) = mpsc::channel::<HistReq>();
     // If the thread can't start, requests go nowhere and views fall back to live data.
     let _ = thread::Builder::new().name("fat-history".into()).spawn(move || {
@@ -402,14 +429,26 @@ fn spawn_history(hist: Option<History>, tx: Sender<Msg>) -> Sender<HistReq> {
                 }
             }
             if let Some((from, to)) = events {
-                let got = hist.as_ref().and_then(|h| guarded(|| crate::server::incident::timeline(h, from, to, &[])).ok()?.ok());
+                let mut got = hist.as_ref().and_then(|h| guarded(|| crate::server::incident::timeline(h, from, to, &[])).ok()?.ok());
+                if let Some(k) = klog.as_mut() {
+                    got = Some(crate::server::incident::merge_events(got.unwrap_or_default(), k.events(from, to)));
+                }
                 if tx.send(Msg::Events(from, got)).is_err() {
                     return;
                 }
             }
             if counts {
-                let from = now_ms() - 86_400_000;
-                let n = hist.as_ref().and_then(|h| guarded(|| h.event_count(crate::server::EventKind::OomKill, from)).ok()?.ok());
+                let (from, to) = (now_ms() - 86_400_000, now_ms());
+                let oom = [crate::server::EventKind::OomKill];
+                let n = match klog.as_mut() {
+                    // Recorder and kernel log together, each kill once.
+                    Some(k) => {
+                        let rec = hist.as_ref().and_then(|h| guarded(|| crate::server::incident::timeline(h, from, to, &oom)).ok()?.ok()).unwrap_or_default();
+                        let kev: Vec<_> = k.events(from, to).into_iter().filter(|e| e.kind == oom[0]).collect();
+                        Some(crate::server::incident::merge_events(rec, kev).len() as u64)
+                    }
+                    None => hist.as_ref().and_then(|h| guarded(|| h.event_count(oom[0], from)).ok()?.ok()),
+                };
                 if tx.send(Msg::Counts(n)).is_err() {
                     return;
                 }
@@ -1086,7 +1125,9 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
     app.history_ok = hist.is_some();
     app.configured_hosts = cfg.hosts.len();
     app.set_profile(profile, cfg.server.clone(), cfg.fleet.tui_refresh_s);
-    let hist_tx = spawn_history(hist, tx.clone());
+    let klog = (profile == crate::server::Profile::Server && cfg.server.kmsg && cfg!(target_os = "linux"))
+        .then(|| KernelLogCache { read: Box::new(|since| crate::server::kernel::read_kmsg_since(Some(since))), cached: None });
+    let hist_tx = spawn_history(hist, tx.clone(), klog);
     let inventory: Inventory = Arc::default();
     spawn_inventory(cfg.clone(), inventory.clone(), tx.clone());
     let transport: Arc<dyn Transport> = Arc::new(fanout::SshTransport { cfg: cfg.fleet.clone() });
@@ -1186,6 +1227,37 @@ mod tests {
         assert_eq!(m.get(&pid), Some(&s.procs[0].start_time));
     }
 
+    /// Without a recorder, the OOM/24h header and the Events tab still show the kernel log's
+    /// OOM kills.
+    #[test]
+    fn history_thread_merges_kernel_log() {
+        let kill = now_ms() - 3_600_000;
+        let read = move |_since: Ts| -> anyhow::Result<Vec<crate::server::Event>> {
+            Ok(vec![crate::server::Event {
+                ts: kill,
+                kind: crate::server::EventKind::OomKill,
+                subject: "pid:42".into(),
+                source: "kmsg".into(),
+                ..Default::default()
+            }])
+        };
+        let (tx, rx) = mpsc::channel();
+        let req = spawn_history(None, tx, Some(KernelLogCache { read: Box::new(read), cached: None }));
+        req.send(HistReq::Counts).unwrap();
+        req.send(HistReq::Events { from: kill - 60_000, to: now_ms() }).unwrap();
+        let (mut counts, mut events) = (None, None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (counts.is_none() || events.is_none()) && Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Msg::Counts(n)) => counts = Some(n),
+                Ok(Msg::Events(_, v)) => events = Some(v),
+                _ => {}
+            }
+        }
+        assert_eq!(counts, Some(Some(1)));
+        assert_eq!(events.flatten().map(|v| v.len()), Some(1));
+    }
+
     #[test]
     fn history_thread_serves_timeline_past_and_why() {
         let path = std::env::temp_dir().join(format!("fat-tui-hist-{}-{}.db", std::process::id(), now_ms()));
@@ -1197,7 +1269,7 @@ mod tests {
             h.record(&s).unwrap();
         }
         let (tx, rx) = mpsc::channel();
-        let req = spawn_history(Some(h), tx);
+        let req = spawn_history(Some(h), tx, None);
         let last_ts = s.ts;
         // A burst of time-travel requests: the newest must win, older ones may be skipped.
         for ts in (s.ts - 4000..=last_ts).step_by(1000) {

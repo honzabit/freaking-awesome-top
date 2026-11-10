@@ -256,6 +256,16 @@ pub struct ServerCfg {
     /// costs systemd and systemctl about 1 ms, so every 5 minutes keeps it negligible on hosts
     /// with thousands of units.
     pub unit_full_refresh_s: u64,
+    /// One OOM kill is seen by up to three sources: the kernel log, the unit's cgroup
+    /// memory.events and systemd's Result=oom-kill. A cgroup or systemd OOM event matching a
+    /// kernel-log kill in the same cgroup within this many seconds is the same kill and is not
+    /// recorded again. Long enough for systemd to notice the death and for slow property
+    /// refreshes (`unit_refresh_s`), short next to how often a unit can really be re-killed.
+    pub oom_dedup_s: u64,
+    /// Thread stat files read per sample, at most, to find blocked worker threads (only while
+    /// /proc/stat counts more blocked tasks than the main-thread scan found). Bounds the cost
+    /// on hosts with very many threads; 20000 small procfs reads take tens of milliseconds.
+    pub dstate_max_thread_reads: usize,
 }
 
 impl Default for ServerCfg {
@@ -284,12 +294,15 @@ impl Default for ServerCfg {
             fs_scan: false,
             throttle_warn_pct: 25.0,
             unit_full_refresh_s: 300,
+            oom_dedup_s: 120,
+            dstate_max_thread_reads: 20_000,
         }
     }
 }
 
-/// `[fleet]` table. Fleet size is never assumed: concurrency and timeouts bound the cost of
-/// one poll whatever the host count.
+/// `[fleet]` table. Fleet size is never assumed: concurrency and timeouts bound the in-flight
+/// cost of one poll whatever the host count (`control_master`, off by default, is the one
+/// option whose resident cost grows with the hosts polled).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct FleetCfg {
@@ -301,12 +314,18 @@ pub struct FleetCfg {
     /// Hard wall-clock limit per remote command (connect + run + transfer), seconds.
     pub command_timeout_s: u64,
     /// Add `ControlMaster=auto`, `ControlPath` (in fat's runtime dir) and `ControlPersist` so
-    /// repeated polls reuse connections. Off = plain ssh. The operator's ssh_config still applies
-    /// either way (fat never adds ProxyJump or similar).
+    /// repeated polls reuse connections. Off by default: plain ssh, so connection sharing is
+    /// whatever the operator's own ssh_config sets (fat never adds ProxyJump or similar). When
+    /// on, these options override any ControlMaster/ControlPath/ControlPersist in ssh_config, and
+    /// every host polled keeps one ssh master process here (and a session on the host) for
+    /// `control_persist` after its last use: the resident cost grows with the number of hosts
+    /// polled, not with `concurrency`. Enable it for inventories well inside your per-user
+    /// process limit.
     pub control_master: bool,
     /// ssh `ControlPersist` value.
     pub control_persist: String,
-    /// Extra `-o` options appended verbatim (operator-chosen).
+    /// Extra `-o` options passed verbatim (operator-chosen), placed before fat's own so they win
+    /// (ssh keeps the first value it sees for an option).
     pub ssh_options: Vec<String>,
     /// Optional inventory file: one host per line, `name [ssh=DEST] [fat=PATH] [groups=a,b]
     /// [tags=x,y]`, `#` comments.
@@ -348,6 +367,12 @@ pub struct FleetCfg {
     /// ...and it must also differ from the group median by at least this many percentage
     /// points, so a near-uniform group (MAD ~ 0) does not flag 1-point differences.
     pub outlier_min_delta: f32,
+    /// A host whose poll timed out is not polled again by fleet summaries (CLI, Fleet tab, MCP)
+    /// for this many seconds; it is listed as `timeout` meanwhile. The remote fat is told to
+    /// end itself after `command_timeout_s`, but one blocked in the kernel (hung storage) cannot,
+    /// so re-polling on every refresh would pile copies onto the host that is already in trouble.
+    /// Five minutes spans many refreshes yet lets a recovered host back soon; 0 disables.
+    pub timeout_backoff_s: u64,
 }
 
 impl Default for FleetCfg {
@@ -356,7 +381,7 @@ impl Default for FleetCfg {
             concurrency: 64,
             connect_timeout_s: 5,
             command_timeout_s: 20,
-            control_master: true,
+            control_master: false,
             control_persist: "60s".into(),
             ssh_options: vec![],
             hosts_file: None,
@@ -373,6 +398,7 @@ impl Default for FleetCfg {
             outlier_min_group: 5,
             outlier_z: 3.5,
             outlier_min_delta: 20.0,
+            timeout_backoff_s: 300,
         }
     }
 }
@@ -706,6 +732,8 @@ pub struct OomInfo {
     pub constraint: String,
     /// cgroup whose limit was hit (task_memcg / oom_memcg).
     pub memcg: String,
+    /// cgroup of the killed task ("task_memcg=", or "Task in <cg> killed ..." before 4.19).
+    pub task_memcg: String,
     pub anon_rss_kb: u64,
     pub file_rss_kb: u64,
     pub shmem_rss_kb: u64,
@@ -968,6 +996,10 @@ pub struct FleetFinding {
     pub count: usize,
     /// Affected hosts, worst first, capped by the caller's `max_hosts` (count stays exact).
     pub hosts: Vec<String>,
+    /// When hosts' titles differ in their numbers: the worst host's own title, values intact
+    /// ("web-03: Disk /var is 99% full"). Empty when every host has the identical title.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub worst: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -1036,11 +1068,16 @@ pub type LatestSnapshot = std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc
 pub struct ServerSampler {
     pub services: services::Services,
     pub kernel: kernel::KernelSampler,
+    oom: OomDedup,
 }
 
 impl ServerSampler {
     pub fn new(cfg: &ServerCfg) -> ServerSampler {
-        ServerSampler { services: services::Services::new(cfg), kernel: kernel::KernelSampler::new(cfg) }
+        ServerSampler {
+            services: services::Services::new(cfg),
+            kernel: kernel::KernelSampler::new(cfg),
+            oom: OomDedup::new(cfg.oom_dedup_s),
+        }
     }
 
     /// Fill `snap.units`, `snap.kernel`, `snap.events` (events since the previous fill, sorted
@@ -1050,11 +1087,78 @@ impl ServerSampler {
         snap.units = self.services.sample(&snap.procs);
         snap.kernel = self.kernel.sample(&snap.procs, &snap.units);
         let mut ev = self.services.drain_events();
-        ev.extend(self.kernel.drain_events());
+        let kev = self.kernel.drain_events();
+        self.oom.dedup(&kev, &mut ev);
+        ev.extend(kev);
         ev.sort_by_key(|e| e.ts);
         snap.events = ev;
         snap.meta = Some(SnapMeta::live(Profile::Server));
     }
+}
+
+/// Drops cgroup/systemd OOM events that repeat a kernel-log OOM kill (see
+/// [`ServerCfg::oom_dedup_s`]), so one kill counts once in doctor, fleet and exported totals.
+struct OomDedup {
+    window_ms: Ts,
+    /// Recent kernel-log kills not yet matched: (ts, victim's cgroup, unit name).
+    kills: std::collections::VecDeque<(Ts, String, Option<String>)>,
+}
+
+impl OomDedup {
+    fn new(window_s: u64) -> OomDedup {
+        OomDedup { window_ms: (window_s * 1000) as Ts, kills: Default::default() }
+    }
+
+    /// Remember the kernel-log kills in `kernel`; remove (or reduce) the unit-level OOM events
+    /// in `units` that they already account for.
+    fn dedup(&mut self, kernel: &[Event], units: &mut Vec<Event>) {
+        for e in kernel.iter().filter(|e| e.kind == EventKind::OomKill && e.source == "kmsg") {
+            let cg = e.extra.get("task_memcg").or_else(|| e.extra.get("memcg")).cloned().unwrap_or_default();
+            self.kills.push_back((e.ts, cg, e.unit.clone()));
+        }
+        let newest = self.kills.iter().map(|k| k.0).chain(units.iter().map(|e| e.ts)).max().unwrap_or(0);
+        while self.kills.front().is_some_and(|k| k.0 < newest - self.window_ms) {
+            self.kills.pop_front();
+        }
+        units.retain_mut(|e| {
+            if e.kind != EventKind::OomKill || e.source == "kmsg" {
+                return true;
+            }
+            let n = e.value.map_or(1, |v| v.max(1.0) as u64);
+            let cg = e.extra.get("cgroup").map(String::as_str).unwrap_or("");
+            let mut matched = 0u64;
+            while matched < n {
+                let hit = self.kills.iter().position(|(ts, kcg, kunit)| {
+                    (ts - e.ts).abs() <= self.window_ms
+                        && (cg_within(kcg, cg) || (kunit.is_some() && kunit.as_deref() == e.unit.as_deref()))
+                });
+                let Some(i) = hit else { break };
+                self.kills.remove(i);
+                matched += 1;
+            }
+            if matched == 0 {
+                return true;
+            }
+            if matched >= n {
+                return false;
+            }
+            let rest = n - matched;
+            e.value = Some(rest as f64);
+            if let Some(tail) = e.detail.strip_prefix(&format!("{n} process(es)")) {
+                e.detail = format!("{rest} process(es){tail}");
+            }
+            true
+        });
+    }
+}
+
+/// True when cgroup path `task` is `unit` or below it. Paths may differ in prefix when the
+/// kernel prints them from outside a cgroup namespace, so `unit` is matched as a path suffix.
+fn cg_within(task: &str, unit: &str) -> bool {
+    let (t, u) = (task.trim_matches('/'), unit.trim_matches('/'));
+    !u.is_empty()
+        && !t.is_empty()
+        && (t == u || t.starts_with(&format!("{u}/")) || t.ends_with(&format!("/{u}")) || t.contains(&format!("/{u}/")))
 }
 
 /// Keep only the processes worth recording in server mode: the union of the top `n` by cpu,
@@ -1081,6 +1185,53 @@ pub fn top_procs<'a>(procs: &'a [Proc], units: &[Unit], n: usize) -> Vec<&'a Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn oom_ev(ts: Ts, subject: &str, source: &str, extra: &[(&str, &str)], value: Option<f64>, detail: &str) -> Event {
+        Event {
+            ts,
+            kind: EventKind::OomKill,
+            severity: Severity::Crit,
+            subject: subject.into(),
+            unit: subject.strip_prefix("unit:").map(str::to_string),
+            pid: None,
+            detail: detail.into(),
+            value,
+            source: source.into(),
+            extra: extra.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    /// One kill reported by the kernel log, the cgroup and systemd is counted once; a cgroup
+    /// report of more kills than the kernel log saw keeps the remainder.
+    #[test]
+    fn oom_sources_dedup() {
+        let mut d = OomDedup::new(120);
+        let k = oom_ev(1000, "pid:42", "kmsg", &[("task_memcg", "/outer/ns/system.slice/x.service")], Some(1e6), "OOM killer killed python3");
+        let mut units = vec![oom_ev(5000, "unit:x.service", "cgroup", &[("cgroup", "/system.slice/x.service")], Some(1.0), "1 process(es) OOM-killed in x.service")];
+        d.dedup(std::slice::from_ref(&k), &mut units);
+        assert!(units.is_empty(), "cgroup report of the logged kill dropped");
+        // systemd's later Result=oom-kill for the same unit: the kill was already consumed, so it
+        // is kept only if no kernel kill remains; here the services layer suppresses it itself.
+        let mut units = vec![oom_ev(7000, "unit:y.service", "systemd", &[("cgroup", "/system.slice/y.service")], None, "y was OOM-killed")];
+        d.dedup(&[], &mut units);
+        assert_eq!(units.len(), 1, "no kernel kill for y: kept");
+        // Three kills in the cgroup, one logged: two remain.
+        let k = oom_ev(10_000, "pid:7", "kmsg", &[("memcg", "/system.slice/z.service")], None, "");
+        let mut units = vec![oom_ev(11_000, "unit:z.service", "cgroup", &[("cgroup", "/system.slice/z.service")], Some(3.0), "3 process(es) OOM-killed in z.service")];
+        d.dedup(&[k], &mut units);
+        assert_eq!(units[0].value, Some(2.0));
+        assert!(units[0].detail.starts_with("2 process(es)"), "{}", units[0].detail);
+        // Outside the window: a different kill.
+        let k = oom_ev(20_000, "pid:8", "kmsg", &[("memcg", "/system.slice/w.service")], None, "");
+        d.dedup(&[k], &mut vec![]);
+        let mut units = vec![oom_ev(20_000 + 121_000, "unit:w.service", "cgroup", &[("cgroup", "/system.slice/w.service")], Some(1.0), "")];
+        d.dedup(&[], &mut units);
+        assert_eq!(units.len(), 1);
+        assert!(cg_within("/a/system.slice/x.service", "/system.slice/x.service"));
+        assert!(cg_within("/system.slice/x.service/child", "/system.slice/x.service"));
+        assert!(!cg_within("/system.slice/x.service2", "/system.slice/x.service"));
+        assert!(!cg_within("/system.slice/x.service", ""));
+    }
 
     #[test]
     fn profile_resolution() {
