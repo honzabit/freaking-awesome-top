@@ -13,8 +13,9 @@ use std::time::Duration;
 
 const API_VERSION: &str = "2026-10-21";
 const API_BETA: &str = "server-side-fallback-2026-07-01";
-const MAX_CONTEXT_BYTES: usize = 20_000;
-const KEY_HINT: &str = "(set ANTHROPIC_API_KEY for richer answers)";
+#[cfg(test)]
+const MAX_CONTEXT_BYTES: usize = crate::llm::DEFAULT_CONTEXT_BYTES;
+const KEY_HINT: &str = "(set ANTHROPIC_API_KEY, or point [ask] at a self-hosted model, for richer answers)";
 
 const SYSTEM_PROMPT: &str = "You are fat's diagnostic assistant. fat is a process monitor (like htop) \
 for macOS and Linux. You receive a JSON digest of one machine snapshot (system summary, top processes \
@@ -41,8 +42,9 @@ Name the paths and the processes from it; say which evidence backs each claim. \
 Format the answer as GitHub-flavored Markdown for a terminal: short paragraphs, `-` bullet lists, **bold** for the \
 key finding, `code` for commands, paths, pids and units. No tables and no headings above level 3.";
 
-/// Answer a question. Uses Claude API if ANTHROPIC_API_KEY is set (cfg.ask.enabled), else a
-/// rule-based answer built from findings. Never panics; errors become explanatory text.
+/// Answer a question. Uses the model `[ask]` configures (the Claude API with
+/// ANTHROPIC_API_KEY by default, or a self-hosted server), else a rule-based answer built
+/// from findings. Never panics; errors become explanatory text.
 pub fn ask(
     question: &str,
     snap: &Snapshot,
@@ -50,24 +52,39 @@ pub fn ask(
     storage: Option<&Storage>,
     cfg: &crate::config::AskCfg,
 ) -> String {
-    let key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.trim().is_empty());
-    match key {
-        Some(key) if cfg.enabled => match call_claude(question, snap, findings, storage, &cfg.model, key.trim()) {
-            Ok(answer) => answer,
-            Err(e) => format!("{e}\n\nOffline answer instead:\n{}", offline_answer(question, snap, findings, storage)),
-        },
-        _ => offline_answer(question, snap, findings, storage),
+    let offline = || offline_answer(question, snap, findings, storage);
+    if !cfg.enabled {
+        return offline();
+    }
+    match crate::llm::resolve(cfg) {
+        Ok(ep) if ep.usable() => {
+            let body = request_json(question, snap, findings, storage, &ep);
+            let headers: &[(&str, &str)] = match ep.provider {
+                crate::llm::Provider::Anthropic => &[("anthropic-version", API_VERSION), ("anthropic-beta", API_BETA)],
+                _ => &[],
+            };
+            match ep.send(&body, headers) {
+                Ok(answer) => answer,
+                Err(e) => format!("{e}\n\nOffline answer instead:\n{}", offline()),
+            }
+        }
+        Ok(_) => offline(),
+        Err(e) => format!("{e}\n\nOffline answer instead:\n{}", offline()),
     }
 }
 
 // ---------- Claude API ----------
 
-pub(crate) fn request_body(question: &str, context: &str, model: &str) -> Value {
-    let model = if model.trim().is_empty() { "claude-opus-5-5" } else { model };
+/// The user turn: the redacted question after the digest.
+fn user_content(question: &str, context: &str) -> String {
     let (home, user) = identity();
     let mut q = Value::String(question.trim().to_string());
     redact_value(&mut q, home.as_deref(), user.as_deref());
-    let question = q.as_str().unwrap_or_default().to_string();
+    format!("<snapshot>\n{context}\n</snapshot>\n\nQuestion: {}", q.as_str().unwrap_or_default())
+}
+
+pub(crate) fn request_body(question: &str, context: &str, model: &str) -> Value {
+    let model = if model.trim().is_empty() { crate::llm::DEFAULT_CLAUDE_MODEL } else { model };
     json!({
         "model": model,
         "max_tokens": 16000,
@@ -76,26 +93,25 @@ pub(crate) fn request_body(question: &str, context: &str, model: &str) -> Value 
         "system": SYSTEM_PROMPT,
         "messages": [{
             "role": "user",
-            "content": format!("<snapshot>\n{context}\n</snapshot>\n\nQuestion: {question}"),
+            "content": user_content(question, context),
         }],
     })
 }
 
-/// The exact bytes `ask` would POST for this question (redacted; see [`redact`]).
+/// The exact bytes `ask` would POST to `ep` for this question (redacted; see [`redact`]).
 pub fn request_json(
     question: &str,
     snap: &Snapshot,
     findings: &[Finding],
     storage: Option<&Storage>,
-    model: &str,
+    ep: &crate::llm::Endpoint,
 ) -> String {
-    request_body(question, &build_context(snap, findings, storage), model).to_string()
-}
-
-/// Where the request goes.
-pub fn endpoint() -> String {
-    let base = std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".into());
-    format!("{}/v1/messages", base.trim_end_matches('/'))
+    let context = build_context_for(snap, findings, storage, ep.context_bytes, ep.minimal);
+    match ep.provider {
+        crate::llm::Provider::Anthropic => request_body(question, &context, &ep.model),
+        _ => ep.body(SYSTEM_PROMPT, &user_content(question, &context)),
+    }
+    .to_string()
 }
 
 /// `fat ask --dry-run`: the request body that would be sent, and nothing is sent.
@@ -106,45 +122,22 @@ pub fn dry_run(
     storage: Option<&Storage>,
     cfg: &crate::config::AskCfg,
 ) -> (String, String) {
-    let key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.trim().is_empty());
-    let note = match (key.is_some(), cfg.enabled) {
-        (true, true) => format!("dry run: this body would be POSTed to {} (headers x-api-key, anthropic-version {API_VERSION}); nothing was sent", endpoint()),
-        (_, false) => "dry run: [ask] enabled = false, so `fat ask` answers offline and sends nothing; this is what it would send if enabled".to_string(),
-        (false, true) => "dry run: ANTHROPIC_API_KEY is not set, so `fat ask` answers offline and sends nothing; this is what it would send with a key".to_string(),
+    let ep = match crate::llm::resolve(cfg) {
+        Ok(ep) => ep,
+        Err(e) => return (String::new(), format!("dry run: {e}; `fat ask` answers offline and sends nothing")),
     };
-    (request_json(question, snap, findings, storage, &cfg.model), note)
-}
-
-fn call_claude(
-    question: &str,
-    snap: &Snapshot,
-    findings: &[Finding],
-    storage: Option<&Storage>,
-    model: &str,
-    key: &str,
-) -> Result<String, String> {
-    // Sent as these exact bytes, so `fat ask --dry-run` shows precisely what leaves the machine.
-    let body = request_json(question, snap, findings, storage, model);
-    let url = endpoint();
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(90)).build();
-    let resp = agent
-        .post(&url)
-        .set("x-api-key", key)
-        .set("anthropic-version", API_VERSION)
-        .set("anthropic-beta", API_BETA)
-        .set("content-type", "application/json")
-        .send_string(&body);
-    match resp {
-        Ok(r) => {
-            let v: Value = r.into_json().map_err(|e| format!("Claude API returned unreadable JSON: {e}"))?;
-            parse_response(&v)
-        }
-        Err(ureq::Error::Status(code, r)) => {
-            let text = r.into_string().unwrap_or_default();
-            Err(http_error_message(code, &text))
-        }
-        Err(ureq::Error::Transport(t)) => Err(format!("Could not reach the Claude API: {t}")),
-    }
+    let to = format!("{} ({})", ep.url, ep.describe());
+    let note = match (cfg.enabled, ep.usable()) {
+        (false, _) => format!(
+            "dry run: [ask] enabled = false, so `fat ask` answers offline and sends nothing; this is what it would send to {to}"
+        ),
+        (true, false) => format!(
+            "dry run: {} is not set, so `fat ask` answers offline and sends nothing; this is what it would send to {to}",
+            ep.key_env
+        ),
+        (true, true) => format!("dry run: this body would be POSTed to {to}; nothing was sent"),
+    };
+    (request_json(question, snap, findings, storage, &ep), note)
 }
 
 /// Turn a non-2xx response into "Claude API error 401 (authentication_error): invalid x-api-key".
@@ -702,20 +695,123 @@ fn context_with(
 
 /// Compact JSON digest of the snapshot, kept under ~20KB by shrinking lists if needed.
 /// Every string in it is redacted (secrets, home directory, user name) before it is measured.
+#[cfg(test)]
 pub fn build_context(snap: &Snapshot, findings: &[Finding], storage: Option<&Storage>) -> String {
+    build_context_for(snap, findings, storage, MAX_CONTEXT_BYTES, false)
+}
+
+/// [`build_context`] bounded to `max_bytes`; `minimal` leaves out command lines, cuts paths
+/// to two components and replaces the hostname and container names.
+pub fn build_context_for(
+    snap: &Snapshot,
+    findings: &[Finding],
+    storage: Option<&Storage>,
+    max_bytes: usize,
+    minimal: bool,
+) -> String {
     let (home, user) = identity();
     let render = |mut v: Value| {
         redact_value(&mut v, home.as_deref(), user.as_deref());
+        if minimal {
+            minimize(&mut v, snap);
+        }
         v.to_string()
     };
-    for (scale, cmd_len) in [(4, 80), (4, 40), (3, 0), (2, 0), (1, 0)] {
+    let steps: &[(usize, usize)] =
+        if minimal { &[(4, 0), (3, 0), (2, 0), (1, 0)] } else { &[(4, 80), (4, 40), (3, 0), (2, 0), (1, 0)] };
+    for &(scale, cmd_len) in steps {
         let s = render(context_with(snap, findings, storage, scale, cmd_len));
-        if s.len() <= MAX_CONTEXT_BYTES {
+        if s.len() <= max_bytes {
             return s;
         }
     }
     let s = render(context_with(snap, &findings[..findings.len().min(3)], storage, 1, 0));
-    s.chars().take(MAX_CONTEXT_BYTES).collect()
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Still too big: drop whole sections, least useful first, so the JSON stays valid.
+    let mut v: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
+    for key in ["ports", "containers", "top_net", "top_power", "top_mem", "storage", "findings", "top_disk"] {
+        if let Some(o) = v.as_object_mut() {
+            o.remove(key);
+        }
+        let t = v.to_string();
+        if t.len() <= max_bytes {
+            return t;
+        }
+    }
+    v.to_string()
+}
+
+/// `detail = "minimal"`: no images or command lines, hostname and container names replaced,
+/// every path cut to its first two components ("/var/lib/…").
+fn minimize(v: &mut Value, snap: &Snapshot) {
+    let mut names: Vec<(String, String)> = Vec::new();
+    for w in [snap.system.hostname.as_str(), snap.host.as_str()] {
+        let short = w.split('.').next().unwrap_or(w);
+        for n in [w, short] {
+            if n.len() >= 3 && n != "local" && !names.iter().any(|(a, _)| a == n) {
+                names.push((n.to_string(), "host".to_string()));
+            }
+        }
+    }
+    for (i, c) in snap.containers.iter().enumerate() {
+        if c.name.len() >= 3 {
+            names.push((c.name.clone(), format!("container-{}", i + 1)));
+        }
+    }
+    // Longest first, so "web-01.example" goes before "web-01".
+    names.sort_by_key(|(n, _)| std::cmp::Reverse(n.len()));
+    fn walk(v: &mut Value, names: &[(String, String)]) {
+        match v {
+            Value::String(s) => {
+                let mut t = short_paths(s);
+                for (from, to) in names {
+                    t = replace_word(&t, from, to);
+                }
+                *s = t;
+            }
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(x, names)),
+            Value::Object(o) => {
+                o.remove("image");
+                o.remove("cmd");
+                o.values_mut().for_each(|x| walk(x, names));
+            }
+            _ => {}
+        }
+    }
+    walk(v, &names);
+}
+
+/// "/var/lib/prometheus/wal/0001" -> "/var/lib/…"; "~/code/app/x" -> "~/code/…".
+fn short_paths(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, tok) in s.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let start = tok.find(['/', '~']).filter(|&j| tok[j..].starts_with('/') || tok[j..].starts_with("~/"));
+        match start {
+            Some(j) => {
+                let (lead, rest) = tok.split_at(j);
+                let cut = rest.trim_end_matches([',', '.', ';', ':', ')', '\'', '"', '`']).len();
+                let (path, trail) = rest.split_at(cut);
+                let parts: Vec<&str> = path.split('/').collect();
+                // ["", "var", "lib", "x"] or ["~", "code", "x"]
+                let keep = if path.starts_with('/') { 3 } else { 2 };
+                out.push_str(lead);
+                if parts.len() > keep && parts[keep..].iter().any(|p| !p.is_empty()) {
+                    out.push_str(&parts[..keep].join("/"));
+                    out.push_str("/…");
+                } else {
+                    out.push_str(path);
+                }
+                out.push_str(trail);
+            }
+            None => out.push_str(tok),
+        }
+    }
+    out
 }
 
 // ---------- storage evidence ----------
@@ -1458,7 +1554,7 @@ mod tests {
             action: Some("pause 500".into()),
         }];
         let q = format!("why is my key {} slow", secrets[0]);
-        let body = request_json(&q, &s, &f, None, "claude-opus-5-5");
+        let body = request_json(&q, &s, &f, None, &crate::llm::resolve(&crate::config::AskCfg::default()).unwrap());
         for sec in secrets {
             if let Some(i) = body.find(sec) {
                 panic!("{sec} leaked into the request: …{}…", &body[i.saturating_sub(120)..(i + 40).min(body.len())]);
@@ -1665,5 +1761,157 @@ mod tests {
         );
         assert!(reuse_storage(&q, vec![], Some(g("/home", now - 600_000, now)), now, 120_000).is_none());
         assert!(reuse_storage("disk?", vec![], None, now, 120_000).is_none());
+    }
+
+    #[test]
+    fn minimal_detail_hides_names_commands_and_deep_paths() {
+        let mut s = snap();
+        s.system.hostname = "db-prod-07.corp.example".into();
+        s.procs[0].cmd = "/usr/bin/postgres -D /srv/pg/data/main".into();
+        let f = vec![Finding {
+            severity: "warn".into(),
+            title: "db-prod-07 is busy".into(),
+            detail: "writes to /srv/pg/data/main/base/16384 from db-prod-07".into(),
+            ..Default::default()
+        }];
+        let full = build_context_for(&s, &f, None, 20_000, false);
+        assert!(full.contains("db-prod-07") && full.contains("/srv/pg/data/main"));
+        let min = build_context_for(&s, &f, None, 20_000, true);
+        assert!(!min.contains("db-prod-07") && !min.contains("corp.example"), "{min}");
+        assert!(!min.contains("postgres -D") && !min.contains("/srv/pg/data"), "{min}");
+        assert!(min.contains("/srv/pg/…") && min.contains("host is busy"), "{min}");
+        serde_json::from_str::<Value>(&min).unwrap();
+        assert_eq!(
+            short_paths("at /var/lib/prometheus/wal and ~/code/app/x, / or /tmp"),
+            "at /var/lib/… and ~/code/…, / or /tmp"
+        );
+    }
+
+    #[test]
+    fn small_digests_stay_valid_json() {
+        let s = snap();
+        let many: Vec<Finding> = (0..200)
+            .map(|i| Finding { title: format!("finding {i}"), detail: "x".repeat(300), ..Default::default() })
+            .collect();
+        for max in [3_000, 6_000, 12_000] {
+            let c = build_context_for(&s, &many, None, max, false);
+            assert!(c.len() <= max, "{} > {max}", c.len());
+            let v: Value = serde_json::from_str(&c).unwrap();
+            assert!(v["system"].is_object());
+        }
+    }
+
+    /// One HTTP exchange on a local port: returns the URL and a handle yielding the request.
+    fn serve_once(reply: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let h = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = c.read(&mut buf).unwrap_or(0);
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if req.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let _ = write!(
+                c,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            String::from_utf8_lossy(&req).into_owned()
+        });
+        (url, h)
+    }
+
+    #[test]
+    fn self_hosted_servers_get_the_digest_and_answer() {
+        let (url, h) =
+            serve_once(r#"{"choices":[{"message":{"content":"**node** (pid 200) is busy."},"finish_reason":"stop"}]}"#);
+        let cfg = crate::config::AskCfg {
+            provider: "openai".into(),
+            url,
+            model: "local-m".into(),
+            local_only: true,
+            ..Default::default()
+        };
+        let a = ask("why slow", &snap(), &findings(), None, &cfg);
+        assert_eq!(a, "**node** (pid 200) is busy.");
+        let req = h.join().unwrap();
+        assert!(req.starts_with("POST /v1/chat/completions "), "{req}");
+        assert!(
+            req.contains("\"model\":\"local-m\"") && req.contains("<snapshot>") && req.contains("Question: why slow")
+        );
+        assert!(!req.to_ascii_lowercase().contains("authorization:"), "no key, no header");
+
+        let (url, h) = serve_once(
+            r#"{"message":{"role":"assistant","content":"<think>x</think>ok"},"done":true,"done_reason":"stop"}"#,
+        );
+        let cfg = crate::config::AskCfg {
+            provider: "ollama".into(),
+            url,
+            model: "qwen3:1.7b".into(),
+            detail: "minimal".into(),
+            ..Default::default()
+        };
+        assert_eq!(ask("why slow", &snap(), &[], None, &cfg), "ok");
+        let req = h.join().unwrap();
+        assert!(req.starts_with("POST /api/chat ") && req.contains("\"num_ctx\":"), "{req}");
+
+        // Unreachable server: the error, then the offline answer.
+        let cfg = crate::config::AskCfg {
+            provider: "openai".into(),
+            url: "http://127.0.0.1:9".into(),
+            model: "m".into(),
+            timeout_s: 3,
+            ..Default::default()
+        };
+        let a = ask("why slow", &snap(), &[], None, &cfg);
+        assert!(
+            a.contains("Could not reach openai · m · http://127.0.0.1:9") && a.contains("Offline answer instead"),
+            "{a}"
+        );
+        // Misconfigured: explained, offline answer.
+        let cfg = crate::config::AskCfg { provider: "ollama".into(), ..Default::default() };
+        assert!(ask("why slow", &snap(), &[], None, &cfg).starts_with("[ask] provider = \"ollama\" needs url"));
+    }
+
+    #[test]
+    fn dry_run_names_the_destination() {
+        let cfg = crate::config::AskCfg {
+            provider: "ollama".into(),
+            url: "http://10.0.0.9:11434".into(),
+            model: "m".into(),
+            ..Default::default()
+        };
+        let (body, note) = dry_run("q", &snap(), &[], None, &cfg);
+        assert!(note.contains("http://10.0.0.9:11434/api/chat") && note.contains("nothing was sent"), "{note}");
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["model"], "m");
+        let (body, note) = dry_run(
+            "q",
+            &snap(),
+            &[],
+            None,
+            &crate::config::AskCfg { provider: "ollama".into(), ..Default::default() },
+        );
+        assert!(body.is_empty() && note.contains("needs url"), "{note}");
     }
 }

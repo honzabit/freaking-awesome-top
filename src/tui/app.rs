@@ -757,6 +757,8 @@ pub struct App {
     pub why: Option<Explanation>,
     pub why_scroll: u16,
     pub ask: AskState,
+    /// Where the current question goes ("ollama · qwen3 · http://…", "offline (…)").
+    pub ask_dest: String,
     ask_seq: u64,
     pub modal: Modal,
     pub status: Option<Status>,
@@ -829,6 +831,7 @@ impl App {
             why: None,
             why_scroll: 0,
             ask: AskState::Idle,
+            ask_dest: String::new(),
             ask_seq: 0,
             modal: Modal::None,
             status: None,

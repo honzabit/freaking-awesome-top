@@ -1673,12 +1673,16 @@ fn draw_ask(f: &mut Frame, app: &App, area: Rect) {
     match &app.ask {
         AskState::Idle => {}
         AskState::Thinking { question, since, .. } => {
-            let r = centered(60.min(area.width.saturating_sub(4)), 5, area);
+            let r = centered(72.min(area.width.saturating_sub(4)), 6, area);
             let spin = SPINNER[((app.now - since).max(0) / 100) as usize % SPINNER.len()];
-            let t = Text::from(vec![
+            let mut lines = vec![
                 Line::from(vec![Span::styled(format!("{spin} thinking… "), Style::default().fg(ACCENT).bold())]),
                 Line::styled(format!("“{question}”"), dim()),
-            ]);
+            ];
+            if !app.ask_dest.is_empty() {
+                lines.push(Line::styled(format!("→ {}", app.ask_dest), dim()));
+            }
+            let t = Text::from(lines);
             f.render_widget(Clear, r);
             f.render_widget(
                 Paragraph::new(t).wrap(Wrap { trim: true }).block(
@@ -1702,6 +1706,7 @@ fn draw_ask(f: &mut Frame, app: &App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(ACCENT))
                 .title(Line::styled(format!(" Ask · {} ", clip(question, 60)), Style::default().bold()))
+                .title(Line::styled(format!(" {} ", clip(&app.ask_dest, 60)), dim()).right_aligned())
                 .title_bottom(Line::styled(" ↑↓ PgUp/PgDn scroll · ? ask again · Esc close ", dim()));
             // The answer is Markdown (the model writes it so); render it, pre-wrapped to the box.
             let lines = super::markdown::render(text, r.width.saturating_sub(2));

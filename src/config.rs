@@ -76,13 +76,47 @@ pub struct HostCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AskCfg {
-    pub model: String,
     pub enabled: bool,
+    /// "anthropic" (default), "openai" (any OpenAI-compatible chat server: LM Studio, vLLM,
+    /// llama.cpp, LocalAI, LiteLLM, Ollama's /v1) or "ollama" (Ollama's own API).
+    /// Env: FAT_ASK_PROVIDER.
+    pub provider: String,
+    /// Server base URL. Empty: the Anthropic API (or ANTHROPIC_BASE_URL). Required for
+    /// "openai" and "ollama". Env: FAT_ASK_URL.
+    pub url: String,
+    /// Model name. Empty: claude-opus-5-5 for "anthropic"; required otherwise. Env: FAT_ASK_MODEL.
+    pub model: String,
+    /// Name of the environment variable holding the API key (the key itself never goes in
+    /// the config). Empty: ANTHROPIC_API_KEY for "anthropic", FAT_ASK_KEY otherwise (optional there).
+    pub key_env: String,
+    /// Refuse to send anything to an address outside loopback / private / link-local networks,
+    /// checked on the addresses the name resolves to when connecting. Env: FAT_ASK_LOCAL_ONLY.
+    pub local_only: bool,
+    /// "full" (default) or "minimal": no command lines, paths cut to two components,
+    /// hostname and container names replaced. Env: FAT_ASK_DETAIL.
+    pub detail: String,
+    /// Upper bound on the machine digest sent, bytes. 0: 20000.
+    pub context_bytes: usize,
+    /// Ollama context window (num_ctx). 0: sized to fit the digest.
+    pub num_ctx: u32,
+    /// Seconds to wait for an answer. 0: 90 for the Anthropic API, 300 for self-hosted servers.
+    pub timeout_s: u64,
 }
 
 impl Default for AskCfg {
     fn default() -> Self {
-        Self { model: "claude-opus-5-5".into(), enabled: true }
+        Self {
+            enabled: true,
+            provider: "anthropic".into(),
+            url: String::new(),
+            model: String::new(),
+            key_env: String::new(),
+            local_only: false,
+            detail: "full".into(),
+            context_bytes: 0,
+            num_ctx: 0,
+            timeout_s: 0,
+        }
     }
 }
 
@@ -139,9 +173,6 @@ impl Config {
         if c.interval_ms < 100 {
             c.interval_ms = 100;
         }
-        if c.ask.model.trim().is_empty() {
-            c.ask.model = AskCfg::default().model;
-        }
         Ok(c)
     }
 }
@@ -159,14 +190,17 @@ mod tests {
         assert_eq!(c.hosts.len(), 1);
         assert_eq!(c.hosts[0].name, "devbox");
         assert!(c.hosts[0].ssh.is_none());
-        assert_eq!(c.ask.model, "claude-opus-5-5");
+        assert_eq!(c.ask.provider, "anthropic");
+        assert!(c.ask.model.is_empty() && c.ask.url.is_empty() && !c.ask.local_only);
     }
 
     #[test]
     fn parse_ask_section() {
         let c = Config::parse("[ask]\nenabled = false\n").unwrap();
         assert!(!c.ask.enabled);
-        assert_eq!(c.ask.model, "claude-opus-5-5");
+        let c = Config::parse("[ask]\nprovider = \"ollama\"\nurl = \"http://127.0.0.1:11434\"\nmodel = \"m\"\nlocal_only = true\ndetail = \"minimal\"\n").unwrap();
+        assert_eq!((c.ask.provider.as_str(), c.ask.model.as_str(), c.ask.detail.as_str()), ("ollama", "m", "minimal"));
+        assert!(c.ask.enabled && c.ask.local_only);
     }
 
     #[test]

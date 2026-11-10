@@ -10,6 +10,7 @@ mod config;
 mod fleet;
 mod fs;
 mod history;
+mod llm;
 mod mcp;
 mod model;
 mod server;
@@ -884,6 +885,7 @@ fn main() -> Result<()> {
                 eprintln!("{note}");
                 println!("{body}");
             } else {
+                eprintln!("→ {}", llm::destination(&cfg.ask));
                 println!("{}", ask::ask(&q, &s, &f, st.as_ref(), &cfg.ask));
             }
         }

@@ -1072,6 +1072,7 @@ impl Ctx {
                 }
             }
             Command::Ask { id, question: q } => {
+                app.ask_dest = crate::llm::destination(&self.cfg.ask);
                 let snap = app.live.clone().unwrap_or_default();
                 let findings = app.findings.clone();
                 let ask_cfg = self.cfg.ask.clone();

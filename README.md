@@ -453,8 +453,16 @@ history_days = 3           # flight-recorder retention
 # history_path = "~/.local/share/fat/history.db"
 
 [ask]
-enabled = true             # use the Claude API when ANTHROPIC_API_KEY is set
-model   = "claude-opus-5-5"
+enabled  = true            # false: always answer offline, send nothing
+provider = "anthropic"     # "anthropic" | "openai" (any OpenAI-compatible server) | "ollama"
+# url      = ""            # required for openai/ollama, e.g. "http://HOST:11434"
+# model    = ""            # default claude-opus-5-5 for anthropic; required otherwise
+# key_env  = ""            # env var holding the key: ANTHROPIC_API_KEY / FAT_ASK_KEY by default
+# local_only = false       # refuse any address outside loopback/private/link-local networks
+# detail   = "full"        # "minimal": no command lines, short paths, hostnames replaced
+# context_bytes = 20000    # digest size bound; lower it for small or CPU-only models
+# num_ctx  = 0             # ollama: context window (0 = sized to the digest)
+# timeout_s = 0            # 0 = 90 s for anthropic, 300 s for self-hosted
 
 [mcp]
 allow_actions = []         # side-effect tools agents may use: "pause", "resume", "renice", "kill", "undo", or "all"
@@ -1066,13 +1074,44 @@ The history DB is `~/Library/Application Support/fat/history.db` (Linux: `~/.loc
 Each entry records the pid's start time, so undo never signals a recycled pid.
 
 **Privacy.** Everything stays on your machine: the history DB, the journal and all collection.
-The one exception is `ask`. When `ANTHROPIC_API_KEY` is set (and `[ask] enabled`), it sends a compact summary to the
-Anthropic API: about 20 KB at most, with the top processes, ports, containers and doctor findings. Every string in
+The one exception is `ask`. When a model is configured (by default: `ANTHROPIC_API_KEY` is set and `[ask] enabled`),
+it sends a compact summary to that model: about 20 KB at most, with the top processes, ports, containers and doctor
+findings, plus volumes and recent growth for questions about disk. Every string in
 that request is redacted first: API keys and tokens (`sk-…`, `ghp_…`, `github_pat_…`, `xox…`, `AKIA…`, JWTs, `Bearer …`),
 `password=` / `token=` / `secret=` style values, the value after `--token` / `--password` and in `-pX`, credentials in
 URLs (`user:pass@`), and long hex or base64 blobs; your home directory becomes `~` and your user name `me`.
-`fat ask --dry-run QUESTION` prints exactly the body that would be sent, and sends nothing. Without a key, `ask`
-answers offline from rules.
+`fat ask --dry-run QUESTION` prints exactly the body that would be sent, and where, and sends nothing. Without a
+model, `ask` answers offline from rules. Every answer says where the question went (`→ ollama · qwen3:32b ·
+http://…` on stderr, in the TUI's ask box, and as `via` in the MCP result).
+
+### Keep `ask` inside your network
+
+To keep this data on your own infrastructure, point `ask` at a model server you run:
+
+```toml
+[ask]
+provider   = "ollama"                 # or "openai" for LM Studio, vLLM, llama.cpp, LocalAI, LiteLLM…
+url        = "http://HOST:11434"
+model      = "MODEL"
+local_only = true                     # never send to a public address, even by mistake
+```
+
+The same settings can come from the environment, handy for a fleet: `FAT_ASK_PROVIDER`, `FAT_ASK_URL`,
+`FAT_ASK_MODEL`, `FAT_ASK_LOCAL_ONLY=1`, `FAT_ASK_DETAIL=minimal`. A key, if the server wants one, is read from the
+variable `key_env` names (default `FAT_ASK_KEY`), never from the config file.
+
+- **`local_only`** is checked on the addresses the server name resolves to, when connecting: loopback, RFC 1918,
+  CGNAT (100.64/10), IPv6 ULA and link-local pass; anything else is refused before a byte is sent. Redirects are
+  not followed.
+- **`detail = "minimal"`** sends less: no command lines or images, every path cut to two components
+  (`/var/lib/…`), the hostname and container names replaced. Answers get vaguer about paths.
+- **Use `provider = "ollama"` for Ollama**, not its OpenAI-compatible `/v1`: through `/v1` Ollama keeps its small
+  default context window and silently drops most of the digest, and reasoning models spend the answer budget
+  thinking. With `ollama`, fat sizes `num_ctx` to the digest and turns thinking off.
+- **Size matters on CPU.** The default digest is about 10,000 tokens. A GPU server reads that in a second or two;
+  a CPU-only one at 50–150 tokens/s needs minutes. Set `context_bytes = 6000` (about 3,000 tokens) there.
+- **Model quality.** fat ranks findings and labels evidence before asking, which helps small models a lot, but
+  models below roughly 30B parameters give noticeably weaker diagnoses than Claude.
 
 ## Performance (macOS: M3 Max, ~1,050 processes)
 
