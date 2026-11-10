@@ -89,6 +89,7 @@ fat mcp                     # MCP server on stdio
 | `space` / `z` | pause / resume (undoable) |
 | `r` | renice (default +10; undoing it needs root) |
 | `k` / `K` | terminate / terminate the whole tree (asks for confirmation; **not undoable**; in Ports, `k` kills the tree) |
+| `←` `→` · `f` | in Ports (`2`): switch view (All · Listen · Established · Time-wait · Close-wait · Other · Orphans, each with a live count) · open the filter (protocol, address scope, process, port or range, peer address; `Esc` clears it) |
 | `u` | undo the last pause or renice |
 | `a` | the action log screen: everything fat did and who asked (you in the TUI, the CLI, or an agent over MCP); `⏎` undoes the selected entry if it can be undone, `f` filters by kind, `/` searches, `Esc` goes back |
 | `← → [ ] { }` | in Timeline (`4`): time travel through history (`{ }` = ×10) |
@@ -498,6 +499,13 @@ an MCP / JSON interface for agents (every view is also a tool or a `--json` flag
   RAPL package energy on Linux), GPU, thermal state and temperatures, memory pressure (and Linux PSI stall times for
   cpu, memory and io), battery, and per-process net and disk rates.
 - **Ports are first-class.** Shows every listening socket and its owner, with a framework hint ("node · vite dev · ~/code/app · up 3h").
+- **Connections by state, too.** Besides listeners, the Ports view counts every TCP socket by state and groups
+  connections: inbound ones by local port and peer address, outbound ones by peer and port, so thousands of
+  connections become a few rows (`nginx ← 203.0.113.5 ×412`, `app → 10.0.3.7:5432 ×80`). TIME_WAIT sockets belong
+  to the kernel and are grouped the same way. A Close-wait count that keeps rising (an application not closing
+  connections) is flagged. Linux reads `/proc/net/tcp*` of every network namespace it can see; macOS reads the
+  sockets of processes it may inspect, so TIME_WAIT (no owning process) is not shown there. Counts are live only:
+  they are not recorded in history.
   It also flags **orphans**: dev servers whose launcher died and that were re-parented to launchd (macOS) or to init /
   a systemd user manager (Linux).
 - **Safe actions.** Pause (SIGSTOP) before kill, renice, and kill a whole tree. Everything is journaled. Pause and

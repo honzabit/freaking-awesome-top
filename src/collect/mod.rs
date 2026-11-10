@@ -182,12 +182,14 @@ impl Collector {
 
         let system = self.build_system(&list, power_source);
         let ports = ports::ports(&list);
+        let conns = ports::connections(&list);
         Snapshot {
             ts: now_ms(),
             host: "local".into(),
             system,
             procs: list,
             ports,
+            conns,
             containers: Vec::new(),
             ..Default::default()
         }

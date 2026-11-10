@@ -49,11 +49,31 @@ struct RawSock {
     foreign_ns: bool,
 }
 
-static CACHE: Mutex<Option<(Instant, Vec<RawSock>)>> = Mutex::new(None);
+/// One TCP socket that is not a listener (established, time-wait, close-wait…).
+#[derive(Debug, Clone, PartialEq)]
+struct RawConn {
+    pid: u32,
+    command: String,
+    state: &'static str,
+    local: std::net::IpAddr,
+    lport: u16,
+    remote: std::net::IpAddr,
+    rport: u16,
+}
+
+/// What one scan found: listeners and bound UDP sockets, and the other TCP sockets.
+#[derive(Debug, Clone, Default)]
+struct Scan {
+    socks: Vec<RawSock>,
+    conns: Vec<RawConn>,
+    notes: Vec<String>,
+}
+
+static CACHE: Mutex<Option<(Instant, Scan)>> = Mutex::new(None);
 
 /// List TCP listeners and bound UDP sockets, annotated with notes and orphan flags.
 pub fn ports(procs: &[Proc]) -> Vec<Port> {
-    let raw = cached_raw();
+    let raw = cached_raw().socks;
     let by_pid: HashMap<u32, &Proc> = procs.iter().map(|p| (p.pid, p)).collect();
     let now = chrono::Utc::now().timestamp().max(0) as u64;
     let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
@@ -67,17 +87,111 @@ pub fn ports(procs: &[Proc]) -> Vec<Port> {
     }
 }
 
+/// TCP sockets by state, and connections grouped by owner and peer (from the same cached
+/// scan as [`ports`]).
+pub fn connections(procs: &[Proc]) -> crate::model::Conns {
+    let scan = cached_raw();
+    let names: HashMap<u32, &str> = procs.iter().map(|p| (p.pid, p.name.as_str())).collect();
+    group_conns(&scan.socks, &scan.conns, &names, scan.notes.clone())
+}
+
+/// Count and group. Inbound = to a port something listens on here; those are grouped by
+/// (state, owner, local port, peer address), outbound ones by (state, owner, peer, peer port).
+fn group_conns(
+    socks: &[RawSock],
+    conns: &[RawConn],
+    names: &HashMap<u32, &str>,
+    notes: Vec<String>,
+) -> crate::model::Conns {
+    use crate::model::{ConnGroup, Conns};
+    let listening: std::collections::HashSet<u16> =
+        socks.iter().filter(|s| s.proto == Proto::Tcp).map(|s| s.port).collect();
+    let mut states: HashMap<&str, u32> = HashMap::new();
+    let listeners = socks.iter().filter(|s| s.proto == Proto::Tcp).count() as u32;
+    if listeners > 0 {
+        states.insert("LISTEN", listeners);
+    }
+    let fmt = |ip: &std::net::IpAddr| match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => format!("[{v6}]"),
+        },
+        ip => ip.to_string(),
+    };
+    /// (state, pid, inbound, local port, peer, peer port) -> (local address, count)
+    type Key<'a> = (&'a str, u32, bool, u16, String, u16);
+    let mut groups: HashMap<Key, (String, u32)> = HashMap::new();
+    for c in conns {
+        *states.entry(c.state).or_default() += 1;
+        let inbound = listening.contains(&c.lport);
+        let key = (
+            c.state,
+            c.pid,
+            inbound,
+            if inbound { c.lport } else { 0 },
+            fmt(&c.remote),
+            if inbound { 0 } else { c.rport },
+        );
+        let e = groups.entry(key).or_insert_with(|| (if inbound { fmt(&c.local) } else { String::new() }, 0));
+        e.1 += 1;
+    }
+    let mut groups: Vec<ConnGroup> = groups
+        .into_iter()
+        .map(|((state, pid, inbound, local_port, remote, remote_port), (local, count))| {
+            let process = if pid == 0 {
+                String::new()
+            } else {
+                names
+                    .get(&pid)
+                    .map(|n| n.to_string())
+                    .or_else(|| conns.iter().find(|c| c.pid == pid).map(|c| c.command.clone()))
+                    .unwrap_or_default()
+            };
+            ConnGroup { state: state.into(), pid, process, inbound, local, local_port, remote, remote_port, count }
+        })
+        .collect();
+    groups.sort_by(|a, b| {
+        b.count.cmp(&a.count).then_with(|| a.state.cmp(&b.state)).then_with(|| a.remote.cmp(&b.remote))
+    });
+    let more = groups.len().saturating_sub(Conns::MAX_GROUPS) as u32;
+    groups.truncate(Conns::MAX_GROUPS);
+    let mut states: Vec<(String, u32)> = states.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    states.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Conns { states, groups, more_groups: more, notes }
+}
+
 /// Fetch the raw socket list from the platform source (uncached).
 #[cfg(target_os = "macos")]
-fn fetch_raw() -> Vec<RawSock> {
+fn fetch_raw() -> Scan {
     if !crate::sys::force_fallback()
-        && let Some(l) = crate::sys::darwin::libproc::listeners()
+        && let Some((l, c)) = crate::sys::darwin::libproc::sockets()
     {
         crate::sys::note_source("ports", "libproc");
-        return dedup(l.iter().map(from_listener).collect());
+        let conns = c
+            .into_iter()
+            .map(|c| RawConn {
+                pid: c.pid,
+                command: c.comm,
+                state: c.state,
+                local: c.local,
+                lport: c.lport,
+                remote: c.remote,
+                rport: c.rport,
+            })
+            .collect();
+        let mut notes = vec!["TIME_WAIT is not shown on macOS: those sockets have no process to read them from".into()];
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            notes.push("only your own processes' connections are visible without root".into());
+        }
+        return Scan { socks: dedup(l.iter().map(from_listener).collect()), conns, notes };
     }
     crate::sys::note_source("ports", "lsof");
-    run_lsof().map(|out| dedup(parse_lsof(&out))).unwrap_or_default()
+    Scan {
+        socks: run_lsof().map(|out| dedup(parse_lsof(&out))).unwrap_or_default(),
+        conns: Vec::new(),
+        notes: vec!["connections unavailable (libproc failed; lsof lists listeners only)".into()],
+    }
 }
 
 /// libproc listener -> the same RawSock the lsof parser produces ("*" wildcard, "[v6]").
@@ -102,13 +216,15 @@ fn from_listener(l: &crate::sys::darwin::libproc::Listener) -> RawSock {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn fetch_raw() -> Vec<RawSock> {
-    run_lsof().map(|out| dedup(parse_lsof(&out))).unwrap_or_default()
+fn fetch_raw() -> Scan {
+    Scan { socks: run_lsof().map(|out| dedup(parse_lsof(&out))).unwrap_or_default(), ..Default::default() }
 }
 
 #[cfg(target_os = "linux")]
-fn fetch_raw() -> Vec<RawSock> {
-    dedup(linux::scan(std::path::Path::new("/proc")))
+fn fetch_raw() -> Scan {
+    let mut s = linux::scan_all(std::path::Path::new("/proc"));
+    s.socks = dedup(s.socks);
+    s
 }
 
 /// A background refresh of the Linux socket scan is running.
@@ -116,7 +232,7 @@ fn fetch_raw() -> Vec<RawSock> {
 static REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg_attr(not(target_os = "linux"), allow(clippy::collapsible_if))]
-fn cached_raw() -> Vec<RawSock> {
+fn cached_raw() -> Scan {
     if let Ok(guard) = CACHE.lock()
         && let Some((at, socks)) = guard.as_ref()
     {
@@ -488,6 +604,7 @@ mod linux {
     pub struct NetRow {
         pub local: IpAddr,
         pub port: u16,
+        pub remote: IpAddr,
         pub rem_port: u16,
         pub state: u8,
         pub uid: u32,
@@ -524,10 +641,11 @@ mod linux {
                     return None;
                 }
                 let (local, port) = split_hex_endpoint(f[1])?;
-                let (_, rem_port) = split_hex_endpoint(f[2])?;
+                let (remote, rem_port) = split_hex_endpoint(f[2])?;
                 Some(NetRow {
                     local,
                     port,
+                    remote,
                     rem_port,
                     state: u8::from_str_radix(f[3], 16).ok()?,
                     uid: f[7].parse().ok()?,
@@ -677,6 +795,7 @@ mod linux {
 
     /// Listening TCP + bound UDP sockets of our network namespace and of every other one we
     /// can see (containers), with owners.
+    #[cfg(test)]
     pub fn scan(proc_root: &Path) -> Vec<RawSock> {
         let all = can_read_all_fds(proc_root);
         // SAFETY: geteuid has no preconditions and cannot fail.
@@ -684,43 +803,109 @@ mod linux {
         scan_with(proc_root, &|uid| all || uid == me)
     }
 
+    /// TCP state names by /proc/net/tcp code.
+    pub fn tcp_state(code: u8) -> &'static str {
+        match code {
+            0x01 => "ESTABLISHED",
+            0x02 => "SYN_SENT",
+            0x03 => "SYN_RECV",
+            0x04 => "FIN_WAIT1",
+            0x05 => "FIN_WAIT2",
+            0x06 => "TIME_WAIT",
+            0x07 => "CLOSE",
+            0x08 => "CLOSE_WAIT",
+            0x09 => "LAST_ACK",
+            0x0A => "LISTEN",
+            0x0B => "CLOSING",
+            0x0C => "NEW_SYN_RECV",
+            _ => "UNKNOWN",
+        }
+    }
+
     /// [`scan`] with an explicit "can we read fds of a process of this uid" test.
+    #[cfg(test)]
     pub fn scan_with(proc_root: &Path, readable_uid: &dyn Fn(u32) -> bool) -> Vec<RawSock> {
+        scan_all_with(proc_root, readable_uid).socks
+    }
+
+    /// Listeners, bound UDP sockets and every other TCP socket, with owners.
+    pub fn scan_all(proc_root: &Path) -> Scan {
+        let all = can_read_all_fds(proc_root);
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        let mut s = scan_all_with(proc_root, &|uid| all || uid == me);
+        if !all {
+            s.notes.push("owners of other users' connections need root".into());
+        }
+        s
+    }
+
+    pub fn scan_all_with(proc_root: &Path, readable_uid: &dyn Fn(u32) -> bool) -> Scan {
         let mut rows: Vec<(Proto, NetRow, bool)> = Vec::new();
+        let mut conns: Vec<NetRow> = Vec::new();
         let mut seen_ino: HashSet<u64> = HashSet::new();
-        let mut read_ns = |net: &Path, foreign: bool, rows: &mut Vec<(Proto, NetRow, bool)>| {
-            for (file, proto) in [("tcp", Proto::Tcp), ("tcp6", Proto::Tcp), ("udp", Proto::Udp), ("udp6", Proto::Udp)]
-            {
-                let Ok(text) = std::fs::read_to_string(net.join(file)) else { continue };
-                for r in parse_proc_net(&text) {
-                    let keep = match proto {
-                        Proto::Tcp => r.state == TCP_LISTEN,
-                        // Connected UDP sockets are clients (QUIC, DNS lookups), not services.
-                        Proto::Udp => r.rem_port == 0,
-                    };
-                    // Inodes are unique system-wide: a row seen twice is the same socket.
-                    if keep && r.port != 0 && (r.inode == 0 || seen_ino.insert(r.inode)) {
-                        rows.push((proto, r, foreign));
+        let mut read_ns =
+            |net: &Path, foreign: bool, rows: &mut Vec<(Proto, NetRow, bool)>, conns: &mut Vec<NetRow>| {
+                for (file, proto) in
+                    [("tcp", Proto::Tcp), ("tcp6", Proto::Tcp), ("udp", Proto::Udp), ("udp6", Proto::Udp)]
+                {
+                    let Ok(text) = std::fs::read_to_string(net.join(file)) else { continue };
+                    for r in parse_proc_net(&text) {
+                        // Inodes are unique system-wide: a row seen twice is the same socket.
+                        let fresh = r.inode == 0 || seen_ino.insert(r.inode);
+                        if !fresh || r.port == 0 {
+                            continue;
+                        }
+                        match proto {
+                            Proto::Tcp if r.state == TCP_LISTEN => rows.push((proto, r, foreign)),
+                            Proto::Tcp if r.state != 0x07 => conns.push(r),
+                            Proto::Tcp => {}
+                            // Connected UDP sockets are clients (QUIC, DNS lookups), not services.
+                            Proto::Udp if r.rem_port == 0 => rows.push((proto, r, foreign)),
+                            Proto::Udp => {}
+                        }
                     }
                 }
-            }
-        };
-        read_ns(&proc_root.join("net"), false, &mut rows);
+            };
+        read_ns(&proc_root.join("net"), false, &mut rows, &mut conns);
         for (_, pid) in foreign_netns(proc_root, MAX_NETNS) {
-            read_ns(&proc_root.join(pid.to_string()).join("net"), true, &mut rows);
+            read_ns(&proc_root.join(pid.to_string()).join("net"), true, &mut rows, &mut conns);
         }
-        let wanted: HashMap<u64, u32> =
-            rows.iter().filter(|(_, r, _)| r.inode != 0).map(|(_, r, _)| (r.inode, r.uid)).collect();
+        let wanted: HashMap<u64, u32> = rows
+            .iter()
+            .map(|(_, r, _)| r)
+            .chain(conns.iter())
+            .filter(|r| r.inode != 0)
+            .map(|r| (r.inode, r.uid))
+            .collect();
         let owners = socket_owners_uid(proc_root, &wanted, readable_uid);
         let mut stat_cache: HashMap<u32, Option<(String, u32)>> = HashMap::new();
-        rows.into_iter()
+        let mut comm = |pid: u32| -> (String, u32) {
+            if pid == 0 {
+                return ("?".to_string(), 0);
+            }
+            stat_cache.entry(pid).or_insert_with(|| read_stat(proc_root, pid)).clone().unwrap_or_default()
+        };
+        let raw_conns: Vec<RawConn> = conns
+            .iter()
+            .map(|r| {
+                let pid = owners.get(&r.inode).copied().unwrap_or(0);
+                RawConn {
+                    pid,
+                    command: if pid == 0 { String::new() } else { comm(pid).0 },
+                    state: tcp_state(r.state),
+                    local: r.local,
+                    lport: r.port,
+                    remote: r.remote,
+                    rport: r.rem_port,
+                }
+            })
+            .collect();
+        let socks = rows
+            .into_iter()
             .map(|(proto, r, foreign_ns)| {
                 let pid = owners.get(&r.inode).copied().unwrap_or(0);
-                let (command, ppid) = if pid == 0 {
-                    ("?".to_string(), 0)
-                } else {
-                    stat_cache.entry(pid).or_insert_with(|| read_stat(proc_root, pid)).clone().unwrap_or_default()
-                };
+                let (command, ppid) = comm(pid);
                 RawSock {
                     pid,
                     ppid,
@@ -733,7 +918,8 @@ mod linux {
                     foreign_ns,
                 }
             })
-            .collect()
+            .collect();
+        Scan { socks, conns: raw_conns, notes: Vec::new() }
     }
 
     /// uid -> login name from /etc/passwd (no NSS; good enough for a hint).
@@ -1355,5 +1541,76 @@ TST=LISTEN
         let rp = ports.iter().find(|x| x.pid == 606).unwrap();
         assert_eq!(rp.process, "rapportd");
         assert!(!rp.orphan);
+    }
+
+    #[test]
+    fn connections_are_counted_and_grouped() {
+        use std::net::IpAddr;
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let listener = RawSock {
+            pid: 10,
+            ppid: 1,
+            command: "nginx".into(),
+            proto: Proto::Tcp,
+            addr: "*".into(),
+            port: 443,
+            state: "LISTEN".into(),
+            hidden_uid: None,
+            foreign_ns: false,
+        };
+        let conn = |pid: u32, state: &'static str, lport: u16, remote: &str, rport: u16| RawConn {
+            pid,
+            command: if pid == 10 { "nginx".into() } else { "app".into() },
+            state,
+            local: ip("10.0.0.2"),
+            lport,
+            remote: ip(remote),
+            rport,
+        };
+        let mut conns = Vec::new();
+        // 3 clients from one address into :443, each from its own source port.
+        for p in 50000..50003 {
+            conns.push(conn(10, "ESTABLISHED", 443, "203.0.113.5", p));
+        }
+        // An app talking out to a database, twice.
+        conns.push(conn(20, "ESTABLISHED", 41000, "10.0.0.9", 5432));
+        conns.push(conn(20, "ESTABLISHED", 41001, "10.0.0.9", 5432));
+        conns.push(conn(20, "CLOSE_WAIT", 41002, "10.0.0.9", 5432));
+        // TIME_WAIT has no owner; IPv4-mapped peers show as IPv4.
+        conns.push(conn(0, "TIME_WAIT", 443, "::ffff:203.0.113.7", 50100));
+        let names = HashMap::from([(20u32, "app")]);
+        let c = group_conns(&[listener], &conns, &names, vec![]);
+        assert_eq!(c.count("ESTABLISHED"), 5);
+        assert_eq!((c.count("LISTEN"), c.count("CLOSE_WAIT"), c.count("TIME_WAIT")), (1, 1, 1));
+        let g = &c.groups[0];
+        assert_eq!(
+            (g.state.as_str(), g.pid, g.inbound, g.local_port, g.remote.as_str(), g.count),
+            ("ESTABLISHED", 10, true, 443, "203.0.113.5", 3)
+        );
+        assert_eq!((g.remote_port, g.local.as_str()), (0, "10.0.0.2"), "inbound: many source ports, one group");
+        let db = c.groups.iter().find(|g| g.pid == 20 && g.state == "ESTABLISHED").unwrap();
+        assert_eq!((db.inbound, db.remote_port, db.count, db.process.as_str()), (false, 5432, 2, "app"));
+        let tw = c.groups.iter().find(|g| g.state == "TIME_WAIT").unwrap();
+        assert_eq!((tw.pid, tw.remote.as_str(), tw.inbound), (0, "203.0.113.7", true));
+        assert_eq!(c.groups.len(), 4);
+        // Bounded however many peers there are.
+        let many: Vec<RawConn> = (0..2000u32)
+            .map(|i| conn(20, "ESTABLISHED", 40000, &format!("10.1.{}.{}", i / 250, i % 250), 80))
+            .collect();
+        let c = group_conns(&[], &many, &names, vec![]);
+        assert_eq!(c.groups.len(), crate::model::Conns::MAX_GROUPS);
+        assert_eq!(c.more_groups as usize, 2000 - crate::model::Conns::MAX_GROUPS);
+        assert_eq!(c.count("ESTABLISHED"), 2000, "counts cover every socket, not just the groups shown");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proc_net_rows_carry_state_and_peer() {
+        let text = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:1F90 0100007F:B4B8 01 00000000:00000000 00:00000000 00000000  1000        0 8713261 1 0 100 0 0 10 0\n   1: 0100007F:1F90 0100007F:B4BA 06 00000000:00000000 00:00000000 00000000     0        0 0 1 0 100 0 0 10 0\n";
+        let rows = linux::parse_proc_net(text);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((linux::tcp_state(rows[0].state), rows[0].port, rows[0].rem_port), ("ESTABLISHED", 8080, 46264));
+        assert_eq!(rows[0].remote.to_string(), "127.0.0.1");
+        assert_eq!((linux::tcp_state(rows[1].state), rows[1].inode), ("TIME_WAIT", 0));
     }
 }

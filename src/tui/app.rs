@@ -234,6 +234,195 @@ pub enum Modal {
         start: u64,
     },
     Help,
+    /// The Ports filter dialog (`f` in Ports).
+    PortFilter(PortFilterForm),
+}
+
+/// Ports view presets (the chips above the table). All is the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PortView {
+    #[default]
+    All,
+    Listen,
+    Established,
+    TimeWait,
+    CloseWait,
+    /// SYN_*, FIN_WAIT*, LAST_ACK, CLOSING…
+    Other,
+    Orphans,
+}
+
+impl PortView {
+    pub const ALL: [PortView; 7] = [
+        PortView::All,
+        PortView::Listen,
+        PortView::Established,
+        PortView::TimeWait,
+        PortView::CloseWait,
+        PortView::Other,
+        PortView::Orphans,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            PortView::All => "All",
+            PortView::Listen => "Listen",
+            PortView::Established => "Established",
+            PortView::TimeWait => "Time-wait",
+            PortView::CloseWait => "Close-wait",
+            PortView::Other => "Other",
+            PortView::Orphans => "Orphans",
+        }
+    }
+
+    /// Does a connection in TCP `state` belong here?
+    pub fn has_state(self, state: &str) -> bool {
+        match self {
+            PortView::All => true,
+            PortView::Established => state == "ESTABLISHED",
+            PortView::TimeWait => state == "TIME_WAIT",
+            PortView::CloseWait => state == "CLOSE_WAIT",
+            PortView::Other => !matches!(state, "ESTABLISHED" | "TIME_WAIT" | "CLOSE_WAIT" | "LISTEN"),
+            PortView::Listen | PortView::Orphans => false,
+        }
+    }
+}
+
+/// Where an address is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PortScope {
+    #[default]
+    Any,
+    Loopback,
+    /// RFC 1918, CGNAT, IPv6 ULA and link-local.
+    Private,
+    Public,
+}
+
+impl PortScope {
+    pub const ALL: [PortScope; 4] = [PortScope::Any, PortScope::Loopback, PortScope::Private, PortScope::Public];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            PortScope::Any => "any",
+            PortScope::Loopback => "loopback",
+            PortScope::Private => "private (LAN)",
+            PortScope::Public => "public",
+        }
+    }
+
+    /// The scope of an address as fat shows it ("127.0.0.1", "[::1]", "*"). A listener on
+    /// every interface ("*") is reachable from outside: public.
+    pub fn of(addr: &str) -> PortScope {
+        let a = addr.trim_start_matches('[').trim_end_matches(']');
+        if a == "*" || a.is_empty() {
+            return PortScope::Public;
+        }
+        match a.parse::<std::net::IpAddr>() {
+            Ok(ip) if ip.is_loopback() => PortScope::Loopback,
+            Ok(ip) if crate::llm::is_local(ip) => PortScope::Private,
+            Ok(_) => PortScope::Public,
+            Err(_) => PortScope::Any,
+        }
+    }
+}
+
+/// The Ports filter (`f`). Empty fields match everything.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PortFilter {
+    pub proto: Option<crate::model::Proto>,
+    pub scope: PortScope,
+    /// Substring of the process name.
+    pub process: String,
+    /// "8080" or "8000-8100": our port or the peer's.
+    pub port: String,
+    /// Substring of the peer address.
+    pub remote: String,
+}
+
+impl PortFilter {
+    pub fn is_empty(&self) -> bool {
+        *self == PortFilter::default()
+    }
+
+    fn port_range(&self) -> Option<(u16, u16)> {
+        let t = self.port.trim();
+        match t.split_once('-') {
+            Some((a, b)) => Some((a.trim().parse().ok()?, b.trim().parse().ok()?)),
+            None => t.parse().ok().map(|p| (p, p)),
+        }
+    }
+
+    fn port_ok(&self, ports: &[u16]) -> bool {
+        if self.port.trim().is_empty() {
+            return true;
+        }
+        match self.port_range() {
+            Some((lo, hi)) => ports.iter().any(|p| *p != 0 && (lo..=hi).contains(p)),
+            None => false,
+        }
+    }
+
+    fn process_ok(&self, name: &str) -> bool {
+        self.process.is_empty() || name.to_lowercase().contains(&self.process.trim().to_lowercase())
+    }
+
+    pub fn matches_port(&self, p: &crate::model::Port) -> bool {
+        self.proto.is_none_or(|x| x == p.proto)
+            && (self.scope == PortScope::Any || PortScope::of(&p.addr) == self.scope)
+            && self.process_ok(&p.process)
+            && self.port_ok(&[p.port])
+            && self.remote.trim().is_empty()
+    }
+
+    pub fn matches_group(&self, g: &crate::model::ConnGroup) -> bool {
+        self.proto.is_none_or(|x| x == crate::model::Proto::Tcp)
+            && (self.scope == PortScope::Any || PortScope::of(&g.remote) == self.scope)
+            && self.process_ok(&g.process)
+            && self.port_ok(&[g.local_port, g.remote_port])
+            && (self.remote.trim().is_empty() || g.remote.contains(self.remote.trim()))
+    }
+
+    /// "tcp · public · port 443" for titles.
+    pub fn describe(&self) -> String {
+        let mut v = Vec::new();
+        if let Some(p) = self.proto {
+            v.push(format!("{p:?}").to_lowercase());
+        }
+        if self.scope != PortScope::Any {
+            v.push(self.scope.title().to_string());
+        }
+        if !self.process.is_empty() {
+            v.push(format!("process ~{}", self.process));
+        }
+        if !self.port.is_empty() {
+            v.push(format!("port {}", self.port));
+        }
+        if !self.remote.is_empty() {
+            v.push(format!("peer ~{}", self.remote));
+        }
+        v.join(" · ")
+    }
+}
+
+/// The filter dialog: rows protocol, scope, process, port, peer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PortFilterForm {
+    pub sel: usize,
+    pub editing: bool,
+}
+
+impl PortFilterForm {
+    pub const LABELS: [&'static str; 5] = ["Protocol", "Address scope", "Process", "Port", "Peer address"];
+}
+
+/// One row of the Ports table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortRow {
+    /// A listener or bound UDP socket (index into `Snapshot::ports`).
+    Listen(usize),
+    /// A group of connections (index into `Snapshot::conns.groups`).
+    Group(usize),
 }
 
 /// The Settings screen: every setting, its value and where it comes from, by group.
@@ -907,7 +1096,11 @@ pub struct App {
     pub offset: usize,
 
     // other lists
-    pub port_rows: Vec<usize>,
+    pub port_rows: Vec<PortRow>,
+    pub port_view: PortView,
+    pub port_filter: PortFilter,
+    /// CLOSE_WAIT counts of the last few live samples (a steady rise is a leak).
+    pub close_wait_hist: std::collections::VecDeque<u32>,
     pub port_sel: usize,
     pub port_offset: usize,
     pub fleet_sel: usize,
@@ -998,6 +1191,9 @@ impl App {
             sel: 0,
             offset: 0,
             port_rows: Vec::new(),
+            port_view: PortView::All,
+            port_filter: PortFilter::default(),
+            close_wait_hist: std::collections::VecDeque::new(),
             port_sel: 0,
             port_offset: 0,
             fleet_sel: 0,
@@ -1053,6 +1249,10 @@ impl App {
     }
 
     pub fn on_snapshot(&mut self, mut snap: Snapshot) {
+        self.close_wait_hist.push_back(snap.conns.count("CLOSE_WAIT"));
+        while self.close_wait_hist.len() > 6 {
+            self.close_wait_hist.pop_front();
+        }
         if snap.containers.is_empty() && !self.containers.is_empty() {
             snap.containers = self.containers.clone();
         }
@@ -1561,7 +1761,7 @@ impl App {
                 let cs = if s.containers.is_empty() { &self.containers } else { &s.containers };
                 (
                     build_rows_in(&s.procs, cs, self.sort, self.sort_desc, self.tree, &self.filter_lower),
-                    port_order(s),
+                    port_rows_of(s, self.port_view, &self.port_filter),
                     s.procs.iter().any(|p| p.container.is_some()),
                 )
             }
@@ -1601,9 +1801,30 @@ impl App {
         self.follow = self.sel != 0;
     }
 
+    /// The selected listener, when the selected row is one.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn selected_port(&self) -> Option<&crate::model::Port> {
         let s = self.view()?;
-        s.ports.get(*self.port_rows.get(self.port_sel)?)
+        match self.port_rows.get(self.port_sel)? {
+            PortRow::Listen(i) => s.ports.get(*i),
+            PortRow::Group(_) => None,
+        }
+    }
+
+    /// The process behind the selected Ports row (pid 0: none, e.g. TIME_WAIT).
+    pub fn selected_port_owner(&self) -> Option<(u32, String)> {
+        let s = self.view()?;
+        match self.port_rows.get(self.port_sel)? {
+            PortRow::Listen(i) => s.ports.get(*i).map(|p| (p.pid, p.process.clone())),
+            PortRow::Group(i) => s.conns.groups.get(*i).map(|g| (g.pid, g.process.clone())),
+        }
+    }
+
+    /// Whether CLOSE_WAIT rose in each of the last three samples (connections the
+    /// application never closes).
+    pub fn close_wait_rising(&self) -> bool {
+        let h: Vec<u32> = self.close_wait_hist.iter().copied().collect();
+        h.len() >= 4 && h.windows(2).rev().take(3).all(|w| w[1] > w[0])
     }
 
     /// Rows of the local Fleet view (this machine and its containers).
@@ -1731,6 +1952,7 @@ impl App {
         match modal {
             Modal::None => Vec::new(),
             Modal::Help => Vec::new(), // any key closes
+            Modal::PortFilter(form) => self.on_port_filter_key(form, k),
 
             Modal::Filter => {
                 match k.code {
@@ -2272,6 +2494,13 @@ impl App {
                 let back = self.back_tab;
                 return self.switch_tab(back);
             }
+            KeyCode::Esc
+                if self.tab == Tab::Ports && (self.port_view != PortView::All || !self.port_filter.is_empty()) =>
+            {
+                self.port_filter = PortFilter::default();
+                self.set_port_view(PortView::All);
+                return Vec::new();
+            }
             KeyCode::Esc => {
                 if let Some(done) = self.server_esc() {
                     return done;
@@ -2479,14 +2708,108 @@ impl App {
         }
     }
 
+    /// Keys in the Ports filter dialog. Changes apply as they are made.
+    fn on_port_filter_key(&mut self, mut form: PortFilterForm, k: KeyEvent) -> Vec<Command> {
+        use crate::model::Proto;
+        fn text(f: &mut PortFilter, i: usize) -> Option<&mut String> {
+            match i {
+                2 => Some(&mut f.process),
+                3 => Some(&mut f.port),
+                4 => Some(&mut f.remote),
+                _ => None,
+            }
+        }
+        let f = &mut self.port_filter;
+        if form.editing {
+            match k.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Tab => form.editing = false,
+                KeyCode::Backspace => {
+                    if let Some(t) = text(f, form.sel) {
+                        t.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(t) = text(f, form.sel) {
+                        t.push(c);
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('f') | KeyCode::Char('q') => {
+                    self.rows_dirty = true;
+                    self.port_sel = 0;
+                    return Vec::new();
+                }
+                KeyCode::Up | KeyCode::Char('k') => form.sel = form.sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => form.sel = (form.sel + 1).min(4),
+                KeyCode::Char('c') => *f = PortFilter::default(),
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => match form.sel {
+                    0 => {
+                        let opts = [None, Some(Proto::Tcp), Some(Proto::Udp)];
+                        let i = opts.iter().position(|o| *o == f.proto).unwrap_or(0);
+                        f.proto = opts[if k.code == KeyCode::Left { (i + 2) % 3 } else { (i + 1) % 3 }];
+                    }
+                    1 => {
+                        let all = PortScope::ALL;
+                        let i = all.iter().position(|s| *s == f.scope).unwrap_or(0);
+                        f.scope = all[if k.code == KeyCode::Left { (i + 3) % 4 } else { (i + 1) % 4 }];
+                    }
+                    _ if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) => form.editing = true,
+                    _ => {}
+                },
+                KeyCode::Backspace | KeyCode::Delete => {
+                    if let Some(t) = text(f, form.sel) {
+                        t.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.rows_dirty = true;
+        self.port_sel = 0;
+        self.modal = Modal::PortFilter(form);
+        Vec::new()
+    }
+
+    fn set_port_view(&mut self, v: PortView) {
+        self.port_view = v;
+        self.port_sel = 0;
+        self.port_offset = 0;
+        self.rows_dirty = true;
+    }
+
     fn on_ports_key(&mut self, k: KeyEvent) -> Vec<Command> {
         self.ensure_rows();
+        match k.code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('s') => {
+                let all = PortView::ALL;
+                let i = all.iter().position(|v| *v == self.port_view).unwrap_or(0);
+                let next = if k.code == KeyCode::Left { (i + all.len() - 1) % all.len() } else { (i + 1) % all.len() };
+                self.set_port_view(all[next]);
+                return Vec::new();
+            }
+            KeyCode::Char('f') => {
+                self.modal = Modal::PortFilter(PortFilterForm::default());
+                return Vec::new();
+            }
+            _ => {}
+        }
         let n = self.port_rows.len();
         if list_nav(&mut self.port_sel, n, k.code) {
             return Vec::new();
         }
-        let Some(port) = self.selected_port() else { return Vec::new() };
-        let (pid, name) = (port.pid, port.process.clone());
+        let Some((pid, name)) = self.selected_port_owner() else { return Vec::new() };
+        if pid == 0 {
+            if matches!(k.code, KeyCode::Enter | KeyCode::Char('w' | ' ' | 'z' | 'r' | 'k' | 'K')) {
+                self.set_status(
+                    "no process owns these sockets (the kernel holds TIME_WAIT; other users' owners need root)",
+                    false,
+                );
+            }
+            return Vec::new();
+        }
         match k.code {
             KeyCode::Enter | KeyCode::Char('w') => vec![Command::Explain(pid)],
             KeyCode::Char(' ') | KeyCode::Char('z') | KeyCode::Char('r') | KeyCode::Char('k') | KeyCode::Char('K') => {
@@ -3195,6 +3518,32 @@ pub fn build_rows_in(
 }
 
 /// Ports ordered orphans first, then by port number.
+/// Ports table rows for a view and filter: listeners first (orphans on top), then
+/// connection groups (largest first).
+pub fn port_rows_of(s: &Snapshot, view: PortView, filter: &PortFilter) -> Vec<PortRow> {
+    let mut rows: Vec<PortRow> = Vec::new();
+    if matches!(view, PortView::All | PortView::Listen | PortView::Orphans) {
+        rows.extend(
+            port_order(s)
+                .into_iter()
+                .filter(|&i| view != PortView::Orphans || s.ports[i].orphan)
+                .filter(|&i| filter.matches_port(&s.ports[i]))
+                .map(PortRow::Listen),
+        );
+    }
+    if !matches!(view, PortView::Listen | PortView::Orphans) {
+        rows.extend(
+            s.conns
+                .groups
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| view.has_state(&g.state) && filter.matches_group(g))
+                .map(|(i, _)| PortRow::Group(i)),
+        );
+    }
+    rows
+}
+
 pub fn port_order(s: &Snapshot) -> Vec<usize> {
     let mut v: Vec<usize> = (0..s.ports.len()).collect();
     v.sort_by(|&a, &b| {
@@ -4335,5 +4684,145 @@ pub(crate) mod tests {
         assert_eq!(a.fs.used_at("/home", 1_002_000), None);
         a.set_volumes(1_000_000 + RING_MS + 10_000, vec![]);
         assert_eq!(a.fs.vol_ring.len(), 1, "ring bounded to RING_MS");
+    }
+
+    #[test]
+    fn ports_views_filters_and_owners() {
+        use crate::model::{ConnGroup, Conns, Port, Proto};
+        let mut a = app();
+        let mut s = snap(2_000_000);
+        s.ports = vec![
+            Port {
+                proto: Proto::Tcp,
+                addr: "*".into(),
+                port: 443,
+                pid: 10,
+                process: "nginx".into(),
+                state: "LISTEN".into(),
+                ..Default::default()
+            },
+            Port {
+                proto: Proto::Udp,
+                addr: "127.0.0.1".into(),
+                port: 53,
+                pid: 11,
+                process: "dnsmasq".into(),
+                ..Default::default()
+            },
+        ];
+        let g = |state: &str, pid: u32, process: &str, inbound: bool, remote: &str, rport: u16, count: u32| ConnGroup {
+            state: state.into(),
+            pid,
+            process: process.into(),
+            inbound,
+            local: if inbound { "10.0.0.2".into() } else { String::new() },
+            local_port: if inbound { 443 } else { 0 },
+            remote: remote.into(),
+            remote_port: rport,
+            count,
+        };
+        s.conns = Conns {
+            states: vec![
+                ("ESTABLISHED".into(), 7),
+                ("TIME_WAIT".into(), 30),
+                ("CLOSE_WAIT".into(), 2),
+                ("SYN_SENT".into(), 1),
+                ("LISTEN".into(), 1),
+            ],
+            groups: vec![
+                g("TIME_WAIT", 0, "", true, "203.0.113.5", 0, 30),
+                g("ESTABLISHED", 10, "nginx", true, "203.0.113.5", 0, 5),
+                g("ESTABLISHED", 20, "app", false, "10.0.0.9", 5432, 2),
+                g("CLOSE_WAIT", 20, "app", false, "10.0.0.9", 5432, 2),
+                g("SYN_SENT", 20, "app", false, "198.51.100.1", 443, 1),
+            ],
+            ..Default::default()
+        };
+        a.on_snapshot(s);
+        a.switch_tab(Tab::Ports);
+        a.ensure_rows();
+        assert_eq!(a.port_rows.len(), 7, "All: both listeners and every group");
+        assert!(matches!(a.port_rows[0], PortRow::Listen(_)), "listeners first");
+        let view = |a: &mut App, v: PortView| {
+            a.set_port_view(v);
+            a.ensure_rows();
+            a.port_rows.clone()
+        };
+        assert_eq!(view(&mut a, PortView::Listen).len(), 2);
+        assert_eq!(view(&mut a, PortView::Established), vec![PortRow::Group(1), PortRow::Group(2)]);
+        assert_eq!(view(&mut a, PortView::TimeWait), vec![PortRow::Group(0)]);
+        assert_eq!(view(&mut a, PortView::CloseWait), vec![PortRow::Group(3)]);
+        assert_eq!(view(&mut a, PortView::Other), vec![PortRow::Group(4)]);
+        assert!(view(&mut a, PortView::Orphans).is_empty());
+        // ←→ cycle the chips.
+        a.set_port_view(PortView::All);
+        a.on_key(code(KeyCode::Right));
+        assert_eq!(a.port_view, PortView::Listen);
+        a.on_key(code(KeyCode::Left));
+        a.on_key(code(KeyCode::Left));
+        assert_eq!(a.port_view, PortView::Orphans);
+        // Filters combine; Esc clears view and filter.
+        a.set_port_view(PortView::All);
+        a.port_filter.scope = PortScope::Private;
+        a.rows_dirty = true;
+        a.ensure_rows();
+        assert_eq!(a.port_rows, vec![PortRow::Group(2), PortRow::Group(3)], "peers on private networks");
+        a.port_filter = PortFilter { port: "5000-6000".into(), ..Default::default() };
+        a.rows_dirty = true;
+        a.ensure_rows();
+        assert_eq!(a.port_rows.len(), 2);
+        a.port_filter = PortFilter { proto: Some(Proto::Udp), ..Default::default() };
+        a.rows_dirty = true;
+        a.ensure_rows();
+        assert_eq!(a.port_rows, vec![PortRow::Listen(1)]);
+        a.port_filter = PortFilter { port: "nonsense".into(), ..Default::default() };
+        a.rows_dirty = true;
+        a.ensure_rows();
+        assert!(a.port_rows.is_empty(), "an unreadable port matches nothing, rather than everything");
+        a.on_key(code(KeyCode::Esc));
+        assert!(a.port_filter.is_empty() && a.port_view == PortView::All && a.tab == Tab::Ports);
+        // The dialog edits the filter live.
+        a.on_key(key('f'));
+        assert!(matches!(a.modal, Modal::PortFilter(_)));
+        a.on_key(code(KeyCode::Enter)); // protocol: any -> tcp
+        assert_eq!(a.port_filter.proto, Some(Proto::Tcp));
+        a.on_key(code(KeyCode::Down));
+        a.on_key(code(KeyCode::Down)); // process
+        a.on_key(code(KeyCode::Enter));
+        for c in "ngi".chars() {
+            a.on_key(key(c));
+        }
+        a.on_key(code(KeyCode::Enter));
+        assert_eq!(a.port_filter.process, "ngi");
+        a.on_key(code(KeyCode::Esc));
+        assert_eq!(a.modal, Modal::None);
+        a.ensure_rows();
+        assert_eq!(a.port_rows, vec![PortRow::Listen(0), PortRow::Group(1)]);
+        // A row nobody owns (TIME_WAIT) says so instead of acting.
+        a.port_filter = PortFilter::default();
+        a.set_port_view(PortView::TimeWait);
+        a.ensure_rows();
+        assert!(a.on_key(key('k')).is_empty());
+        assert!(a.status.as_ref().unwrap().text.contains("kernel"));
+        assert_eq!(a.modal, Modal::None);
+        // Scopes of addresses.
+        assert_eq!(PortScope::of("*"), PortScope::Public);
+        assert_eq!(PortScope::of("[::1]"), PortScope::Loopback);
+        assert_eq!(PortScope::of("192.168.1.4"), PortScope::Private);
+        assert_eq!(PortScope::of("8.8.8.8"), PortScope::Public);
+    }
+
+    #[test]
+    fn close_wait_rising_needs_a_steady_climb() {
+        let mut a = app();
+        a.close_wait_hist.clear();
+        for n in [5, 6, 7] {
+            a.close_wait_hist.push_back(n);
+        }
+        assert!(!a.close_wait_rising(), "needs four samples");
+        a.close_wait_hist.push_back(9);
+        assert!(a.close_wait_rising());
+        a.close_wait_hist.push_back(9);
+        assert!(!a.close_wait_rising(), "flat is not rising");
     }
 }

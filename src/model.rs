@@ -54,14 +54,15 @@ pub struct Proc {
     pub container: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Proto {
+    #[default]
     Tcp,
     Udp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Port {
     pub proto: Proto,
     pub addr: String,
@@ -177,6 +178,59 @@ pub struct Snapshot {
     /// fill (and the disk rules can run on it) without a second remote call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<crate::fs::Volume>,
+    /// TCP connections (besides listeners), counted by state and grouped. Live only: not
+    /// recorded in history.
+    #[serde(default, skip_serializing_if = "Conns::is_empty")]
+    pub conns: Conns,
+}
+
+/// TCP sockets by state, and connections grouped by owner and peer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Conns {
+    /// Every TCP socket we can see by state ("ESTABLISHED", "TIME_WAIT", "LISTEN"…), all
+    /// network namespaces we read.
+    pub states: Vec<(String, u32)>,
+    /// Groups, largest first, at most [`Conns::MAX_GROUPS`].
+    pub groups: Vec<ConnGroup>,
+    /// Groups left out past the cap.
+    #[serde(default)]
+    pub more_groups: u32,
+    /// What could not be seen, and why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+impl Conns {
+    pub const MAX_GROUPS: usize = 400;
+
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty() && self.groups.is_empty()
+    }
+
+    pub fn count(&self, state: &str) -> u32 {
+        self.states.iter().find(|(s, _)| s == state).map_or(0, |(_, n)| *n)
+    }
+}
+
+/// Connections sharing a state, an owner and a peer: inbound ones to the same local port
+/// from the same address, outbound ones to the same address and port.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ConnGroup {
+    /// TCP state: "ESTABLISHED", "TIME_WAIT", "CLOSE_WAIT", "SYN_SENT"…
+    pub state: String,
+    /// Owning process; 0 when no process holds the socket (TIME_WAIT belongs to the kernel)
+    /// or its owner is hidden (another user's process without root).
+    pub pid: u32,
+    pub process: String,
+    /// Inbound: to one of this machine's listening ports.
+    pub inbound: bool,
+    /// Our address and port (for inbound: the listening port; outbound: 0, many ports).
+    pub local: String,
+    pub local_port: u16,
+    /// The peer's address, and its port (for inbound: 0, many ports).
+    pub remote: String,
+    pub remote_port: u16,
+    pub count: u32,
 }
 
 impl Snapshot {

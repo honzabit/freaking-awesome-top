@@ -420,8 +420,77 @@ pub fn listener_of(si: &SocketFdInfo) -> Option<(bool, std::net::IpAddr, u16)> {
     }
 }
 
+/// A TCP socket that is not a listener.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TcpConn {
+    pub pid: u32,
+    pub comm: String,
+    pub state: &'static str,
+    pub local: std::net::IpAddr,
+    pub lport: u16,
+    pub remote: std::net::IpAddr,
+    pub rport: u16,
+}
+
+/// `tcpsi_state` names (`TSI_S_*` in <netinet/tcp_fsm.h>), in the names Linux uses.
+pub fn tcp_state_name(state: i32) -> &'static str {
+    match state {
+        0 => "CLOSE",
+        1 => "LISTEN",
+        2 => "SYN_SENT",
+        3 => "SYN_RECV",
+        4 => "ESTABLISHED",
+        5 => "CLOSE_WAIT",
+        6 => "FIN_WAIT1",
+        7 => "CLOSING",
+        8 => "LAST_ACK",
+        9 => "FIN_WAIT2",
+        10 => "TIME_WAIT",
+        _ => "UNKNOWN",
+    }
+}
+
+/// A connected (non-listening) TCP socket: (state, local, lport, remote, rport).
+pub fn tcp_conn_of(si: &SocketFdInfo) -> Option<(&'static str, std::net::IpAddr, u16, std::net::IpAddr, u16)> {
+    let psi = &si.psi;
+    if (psi.soi_family != libc::AF_INET && psi.soi_family != libc::AF_INET6) || psi.soi_kind != SOCKINFO_TCP {
+        return None;
+    }
+    // SAFETY: soi_kind says the kernel filled the tcp member.
+    let tcp = unsafe { psi.soi_proto.pri_tcp };
+    let ini = &tcp.tcpsi_ini;
+    let (lport, rport) = (port_of(ini.insi_lport), port_of(ini.insi_fport));
+    if tcp.tcpsi_state == TSI_S_LISTEN || tcp.tcpsi_state == 0 || lport == 0 || rport == 0 {
+        return None;
+    }
+    Some((tcp_state_name(tcp.tcpsi_state), local_addr(ini), lport, addr_of(ini.insi_vflag, &ini.insi_faddr), rport))
+}
+
+/// Listeners and every other TCP socket we may see, in one walk of the process table.
+pub fn sockets() -> Option<(Vec<Listener>, Vec<TcpConn>)> {
+    let mut out = Vec::new();
+    let mut conns = Vec::new();
+    for pid in all_pids()? {
+        let Some(fds) = fds(pid) else { continue };
+        let mut owner: Option<(u32, String)> = None;
+        for fd in fds.iter().filter(|f| f.proc_fdtype == libc::PROX_FDTYPE_SOCKET as u32) {
+            let Some(si) = socket_info(pid, fd.proc_fd) else { continue };
+            let (ppid, comm) = owner
+                .get_or_insert_with(|| short_info(pid).map(|(pp, _, c)| (pp, c)).unwrap_or((0, String::new())))
+                .clone();
+            if let Some((tcp, addr, port)) = listener_of(&si) {
+                out.push(Listener { pid: pid as u32, ppid, comm, tcp, addr, port });
+            } else if let Some((state, local, lport, remote, rport)) = tcp_conn_of(&si) {
+                conns.push(TcpConn { pid: pid as u32, comm, state, local, lport, remote, rport });
+            }
+        }
+    }
+    Some((out, conns))
+}
+
 /// Every listening TCP / bound UDP socket we may see, with its owning process. None only when
 /// the process list itself cannot be read.
+#[allow(dead_code)]
 pub fn listeners() -> Option<Vec<Listener>> {
     let mut out = Vec::new();
     for pid in all_pids()? {

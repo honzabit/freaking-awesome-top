@@ -582,70 +582,237 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
 // ------------------------------------------------------------------- ports
 
 fn draw_ports(f: &mut Frame, app: &mut App, area: Rect) {
-    let body_h = area.height.saturating_sub(2) as usize;
+    use crate::tui::app::{PortRow, PortView};
+    let [chips_area, table_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(2)]).areas(area);
+    let body_h = table_area.height.saturating_sub(2) as usize;
     let len = app.port_rows.len();
     scroll_into_view(app.port_sel, &mut app.port_offset, body_h, len);
     let app = &*app;
     let Some(snap) = app.view() else {
         f.render_widget(
             Paragraph::new("no snapshot").style(dim()).block(Block::default().borders(Borders::TOP).title(" Ports ")),
-            area,
+            table_area,
         );
         return;
     };
-    let orphans = snap.ports.iter().filter(|p| p.orphan).count();
-    let mut title =
-        vec![Span::styled(" Ports ", Style::default().bold()), Span::styled(format!("{} listening ", len), dim())];
-    if orphans > 0 {
-        title.push(Span::styled(format!("· ⚠ {orphans} orphaned "), Style::default().fg(Color::Yellow).bold()));
+    // Chips with live counts.
+    let c = &snap.conns;
+    let other: u32 = c
+        .states
+        .iter()
+        .filter(|(st, _)| !matches!(st.as_str(), "ESTABLISHED" | "TIME_WAIT" | "CLOSE_WAIT" | "LISTEN"))
+        .map(|(_, n)| n)
+        .sum();
+    let orphans = snap.ports.iter().filter(|p| p.orphan).count() as u32;
+    let count = |v: PortView| -> u32 {
+        match v {
+            PortView::All => {
+                snap.ports.len() as u32 + c.states.iter().filter(|(s, _)| s != "LISTEN").map(|(_, n)| n).sum::<u32>()
+            }
+            PortView::Listen => snap.ports.len() as u32,
+            PortView::Established => c.count("ESTABLISHED"),
+            PortView::TimeWait => c.count("TIME_WAIT"),
+            PortView::CloseWait => c.count("CLOSE_WAIT"),
+            PortView::Other => other,
+            PortView::Orphans => orphans,
+        }
+    };
+    let mut spans = Vec::new();
+    for v in PortView::ALL {
+        let n = count(v);
+        let warn = match v {
+            PortView::CloseWait => app.close_wait_rising(),
+            PortView::Orphans => n > 0,
+            _ => false,
+        };
+        let st = if v == app.port_view {
+            Style::default().fg(Color::Black).bg(ACCENT).bold()
+        } else if warn {
+            Style::default().fg(Color::Yellow).bold()
+        } else if n == 0 {
+            dim()
+        } else {
+            Style::default()
+        };
+        let mark = if warn { " ⚠" } else { "" };
+        spans.push(Span::styled(format!(" {} {}{mark} ", v.title(), fmt_count(n as u64)), st));
+        spans.push(Span::styled("·", dim()));
+    }
+    spans.pop();
+    spans.push(Span::styled("  ←→ view · f filter", dim()));
+    f.render_widget(Paragraph::new(Line::from(spans)), chips_area);
+
+    let mut title = vec![
+        Span::styled(" Ports ", Style::default().bold()),
+        Span::styled(format!("{} · {} rows ", app.port_view.title().to_lowercase(), len), dim()),
+    ];
+    if !app.port_filter.is_empty() {
+        title.push(Span::styled(
+            format!("· filter: {} (Esc clears) ", app.port_filter.describe()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if c.more_groups > 0 {
+        title.push(Span::styled(format!("· +{} smaller groups not shown ", c.more_groups), dim()));
     }
     let header = Row::new(
-        ["PROTO", "ADDRESS", "PID", "PROCESS", "NOTE"].map(|h| Cell::from(Span::styled(h, Style::default().bold()))),
+        ["STATE", "LOCAL", "PEER", "COUNT", "PID", "PROCESS", "NOTE"]
+            .map(|h| Cell::from(Span::styled(h, Style::default().bold()))),
     );
-    let rows = app.port_rows.iter().enumerate().skip(app.port_offset).take(body_h).map(|(i, &pi)| {
-        let p = &snap.ports[pi];
-        let proto = match p.proto {
-            crate::model::Proto::Tcp => "tcp",
-            crate::model::Proto::Udp => "udp",
+    let state_style = |st: &str| match st {
+        "LISTEN" => Style::default().fg(Color::Green),
+        "ESTABLISHED" => Style::default().fg(ACCENT),
+        "CLOSE_WAIT" => Style::default().fg(Color::Yellow),
+        "TIME_WAIT" => dim(),
+        _ => Style::default().fg(Color::Magenta),
+    };
+    let rows = app.port_rows.iter().enumerate().skip(app.port_offset).take(body_h).map(|(i, r)| {
+        let mut row = match *r {
+            PortRow::Listen(pi) => {
+                let p = &snap.ports[pi];
+                let (state, st) = match p.proto {
+                    crate::model::Proto::Tcp => ("LISTEN", state_style("LISTEN")),
+                    crate::model::Proto::Udp => ("udp", Style::default()),
+                };
+                let note = if p.orphan {
+                    Line::from(vec![
+                        Span::styled("⚠ orphan ", Style::default().fg(Color::Black).bg(Color::Yellow).bold()),
+                        Span::styled(format!(" {}", p.note), Style::default().fg(Color::Yellow)),
+                    ])
+                } else {
+                    Line::styled(p.note.as_str(), dim())
+                };
+                Row::new(vec![
+                    Cell::from(Span::styled(state, st)),
+                    Cell::from(format!("{}:{}", p.addr, p.port)),
+                    Cell::from(Span::styled("—", dim())),
+                    Cell::from(""),
+                    num(p.pid.to_string(), Style::default()),
+                    Cell::from(Span::styled(p.process.as_str(), Style::default().bold())),
+                    Cell::from(note),
+                ])
+            }
+            PortRow::Group(gi) => {
+                let g = &c.groups[gi];
+                let local = if g.inbound { format!("{}:{}", g.local, g.local_port) } else { "—".to_string() };
+                let peer = if g.inbound || g.remote_port == 0 {
+                    format!("{}:*", g.remote)
+                } else {
+                    format!("{}:{}", g.remote, g.remote_port)
+                };
+                let (pid, process) = match (g.pid, g.state.as_str()) {
+                    (0, "TIME_WAIT") => ("-".to_string(), Span::styled("(kernel)", dim())),
+                    (0, _) => ("-".to_string(), Span::styled("(owner hidden)", dim())),
+                    (p, _) => (p.to_string(), Span::styled(g.process.clone(), Style::default().bold())),
+                };
+                let note = if g.inbound { format!("in → :{}", g.local_port) } else { "out".to_string() };
+                Row::new(vec![
+                    Cell::from(Span::styled(g.state.to_lowercase().replace('_', "-"), state_style(&g.state))),
+                    Cell::from(local),
+                    Cell::from(peer),
+                    num(
+                        format!("×{}", g.count),
+                        if g.count >= 100 { Style::default().bold() } else { Style::default() },
+                    ),
+                    num(pid, Style::default()),
+                    Cell::from(process),
+                    Cell::from(Span::styled(note, dim())),
+                ])
+            }
         };
-        let note = if p.orphan {
-            Line::from(vec![
-                Span::styled("⚠ orphan ", Style::default().fg(Color::Black).bg(Color::Yellow).bold()),
-                Span::styled(format!(" {}", p.note), Style::default().fg(Color::Yellow)),
-            ])
-        } else {
-            Line::styled(p.note.as_str(), dim())
-        };
-        let mut row = Row::new(vec![
-            Cell::from(proto),
-            Cell::from(format!("{}:{}", p.addr, p.port)),
-            num(p.pid.to_string(), Style::default()),
-            Cell::from(Span::styled(p.process.as_str(), Style::default().bold())),
-            Cell::from(note),
-        ]);
         if i == app.port_sel {
             row = row.style(Style::default().bg(SEL_BG));
         }
         row
     });
+    let block = Block::default().borders(Borders::TOP).border_style(dim()).title(Line::from(title));
+    let block = match c.notes.first() {
+        Some(n) => block.title_bottom(Line::styled(format!(" {n} "), dim())),
+        None => block,
+    };
     let table = Table::new(
         rows,
         [
-            Constraint::Length(5),
+            Constraint::Length(11),
+            Constraint::Length(22),
             Constraint::Length(24),
             Constraint::Length(7),
+            Constraint::Length(7),
             Constraint::Length(16),
-            Constraint::Min(10),
+            Constraint::Min(8),
         ],
     )
     .header(header)
     .column_spacing(1)
-    .block(Block::default().borders(Borders::TOP).border_style(dim()).title(Line::from(title)));
-    f.render_widget(table, area);
+    .block(block);
+    f.render_widget(table, table_area);
     if len == 0 {
-        let r = Rect { y: area.y + 2, height: 1, ..area };
-        f.render_widget(Paragraph::new("nothing is listening (or port data unavailable)").style(dim()), r);
+        let r = Rect { y: table_area.y + 2, height: 1, ..table_area };
+        let msg = if app.port_filter.is_empty() && app.port_view == PortView::All {
+            "nothing is listening or connected (or port data unavailable)"
+        } else {
+            "nothing matches this view or filter (Esc shows everything)"
+        };
+        f.render_widget(Paragraph::new(msg).style(dim()), r);
     }
+}
+
+/// The Ports filter dialog.
+fn draw_port_filter(f: &mut Frame, app: &App, form: &crate::tui::app::PortFilterForm, area: Rect) {
+    let flt = &app.port_filter;
+    let r = centered(64.min(area.width.saturating_sub(2)), 11, area);
+    f.render_widget(Clear, r);
+    let values = [
+        flt.proto.map(|p| format!("{p:?}").to_lowercase()).unwrap_or_else(|| "any".into()),
+        flt.scope.title().to_string(),
+        flt.process.clone(),
+        flt.port.clone(),
+        flt.remote.clone(),
+    ];
+    let hints = [
+        "tcp · udp · any (⏎ / ←→)",
+        "loopback · private · public (⏎ / ←→)",
+        "part of the name",
+        "8080 or 8000-8100",
+        "part of the address",
+    ];
+    let mut lines = Vec::new();
+    for (i, label) in crate::tui::app::PortFilterForm::LABELS.iter().enumerate() {
+        let selected = i == form.sel;
+        let mut v = values[i].clone();
+        if selected && form.editing {
+            v.push('▏');
+        }
+        let shown = if v.is_empty() { "—".to_string() } else { v };
+        let mut line = Line::from(vec![
+            Span::raw(format!(" {label:<15}")),
+            Span::styled(format!("{shown:<22}"), Style::default().bold()),
+            Span::styled(hints[i], dim()),
+        ]);
+        if selected {
+            line = line.style(Style::default().bg(SEL_BG));
+        }
+        lines.push(line);
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(format!(" {} rows match", app.port_rows.len()), dim()));
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .title(" Filter ports ")
+                .title_bottom(Line::styled(
+                    if form.editing {
+                        " type · ⏎ done "
+                    } else {
+                        " ↑↓ field · ⏎ change · c clear all · Esc close "
+                    },
+                    dim(),
+                )),
+        ),
+        r,
+    );
 }
 
 // ------------------------------------------------------------------- storage
@@ -2145,6 +2312,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
     match &app.modal {
         Modal::None | Modal::Filter => {}
         Modal::Help => draw_help(f, area),
+        Modal::PortFilter(form) => draw_port_filter(f, app, form, area),
 
         Modal::Confirm { prompt, .. } => {
             let r = centered(64.min(area.width.saturating_sub(2)), 6, area);
@@ -2230,6 +2398,7 @@ const HELP: &[(&str, &str)] = &[
         "H health · c cpu · m mem · d disk · f findings · n name · l latency (nothing in Fleet acts on a host)",
     ),
     ("L / Esc", "return to live"),
+    ("Ports: ←→ f", "view by state (All, Listen, Established, Time-wait, Close-wait, Other, Orphans) · filter dialog"),
     ("?", "ask in plain language: a new thread in the Ask tab"),
     (",", "settings screen: every setting by group (←→), with its source; Esc back"),
     ("Ask: ⏎ n ↑↓ d", "follow up in this thread · new thread · open another · delete (Esc leaves the input)"),
@@ -3153,6 +3322,56 @@ mod tests {
                     assert!(text.contains(word), "{inner}: lost {word:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn ports_view_shows_chips_groups_and_the_filter() {
+        use crate::model::{ConnGroup, Conns};
+        for (w, h) in SIZES {
+            let mut a = full_app();
+            let mut s = a.live.clone().unwrap();
+            s.conns = Conns {
+                states: vec![("ESTABLISHED".into(), 1240), ("TIME_WAIT".into(), 210), ("CLOSE_WAIT".into(), 18)],
+                groups: vec![
+                    ConnGroup {
+                        state: "ESTABLISHED".into(),
+                        pid: 200,
+                        process: "node".into(),
+                        remote: "10.0.3.7".into(),
+                        remote_port: 5432,
+                        count: 412,
+                        ..Default::default()
+                    },
+                    ConnGroup {
+                        state: "TIME_WAIT".into(),
+                        inbound: true,
+                        local: "*".into(),
+                        local_port: 443,
+                        remote: "203.0.113.5".into(),
+                        count: 210,
+                        ..Default::default()
+                    },
+                ],
+                notes: vec!["TIME_WAIT is not shown on macOS".into()],
+                ..Default::default()
+            };
+            a.on_snapshot(s);
+            a.switch_tab(Tab::Ports);
+            let out = render(&mut a, w, h);
+            if h >= 24 && w >= 80 {
+                assert!(
+                    out.contains("Established 1240") && out.contains("Time-wait 210") && out.contains("Close-wait 18"),
+                    "{out}"
+                );
+                assert!(out.contains("10.0.3.7:5432") && out.contains("×412") && out.contains("(kernel)"), "{out}");
+            }
+            a.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+            let out = render(&mut a, w, h);
+            if h >= 24 {
+                assert!(out.contains("Filter ports") && out.contains("Address scope"), "{out}");
+            }
+            a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         }
     }
 }
