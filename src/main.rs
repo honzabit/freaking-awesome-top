@@ -1070,15 +1070,15 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Pause { pid }) => {
             let s = sample();
-            print_action(&actions::Actions::open().apply(ActionKind::Pause, pid, None, &s));
+            print_action(&actions::Actions::open().with_origin("cli").apply(ActionKind::Pause, pid, None, &s));
         }
         Some(Cmd::Resume { pid }) => {
             let s = sample();
-            print_action(&actions::Actions::open().apply(ActionKind::Resume, pid, None, &s));
+            print_action(&actions::Actions::open().with_origin("cli").apply(ActionKind::Resume, pid, None, &s));
         }
         Some(Cmd::Renice { pid, nice }) => {
             let s = sample();
-            print_action(&actions::Actions::open().apply(ActionKind::Renice, pid, Some(nice), &s));
+            print_action(&actions::Actions::open().with_origin("cli").apply(ActionKind::Renice, pid, Some(nice), &s));
         }
         Some(Cmd::Kill { pid, tree, force }) => {
             let s = sample();
@@ -1089,10 +1089,10 @@ fn main() -> Result<()> {
             } else {
                 ActionKind::Term
             };
-            print_action(&actions::Actions::open().apply(kind, pid, None, &s));
+            print_action(&actions::Actions::open().with_origin("cli").apply(kind, pid, None, &s));
         }
         Some(Cmd::Undo { id }) => {
-            let mut a = actions::Actions::open();
+            let mut a = actions::Actions::open().with_origin("cli");
             match id {
                 Some(id) => print_action(&a.undo(id)),
                 None => match a.undo_last() {
@@ -1102,7 +1102,7 @@ fn main() -> Result<()> {
             }
         }
         Some(Cmd::Log { json }) => {
-            let l = actions::Actions::open().log();
+            let l = actions::Actions::open().with_origin("cli").log();
             if json {
                 print_json(&l)?;
             } else {

@@ -53,6 +53,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Tab::Timeline => draw_timeline(f, app, main),
         Tab::Doctor => draw_doctor(f, app, main),
         Tab::Ask => draw_ask_tab(f, app, main),
+        Tab::Log => draw_log(f, app, main),
+        Tab::Settings => draw_settings(f, app, main),
         Tab::Services => server_ui::draw_services(f, app, main),
         Tab::Events => server_ui::draw_events(f, app, main),
     }
@@ -270,7 +272,43 @@ fn thermal_spans(thermal: &str, temp_c: Option<f32>) -> Vec<Span<'static>> {
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let tabs = app.tabs();
+    // Screens (Log, Settings) sit at the right end, dimmed, without number keys.
+    let screen_spans: Vec<Span> = Tab::SCREENS
+        .iter()
+        .enumerate()
+        .flat_map(|(i, t)| {
+            let key = if *t == Tab::Log { "a " } else { ", " };
+            let st = if app.tab == *t { Style::default().fg(Color::Black).bg(ACCENT).bold() } else { dim() };
+            let mut v = vec![Span::styled(format!(" {key}{} ", t.title()), st)];
+            if i + 1 < Tab::SCREENS.len() {
+                v.push(Span::styled("│", dim()));
+            }
+            v
+        })
+        .collect();
+    let screens_w = Line::from(screen_spans.clone()).width() as u16;
+    // Views come first: the screens show only when every view fits beside them
+    // (they stay reachable with `a` and `,`).
+    let views_w: u16 = app
+        .tabs()
+        .iter()
+        .filter(|t| !Tab::SCREENS.contains(t))
+        .map(|t| {
+            t.title().len() as u16
+                + 4
+                + if *t == Tab::Doctor || *t == Tab::Ports || *t == Tab::Services { 3 } else { 0 }
+        })
+        .sum();
+    let (area, right) = if area.width >= screens_w + views_w || Tab::SCREENS.contains(&app.tab) {
+        let [l, r] = Layout::horizontal([Constraint::Min(10), Constraint::Length(screens_w)]).areas(area);
+        (l, Some(r))
+    } else {
+        (area, None)
+    };
+    if let Some(r) = right {
+        f.render_widget(Paragraph::new(Line::from(screen_spans)), r);
+    }
+    let tabs: Vec<Tab> = app.tabs().into_iter().filter(|t| !Tab::SCREENS.contains(t)).collect();
     let titles: Vec<Line> = tabs
         .iter()
         .map(|t| {
@@ -319,7 +357,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let need: usize = titles.iter().map(|l| l.width() + 3).sum();
     let pad = if need <= area.width as usize { " " } else { "" };
     let tabs = Tabs::new(titles)
-        .select(tabs.iter().position(|t| *t == app.tab).unwrap_or(0))
+        .select(tabs.iter().position(|t| *t == app.tab))
         .style(dim())
         .highlight_style(Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
         .divider("│")
@@ -1512,23 +1550,29 @@ fn draw_doctor(f: &mut Frame, app: &App, area: Rect) {
 // ------------------------------------------------------------------- log
 
 /// The action journal, as an overlay over the current view (`a`).
-fn draw_log(f: &mut Frame, app: &App, full: Rect) {
-    // Only as tall as the journal needs, so the view behind it stays recognisable.
-    let want = (app.log.len() as u16).saturating_add(4).max(8);
-    let area = centered(full.width.saturating_sub(4).min(120), want.min(full.height.saturating_sub(4)).max(6), full);
-    f.render_widget(Clear, area);
+/// The action log screen: everything fat did, newest first, with who asked; details and
+/// undo for the selected entry.
+fn draw_log(f: &mut Frame, app: &App, area: Rect) {
+    let rows = app.log_rows();
+    let kind = app.log_kind.map(|k| format!("{k:?}").to_lowercase()).unwrap_or_else(|| "all".into());
+    let filter = if app.log_filter.is_empty() { String::new() } else { format!(" · \"{}\"", app.log_filter) };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
         .title(Line::from(vec![
             Span::styled(" Action log ", Style::default().bold()),
-            Span::styled("most recent first ", dim()),
+            Span::styled(format!("{} of {} · {kind}{filter} ", rows.len(), app.log.len()), dim()),
         ]))
-        .title_bottom(Line::styled(" ⏎ undo selected · u undo last · TERM/KILL can't be undone · Esc close ", dim()));
+        .title_bottom(Line::styled(
+            " ⏎ undo selected · u undo last · f kind · / search · Esc back · TERM/KILL can't be undone ",
+            dim(),
+        ));
     if app.log.is_empty() {
         let t = Text::from(vec![
             Line::styled("No actions yet.", Style::default().bold()),
-            Line::styled("Pause (space), renice (r) or terminate (k) a process: every action lands here.", dim()),
+            Line::styled(
+                "Pause (space), renice (r) or terminate (k) a process: every action lands here, with who asked.",
+                dim(),
+            ),
             Line::styled(
                 "A pause can be undone with u (a renice too, as root); a terminate cannot (pause first to try it out).",
                 dim(),
@@ -1537,13 +1581,19 @@ fn draw_log(f: &mut Frame, app: &App, full: Rect) {
         f.render_widget(Paragraph::new(t).block(block), area);
         return;
     }
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let detail_h = if inner.height >= 16 { 7 } else { 0 };
+    let [list, detail] = Layout::vertical([Constraint::Min(3), Constraint::Length(detail_h)]).areas(inner);
     let header = Row::new(
-        ["TIME", "#", "ACTION", "PID", "NAME", "RESULT"].map(|h| Cell::from(Span::styled(h, Style::default().bold()))),
+        ["TIME", "#", "WHO", "ACTION", "PID", "NAME", "RESULT"]
+            .map(|h| Cell::from(Span::styled(h, Style::default().bold()))),
     );
-    let body_h = area.height.saturating_sub(3) as usize;
+    let body_h = list.height.saturating_sub(1) as usize;
     let mut offset = 0;
-    scroll_into_view(app.log_sel, &mut offset, body_h, app.log.len());
-    let rows = app.log.iter().enumerate().skip(offset).take(body_h).map(|(i, r)| {
+    scroll_into_view(app.log_sel, &mut offset, body_h, rows.len());
+    let table_rows = rows.iter().enumerate().skip(offset).take(body_h).map(|(i, &ri)| {
+        let r = &app.log[ri];
         let (mark, ms) =
             if r.ok { ("✓", Style::default().fg(Color::Green)) } else { ("✗", Style::default().fg(Color::Red)) };
         let mut result = vec![Span::styled(mark, ms), Span::raw(" "), Span::raw(r.message.as_str())];
@@ -1552,9 +1602,12 @@ fn draw_log(f: &mut Frame, app: &App, full: Rect) {
         } else if r.undoable && r.ok {
             result.push(Span::styled("  undoable", Style::default().fg(ACCENT)));
         }
+        let who = if r.origin.is_empty() { "-" } else { r.origin.as_str() };
+        let who_style = if r.origin.starts_with("mcp") { Style::default().fg(Color::Magenta) } else { dim() };
         let mut row = Row::new(vec![
             Cell::from(Span::styled(fmt_datetime(r.ts), dim())),
             num(r.id.to_string(), dim()),
+            Cell::from(Span::styled(who.to_string(), who_style)),
             Cell::from(format!("{:?}", r.kind).to_lowercase()),
             num(r.pid.to_string(), Style::default()),
             Cell::from(Span::styled(r.name.as_str(), Style::default().bold())),
@@ -1569,10 +1622,11 @@ fn draw_log(f: &mut Frame, app: &App, full: Rect) {
         row
     });
     let table = Table::new(
-        rows,
+        table_rows,
         [
             Constraint::Length(14),
             Constraint::Length(4),
+            Constraint::Length(12),
             Constraint::Length(9),
             Constraint::Length(7),
             Constraint::Length(16),
@@ -1580,9 +1634,60 @@ fn draw_log(f: &mut Frame, app: &App, full: Rect) {
         ],
     )
     .header(header)
-    .column_spacing(1)
-    .block(block);
-    f.render_widget(table, area);
+    .column_spacing(1);
+    f.render_widget(table, list);
+    if detail_h == 0 {
+        return;
+    }
+    let Some(r) = rows.get(app.log_sel).map(|&i| &app.log[i]) else {
+        f.render_widget(Paragraph::new(Line::styled("nothing matches the filter (Esc clears it)", dim())), detail);
+        return;
+    };
+    let who = match r.origin.as_str() {
+        "" => "unknown (recorded before fat kept who asked)".to_string(),
+        "tui" => "you, in the TUI".to_string(),
+        "cli" => "the command line (fat pause/kill/…)".to_string(),
+        o if o.starts_with("mcp") => format!("an agent over MCP: {o}"),
+        o => o.to_string(),
+    };
+    let state = if !r.ok {
+        "failed".to_string()
+    } else if r.undone {
+        "undone".to_string()
+    } else if r.undoable {
+        format!("can be undone: ⏎ here, or `fat undo {}`", r.id)
+    } else {
+        "cannot be undone".to_string()
+    };
+    let pids = if r.pids.len() > 1 {
+        format!(
+            "{} processes: {}",
+            r.pids.len(),
+            r.pids.iter().take(12).map(|p| p.to_string()).collect::<Vec<_>>().join(" ")
+        )
+    } else {
+        format!("pid {}", r.pid)
+    };
+    let nice = match (r.prev_nice, r.new_nice) {
+        (Some(a), Some(b)) => format!(" · nice {a} → {b}"),
+        _ => String::new(),
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(format!("#{} {:?} ", r.id, r.kind).to_lowercase(), Style::default().bold()),
+            Span::styled(format!("{} ({pids}){nice}", r.name), Style::default()),
+        ]),
+        Line::from(vec![Span::styled("when  ", dim()), Span::raw(fmt_datetime(r.ts))]),
+        Line::from(vec![Span::styled("who   ", dim()), Span::raw(who)]),
+        Line::from(vec![Span::styled("result ", dim()), Span::raw(r.message.clone())]),
+        Line::from(vec![Span::styled("state ", dim()), Span::raw(state)]),
+    ];
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::TOP).border_style(dim())),
+        detail,
+    );
 }
 
 // ------------------------------------------------------------------- overlays
@@ -1784,95 +1889,191 @@ fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// The settings overlay: grouped settings with their value and where it comes from.
-fn draw_settings(f: &mut Frame, app: &App, ui: &crate::tui::app::SettingsUi, area: Rect) {
-    use crate::settings::{Kind, Source};
-    let w = area.width.saturating_sub(4).min(110);
-    let h = area.height.saturating_sub(2);
-    let r = centered(w, h, area);
-    f.render_widget(Clear, r);
+/// The Settings screen: groups on the left, the selected group's settings on the right.
+fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
+    use crate::settings::{GROUPS, Kind, Source};
+    use crate::tui::app::SRow;
+    let ui = &app.settings;
+    let rows = ui.rows();
+    let cur_group = ui.selected().map(|r| ui.group_of(r)).unwrap_or(GROUPS[0]);
+    let [side, main] = Layout::horizontal([Constraint::Length(18), Constraint::Min(30)]).areas(area);
+    // Sidebar.
+    let items: Vec<ListItem> = GROUPS
+        .iter()
+        .map(|g| {
+            let count = if *g == "Hosts" { ui.hosts.len() } else { ui.fields.iter().filter(|f| f.group == *g).count() };
+            let st =
+                if *g == cur_group { Style::default().fg(Color::Black).bg(ACCENT).bold() } else { Style::default() };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {g:<10}"), st),
+                Span::styled(format!(" {count}"), dim()),
+            ]))
+        })
+        .collect();
+    f.render_widget(
+        List::new(items).block(
+            Block::default().borders(Borders::ALL).title(" Settings ").title_bottom(Line::styled(" ←→ ", dim())),
+        ),
+        side,
+    );
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
-        .title(Line::styled(" Settings ", Style::default().bold()))
-        .title(Line::styled(format!(" {} ", clip(&ui.path, (w as usize).saturating_sub(16))), dim()).right_aligned())
+        .title(Line::styled(format!(" {cur_group} "), Style::default().bold()))
+        .title(
+            Line::styled(format!(" {} ", clip(&ui.path, (main.width as usize).saturating_sub(20))), dim())
+                .right_aligned(),
+        )
         .title_bottom(Line::styled(
             if ui.editing.is_some() {
                 " ⏎ save · Esc cancel · Ctrl-U clear "
             } else if ui.picker.is_some() {
                 " ↑↓ choose · ⏎ use this model · Esc back "
+            } else if ui.multi.is_some() {
+                " ↑↓ move · space toggle · ⏎ save · Esc back "
+            } else if ui.host_form.as_ref().is_some_and(|h| h.editing) {
+                " type · Tab next field · ⏎/Esc done "
+            } else if ui.host_form.is_some() {
+                " ↑↓ field · ⏎ edit · s save · t test ssh · Esc back "
+            } else if cur_group == "Hosts" {
+                " ⏎ edit / add · d remove · t test ssh · ←→ groups · Esc back "
             } else {
-                " ↑↓ move · ⏎ change · r reset · t test model · m pick model · Esc close "
+                " ↑↓ move · ⏎ change · r reset · t test model · m pick model · ←→ groups · Esc back "
             },
             dim(),
         ));
-    let inner = block.inner(r);
-    f.render_widget(block, r);
+    let inner = block.inner(main);
+    f.render_widget(block, main);
     let [list, foot] = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(inner);
 
-    let label_w = 26usize;
-    let src_w = 22usize;
-    let val_w = (list.width as usize).saturating_sub(label_w + src_w + 3).max(8);
     let mut lines: Vec<Line> = Vec::new();
     let mut sel_line = 0usize;
-    let mut group = "";
-    for (i, fd) in ui.fields.iter().enumerate() {
-        if fd.group() != group {
-            group = fd.group();
-            if !lines.is_empty() {
-                lines.push(Line::raw(""));
+    if let Some(form) = &ui.host_form {
+        let title = if form.index.is_some() { "Edit host" } else { "Add a host" };
+        lines.push(Line::styled(title, Style::default().fg(ACCENT).bold()));
+        lines.push(Line::raw(""));
+        for (i, label) in crate::tui::app::HostForm::LABELS.iter().enumerate() {
+            let selected = i == form.sel;
+            let mut v = form.values[i].clone();
+            if selected && form.editing {
+                v.push('▏');
             }
-            lines.push(Line::styled(group.to_string(), Style::default().fg(ACCENT).bold()));
-            if fd.section == "ask" {
-                lines.push(Line::styled(format!("  key: {}", ui.key_status), dim()));
-                lines.push(Line::styled(format!("  now: {}", crate::llm::destination(&ask_cfg_of(ui))), dim()));
+            let mut line = Line::from(vec![
+                Span::raw(format!("  {label:<18}")),
+                Span::styled(if v.is_empty() { "—".to_string() } else { v }, Style::default().bold()),
+            ]);
+            if selected {
+                line = line.style(Style::default().bg(SEL_BG));
+                sel_line = lines.len();
             }
+            lines.push(line);
         }
-        let selected = i == ui.sel;
-        if selected {
-            sel_line = lines.len();
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(format!("  {}", crate::tui::app::HostForm::HELP[form.sel]), dim()));
+    } else {
+        let label_w = 28usize;
+        let src_w = 20usize;
+        let val_w = (list.width as usize).saturating_sub(label_w + src_w + 3).max(8);
+        if cur_group == "Ask" {
+            lines.push(Line::styled(format!("  key: {}", ui.key_status), dim()));
+            lines.push(Line::styled(format!("  now: {}", crate::llm::destination(&ask_cfg_of(ui))), dim()));
+            lines.push(Line::raw(""));
         }
-        let value = match (&ui.editing, selected) {
-            (Some(input), true) => format!("{input}▏"),
-            _ => match (&fd.kind, fd.value.as_str()) {
-                (Kind::Bool, "true") => "on".to_string(),
-                (Kind::Bool, _) => "off".to_string(),
-                (Kind::Text, "") => "—".to_string(),
-                (Kind::Number(..), "0") if matches!(fd.key, "context_bytes" | "num_ctx" | "timeout_s") => {
-                    "auto".to_string()
+        if cur_group == "Hosts" && ui.hosts.is_empty() {
+            lines.push(Line::styled(
+                "  No hosts yet: add one to see it in Fleet (ssh with your own ssh config).",
+                dim(),
+            ));
+            lines.push(Line::raw(""));
+        }
+        for (ri, r) in rows.iter().enumerate() {
+            if ui.group_of(*r) != cur_group {
+                continue;
+            }
+            let selected = ri == ui.sel;
+            if selected {
+                sel_line = lines.len();
+            }
+            let mut line = match *r {
+                SRow::Host(i) => {
+                    let h = &ui.hosts[i];
+                    let mut parts = vec![format!("ssh {}", h.ssh.as_deref().unwrap_or(&h.name))];
+                    if let Some(p) = &h.fat_path {
+                        parts.push(format!("fat {p}"));
+                    }
+                    if !h.groups.is_empty() {
+                        parts.push(format!("groups {}", h.groups.join(",")));
+                    }
+                    if !h.tags.is_empty() {
+                        parts.push(format!("tags {}", h.tags.join(",")));
+                    }
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {:<width$}", clip(&h.name, label_w - 2), width = label_w - 2),
+                            Style::default().bold(),
+                        ),
+                        Span::styled(format!(" {}", parts.join(" · ")), dim()),
+                    ])
                 }
-                (_, v) => v.to_string(),
-            },
-        };
-        let src = match &fd.source {
-            Source::Default => "default".to_string(),
-            Source::File => "config file".to_string(),
-            Source::Env(v) => format!("env {v}"),
-        };
-        let val_style = if !fd.editable() {
-            dim()
-        } else if ui.editing.is_some() && selected {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().bold()
-        };
-        let mut line = Line::from(vec![
-            Span::raw(format!("  {:<width$}", clip(fd.label, label_w - 2), width = label_w - 2)),
-            Span::styled(format!(" {:<width$}", clip_end(&value, val_w), width = val_w), val_style),
-            Span::styled(format!(" {:>width$}", clip(&src, src_w), width = src_w), dim()),
-        ]);
-        if selected {
-            line = line.style(Style::default().bg(Color::DarkGray));
+                SRow::AddHost => Line::styled("  + add a host", Style::default().fg(ACCENT)),
+                SRow::Field(i) => {
+                    let fd = &ui.fields[i];
+                    let value = match (&ui.editing, selected) {
+                        (Some(input), true) => format!("{input}▏"),
+                        _ => match (&fd.kind, fd.value.as_str()) {
+                            (Kind::Bool, "true") => "on".to_string(),
+                            (Kind::Bool, _) => "off".to_string(),
+                            (Kind::Multi(_), "") => "nothing (read-only)".to_string(),
+                            (Kind::Text | Kind::List | Kind::Map, "") => "—".to_string(),
+                            (Kind::Number(..), "0")
+                                if matches!(fd.key.as_str(), "context_bytes" | "num_ctx" | "timeout_s") =>
+                            {
+                                "auto".to_string()
+                            }
+                            (_, v) => v.to_string(),
+                        },
+                    };
+                    let src = match &fd.source {
+                        Source::Default => "default".to_string(),
+                        Source::File => "config file".to_string(),
+                        Source::Env(v) => format!("env {v}"),
+                    };
+                    let val_style = if !fd.editable() {
+                        dim()
+                    } else if ui.editing.is_some() && selected {
+                        Style::default().fg(Color::Yellow)
+                    } else if fd.sensitive() && !fd.value.is_empty() {
+                        Style::default().fg(Color::Magenta).bold()
+                    } else {
+                        Style::default().bold()
+                    };
+                    Line::from(vec![
+                        Span::raw(format!("  {:<width$}", clip(&fd.label, label_w - 2), width = label_w - 2)),
+                        Span::styled(format!(" {:<width$}", clip_end(&value, val_w), width = val_w), val_style),
+                        Span::styled(format!(" {:>width$}", clip(&src, src_w), width = src_w), dim()),
+                    ])
+                }
+            };
+            if selected {
+                line = line.style(Style::default().bg(SEL_BG));
+            }
+            lines.push(line);
         }
-        lines.push(line);
     }
     let visible = list.height as usize;
     let top = sel_line.saturating_sub(visible.saturating_sub(3)).min(lines.len().saturating_sub(visible));
     f.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), list);
 
     let mut foot_lines = Vec::new();
-    if let Some(fd) = ui.fields.get(ui.sel) {
-        foot_lines.push(Line::styled(fd.help.to_string(), dim()));
+    if let Some(fd) = ui.field().filter(|_| ui.host_form.is_none()) {
+        let when = if fd.live { "" } else { " (applies the next time fat starts)" };
+        let help = if fd.help.is_empty() {
+            format!("[{}] {}{when}", if fd.section.is_empty() { "top level" } else { &fd.section }, fd.key)
+        } else {
+            format!("{}{when}", fd.help)
+        };
+        foot_lines.push(Line::styled(help, dim()));
     }
     if let Some(b) = &ui.busy {
         let spin = SPINNER[(app.now / 100) as usize % SPINNER.len()];
@@ -1883,23 +2084,32 @@ fn draw_settings(f: &mut Frame, app: &App, ui: &crate::tui::app::SettingsUi, are
     }
     f.render_widget(Paragraph::new(foot_lines).wrap(Wrap { trim: true }), foot);
 
-    if let Some((models, i)) = &ui.picker {
-        let ph = (models.len() as u16 + 2).min(r.height.saturating_sub(4)).max(3);
-        let pw = models.iter().map(|m| m.chars().count()).max().unwrap_or(10).clamp(20, 60) as u16 + 4;
-        let pr = centered(pw.min(r.width.saturating_sub(4)), ph, r);
+    let popup = |f: &mut Frame, title: &str, items: Vec<ListItem>, sel: usize| {
+        let ph = (items.len() as u16 + 2).min(main.height.saturating_sub(4)).max(3);
+        let pr = centered(46.min(main.width.saturating_sub(4)), ph, main);
         f.render_widget(Clear, pr);
-        let items: Vec<ListItem> = models.iter().map(|m| ListItem::new(m.clone())).collect();
         let mut state = ratatui::widgets::ListState::default();
-        state.select(Some(*i));
+        state.select(Some(sel));
         f.render_stateful_widget(
             List::new(items)
                 .block(
-                    Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)).title(" Models "),
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(ACCENT))
+                        .title(format!(" {title} ")),
                 )
-                .highlight_style(Style::default().bg(Color::DarkGray).bold()),
+                .highlight_style(Style::default().bg(SEL_BG).bold()),
             pr,
             &mut state,
         );
+    };
+    if let Some((models, i)) = &ui.picker {
+        popup(f, "Models", models.iter().map(|m| ListItem::new(m.clone())).collect(), *i);
+    }
+    if let Some((items, i)) = &ui.multi {
+        let rows =
+            items.iter().map(|(name, on)| ListItem::new(format!("[{}] {name}", if *on { "x" } else { " " }))).collect();
+        popup(f, "Agents may", rows, *i);
     }
 }
 
@@ -1911,7 +2121,7 @@ fn ask_cfg_of(ui: &crate::tui::app::SettingsUi) -> crate::config::AskCfg {
             continue;
         }
         let v = fd.value.clone();
-        match fd.key {
+        match fd.key.as_str() {
             "enabled" => a.enabled = v == "true",
             "provider" => a.provider = v,
             "url" => a.url = v,
@@ -1935,8 +2145,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
     match &app.modal {
         Modal::None | Modal::Filter => {}
         Modal::Help => draw_help(f, area),
-        Modal::Log => draw_log(f, app, area),
-        Modal::Settings(ui) => draw_settings(f, app, ui, area),
+
         Modal::Confirm { prompt, .. } => {
             let r = centered(64.min(area.width.saturating_sub(2)), 6, area);
             let t = Text::from(vec![
@@ -1999,7 +2208,7 @@ const HELP: &[(&str, &str)] = &[
     ("r", "renice (default 10; undo restores it, lowering needs root)"),
     ("k / K", "terminate / whole tree (confirm; NOT undoable: pause first)"),
     ("u", "undo the last pause or renice"),
-    ("a", "action log: everything fat did, ⏎ undoes the selected entry"),
+    ("a", "action log screen: everything fat did and who asked; ⏎ undo · f kind · / search · Esc back"),
     ("← → [ ] { }", "timeline: move through time (shift / braces = ×10)"),
     ("s  +/-", "timeline: jump to next spike · zoom window"),
     ("Fs: ⏎ → l  ← ⌫", "storage: open directory · go up (⏎ on a 🔒 dir reads it once)"),
@@ -2022,7 +2231,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("L / Esc", "return to live"),
     ("?", "ask in plain language: a new thread in the Ask tab"),
-    (",", "settings: the model ask uses (test it, pick a model), recording, and where each value comes from"),
+    (",", "settings screen: every setting by group (←→), with its source; Esc back"),
     ("Ask: ⏎ n ↑↓ d", "follow up in this thread · new thread · open another · delete (Esc leaves the input)"),
     ("h", "this help"),
     ("q / Ctrl-C", "quit"),
@@ -2203,14 +2412,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("PgUp", "scroll"),
             ("q", "quit"),
         ],
+        Tab::Log => &[("⏎", "undo selected"), ("u", "undo last"), ("f", "kind"), ("/", "search"), ("Esc", "back")],
+        Tab::Settings => &[("⏎", "change"), ("←→", "groups"), ("r", "reset"), ("t", "test"), ("Esc", "back")],
     };
-    let hints: &[(&str, &str)] = if app.panel.is_some() {
-        &[("↑↓", "scroll"), ("w", "why pid"), ("Esc", "close")]
-    } else if app.modal == Modal::Log {
-        &[("↑↓", "move"), ("⏎", "undo selected"), ("u", "undo last"), ("Esc", "close")]
-    } else {
-        hints
-    };
+    let hints: &[(&str, &str)] =
+        if app.panel.is_some() { &[("↑↓", "scroll"), ("w", "why pid"), ("Esc", "close")] } else { hints };
     let mut spans = Vec::with_capacity(hints.len() * 3);
     if app.rewound() && app.tab != Tab::Timeline {
         spans.push(Span::styled(" ⏪ L live ", Style::default().fg(Color::White).bg(Color::Magenta).bold()));
@@ -2291,6 +2497,7 @@ mod tests {
             undone: false,
             ok: true,
             message: "stopped".into(),
+            origin: "tui".into(),
         }]);
         a
     }
@@ -2430,21 +2637,22 @@ mod tests {
                 assert!(out.contains("CRIT") && out.contains("pegging") && out.contains("pause 200"), "{out}");
             }
             a.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-            assert_eq!(a.modal, Modal::Log);
+            assert_eq!(a.tab, Tab::Log);
             let out = render(&mut a, w, h);
             if h >= 24 {
-                assert!(out.contains("Action log") && out.contains("pause") && out.contains("undoable"), "{out}");
-                assert!(out.contains("Doctor"), "the log is an overlay: the Doctor view stays behind it\n{out}");
+                assert!(out.contains("Action log") && out.contains("pause"), "{out}");
+                assert!(out.contains("undoable") || out.contains("can be undone"), "{out}");
+                assert!(out.contains("WHO") && out.contains("tui"), "{out}");
             }
             a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-            assert_eq!(a.modal, Modal::None);
+            assert_eq!(a.tab, Tab::Doctor);
         }
         let mut a = App::new(1000);
         a.switch_tab(Tab::Doctor);
         assert!(render(&mut a, 80, 24).contains("diagnosing"));
         a.set_findings(vec![]);
         assert!(render(&mut a, 80, 24).contains("All good"));
-        a.modal = Modal::Log;
+        a.switch_tab(Tab::Log);
         let out = render(&mut a, 80, 24);
         assert!(out.contains("No actions yet") && out.contains("cannot"), "{out}");
     }
@@ -2536,32 +2744,57 @@ mod tests {
                 ..Default::default()
             };
             ui.key_status = "ANTHROPIC_API_KEY: set ✓".into();
-            a.modal = Modal::Settings(Box::new(ui.clone()));
+            a.tab = Tab::Settings;
+            a.settings = ui.clone();
             let out = render(&mut a, w, h);
             if h >= 30 && w >= 100 {
-                assert!(
-                    out.contains("Settings") && out.contains("Ask: the model") && out.contains("Provider"),
-                    "{out}"
-                );
+                assert!(out.contains("Settings") && out.contains("Recording") && out.contains("Provider"), "{out}");
                 assert!(out.contains("env FAT_ASK_URL") && out.contains("default"), "{out}");
                 assert!(out.contains("ANTHROPIC_API_KEY: set"), "{out}");
                 assert!(!out.contains("sk-"), "{out}");
             }
             ui.editing = Some("qwen3:32".into());
-            ui.sel = ui.fields.iter().position(|f| f.key == "model").unwrap();
-            a.modal = Modal::Settings(Box::new(ui.clone()));
+            ui.sel = ui
+                .rows()
+                .iter()
+                .position(|r| matches!(r, crate::tui::app::SRow::Field(i) if ui.fields[*i].key == "model"))
+                .unwrap();
+            a.settings = ui.clone();
             let out = render(&mut a, w, h);
             if h >= 30 && w >= 100 {
                 assert!(out.contains("qwen3:32▏"), "{out}");
             }
             ui.editing = None;
             ui.picker = Some((vec!["llama3.3:70b".into(), "qwen3:32b".into()], 1));
-            a.modal = Modal::Settings(Box::new(ui));
+            a.settings = ui.clone();
             let out = render(&mut a, w, h);
             if h >= 24 {
                 assert!(out.contains("Models") && out.contains("qwen3:32b"), "{out}");
             }
-            a.modal = Modal::None;
+            // The Hosts group and the host form.
+            ui.picker = None;
+            ui.hosts = vec![crate::config::HostCfg {
+                name: "web-01".into(),
+                ssh: Some("ops@web-01".into()),
+                ..Default::default()
+            }];
+            ui.sel = ui.rows().iter().position(|r| *r == crate::tui::app::SRow::Host(0)).unwrap();
+            a.settings = ui.clone();
+            let out = render(&mut a, w, h);
+            if h >= 24 && w >= 80 {
+                assert!(
+                    out.contains("web-01") && out.contains("ssh ops@web-01") && out.contains("add a host"),
+                    "{out}"
+                );
+            }
+            ui.host_form = Some(crate::tui::app::HostForm::from(Some(0), &ui.hosts[0]));
+            a.settings = ui;
+            let out = render(&mut a, w, h);
+            if h >= 24 && w >= 80 {
+                assert!(out.contains("Edit host") && out.contains("ssh destination"), "{out}");
+            }
+            a.settings = Default::default();
+            a.tab = Tab::Procs;
         }
     }
 

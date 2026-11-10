@@ -274,6 +274,9 @@ pub struct ActionRecord {
     pub undone: bool,
     pub ok: bool,
     pub message: String,
+    /// Who asked for it: "tui", "cli", "mcp (CLIENT)", "budget". Empty in older journals.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
 }
 
 /// Resource budget for `fat run`.

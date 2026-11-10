@@ -189,7 +189,7 @@ impl State {
         let last = collector.as_mut().and_then(|c| guard(AssertUnwindSafe(|| c.sample())).map(|s| (Instant::now(), s)));
         let history_path = config.history_path.clone();
         let history = guard(move || History::open(history_path.as_deref()).ok()).flatten();
-        let actions = guard(Actions::open);
+        let actions = guard(|| Actions::open().with_origin("mcp"));
         if collector.is_none() {
             log("collector unavailable; snapshot-based tools will fail");
         }
@@ -371,7 +371,16 @@ pub fn handle_message(state: &mut State, msg: &Value) -> Option<Value> {
     };
 
     let result: std::result::Result<Value, (i64, String)> = match method {
-        "initialize" => Ok(initialize_result(&params)),
+        "initialize" => {
+            // Name the agent in the action journal: "mcp (claude-code)".
+            if let Some(name) = params.pointer("/clientInfo/name").and_then(Value::as_str)
+                && let Some(a) = state.actions.as_mut()
+            {
+                let name: String = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(40).collect();
+                a.set_origin(format!("mcp ({})", name.trim()));
+            }
+            Ok(initialize_result(&params))
+        }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools_listed(&state.allowed) })),
         "tools/call" => tools_call(state, &params),

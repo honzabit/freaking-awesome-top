@@ -34,7 +34,7 @@ use crate::history::History;
 use crate::history::Point;
 use crate::model::{Container, Explanation, Finding, Snapshot, Ts, now_ms};
 use crate::server::{FleetHost, FleetSummary, Incident};
-use app::{App, Command, Modal};
+use app::{App, Command};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -929,8 +929,14 @@ struct Ctx {
 fn settings_ui(cfg: &Config, path: Option<&std::path::Path>) -> app::SettingsUi {
     let text = path.and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
     let env = |k: &str| std::env::var(k).ok();
+    let file_cfg = Config::parse(&text).ok();
     app::SettingsUi {
-        fields: crate::settings::fields(cfg, &text, &env),
+        fields: crate::settings::fields(
+            &file_cfg.clone().map(|f| Config { ask: cfg.ask.clone(), ..f }).unwrap_or_else(|| cfg.clone()),
+            &text,
+            &env,
+        ),
+        hosts: file_cfg.map(|c| c.hosts).unwrap_or_else(|| cfg.hosts.clone()),
         path: path.map(|p| p.display().to_string()).unwrap_or_default(),
         key_status: crate::settings::key_status(cfg, &env),
         ..Default::default()
@@ -938,9 +944,54 @@ fn settings_ui(cfg: &Config, path: Option<&std::path::Path>) -> app::SettingsUi 
 }
 
 impl Ctx {
+    /// After a settings write: apply what can apply live, rebuild the screen, say what happened.
+    fn after_settings_write(
+        &mut self,
+        app: &mut App,
+        path: &std::path::Path,
+        result: Result<(Config, String), String>,
+        section: &str,
+    ) {
+        let note = match result {
+            Ok((cfg, what)) => {
+                let mut msg = format!("saved {what} to {}", path.display());
+                if section == "ask"
+                    && let Err(e) = crate::llm::resolve(&cfg.ask)
+                {
+                    msg = format!("saved; but ask can't use it yet: {e}");
+                } else if section != "ask" {
+                    msg.push_str(" (takes effect the next time fat starts)");
+                }
+                // Live from now on: ask and the destination shown. The rest is read at start.
+                self.cfg.ask = cfg.ask.clone();
+                app.ask_dest = crate::llm::destination(&self.cfg.ask);
+                // Keep the rest of the screen's view of the file current.
+                self.cfg.hosts = cfg.hosts;
+                self.cfg.history_days = cfg.history_days;
+                (msg, false)
+            }
+            Err(e) => (e, true),
+        };
+        let sel = app.settings.sel;
+        let host_form = app.settings.host_form.take();
+        let mut ui = settings_ui(&self.cfg, Some(path));
+        // Settings other than ask apply at the next start: show the file's values for them.
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(file_cfg) = Config::parse(&text)
+        {
+            let env = |k: &str| std::env::var(k).ok();
+            ui.fields = crate::settings::fields(&Config { ask: self.cfg.ask.clone(), ..file_cfg.clone() }, &text, &env);
+            ui.hosts = file_cfg.hosts;
+        }
+        ui.sel = sel.min(ui.rows().len().saturating_sub(1));
+        ui.host_form = host_form;
+        ui.note = Some(note);
+        app.settings = ui;
+    }
+
     fn actions(&mut self) -> Option<&mut Actions> {
         if self.actions.is_none() && !self.actions_failed {
-            match guarded(Actions::open) {
+            match guarded(|| Actions::open().with_origin("tui")) {
                 Ok(a) => self.actions = Some(a),
                 Err(_) => self.actions_failed = true,
             }
@@ -1142,44 +1193,53 @@ impl Ctx {
                     app.set_thread(id, t);
                 }
             }
-            Command::OpenSettings => {
+            Command::LoadSettings => {
+                let keep = std::mem::take(&mut app.settings);
                 let mut ui = settings_ui(&self.cfg, self.settings_path.as_deref());
-                ui.note = Some(("⏎ change · r reset to default · t test the model · m pick a model".into(), false));
-                app.modal = Modal::Settings(Box::new(ui));
+                ui.sel = keep.sel.min(ui.rows().len().saturating_sub(1));
+                ui.note = keep.note.or_else(|| {
+                    Some(("⏎ change · r reset to default · t test · m pick a model · ←→ groups".into(), false))
+                });
+                app.settings = ui;
             }
             Command::SetSetting { section, key, value } => {
                 let Some(path) = self.settings_path.clone() else { return };
                 let fields = settings_ui(&self.cfg, Some(&path)).fields;
                 let result = match (fields.iter().find(|f| f.section == section && f.key == key), value) {
                     (None, _) => Err(format!("unknown setting {section}.{key}")),
-                    (Some(f), Some(v)) => crate::settings::parse_input(f, &v).map(Some),
+                    (Some(f), Some(v)) => crate::settings::parse_input(f, &v),
                     (Some(_), None) => Ok(None),
                 }
-                .and_then(|v| crate::settings::write(&path, section, key, v).map_err(|e| format!("{e:#}")));
-                let (note, cfg) = match result {
-                    Ok(cfg) => {
-                        let what = if key.is_empty() { section } else { key };
-                        let mut msg = format!("saved {what} to {}", path.display());
-                        if section == "ask"
-                            && let Err(e) = crate::llm::resolve(&cfg.ask)
-                        {
-                            msg = format!("saved; but ask can't use it yet: {e}");
-                        }
-                        (Some((msg, false)), Some(cfg))
-                    }
-                    Err(e) => (Some((e, true)), None),
-                };
-                if let Some(cfg) = cfg {
-                    // Live from now on: ask, the destination shown, the next settings view.
-                    self.cfg.ask = cfg.ask;
-                    self.cfg.history_days = cfg.history_days;
-                    app.ask_dest = crate::llm::destination(&self.cfg.ask);
+                .and_then(|v| crate::settings::write(&path, &section, &key, v).map_err(|e| format!("{e:#}")));
+                self.after_settings_write(app, &path, result.map(|c| (c, key.clone())), &section);
+            }
+            Command::SaveHost { index, host } => {
+                let Some(path) = self.settings_path.clone() else { return };
+                let name = host.name.clone();
+                let r = crate::settings::write_host(&path, index, Some(&host)).map_err(|e| format!("{e:#}"));
+                if r.is_ok() {
+                    app.settings.host_form = None;
+                } else if app.settings.host_form.is_none() {
+                    app.settings.host_form = Some(app::HostForm::from(index, &host));
                 }
-                let sel = app.settings_ui().map_or(0, |u| u.sel);
-                let mut ui = settings_ui(&self.cfg, Some(&path));
-                ui.sel = sel.min(ui.fields.len().saturating_sub(1));
-                ui.note = note;
-                app.modal = Modal::Settings(Box::new(ui));
+                self.after_settings_write(app, &path, r.map(|c| (c, format!("host {name}"))), "hosts");
+            }
+            Command::DeleteHost(i) => {
+                let Some(path) = self.settings_path.clone() else { return };
+                let r = crate::settings::write_host(&path, Some(i), None).map_err(|e| format!("{e:#}"));
+                self.after_settings_write(app, &path, r.map(|c| (c, "the host removal".to_string())), "hosts");
+            }
+            Command::TestHost(h) => {
+                let tx = self.tx.clone();
+                let timeout = self.cfg.fleet.connect_timeout_s;
+                thread::spawn(move || {
+                    let (msg, err) = match guarded(|| crate::settings::test_host(&h, timeout)) {
+                        Ok(Ok(v)) => (format!("✓ {v}"), false),
+                        Ok(Err(e)) => (format!("✗ {e}"), true),
+                        Err(e) => (format!("✗ {e}"), true),
+                    };
+                    let _ = tx.send(Msg::SettingsNote(msg, err));
+                });
             }
             Command::SettingsTest => {
                 let ask = self.cfg.ask.clone();
@@ -1443,6 +1503,7 @@ mod tests {
 
     #[test]
     fn settings_save_to_the_config_file_and_apply_live() {
+        use app::Modal;
         let dir = std::env::temp_dir().join(format!("fat-tui-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("config.toml");
@@ -1463,45 +1524,86 @@ mod tests {
             settings_path: Some(path.clone()),
         };
         let mut app = App::new(1000);
-        ctx.exec(&mut app, Command::OpenSettings);
-        assert!(matches!(app.modal, Modal::Settings(_)));
+        use crossterm::event::{KeyCode, KeyEvent};
+        let select = |app: &mut App, key: &str| {
+            let ui = &mut app.settings;
+            ui.sel =
+                ui.rows().iter().position(|r| matches!(r, app::SRow::Field(i) if ui.fields[*i].key == key)).unwrap();
+        };
+        for c in app.on_key(KeyEvent::from(KeyCode::Char(','))) {
+            ctx.exec(&mut app, c);
+        }
+        assert_eq!(app.tab, app::Tab::Settings);
         // Choices cycle and save at once.
-        let ui = app.settings_ui().unwrap();
-        ui.sel = ui.fields.iter().position(|f| f.key == "provider").unwrap();
-        let cmds = app.on_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter));
-        assert_eq!(cmds, vec![Command::SetSetting { section: "ask", key: "provider", value: Some("openai".into()) }]);
+        select(&mut app, "provider");
+        let cmds = app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            cmds,
+            vec![Command::SetSetting { section: "ask".into(), key: "provider".into(), value: Some("openai".into()) }]
+        );
         for c in cmds {
             ctx.exec(&mut app, c);
         }
         assert_eq!(ctx.cfg.ask.provider, "openai", "applied live");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("provider = \"openai\" # for now") && text.contains("# mine"), "{text}");
-        let ui = app.settings_ui().unwrap();
-        let note = ui.note.clone().unwrap();
+        let note = app.settings.note.clone().unwrap();
         assert!(!note.1 && note.0.contains("needs url"), "saved, with a warning that ask can't use it yet: {note:?}");
         // Bad input is refused with a reason; the file stays as it was.
-        ctx.exec(&mut app, Command::SetSetting { section: "ask", key: "url", value: Some("llm:1234".into()) });
-        let ui = app.settings_ui().unwrap();
-        assert!(ui.note.as_ref().is_some_and(|(t, e)| *e && t.contains("http://")));
+        let set = |k: &str, v: Option<&str>| Command::SetSetting {
+            section: "ask".into(),
+            key: k.into(),
+            value: v.map(str::to_string),
+        };
+        ctx.exec(&mut app, set("url", Some("llm:1234")));
+        assert!(app.settings.note.as_ref().is_some_and(|(t, e)| *e && t.contains("http://")));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-        ctx.exec(
-            &mut app,
-            Command::SetSetting { section: "ask", key: "url", value: Some("http://127.0.0.1:1".into()) },
-        );
-        ctx.exec(&mut app, Command::SetSetting { section: "ask", key: "model", value: Some("m".into()) });
+        ctx.exec(&mut app, set("url", Some("http://127.0.0.1:1")));
+        ctx.exec(&mut app, set("model", Some("m")));
         assert_eq!(app.ask_dest, "openai · m · http://127.0.0.1:1");
         // Reset removes the key; the default applies again.
-        ctx.exec(&mut app, Command::SetSetting { section: "ask", key: "model", value: None });
+        ctx.exec(&mut app, set("model", None));
         assert!(ctx.cfg.ask.model.is_empty());
         assert!(!std::fs::read_to_string(&path).unwrap().contains("model ="));
-        // Read-only rows explain instead of editing.
-        let ui = app.settings_ui().unwrap();
-        ui.sel = ui.fields.iter().position(|f| f.key == "allow_actions").unwrap();
-        assert!(app.on_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter)).is_empty());
-        assert!(app.settings_ui().unwrap().note.as_ref().unwrap().0.contains("allow_actions"));
-        // Esc closes.
-        app.on_key(crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Esc));
-        assert_eq!(app.modal, Modal::None);
+        // Server settings are editable too (they apply at the next start).
+        ctx.exec(
+            &mut app,
+            Command::SetSetting { section: "fleet".into(), key: "concurrency".into(), value: Some("16".into()) },
+        );
+        assert!(std::fs::read_to_string(&path).unwrap().contains("concurrency = 16"));
+        assert!(app.settings.note.as_ref().unwrap().0.contains("next time"));
+        let shown = app.settings.fields.iter().find(|f| f.key == "concurrency").unwrap();
+        assert_eq!((shown.value.as_str(), shown.source.clone()), ("16", crate::settings::Source::File));
+        // Letting agents act asks first.
+        select(&mut app, "allow_actions");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.settings.multi.is_some());
+        app.on_key(KeyEvent::from(KeyCode::Char(' '))); // pause
+        assert!(app.on_key(KeyEvent::from(KeyCode::Enter)).is_empty());
+        let Modal::Confirm { prompt, cmd } = app.modal.clone() else { panic!("expected a confirmation") };
+        assert!(prompt.contains("pause"), "{prompt}");
+        app.modal = Modal::None;
+        ctx.exec(&mut app, cmd);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("allow_actions = [\"pause\"]"));
+        // Hosts: add one through the form, then remove it.
+        ctx.exec(
+            &mut app,
+            Command::SaveHost {
+                index: None,
+                host: crate::config::HostCfg {
+                    name: "web-01".into(),
+                    ssh: Some("ops@web-01".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(app.settings.hosts.len(), 1);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("[[hosts]]"));
+        ctx.exec(&mut app, Command::DeleteHost(0));
+        assert!(app.settings.hosts.is_empty());
+        // Esc goes back to the view.
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.tab, app::Tab::Procs);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

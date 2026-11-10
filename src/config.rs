@@ -59,7 +59,7 @@ pub struct Config {
     pub fleet: crate::server::FleetCfg,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct HostCfg {
     pub name: String,
     /// ssh destination, e.g. "user@devbox". Defaults to name.

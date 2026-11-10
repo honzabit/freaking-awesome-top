@@ -183,6 +183,8 @@ impl Entry {
 pub struct Actions {
     path: PathBuf,
     entries: Vec<Entry>,
+    /// Stamped on every record this handle writes (see [`ActionRecord::origin`]).
+    origin: String,
 }
 
 /// What the kernel says about a pid right now.
@@ -240,7 +242,17 @@ impl Actions {
     pub fn open_at(path: impl Into<PathBuf>) -> Actions {
         let path = path.into();
         let entries = load(&path);
-        Actions { path, entries }
+        Actions { path, entries, origin: String::new() }
+    }
+
+    /// Record `origin` ("tui", "cli", "mcp (client)") as who asked for every action from here on.
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Actions {
+        self.origin = origin.into();
+        self
+    }
+
+    pub fn set_origin(&mut self, origin: impl Into<String>) {
+        self.origin = origin.into();
     }
 
     #[allow(dead_code)]
@@ -434,6 +446,9 @@ impl Actions {
     /// in the journal would only produce a failing `fat undo N` hint.
     fn write(&mut self, mut entry: Entry, journal: std::io::Result<File>) -> ActionRecord {
         entry.rec.id = self.entries.iter().map(|e| e.rec.id).max().unwrap_or(0) + 1;
+        if entry.rec.origin.is_empty() {
+            entry.rec.origin = self.origin.clone();
+        }
         let line = serde_json::to_string(&entry).unwrap_or_default();
         let res = journal.and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()));
         if let Err(e) = res {
@@ -498,6 +513,7 @@ fn blank(kind: ActionKind, pid: u32, name: &str) -> ActionRecord {
         undone: false,
         ok: false,
         message: String::new(),
+        origin: String::new(),
     }
 }
 
@@ -1441,10 +1457,12 @@ mod tests {
         let pid = kid.0.id();
         let snap = snap_with(pid);
         let path = tmp_journal("flow");
-        let mut a = Actions::open_at(&path);
+        let mut a = Actions::open_at(&path).with_origin("tui");
 
         let r = a.apply(ActionKind::Pause, pid, None, &snap);
         assert!(r.ok && r.undoable, "{r:?}");
+        assert_eq!(r.origin, "tui", "who asked is journaled");
+        assert_eq!(Actions::open_at(&path).log().iter().find(|x| x.id == r.id).unwrap().origin, "tui");
         assert!(wait_stopped(pid, true));
 
         let u = a.undo_last().expect("something to undo");

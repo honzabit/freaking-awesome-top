@@ -44,14 +44,32 @@ pub enum Tab {
     Ask,
     /// Only shown when there is something beyond this machine (see [`App::fleet_visible`]).
     Fleet,
+    /// Screens at the right of the tab bar, not views of the machine: no number key.
+    /// The action journal (`a`).
+    Log,
+    /// Settings (`,`).
+    Settings,
 }
 
 impl Tab {
     /// Every tab (tests iterate it). Which ones a profile shows, and their number keys, come
     /// from [`App::tab_order`].
     #[cfg(test)]
-    pub const ALL: [Tab; 9] =
-        [Tab::Services, Tab::Events, Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Ask, Tab::Fleet];
+    pub const ALL: [Tab; 11] = [
+        Tab::Services,
+        Tab::Events,
+        Tab::Procs,
+        Tab::Ports,
+        Tab::Fs,
+        Tab::Timeline,
+        Tab::Doctor,
+        Tab::Ask,
+        Tab::Fleet,
+        Tab::Log,
+        Tab::Settings,
+    ];
+    /// Screens (right of the tab bar, reached with `a` and `,` or Tab).
+    pub const SCREENS: [Tab; 2] = [Tab::Log, Tab::Settings];
     /// Desktop: number keys 1-7. Fleet is last so hiding it never renumbers.
     pub const DESKTOP: [Tab; 7] = [Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Ask, Tab::Fleet];
     /// Server: services first, the event timeline next to processes.
@@ -68,6 +86,8 @@ impl Tab {
             Tab::Doctor => "Doctor",
             Tab::Ask => "Ask",
             Tab::Fleet => "Fleet",
+            Tab::Log => "Log",
+            Tab::Settings => "Settings",
         }
     }
 }
@@ -129,14 +149,22 @@ pub enum Command {
     /// Load one thread's turns.
     OpenThread(i64),
     DeleteThread(i64),
-    /// Open the settings overlay (built from the config the app runs with).
-    OpenSettings,
+    /// (Re)build the Settings screen from the config the app runs with.
+    LoadSettings,
     /// Set `section.key` in the config file (None: remove it, so the default applies).
     SetSetting {
-        section: &'static str,
-        key: &'static str,
+        section: String,
+        key: String,
         value: Option<String>,
     },
+    /// Add (index None) or replace a `[[hosts]]` entry.
+    SaveHost {
+        index: Option<usize>,
+        host: crate::config::HostCfg,
+    },
+    DeleteHost(usize),
+    /// ssh to the host and run `fat --version`.
+    TestHost(crate::config::HostCfg),
     /// Send a tiny question to the configured model.
     SettingsTest,
     /// List the configured server's models.
@@ -206,27 +234,124 @@ pub enum Modal {
         start: u64,
     },
     Help,
-    /// The settings screen (`,`).
-    Settings(Box<SettingsUi>),
-    /// The action journal (`a`): most recent first, `u`/⏎ undo.
-    Log,
 }
 
-/// The settings overlay: every setting, its value and where it comes from.
+/// The Settings screen: every setting, its value and where it comes from, by group.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SettingsUi {
     pub fields: Vec<crate::settings::Field>,
+    pub hosts: Vec<crate::config::HostCfg>,
+    /// Selected row in [`SettingsUi::rows`].
     pub sel: usize,
     /// Text being typed for the selected field.
     pub editing: Option<String>,
     /// Models offered by the server, and the highlighted one.
     pub picker: Option<(Vec<String>, usize)>,
+    /// A checklist being edited (agents' allowed actions): (option, on), highlighted row.
+    pub multi: Option<(Vec<(String, bool)>, usize)>,
+    pub host_form: Option<HostForm>,
     /// Last result: (message, is_error).
     pub note: Option<(String, bool)>,
     /// A background check is running ("testing…").
     pub busy: Option<String>,
     pub path: String,
     pub key_status: String,
+}
+
+/// One row of the Settings screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SRow {
+    Field(usize),
+    Host(usize),
+    AddHost,
+}
+
+impl SettingsUi {
+    /// Rows in sidebar-group order.
+    pub fn rows(&self) -> Vec<SRow> {
+        let mut out = Vec::new();
+        for g in crate::settings::GROUPS {
+            if *g == "Hosts" {
+                out.extend((0..self.hosts.len()).map(SRow::Host));
+                out.push(SRow::AddHost);
+            } else {
+                out.extend(self.fields.iter().enumerate().filter(|(_, f)| f.group == *g).map(|(i, _)| SRow::Field(i)));
+            }
+        }
+        out
+    }
+
+    pub fn group_of(&self, r: SRow) -> &'static str {
+        match r {
+            SRow::Field(i) => self.fields.get(i).map_or("", |f| f.group),
+            _ => "Hosts",
+        }
+    }
+
+    pub fn selected(&self) -> Option<SRow> {
+        self.rows().get(self.sel).copied()
+    }
+
+    pub fn field(&self) -> Option<&crate::settings::Field> {
+        match self.selected() {
+            Some(SRow::Field(i)) => self.fields.get(i),
+            _ => None,
+        }
+    }
+
+    /// Something has the keyboard (typing, a picker, a checklist, the host form).
+    pub fn capturing(&self) -> bool {
+        self.editing.is_some() || self.picker.is_some() || self.multi.is_some() || self.host_form.is_some()
+    }
+}
+
+/// Adding or editing one `[[hosts]]` entry.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HostForm {
+    /// None: a new host.
+    pub index: Option<usize>,
+    /// name, ssh destination, fat path, groups, tags.
+    pub values: [String; 5],
+    pub sel: usize,
+    pub editing: bool,
+}
+
+impl HostForm {
+    pub const LABELS: [&'static str; 5] = ["Name", "ssh destination", "fat path", "Groups", "Tags"];
+    pub const HELP: [&'static str; 5] = [
+        "how fat names it (and the ssh destination if none is given)",
+        "user@host or an ssh config alias; empty = the name",
+        "fat on that host; empty = found on PATH or the usual install dirs",
+        "comma-separated, for fat fleet --group",
+        "comma-separated, for fat fleet --tag",
+    ];
+
+    pub fn from(index: Option<usize>, h: &crate::config::HostCfg) -> HostForm {
+        HostForm {
+            index,
+            values: [
+                h.name.clone(),
+                h.ssh.clone().unwrap_or_default(),
+                h.fat_path.clone().unwrap_or_default(),
+                h.groups.join(", "),
+                h.tags.join(", "),
+            ],
+            sel: 0,
+            editing: index.is_none(),
+        }
+    }
+
+    pub fn host(&self) -> crate::config::HostCfg {
+        let opt = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
+        let list = |s: &str| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+        crate::config::HostCfg {
+            name: self.values[0].trim().to_string(),
+            ssh: opt(&self.values[1]),
+            fat_path: opt(&self.values[2]),
+            groups: list(&self.values[3]),
+            tags: list(&self.values[4]),
+        }
+    }
 }
 
 /// The Ask tab: past threads on the left, the open thread on the right, an input line below.
@@ -817,6 +942,13 @@ pub struct App {
     pub why: Option<Explanation>,
     pub why_scroll: u16,
     pub ask: AskTab,
+    pub settings: SettingsUi,
+    /// The view to return to from a screen (Log, Settings) on Esc.
+    pub back_tab: Tab,
+    /// Action log filter by kind (None = all).
+    pub log_kind: Option<ActionKind>,
+    /// Action log text filter (`/`): name, pid, who, message.
+    pub log_filter: String,
     /// Where the current question goes ("ollama · qwen3 · http://…", "offline (…)").
     pub ask_dest: String,
     ask_seq: u64,
@@ -891,6 +1023,10 @@ impl App {
             why: None,
             why_scroll: 0,
             ask: AskTab::default(),
+            settings: SettingsUi::default(),
+            back_tab: Tab::Procs,
+            log_kind: None,
+            log_filter: String::new(),
             ask_dest: String::new(),
             ask_seq: 0,
             modal: Modal::None,
@@ -1102,7 +1238,10 @@ impl App {
 
     /// The tabs on screen, in order.
     pub fn tabs(&self) -> Vec<Tab> {
-        self.tab_order().iter().copied().filter(|t| *t != Tab::Fleet || self.fleet_visible()).collect()
+        let mut v: Vec<Tab> =
+            self.tab_order().iter().copied().filter(|t| *t != Tab::Fleet || self.fleet_visible()).collect();
+        v.extend(Tab::SCREENS);
+        v
     }
 
     pub fn set_log(&mut self, log: Vec<ActionRecord>) {
@@ -1558,6 +1697,9 @@ impl App {
         if self.modal != Modal::None {
             return self.on_modal_key(k);
         }
+        if self.tab == Tab::Settings && self.settings.capturing() {
+            return self.on_settings_key(k);
+        }
         if self.tab == Tab::Ask && (self.ask.typing || (k.code == KeyCode::Esc && self.ask.pending.is_some())) {
             return if self.ask.typing { self.on_ask_input(k) } else { self.on_ask_tab_key(k) };
         }
@@ -1589,8 +1731,7 @@ impl App {
         match modal {
             Modal::None => Vec::new(),
             Modal::Help => Vec::new(), // any key closes
-            Modal::Log => self.on_log_key(k),
-            Modal::Settings(ui) => self.on_settings_key(*ui, k),
+
             Modal::Filter => {
                 match k.code {
                     KeyCode::Esc => self.set_active_filter(String::new()),
@@ -1657,15 +1798,22 @@ impl App {
         }
     }
 
-    fn on_settings_key(&mut self, mut ui: SettingsUi, k: KeyEvent) -> Vec<Command> {
-        let mut cmds = Vec::new();
-        let n = ui.fields.len();
+    fn on_settings_key(&mut self, k: KeyEvent) -> Vec<Command> {
+        use crate::settings::{Kind, Source};
+        let ui = &mut self.settings;
+        let rows = ui.rows();
+        let n = rows.len();
+        // Typing a value.
         if let Some(mut input) = ui.editing.take() {
             match k.code {
                 KeyCode::Esc => {}
                 KeyCode::Enter => {
-                    if let Some(f) = ui.fields.get(ui.sel) {
-                        cmds.push(Command::SetSetting { section: f.section, key: f.key, value: Some(input) });
+                    if let Some(f) = ui.field() {
+                        return vec![Command::SetSetting {
+                            section: f.section.clone(),
+                            key: f.key.clone(),
+                            value: Some(input),
+                        }];
                     }
                 }
                 KeyCode::Backspace => {
@@ -1679,12 +1827,19 @@ impl App {
                 }
                 _ => ui.editing = Some(input),
             }
-        } else if let Some((models, mut i)) = ui.picker.take() {
+            return Vec::new();
+        }
+        // Choosing a model.
+        if let Some((models, mut i)) = ui.picker.take() {
             match k.code {
                 KeyCode::Esc => {}
                 KeyCode::Enter => {
                     if let Some(m) = models.get(i) {
-                        cmds.push(Command::SetSetting { section: "ask", key: "model", value: Some(m.clone()) });
+                        return vec![Command::SetSetting {
+                            section: "ask".into(),
+                            key: "model".into(),
+                            value: Some(m.clone()),
+                        }];
                     }
                 }
                 code => {
@@ -1692,74 +1847,213 @@ impl App {
                     ui.picker = Some((models, i));
                 }
             }
-        } else {
+            return Vec::new();
+        }
+        // A checklist (agents' allowed actions).
+        if let Some((mut items, mut i)) = ui.multi.take() {
             match k.code {
-                KeyCode::Esc | KeyCode::Char(',') | KeyCode::Char('q') => return Vec::new(),
-                KeyCode::Up | KeyCode::Char('k') => ui.sel = ui.sel.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => ui.sel = (ui.sel + 1).min(n.saturating_sub(1)),
-                KeyCode::Home | KeyCode::Char('g') => ui.sel = 0,
-                KeyCode::End | KeyCode::Char('G') => ui.sel = n.saturating_sub(1),
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    if let Some(f) = ui.fields.get(ui.sel) {
-                        use crate::settings::{Kind, Source};
-                        match (&f.kind, &f.source) {
-                            (_, Source::Env(var)) => {
-                                ui.note =
-                                    Some((format!("{} is set by {var}; unset it to change this here", f.label), true));
-                            }
-                            (Kind::ReadOnly, _) => ui.note = Some((format!("not editable here: {}", f.help), false)),
-                            (Kind::Bool, _) => {
-                                let v = if f.value == "true" { "false" } else { "true" };
-                                cmds.push(Command::SetSetting {
-                                    section: f.section,
-                                    key: f.key,
-                                    value: Some(v.into()),
-                                });
-                            }
-                            (Kind::Choice(opts), _) => {
-                                let i = opts.iter().position(|o| *o == f.value).map_or(0, |i| (i + 1) % opts.len());
-                                cmds.push(Command::SetSetting {
-                                    section: f.section,
-                                    key: f.key,
-                                    value: Some(opts[i].to_string()),
-                                });
-                            }
-                            _ => ui.editing = Some(f.value.clone()),
-                        }
+                KeyCode::Esc => {}
+                KeyCode::Char(' ') | KeyCode::Char('x') => {
+                    if let Some(it) = items.get_mut(i) {
+                        it.1 = !it.1;
                     }
+                    ui.multi = Some((items, i));
                 }
-                KeyCode::Char('r') => {
-                    if let Some(f) = ui.fields.get(ui.sel) {
-                        if f.editable() && f.source == crate::settings::Source::File {
-                            cmds.push(Command::SetSetting { section: f.section, key: f.key, value: None });
-                        } else if f.editable() {
-                            ui.note = Some((format!("{} already uses its default", f.label), false));
-                        }
+                KeyCode::Enter => {
+                    let Some(f) = ui.field().cloned() else { return Vec::new() };
+                    let chosen: Vec<String> = items.iter().filter(|x| x.1).map(|x| x.0.clone()).collect();
+                    let before: Vec<&str> = f.value.split(',').map(str::trim).filter(|x| !x.is_empty()).collect();
+                    let added: Vec<&String> = chosen.iter().filter(|c| !before.contains(&c.as_str())).collect();
+                    let cmd = Command::SetSetting {
+                        section: f.section.clone(),
+                        key: f.key.clone(),
+                        value: Some(chosen.join(", ")),
+                    };
+                    if f.sensitive() && !added.is_empty() {
+                        let what = added.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+                        let kill = if added.iter().any(|a| *a == "kill") { " Kill cannot be undone." } else { "" };
+                        self.modal = Modal::Confirm {
+                            prompt: format!(
+                                "Let agents (MCP) {what} processes on this machine?{kill} They still have to ask through fat's tools, and every action is journaled."
+                            ),
+                            cmd,
+                        };
+                        return Vec::new();
                     }
+                    return vec![cmd];
+                }
+                code => {
+                    list_nav(&mut i, items.len(), code);
+                    ui.multi = Some((items, i));
+                }
+            }
+            return Vec::new();
+        }
+        // The host form.
+        if let Some(mut form) = ui.host_form.take() {
+            if form.editing {
+                match k.code {
+                    KeyCode::Esc | KeyCode::Enter => form.editing = false,
+                    KeyCode::Backspace => {
+                        form.values[form.sel].pop();
+                    }
+                    KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => form.values[form.sel].clear(),
+                    KeyCode::Char(c) => form.values[form.sel].push(c),
+                    KeyCode::Tab | KeyCode::Down => form.sel = (form.sel + 1) % 5,
+                    KeyCode::BackTab | KeyCode::Up => form.sel = (form.sel + 4) % 5,
+                    _ => {}
+                }
+                ui.host_form = Some(form);
+                return Vec::new();
+            }
+            match k.code {
+                KeyCode::Esc => return Vec::new(),
+                KeyCode::Up | KeyCode::Char('k') => form.sel = form.sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => form.sel = (form.sel + 1).min(4),
+                KeyCode::Enter | KeyCode::Char('e') => form.editing = true,
+                KeyCode::Char('s') => {
+                    let host = form.host();
+                    let index = form.index;
+                    if let Err(e) = crate::settings::check_host(&host) {
+                        ui.note = Some((e, true));
+                        ui.host_form = Some(form);
+                        return Vec::new();
+                    }
+                    return vec![Command::SaveHost { index, host }];
                 }
                 KeyCode::Char('t') if ui.busy.is_none() => {
-                    ui.busy = Some("testing the model…".into());
+                    let host = form.host();
+                    ui.busy = Some(format!("ssh {}…", host.ssh.as_deref().unwrap_or(&host.name)));
                     ui.note = None;
-                    cmds.push(Command::SettingsTest);
-                }
-                KeyCode::Char('m') if ui.busy.is_none() => {
-                    ui.busy = Some("asking the server for its models…".into());
-                    ui.note = None;
-                    cmds.push(Command::SettingsModels);
+                    ui.host_form = Some(form);
+                    return vec![Command::TestHost(host)];
                 }
                 _ => {}
             }
+            ui.host_form = Some(form);
+            return Vec::new();
         }
-        self.modal = Modal::Settings(Box::new(ui));
-        cmds
+        let group_start = |ui: &SettingsUi, g: &str| rows.iter().position(|r| ui.group_of(*r) == g);
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => ui.sel = ui.sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => ui.sel = (ui.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::PageUp => ui.sel = ui.sel.saturating_sub(10),
+            KeyCode::PageDown => ui.sel = (ui.sel + 10).min(n.saturating_sub(1)),
+            KeyCode::Home | KeyCode::Char('g') => ui.sel = 0,
+            KeyCode::End | KeyCode::Char('G') => ui.sel = n.saturating_sub(1),
+            KeyCode::Left | KeyCode::Right => {
+                let groups = crate::settings::GROUPS;
+                let cur = rows.get(ui.sel).map(|r| ui.group_of(*r)).unwrap_or(groups[0]);
+                let gi = groups.iter().position(|g| *g == cur).unwrap_or(0);
+                let next = if k.code == KeyCode::Right {
+                    (gi + 1) % groups.len()
+                } else {
+                    (gi + groups.len() - 1) % groups.len()
+                };
+                if let Some(i) = group_start(ui, groups[next]) {
+                    ui.sel = i;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => match rows.get(ui.sel).copied() {
+                Some(SRow::Host(i)) => {
+                    if let Some(h) = ui.hosts.get(i) {
+                        ui.host_form = Some(HostForm::from(Some(i), h));
+                    }
+                }
+                Some(SRow::AddHost) => ui.host_form = Some(HostForm::from(None, &Default::default())),
+                Some(SRow::Field(i)) => {
+                    let Some(f) = ui.fields.get(i).cloned() else { return Vec::new() };
+                    match (&f.kind, &f.source) {
+                        (_, Source::Env(var)) => {
+                            ui.note =
+                                Some((format!("{} is set by {var}; unset it to change this here", f.label), true));
+                        }
+                        (Kind::Bool, _) => {
+                            let v = if f.value == "true" { "false" } else { "true" };
+                            return vec![Command::SetSetting { section: f.section, key: f.key, value: Some(v.into()) }];
+                        }
+                        (Kind::Choice(opts), _) => {
+                            let i = opts.iter().position(|o| *o == f.value).map_or(0, |i| (i + 1) % opts.len());
+                            return vec![Command::SetSetting {
+                                section: f.section,
+                                key: f.key,
+                                value: Some(opts[i].to_string()),
+                            }];
+                        }
+                        (Kind::Multi(opts), _) => {
+                            let on: Vec<&str> = f.value.split(',').map(str::trim).collect();
+                            ui.multi = Some((opts.iter().map(|o| (o.to_string(), on.contains(o))).collect(), 0));
+                        }
+                        _ => ui.editing = Some(f.value.clone()),
+                    }
+                }
+                None => {}
+            },
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if let Some(SRow::Host(i)) = rows.get(ui.sel).copied()
+                    && let Some(h) = ui.hosts.get(i)
+                {
+                    self.modal = Modal::Confirm {
+                        prompt: format!("Remove host {} from the config?", h.name),
+                        cmd: Command::DeleteHost(i),
+                    };
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(f) = ui.field() {
+                    if f.editable() && f.source == Source::File {
+                        let f = f.clone();
+                        return vec![Command::SetSetting { section: f.section, key: f.key, value: None }];
+                    } else if f.editable() {
+                        ui.note = Some((format!("{} already uses its default", f.label), false));
+                    }
+                }
+            }
+            KeyCode::Char('t') if ui.busy.is_none() => match rows.get(ui.sel).copied() {
+                Some(SRow::Host(i)) => {
+                    if let Some(h) = ui.hosts.get(i).cloned() {
+                        ui.busy = Some(format!("ssh {}…", h.ssh.as_deref().unwrap_or(&h.name)));
+                        ui.note = None;
+                        return vec![Command::TestHost(h)];
+                    }
+                }
+                _ => {
+                    ui.busy = Some("testing the model…".into());
+                    ui.note = None;
+                    return vec![Command::SettingsTest];
+                }
+            },
+            KeyCode::Char('m') if ui.busy.is_none() => {
+                ui.busy = Some("asking the server for its models…".into());
+                ui.note = None;
+                return vec![Command::SettingsModels];
+            }
+            _ => {}
+        }
+        Vec::new()
     }
 
-    /// The settings overlay, if open.
+    /// The Settings screen's state.
     pub fn settings_ui(&mut self) -> Option<&mut SettingsUi> {
-        match &mut self.modal {
-            Modal::Settings(ui) => Some(ui),
-            _ => None,
-        }
+        Some(&mut self.settings)
+    }
+
+    /// Rows of the action log under the current filters (indices into `log`).
+    pub fn log_rows(&self) -> Vec<usize> {
+        let q = self.log_filter.to_lowercase();
+        self.log
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| self.log_kind.is_none_or(|k| r.kind == k))
+            .filter(|(_, r)| {
+                q.is_empty()
+                    || r.name.to_lowercase().contains(&q)
+                    || r.pid.to_string() == q
+                    || r.origin.to_lowercase().contains(&q)
+                    || r.message.to_lowercase().contains(&q)
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Keys while typing a question.
@@ -1854,6 +2148,7 @@ impl App {
             Tab::Services => &self.svc.filter,
             Tab::Events => &self.ev.filter,
             Tab::Fleet if self.fleet.active() => &self.fleet.filter,
+            Tab::Log => &self.log_filter,
             _ => &self.filter,
         }
     }
@@ -1864,6 +2159,10 @@ impl App {
             Tab::Services => self.svc.set_filter(f),
             Tab::Events => self.ev.set_filter(f),
             Tab::Fleet if self.fleet.active() => self.fleet.set_filter(f),
+            Tab::Log => {
+                self.log_filter = f;
+                self.log_sel = 0;
+            }
             _ => self.set_filter(f),
         }
     }
@@ -1871,6 +2170,13 @@ impl App {
     pub fn switch_tab(&mut self, t: Tab) -> Vec<Command> {
         if self.tab != t {
             self.why = None;
+        }
+        if Tab::SCREENS.contains(&t) {
+            if !Tab::SCREENS.contains(&self.tab) {
+                self.back_tab = self.tab;
+            }
+            self.tab = t;
+            return vec![if t == Tab::Log { Command::RefreshLog } else { Command::LoadSettings }];
         }
         if t == Tab::Fleet && !self.fleet_visible() {
             self.set_status(
@@ -1944,21 +2250,28 @@ impl App {
                 let next = if k.code == KeyCode::Tab { (cur + 1) % n } else { (cur + n - 1) % n };
                 return self.switch_tab(tabs[next]);
             }
-            KeyCode::Char('a') => {
-                self.modal = Modal::Log;
-                return vec![Command::RefreshLog];
-            }
+            KeyCode::Char('a') => return self.switch_tab(Tab::Log),
             KeyCode::Char('h') | KeyCode::F(1) => {
                 self.modal = Modal::Help;
                 return Vec::new();
             }
             KeyCode::Char('?') => return self.ask_new(),
-            KeyCode::Char(',') => return vec![Command::OpenSettings],
+            KeyCode::Char(',') => return self.switch_tab(Tab::Settings),
             KeyCode::Char('L') => {
                 self.go_live();
                 return Vec::new();
             }
             KeyCode::Char('u') => return vec![Command::Undo],
+            KeyCode::Esc if Tab::SCREENS.contains(&self.tab) => {
+                if self.tab == Tab::Log && (!self.log_filter.is_empty() || self.log_kind.is_some()) {
+                    self.log_filter.clear();
+                    self.log_kind = None;
+                    self.log_sel = 0;
+                    return Vec::new();
+                }
+                let back = self.back_tab;
+                return self.switch_tab(back);
+            }
             KeyCode::Esc => {
                 if let Some(done) = self.server_esc() {
                     return done;
@@ -1999,6 +2312,8 @@ impl App {
             }
             Tab::Doctor => self.on_doctor_key(k),
             Tab::Ask => self.on_ask_tab_key(k),
+            Tab::Log => self.on_log_key(k),
+            Tab::Settings => self.on_settings_key(k),
             Tab::Services => self.on_services_key(k),
             Tab::Events => self.on_events_key(k),
         }
@@ -2006,17 +2321,21 @@ impl App {
 
     /// Keys while the action log is open. It stays open until Esc / q / a.
     fn on_log_key(&mut self, k: KeyEvent) -> Vec<Command> {
-        self.modal = Modal::Log;
-        if list_nav(&mut self.log_sel, self.log.len(), k.code) {
+        let rows = self.log_rows();
+        if list_nav(&mut self.log_sel, rows.len(), k.code) {
             return Vec::new();
         }
         match k.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('a') => {
-                self.modal = Modal::None;
+            KeyCode::Char('f') => {
+                use ActionKind::*;
+                const CYCLE: [Option<ActionKind>; 7] =
+                    [None, Some(Pause), Some(Resume), Some(Renice), Some(Term), Some(Kill), Some(KillTree)];
+                let i = CYCLE.iter().position(|c| *c == self.log_kind).unwrap_or(0);
+                self.log_kind = CYCLE[(i + 1) % CYCLE.len()];
+                self.log_sel = 0;
                 Vec::new()
             }
-            KeyCode::Char('u') => vec![Command::Undo],
-            KeyCode::Enter => match self.log.get(self.log_sel) {
+            KeyCode::Enter => match rows.get(self.log_sel).and_then(|i| self.log.get(*i)) {
                 Some(r) if r.ok && r.undoable && !r.undone && r.id != 0 => vec![Command::UndoId(r.id)],
                 Some(r) if r.undone => {
                     self.set_status(format!("#{} was already undone", r.id), false);
@@ -3208,10 +3527,13 @@ pub(crate) mod tests {
         let mut a = app();
         assert_eq!(a.tab, Tab::Procs, "the first screen is the process list");
         assert_eq!((a.sort, a.sort_desc), (SortKey::Cpu, true), "sorted by cpu, hottest first");
-        // No Fleet without containers or hosts: six tabs, BackTab wraps to Ask.
-        assert_eq!(a.tabs(), vec![Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Ask]);
+        // No Fleet without containers or hosts: six views, then the Log and Settings screens.
+        assert_eq!(
+            a.tabs(),
+            vec![Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Ask, Tab::Log, Tab::Settings]
+        );
         a.on_key(code(KeyCode::BackTab));
-        assert_eq!(a.tab, Tab::Ask);
+        assert_eq!(a.tab, Tab::Settings);
         a.on_key(code(KeyCode::Tab));
         assert_eq!(a.tab, Tab::Procs);
         assert!(a.on_key(key('7')).is_empty());
@@ -3237,14 +3559,17 @@ pub(crate) mod tests {
         a.set_fleet(Some(vec![]));
         assert_eq!(a.tab, Tab::Procs);
         assert_eq!(Tab::DESKTOP.map(|t| t.title()), ["Procs", "Ports", "Fs", "Timeline", "Doctor", "Ask", "Fleet"]);
-        // The action log is an overlay on any view, not a tab.
+        // The action log and settings are screens without number keys; Esc returns.
         a.on_key(key('3'));
         assert_eq!(a.on_key(key('a')), vec![Command::RefreshLog]);
-        assert_eq!((a.tab, a.modal.clone()), (Tab::Fs, Modal::Log));
+        assert_eq!(a.tab, Tab::Log);
         assert_eq!(a.on_key(key('u')), vec![Command::Undo]);
-        assert_eq!(a.modal, Modal::Log, "undo keeps the log open");
+        assert_eq!(a.tab, Tab::Log, "undo stays on the log");
+        assert_eq!(a.on_key(key(',')), vec![Command::LoadSettings]);
+        assert_eq!(a.tab, Tab::Settings);
         a.on_key(code(KeyCode::Esc));
-        assert_eq!(a.modal, Modal::None);
+        assert_eq!(a.tab, Tab::Fs, "Esc goes back to the view, not the previous screen");
+        assert_eq!(a.tab_number(Tab::Log), 0);
     }
 
     #[test]
@@ -3263,6 +3588,7 @@ pub(crate) mod tests {
             undoable,
             undone,
             message: String::new(),
+            origin: String::new(),
         };
         a.set_log(vec![
             rec(3, ActionKind::Term, false, false),
@@ -3277,8 +3603,14 @@ pub(crate) mod tests {
         a.on_key(code(KeyCode::Down));
         assert!(a.on_key(code(KeyCode::Enter)).is_empty());
         assert!(a.status.as_ref().unwrap().text.contains("already undone"));
-        assert!(a.on_key(key('q')).is_empty() && !a.quit, "q closes the overlay, it does not quit");
-        assert_eq!(a.modal, Modal::None);
+        // Filters: by kind, and by text.
+        a.on_key(key('f'));
+        assert_eq!(a.log_kind, Some(ActionKind::Pause));
+        assert_eq!(a.log_rows(), vec![1, 2]);
+        a.on_key(code(KeyCode::Esc));
+        assert_eq!((a.log_kind, a.tab), (None, Tab::Log), "Esc clears the filter first");
+        a.on_key(code(KeyCode::Esc));
+        assert_eq!(a.tab, Tab::Procs);
     }
 
     #[test]
@@ -3352,6 +3684,7 @@ pub(crate) mod tests {
             undone: false,
             ok: true,
             message: "SIGSTOP".into(),
+            origin: String::new(),
         };
         a.action_done(&r);
         assert_eq!(a.live.as_ref().unwrap().proc(200).unwrap().status, "T");

@@ -90,12 +90,12 @@ fat mcp                     # MCP server on stdio
 | `r` | renice (default +10; undoing it needs root) |
 | `k` / `K` | terminate / terminate the whole tree (asks for confirmation; **not undoable**; in Ports, `k` kills the tree) |
 | `u` | undo the last pause or renice |
-| `a` | action log (an overlay on any view): everything fat did; `⏎` undoes the selected entry if it can be undone |
+| `a` | the action log screen: everything fat did and who asked (you in the TUI, the CLI, or an agent over MCP); `⏎` undoes the selected entry if it can be undone, `f` filters by kind, `/` searches, `Esc` goes back |
 | `← → [ ] { }` | in Timeline (`4`): time travel through history (`{ }` = ×10) |
 | `s` · `+`/`-` | in Timeline (`4`): jump to the next spike · zoom the window (5m … 24h) |
 | `L` / `Esc` | back to live |
 | `?` | ask in plain language: opens the Ask tab on a new thread |
-| `,` | settings (an overlay on any view): see below |
+| `,` | the settings screen: see below (`Esc` goes back) |
 | `Enter` / `i` · `n` · `↑↓` · `d` | in Ask: type a follow-up in the open thread · new thread · open another thread · delete one (`Esc` leaves the input line, or stops waiting for an answer, which is still saved) |
 | `h` | help |
 | `q` / `Ctrl-C` | quit |
@@ -1092,23 +1092,25 @@ http://…` on stderr, in the TUI's ask box, and as `via` in the MCP result).
 
 ### Settings in the TUI (`,`)
 
-`,` opens the settings screen from any view. It shows every setting with its value and where that value comes
-from: the default, the config file, or an environment variable (which wins, and can't be changed there).
+`,` opens the Settings screen (it sits with the action log at the right end of the tab bar; neither has a number
+key, `Esc` returns to the view you came from). Groups on the left (`←` `→`): **Ask**, **Recording**, **Server**,
+**Fleet**, **Hosts**, **Agents**. Every setting shows its value and where that value comes from: the default, the
+config file, or an environment variable (which wins, and can't be changed there).
 
-- **Ask: the model:** provider, server URL, model, key variable, local only, detail, memory, thread retention,
-  digest size, Ollama context and timeout. The key itself is never shown or stored: only whether the variable
-  holding it is set.
-  - `t` sends a tiny "reply OK" question to the configured model and shows how long it took, or why it failed.
-    Nothing about the machine is sent.
-  - `m` lists the server's models (Ollama, OpenAI-compatible servers, or the Claude API) to pick from, chat
-    models first.
-- **Recording:** history retention and sample interval (a running `fat record` picks them up when restarted).
-- **Other settings** (profile, fleet limits, which actions agents may take) are shown read-only, with the key to
-  edit in the file. Letting agents act is deliberately not a toggle.
+- **Ask:** provider, server URL, model, key variable, local only, detail, memory, thread retention, digest size,
+  Ollama context, timeout. The key itself is never shown or stored, only whether its variable is set. `t` sends a
+  tiny "reply OK" question (nothing about the machine) and shows the time or the error; `m` lists the server's
+  models to pick from, chat models first. Ask changes apply at once.
+- **Recording, Server, Fleet:** every setting of the top level, `[server]` and `[fleet]`, including lists
+  (`ssh_options`) and host groups (`db=db-*,pg-*; web=web-*`). These apply the next time fat (or `fat record`)
+  starts, and the screen says so.
+- **Hosts:** the `[[hosts]]` list: `⏎` edits a host or adds one (name, ssh destination, fat path, groups, tags),
+  `t` runs `fat --version` on it over ssh with your own ssh config (batch mode, never prompts), `d` removes it.
+- **Agents:** which side-effect tools agents may use over MCP (`[mcp] allow_actions`), as a checklist. Allowing
+  anything new asks for confirmation first; kill still needs a preview and a one-time token per process.
 
-`⏎` toggles, cycles or edits; `r` removes the value from the file so the default applies. Changes are written to
-your `config.toml` at once, keeping its comments and layout, and only if the result is still a valid config; ask
-uses them immediately.
+`⏎` toggles, cycles or edits; `r` removes a value from the file so the default applies. Changes are written to
+your `config.toml` at once, keeping its comments and layout, and only if the result is still a valid config.
 
 ### Threads
 
