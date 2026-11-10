@@ -210,11 +210,9 @@ impl Endpoint {
 
     /// Request body for the OpenAI-compatible and Ollama APIs (the Anthropic body is built
     /// by `ask`, which owns the Messages API specifics).
-    pub fn body(&self, system: &str, user: &str) -> Value {
-        let messages = json!([
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]);
+    pub fn body(&self, system: &str, conversation: Vec<Value>) -> Value {
+        let mut messages = vec![json!({"role": "system", "content": system})];
+        messages.extend(conversation);
         match self.provider {
             Provider::Ollama => json!({
                 "model": self.model,
@@ -472,14 +470,16 @@ mod tests {
         let ep = resolve_with(&cfg("ollama", "http://h:11434", "m"), no_env).unwrap();
         assert!(ep.num_ctx as usize >= DEFAULT_CONTEXT_BYTES / BYTES_PER_TOKEN + PROMPT_TOKENS + ANSWER_TOKENS);
         assert_eq!(ep.num_ctx % 1024, 0);
-        assert_eq!(ep.body("s", "u")["options"]["num_ctx"], ep.num_ctx);
+        assert_eq!(ep.body("s", vec![json!({"role": "user", "content": "u"})])["options"]["num_ctx"], ep.num_ctx);
         // A fixed small window shrinks the digest instead.
         let mut c = cfg("ollama", "http://h:11434", "m");
         c.num_ctx = 8192;
         let ep = resolve_with(&c, no_env).unwrap();
         assert_eq!(ep.num_ctx, 8192);
         assert!(ep.context_bytes <= (8192 - PROMPT_TOKENS - ANSWER_TOKENS) * BYTES_PER_TOKEN, "{}", ep.context_bytes);
-        let b = resolve_with(&cfg("openai", "http://h", "m"), no_env).unwrap().body("sys", "usr");
+        let b = resolve_with(&cfg("openai", "http://h", "m"), no_env)
+            .unwrap()
+            .body("sys", vec![json!({"role": "user", "content": "usr"})]);
         assert_eq!(b["messages"][0]["role"], "system");
         assert_eq!(b["messages"][1]["content"], "usr");
         assert_eq!(b["stream"], false);

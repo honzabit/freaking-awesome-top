@@ -3,7 +3,7 @@
 
 use crate::fs::Volume;
 use crate::model::{Container, Proc};
-use crate::tui::app::{App, AskState, FsMode, GrowthRow, Modal, SortKey, Tab, ZOOM_NAMES, ZOOMS};
+use crate::tui::app::{App, FsMode, GrowthRow, Modal, SortKey, Tab, ZOOM_NAMES, ZOOMS};
 use crate::tui::server_ui;
 use crate::tui::widgets::*;
 use ratatui::Frame;
@@ -52,6 +52,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Tab::Fleet => draw_fleet(f, app, main),
         Tab::Timeline => draw_timeline(f, app, main),
         Tab::Doctor => draw_doctor(f, app, main),
+        Tab::Ask => draw_ask_tab(f, app, main),
         Tab::Services => server_ui::draw_services(f, app, main),
         Tab::Events => server_ui::draw_events(f, app, main),
     }
@@ -64,7 +65,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_why(f, app, r);
     }
     draw_footer(f, app, footer);
-    draw_ask(f, app, area);
     draw_modal(f, app, area);
 }
 
@@ -1669,51 +1669,119 @@ fn short_cgroup(cg: &str) -> String {
     out
 }
 
-fn draw_ask(f: &mut Frame, app: &App, area: Rect) {
-    match &app.ask {
-        AskState::Idle => {}
-        AskState::Thinking { question, since, .. } => {
-            let r = centered(72.min(area.width.saturating_sub(4)), 6, area);
-            let spin = SPINNER[((app.now - since).max(0) / 100) as usize % SPINNER.len()];
-            let mut lines = vec![
-                Line::from(vec![Span::styled(format!("{spin} thinking… "), Style::default().fg(ACCENT).bold())]),
-                Line::styled(format!("“{question}”"), dim()),
-            ];
-            if !app.ask_dest.is_empty() {
-                lines.push(Line::styled(format!("→ {}", app.ask_dest), dim()));
-            }
-            let t = Text::from(lines);
-            f.render_widget(Clear, r);
-            f.render_widget(
-                Paragraph::new(t).wrap(Wrap { trim: true }).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(ACCENT))
-                        .title(" Ask ")
-                        .title_bottom(Line::styled(" Esc cancel ", dim())),
-                ),
-                r,
-            );
+/// The Ask tab: threads on the left; the open thread, rendered as Markdown, on the right;
+/// the input line below it.
+fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
+    let a = &app.ask;
+    let narrow = area.width < 90;
+    let [list, convo] = if narrow {
+        [Rect::default(), area]
+    } else {
+        Layout::horizontal([Constraint::Length((area.width / 3).clamp(28, 48)), Constraint::Min(30)]).areas(area)
+    };
+    if !narrow {
+        let mut items: Vec<ListItem> = Vec::new();
+        if let Some(e) = &a.error {
+            items.push(ListItem::new(Line::styled(e.clone(), Style::default().fg(Color::Red))));
         }
-        AskState::Answer { question, text, scroll } => {
-            let r = centered(
-                area.width.saturating_sub(area.width / 8).max(20),
-                area.height.saturating_sub(area.height / 6).max(6),
-                area,
-            );
-            f.render_widget(Clear, r);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT))
-                .title(Line::styled(format!(" Ask · {} ", clip(question, 60)), Style::default().bold()))
-                .title(Line::styled(format!(" {} ", clip(&app.ask_dest, 60)), dim()).right_aligned())
-                .title_bottom(Line::styled(" ↑↓ PgUp/PgDn scroll · ? ask again · Esc close ", dim()));
-            // The answer is Markdown (the model writes it so); render it, pre-wrapped to the box.
-            let lines = super::markdown::render(text, r.width.saturating_sub(2));
-            let max_scroll = (lines.len() as u16).saturating_sub(r.height.saturating_sub(2));
-            f.render_widget(Paragraph::new(lines).scroll(((*scroll).min(max_scroll), 0)).block(block), r);
+        if a.threads.is_empty() && a.error.is_none() {
+            items.push(ListItem::new(Line::styled("no threads yet: ? or Enter to ask", dim())));
+        }
+        let w = list.width.saturating_sub(4) as usize;
+        for (i, t) in a.threads.iter().enumerate() {
+            let selected = i == a.sel;
+            let open = a.open == Some(t.id);
+            let title_style = if open { Style::default().fg(ACCENT).bold() } else { Style::default() };
+            let age = fmt_ago((app.now - t.updated) / 1000);
+            let turns = if t.turns == 1 { "1 turn".to_string() } else { format!("{} turns", t.turns) };
+            let mut lines = vec![Line::styled(clip(&t.title, w).to_string(), title_style)];
+            lines.push(Line::styled(format!("{age} · {turns}"), dim()));
+            let item = ListItem::new(lines);
+            items.push(if selected { item.style(Style::default().bg(Color::DarkGray)) } else { item });
+        }
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Threads ")
+            .title_bottom(Line::styled(" ↑↓ open · n new · d delete ", dim()));
+        f.render_widget(List::new(items).block(block), list);
+    }
+
+    let [body, input] = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(convo);
+    let title = a
+        .open
+        .and_then(|id| a.threads.iter().find(|t| t.id == id))
+        .map(|t| format!(" {} ", clip(&t.title, body.width.saturating_sub(6) as usize)))
+        .unwrap_or_else(|| " New thread ".to_string());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if a.typing { Color::DarkGray } else { ACCENT }))
+        .title(Line::styled(title, Style::default().bold()));
+    let inner_w = body.width.saturating_sub(2);
+    let mut lines: Vec<Line> = Vec::new();
+    let you = |ts: crate::model::Ts| {
+        let when = chrono::DateTime::from_timestamp_millis(ts)
+            .map(|d| d.with_timezone(&chrono::Local).format("%b %d %H:%M").to_string())
+            .unwrap_or_default();
+        Line::from(vec![Span::styled("▍You ", Style::default().fg(ACCENT).bold()), Span::styled(when, dim())])
+    };
+    for t in &a.turns {
+        lines.push(you(t.ts));
+        lines.extend(super::markdown::render(&t.question, inner_w));
+        lines.push(Line::raw(""));
+        lines.extend(super::markdown::render(&t.answer, inner_w));
+        lines.push(Line::styled(format!("via {}", t.via), dim()));
+        lines.push(Line::raw(""));
+    }
+    if let Some(p) = &a.pending {
+        lines.push(you(p.since));
+        lines.extend(super::markdown::render(&p.question, inner_w));
+        lines.push(Line::raw(""));
+        let spin = SPINNER[((app.now - p.since).max(0) / 100) as usize % SPINNER.len()];
+        lines.push(Line::styled(format!("{spin} thinking…  (Esc to stop waiting)"), Style::default().fg(ACCENT)));
+        if !app.ask_dest.is_empty() {
+            lines.push(Line::styled(format!("→ {}", app.ask_dest), dim()));
         }
     }
+    if lines.is_empty() {
+        lines.push(Line::styled("Ask about this machine in plain language, for example:", dim()));
+        for ex in ["why is this machine slow?", "what writes all the time under /var?", "what is using port 3000?"] {
+            lines.push(Line::styled(format!("  · {ex}"), dim()));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "Follow-ups stay in this thread; earlier threads on this host are remembered ([ask] memory).",
+            dim(),
+        ));
+    }
+    let visible = body.height.saturating_sub(2);
+    let max_top = (lines.len() as u16).saturating_sub(visible);
+    let top = max_top.saturating_sub(a.scroll_up.min(max_top));
+    f.render_widget(Paragraph::new(lines).scroll((top, 0)).block(block), body);
+
+    let prompt_style = Style::default().fg(ACCENT).bold();
+    let line = if a.typing {
+        let w = input.width.saturating_sub(6) as usize;
+        let shown: String = {
+            let n = a.input.chars().count();
+            a.input.chars().skip(n.saturating_sub(w)).collect()
+        };
+        Line::from(vec![Span::styled("› ", prompt_style), Span::raw(shown), Span::styled("▏", prompt_style)])
+    } else if a.pending.is_some() {
+        Line::styled("waiting for the answer…", dim())
+    } else {
+        let what = if a.open.is_some() { "follow up in this thread" } else { "ask" };
+        Line::styled(format!("Enter or i to {what} · ? new thread from anywhere"), dim())
+    };
+    let hint = if a.typing { " Enter send · Esc done " } else { "" };
+    f.render_widget(
+        Paragraph::new(line).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(if a.typing { ACCENT } else { Color::DarkGray }))
+                .title_bottom(Line::styled(hint, dim())),
+        ),
+        input,
+    );
 }
 
 fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
@@ -1766,28 +1834,6 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
                 r,
             );
         }
-        Modal::AskInput(q) => {
-            let r = centered(72.min(area.width.saturating_sub(2)), 6, area);
-            let t = Text::from(vec![
-                Line::styled("Ask about this machine in plain language", dim()),
-                Line::from(vec![
-                    Span::styled("> ", Style::default().fg(ACCENT).bold()),
-                    Span::raw(q.as_str()),
-                    Span::styled("▏", Style::default().fg(ACCENT)),
-                ]),
-                Line::styled(
-                    "e.g. why is this machine slow? · what is using port 3000? · Enter ask · Esc cancel",
-                    dim(),
-                ),
-            ]);
-            f.render_widget(Clear, r);
-            f.render_widget(
-                Paragraph::new(t).wrap(Wrap { trim: true }).block(
-                    Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)).title(" Ask "),
-                ),
-                r,
-            );
-        }
     }
 }
 
@@ -1827,7 +1873,8 @@ const HELP: &[(&str, &str)] = &[
         "H health · c cpu · m mem · d disk · f findings · n name · l latency (nothing in Fleet acts on a host)",
     ),
     ("L / Esc", "return to live"),
-    ("?", "ask in plain language"),
+    ("?", "ask in plain language: a new thread in the Ask tab"),
+    ("Ask: ⏎ n ↑↓ d", "follow up in this thread · new thread · open another · delete (Esc leaves the input)"),
     ("h", "this help"),
     ("q / Ctrl-C", "quit"),
 ];
@@ -1999,6 +2046,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("q", "quit"),
         ],
         Tab::Doctor => &[("⏎", "run action"), ("w", "why"), ("a", "log"), ("?", "ask"), ("h", "help"), ("q", "quit")],
+        Tab::Ask => &[
+            ("⏎", "ask / follow up"),
+            ("n", "new"),
+            ("↑↓", "threads"),
+            ("d", "delete"),
+            ("PgUp", "scroll"),
+            ("q", "quit"),
+        ],
     };
     let hints: &[(&str, &str)] = if app.panel.is_some() {
         &[("↑↓", "scroll"), ("w", "why pid"), ("Esc", "close")]
@@ -2139,13 +2194,13 @@ mod tests {
         a.switch_tab(Tab::Fleet);
         assert_eq!(a.tab, Tab::Procs);
         let out = render(&mut a, 80, 24);
-        assert!(!out.contains("6Fleet") && out.contains("5Doctor"), "{out}");
+        assert!(!out.contains("7Fleet") && out.contains("5Doctor"), "{out}");
         // A configured host makes it appear (with its empty-state hint until data arrives).
         a.configured_hosts = 1;
         a.switch_tab(Tab::Fleet);
         assert_eq!(a.tab, Tab::Fleet);
         let out = render(&mut a, 80, 24);
-        assert!(out.contains("6Fleet"), "{out}");
+        assert!(out.contains("7Fleet"), "{out}");
         assert!(out.contains("contacting 1 remote host"), "{out}");
         a.configured_hosts = 0;
         a.set_fleet(Some(vec![Container {
@@ -2273,46 +2328,55 @@ mod tests {
             }
             a.modal = Modal::Renice { pid: 200, name: "node".into(), input: "10".into(), start: 0 };
             render(&mut a, w, h);
-            a.modal = Modal::AskInput("why slow".into());
-            let out = render(&mut a, w, h);
-            if h >= 24 {
-                assert!(out.contains("why slow"));
-            }
             a.modal = Modal::Filter;
             a.set_filter("nod".into());
             let out = render(&mut a, w, h);
             assert!(out.contains("nod"));
             a.modal = Modal::None;
-            a.ask = AskState::Thinking { question: "why slow".into(), since: a.now, id: 1 };
+            // The Ask tab: a pending question, then answers rendered as Markdown.
+            a.tab = Tab::Ask;
+            a.ask.pending =
+                Some(crate::tui::app::Pending { id: 1, question: "why slow".into(), since: a.now, thread: None });
             let out = render(&mut a, w, h);
             if h >= 24 {
-                assert!(out.contains("thinking"));
+                assert!(out.contains("thinking") && out.contains("why slow"), "{out}");
             }
-            a.ask = AskState::Thinking { question: "q".into(), since: a.now, id: 1 };
-            a.set_answer(1, "Your mac is slow because node is busy.\n".repeat(40));
-            let out = render(&mut a, w, h);
-            if h >= 24 {
-                assert!(out.contains("because node"));
-            }
-            // Answers are Markdown: shown formatted, without the markers.
-            a.ask = AskState::Thinking { question: "q".into(), since: a.now, id: 2 };
-            a.set_answer(2, "**Disk** writes come from `prometheus`:\n- pid 1810 writes *steadily*\n".into());
+            a.ask.pending = None;
+            a.ask.open = Some(1);
+            a.ask.threads =
+                vec![crate::threads::Thread { id: 1, title: "disk".into(), turns: 1, ..Default::default() }];
+            a.ask.turns = vec![crate::threads::Turn {
+                question: "what writes?".into(),
+                answer: "**Disk** writes come from `prometheus`:\n- pid 1810 writes *steadily*\n".into(),
+                via: "ollama · m · http://h".into(),
+                ..Default::default()
+            }];
             let out = render(&mut a, w, h);
             if h >= 24 && w >= 60 {
                 assert!(out.contains("Disk writes come from prometheus:"), "{out}");
                 assert!(out.contains("• pid 1810 writes steadily"), "{out}");
                 assert!(!out.contains("**") && !out.contains('`'), "{out}");
+                assert!(out.contains("via ollama"), "{out}");
             }
-            // Scrolling past the end stops at the last page instead of showing an empty box.
-            a.ask = AskState::Thinking { question: "q".into(), since: a.now, id: 3 };
-            a.set_answer(3, "line\n".repeat(200));
-            if let AskState::Answer { scroll, .. } = &mut a.ask {
-                *scroll = u16::MAX;
-            }
+            // Long threads show their end; scrolling far up stops at the top.
+            a.ask.turns[0].answer = "line\n".repeat(200) + "the end";
             let out = render(&mut a, w, h);
             if h >= 24 {
-                assert!(out.contains("line"), "{out}");
+                assert!(out.contains("the end"), "{out}");
             }
+            a.ask.scroll_up = u16::MAX;
+            let out = render(&mut a, w, h);
+            if h >= 24 {
+                assert!(out.contains("what writes?"), "{out}");
+            }
+            a.ask.typing = true;
+            a.ask.input = "since when".into();
+            let out = render(&mut a, w, h);
+            if h >= 24 {
+                assert!(out.contains("› since when"), "{out}");
+            }
+            a.tab = Tab::Procs;
+            a.ask = Default::default();
         }
     }
 

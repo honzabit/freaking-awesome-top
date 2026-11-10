@@ -1275,7 +1275,7 @@ mod tests {
             if h >= 30 {
                 assert!(out.contains("Fleet findings") && out.contains("disk /var almost full"), "{w}x{h}\n{out}");
             } else {
-                assert!(out.contains("2 findings →") && out.contains("8Fleet"), "{w}x{h}\n{out}");
+                assert!(out.contains("2 findings →") && out.contains("9Fleet"), "{w}x{h}\n{out}");
                 a.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
                 let out = render(&mut a, w, h);
                 assert!(

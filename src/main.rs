@@ -15,9 +15,10 @@ mod mcp;
 mod model;
 mod server;
 mod sys;
+mod threads;
 mod tui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use model::{ActionKind, Budget, Snapshot};
 
@@ -60,12 +61,34 @@ enum Cmd {
     },
     /// Ask in plain language ("why is this machine slow?").
     ///
-    /// Offline (rule-based) unless ANTHROPIC_API_KEY is set; then a redacted digest is sent to
-    /// the Claude API. --dry-run prints exactly that request body and sends nothing.
+    /// Offline (rule-based) unless a model is configured ([ask]: ANTHROPIC_API_KEY for Claude,
+    /// or a self-hosted server); then a redacted digest is sent to it. Each question starts a
+    /// thread, kept locally; --continue / --thread N ask a follow-up in one.
+    /// --dry-run prints exactly the request body and sends nothing.
     Ask {
-        /// Print the request body that would be sent to the API, and send nothing.
+        /// Print the request body that would be sent, and send nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Follow up in the most recent thread.
+        #[arg(long = "continue", short = 'c', conflicts_with = "thread")]
+        continue_: bool,
+        /// Follow up in thread N.
+        #[arg(long, value_name = "N")]
+        thread: Option<i64>,
+        /// Don't keep this question and answer.
+        #[arg(long)]
+        no_save: bool,
+        /// List threads (newest first).
+        #[arg(long, conflicts_with_all = ["show", "continue_", "thread", "dry_run"])]
+        list: bool,
+        /// Print thread N.
+        #[arg(long, value_name = "N", conflicts_with_all = ["continue_", "thread", "dry_run"])]
+        show: Option<i64>,
+        /// Delete thread N.
+        #[arg(long, value_name = "N", conflicts_with_all = ["show", "list", "continue_", "thread", "dry_run"])]
+        delete: Option<i64>,
+        #[arg(long)]
+        json: bool,
         question: Vec<String>,
     },
     /// Run the always-on flight recorder (foreground).
@@ -652,6 +675,107 @@ fn fs_facts(h: Option<&history::History>) -> blame::FsFacts {
     facts
 }
 
+struct AskArgs {
+    question: Vec<String>,
+    dry_run: bool,
+    continue_: bool,
+    thread: Option<i64>,
+    no_save: bool,
+    list: bool,
+    show: Option<i64>,
+    delete: Option<i64>,
+    json: bool,
+}
+
+fn run_ask(a: AskArgs, cfg: &config::Config) -> Result<()> {
+    let path = threads::default_path();
+    let store = || threads::Store::open(&path);
+    if a.list {
+        let ts = store()?.threads(500)?;
+        if a.json {
+            return print_json(&ts);
+        }
+        if ts.is_empty() {
+            println!("No threads yet. Ask something: fat ask \"why is this machine slow?\"");
+        }
+        let now = model::now_ms();
+        for t in ts {
+            let age = tui::widgets::fmt_ago((now - t.updated) / 1000);
+            println!(
+                "{:>5}  {:<9} {:>3} turn{}  {}",
+                t.id,
+                age,
+                t.turns,
+                if t.turns == 1 { " " } else { "s" },
+                t.title
+            );
+        }
+        return Ok(());
+    }
+    if let Some(id) = a.delete {
+        let st = store()?;
+        anyhow::ensure!(st.exists(id)?, "no thread {id} (fat ask --list)");
+        st.delete(id)?;
+        println!("deleted thread {id}");
+        return Ok(());
+    }
+    if let Some(id) = a.show {
+        let turns = store()?.turns(id)?;
+        anyhow::ensure!(!turns.is_empty(), "no thread {id} (fat ask --list)");
+        if a.json {
+            return print_json(&turns);
+        }
+        for t in turns {
+            let when = chrono::DateTime::from_timestamp_millis(t.ts)
+                .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default();
+            println!("## {when} · {}\n\n{}\n\n_via {}_\n", t.question, t.answer, t.via);
+        }
+        return Ok(());
+    }
+    let q = a.question.join(" ");
+    anyhow::ensure!(!q.trim().is_empty(), "ask what? e.g. fat ask \"why is this machine slow?\"");
+    let thread = match (a.continue_, a.thread) {
+        (true, _) => Some(store()?.latest()?.context("no thread to continue yet")?),
+        (_, Some(id)) => {
+            anyhow::ensure!(store()?.exists(id)?, "no thread {id} (fat ask --list)");
+            Some(id)
+        }
+        _ => None,
+    };
+    let s = sample_with(true);
+    let h = history::History::open_read_only(cfg.history_path.as_deref()).ok();
+    let f = blame::diagnose(&s, h.as_ref());
+    // Disk-space and write questions get the growth report: which paths, which writers.
+    let st = ask::wants_storage(&q).then(|| ask::gather_storage(&q, cfg.history_path.as_deref()));
+    if a.dry_run {
+        let mut conv = ask::Conversation::default();
+        if let Some(t) = thread {
+            conv.prior = store()?.turns(t)?.into_iter().map(|t| (t.question, t.answer)).collect();
+        }
+        let (body, note) = ask::dry_run(&q, &conv, &s, &f, st.as_ref(), &cfg.ask);
+        eprintln!("{note}");
+        println!("{body}");
+        return Ok(());
+    }
+    eprintln!("→ {}", llm::destination(&cfg.ask));
+    let save = (!a.no_save).then_some(path.as_path());
+    let r = threads::ask_and_save(save, thread, &q, &s, &f, st.as_ref(), &cfg.ask);
+    if a.json {
+        return print_json(&serde_json::json!({
+            "thread": r.thread, "question": r.question, "answer": r.answer, "via": r.via, "error": r.error,
+        }));
+    }
+    println!("{}", r.answer);
+    if let Some(e) = &r.error {
+        eprintln!("note: {e}");
+    }
+    if let Some(t) = r.thread {
+        eprintln!("(thread {t}: follow up with `fat ask -c \"…\"`)");
+    }
+    Ok(())
+}
+
 fn run_fs(a: FsArgs, cfg: &config::Config) -> Result<()> {
     let now = model::now_ms();
     if a.volumes {
@@ -873,21 +997,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Some(Cmd::Ask { question, dry_run }) => {
-            let q = question.join(" ");
-            let s = sample_with(true);
-            let h = history::History::open_read_only(cfg.history_path.as_deref()).ok();
-            let f = blame::diagnose(&s, h.as_ref());
-            // Disk-space and write questions get the growth report: which paths, which writers.
-            let st = ask::wants_storage(&q).then(|| ask::gather_storage(&q, cfg.history_path.as_deref()));
-            if dry_run {
-                let (body, note) = ask::dry_run(&q, &s, &f, st.as_ref(), &cfg.ask);
-                eprintln!("{note}");
-                println!("{body}");
-            } else {
-                eprintln!("→ {}", llm::destination(&cfg.ask));
-                println!("{}", ask::ask(&q, &s, &f, st.as_ref(), &cfg.ask));
-            }
+        Some(Cmd::Ask { question, dry_run, continue_, thread, no_save, list, show, delete, json }) => {
+            return run_ask(AskArgs { question, dry_run, continue_, thread, no_save, list, show, delete, json }, &cfg);
         }
         // --- recorder-export ---
         Some(Cmd::Record { server: server_flag, export, listen }) => {
@@ -1091,7 +1202,7 @@ mod tests {
         }
         let m = cli_command().try_get_matches_from(["fat", "ask", "--dry-run", "why", "hot"]).unwrap();
         assert!(
-            matches!(<Cli as clap::FromArgMatches>::from_arg_matches(&m).unwrap().cmd, Some(Cmd::Ask { dry_run: true, ref question }) if question == &["why", "hot"])
+            matches!(<Cli as clap::FromArgMatches>::from_arg_matches(&m).unwrap().cmd, Some(Cmd::Ask { dry_run: true, ref question, .. }) if question == &["why", "hot"])
         );
     }
 

@@ -68,7 +68,7 @@ enum Msg {
     FleetDone(Box<FleetSummary>),
     FleetFailed(String),
     FleetDrill(String, Result<(Box<Snapshot>, Vec<Finding>), String>),
-    Answer(u64, String),
+    Answer(u64, Box<crate::threads::Asked>),
     /// None = no recorded history for this window (fall back to the in-memory ring).
     Timeline(Option<(Vec<Point>, Vec<Ts>)>),
     Past(Ts, Option<Box<Snapshot>>),
@@ -916,6 +916,8 @@ struct Ctx {
     inventory: Inventory,
     /// Transport for fleet polls (ssh through the operator's own ssh config).
     transport: Arc<dyn Transport>,
+    /// Where ask threads are kept (None: not kept, as in tests).
+    threads_path: Option<std::path::PathBuf>,
 }
 
 impl Ctx {
@@ -1071,28 +1073,73 @@ impl Ctx {
                     None => apply_msg(app, Msg::Why(guarded(|| crate::blame::explain(s, pid, None)))),
                 }
             }
-            Command::Ask { id, question: q } => {
+            Command::Ask { id, question: q, thread } => {
                 app.ask_dest = crate::llm::destination(&self.cfg.ask);
                 let snap = app.live.clone().unwrap_or_default();
                 let findings = app.findings.clone();
                 let ask_cfg = self.cfg.ask.clone();
                 let hist_path = self.cfg.history_path.clone();
+                let threads_path = self.threads_path.clone();
                 let tx = self.tx.clone();
                 // The Fs tab's growth report, when it has one: reused if fresh, so a disk
                 // question doesn't wait for a second FSEvents replay.
                 let facts = self.fs_shared.facts();
                 let now = app.now;
                 thread::spawn(move || {
-                    let ans = guarded(|| {
+                    let asked = guarded(|| {
                         let st = crate::ask::wants_storage(&q).then(|| {
                             crate::ask::reuse_storage(&q, facts.volumes, facts.growth, now, 120_000)
                                 .unwrap_or_else(|| crate::ask::gather_storage(&q, hist_path.as_deref()))
                         });
-                        crate::ask::ask(&q, &snap, &findings, st.as_ref(), &ask_cfg)
+                        crate::threads::ask_and_save(
+                            threads_path.as_deref(),
+                            thread,
+                            &q,
+                            &snap,
+                            &findings,
+                            st.as_ref(),
+                            &ask_cfg,
+                        )
                     })
-                    .unwrap_or_else(|e| format!("ask is unavailable right now ({e})."));
-                    let _ = tx.send(Msg::Answer(id, ans));
+                    .unwrap_or_else(|e| crate::threads::Asked {
+                        question: q.clone(),
+                        answer: format!("ask is unavailable right now ({e})."),
+                        via: "error".into(),
+                        ..Default::default()
+                    });
+                    let _ = tx.send(Msg::Answer(id, Box::new(asked)));
                 });
+            }
+            Command::Threads => {
+                if let Some(p) = &self.threads_path {
+                    let r = guarded(|| crate::threads::Store::open(p).and_then(|s| s.threads(500)))
+                        .map_err(|e| format!("threads unavailable ({e})"))
+                        .and_then(|r| r.map_err(|e| format!("threads unavailable ({e:#})")));
+                    app.set_threads(r);
+                }
+            }
+            Command::OpenThread(id) => {
+                if let Some(p) = &self.threads_path
+                    && let Ok(Ok(t)) = guarded(|| crate::threads::Store::open(p).and_then(|s| s.turns(id)))
+                {
+                    app.set_thread(id, t);
+                }
+            }
+            Command::DeleteThread(id) => {
+                if let Some(p) = &self.threads_path {
+                    match guarded(|| crate::threads::Store::open(p).and_then(|s| s.delete(id))) {
+                        Ok(Ok(())) => {
+                            if app.ask.open == Some(id) {
+                                app.ask.open = None;
+                                app.ask.turns.clear();
+                            }
+                            app.set_status("thread deleted", false);
+                            self.exec(app, Command::Threads);
+                        }
+                        Ok(Err(e)) => app.set_status(format!("could not delete the thread: {e:#}"), true),
+                        Err(e) => app.set_status(format!("could not delete the thread: {e}"), true),
+                    }
+                }
             }
             Command::RefreshTimeline { from, to } => match &self.hist {
                 Some(h) if app.history_ok => {
@@ -1124,7 +1171,7 @@ fn apply_msg(app: &mut App, msg: Msg) {
         Msg::FleetDone(s) => app.fleet_done(*s),
         Msg::FleetFailed(e) => app.fleet_failed(e),
         Msg::FleetDrill(name, r) => app.set_fleet_drill(&name, r.map(|(s, f)| (*s, f))),
-        Msg::Answer(id, a) => app.set_answer(id, a),
+        Msg::Answer(id, a) => app.answered(id, *a),
         Msg::Timeline(Some((pts, spikes))) => app.set_timeline(pts, spikes),
         Msg::Timeline(None) => app.use_ring_timeline(),
         Msg::Past(ts, snap) => app.set_past(ts, snap.map(|s| *s)),
@@ -1158,7 +1205,7 @@ fn event_loop(
             dirty = true;
         }
         // spinner / status expiry need periodic redraws
-        let periodic = if matches!(app.ask, app::AskState::Thinking { .. }) { 100 } else { 1000 };
+        let periodic = if app.ask.pending.is_some() { 100 } else { 1000 };
         if dirty || now - last_draw >= periodic {
             term.draw(|f| ui::draw(f, app))?;
             last_draw = now;
@@ -1226,6 +1273,7 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
         fs: None,
         inventory,
         transport,
+        threads_path: Some(crate::threads::default_path()),
     };
     // Nothing else runs before the first frame: the journal is read when the action log (`a`)
     // opens or an action runs, samples arrive from the sampler thread.
@@ -1276,6 +1324,7 @@ mod tests {
             fs: None,
             inventory: Arc::default(),
             transport: Arc::new(fanout::LocalTransport { program: "true".into(), prefix: vec![] }),
+            threads_path: None,
         };
         let mut app = App::new(1000);
         ctx.exec(&mut app, Command::RefreshTimeline { from: 0, to: 1 });

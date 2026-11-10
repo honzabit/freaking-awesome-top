@@ -40,6 +40,8 @@ pub enum Tab {
     Fs,
     Timeline,
     Doctor,
+    /// Questions to the model, kept as threads.
+    Ask,
     /// Only shown when there is something beyond this machine (see [`App::fleet_visible`]).
     Fleet,
 }
@@ -48,13 +50,13 @@ impl Tab {
     /// Every tab (tests iterate it). Which ones a profile shows, and their number keys, come
     /// from [`App::tab_order`].
     #[cfg(test)]
-    pub const ALL: [Tab; 8] =
-        [Tab::Services, Tab::Events, Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
-    /// Desktop: today's layout, number keys 1-6. Fleet is last so hiding it never renumbers.
-    pub const DESKTOP: [Tab; 6] = [Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
+    pub const ALL: [Tab; 9] =
+        [Tab::Services, Tab::Events, Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Ask, Tab::Fleet];
+    /// Desktop: number keys 1-7. Fleet is last so hiding it never renumbers.
+    pub const DESKTOP: [Tab; 7] = [Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Ask, Tab::Fleet];
     /// Server: services first, the event timeline next to processes.
-    pub const SERVER: [Tab; 8] =
-        [Tab::Services, Tab::Procs, Tab::Events, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
+    pub const SERVER: [Tab; 9] =
+        [Tab::Services, Tab::Procs, Tab::Events, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Ask, Tab::Fleet];
     pub fn title(self) -> &'static str {
         match self {
             Tab::Services => "Services",
@@ -64,6 +66,7 @@ impl Tab {
             Tab::Fs => "Fs",
             Tab::Timeline => "Timeline",
             Tab::Doctor => "Doctor",
+            Tab::Ask => "Ask",
             Tab::Fleet => "Fleet",
         }
     }
@@ -114,11 +117,18 @@ pub enum Command {
     /// Undo one journal entry by id (from the action log).
     UndoId(u64),
     Explain(u32),
-    /// `id` ties the eventual answer to this question (a cancelled ask's late answer is dropped).
+    /// `id` ties the eventual answer to this question (a cancelled ask's late answer is not
+    /// shown). `thread` None starts a new thread.
     Ask {
         id: u64,
         question: String,
+        thread: Option<i64>,
     },
+    /// Reload the list of ask threads.
+    Threads,
+    /// Load one thread's turns.
+    OpenThread(i64),
+    DeleteThread(i64),
     RefreshLog,
     RefreshTimeline {
         from: Ts,
@@ -183,17 +193,36 @@ pub enum Modal {
         input: String,
         start: u64,
     },
-    AskInput(String),
     Help,
     /// The action journal (`a`): most recent first, `u`/⏎ undo.
     Log,
 }
 
+/// The Ask tab: past threads on the left, the open thread on the right, an input line below.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AskTab {
+    pub threads: Vec<crate::threads::Thread>,
+    /// Selected row in `threads`.
+    pub sel: usize,
+    /// The thread shown; None = a new thread (the next question starts one).
+    pub open: Option<i64>,
+    pub turns: Vec<crate::threads::Turn>,
+    pub input: String,
+    /// Keys go to the input line.
+    pub typing: bool,
+    /// Lines scrolled up from the bottom of the conversation.
+    pub scroll_up: u16,
+    pub pending: Option<Pending>,
+    /// Why threads can't be saved or read (shown instead of the list).
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
-pub enum AskState {
-    Idle,
-    Thinking { question: String, since: Ts, id: u64 },
-    Answer { question: String, text: String, scroll: u16 },
+pub struct Pending {
+    pub id: u64,
+    pub question: String,
+    pub since: Ts,
+    pub thread: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -756,7 +785,7 @@ pub struct App {
 
     pub why: Option<Explanation>,
     pub why_scroll: u16,
-    pub ask: AskState,
+    pub ask: AskTab,
     /// Where the current question goes ("ollama · qwen3 · http://…", "offline (…)").
     pub ask_dest: String,
     ask_seq: u64,
@@ -830,7 +859,7 @@ impl App {
             last_counts: i64::MIN / 2,
             why: None,
             why_scroll: 0,
-            ask: AskState::Idle,
+            ask: AskTab::default(),
             ask_dest: String::new(),
             ask_seq: 0,
             modal: Modal::None,
@@ -1059,13 +1088,72 @@ impl App {
         self.why_scroll = 0;
     }
 
-    /// Answer for ask `id`; ignored unless that exact question is still pending.
-    pub fn set_answer(&mut self, id: u64, text: String) {
-        if let AskState::Thinking { question, id: want, .. } = &self.ask
-            && *want == id
-        {
-            self.ask = AskState::Answer { question: question.clone(), text, scroll: 0 };
+    /// The answer to ask `id` arrived. Shown only if that question is still pending (a
+    /// cancelled one is still saved in its thread).
+    pub fn answered(&mut self, id: u64, a: crate::threads::Asked) {
+        if !a.threads.is_empty() {
+            self.set_threads(Ok(a.threads));
         }
+        if self.ask.pending.as_ref().is_none_or(|p| p.id != id) {
+            return;
+        }
+        self.ask.pending = None;
+        self.ask.scroll_up = 0;
+        match a.thread {
+            Some(t) => {
+                self.ask.open = Some(t);
+                self.ask.turns = a.turns;
+                if let Some(i) = self.ask.threads.iter().position(|x| x.id == t) {
+                    self.ask.sel = i;
+                }
+            }
+            None => self.ask.turns.push(crate::threads::Turn {
+                question: a.question,
+                answer: a.answer,
+                via: a.via,
+                ts: self.now,
+                ..Default::default()
+            }),
+        }
+        if let Some(e) = a.error {
+            self.set_status(e, true);
+        }
+    }
+
+    pub fn set_threads(&mut self, threads: Result<Vec<crate::threads::Thread>, String>) {
+        match threads {
+            Ok(t) => {
+                self.ask.threads = t;
+                self.ask.error = None;
+                // Keep the open thread selected.
+                if let Some(i) = self.ask.open.and_then(|id| self.ask.threads.iter().position(|x| x.id == id)) {
+                    self.ask.sel = i;
+                }
+                self.ask.sel = self.ask.sel.min(self.ask.threads.len().saturating_sub(1));
+            }
+            Err(e) => self.ask.error = Some(e),
+        }
+    }
+
+    pub fn set_thread(&mut self, id: i64, turns: Vec<crate::threads::Turn>) {
+        if self.ask.pending.is_none() {
+            self.ask.open = Some(id);
+            self.ask.turns = turns;
+            self.ask.scroll_up = 0;
+        }
+    }
+
+    /// Start a new thread with the input line focused (the `?` key, anywhere).
+    pub fn ask_new(&mut self) -> Vec<Command> {
+        let mut cmds = self.switch_tab(Tab::Ask);
+        if self.ask.pending.is_none() {
+            self.ask.open = None;
+            self.ask.turns.clear();
+            self.ask.scroll_up = 0;
+        }
+        self.ask.typing = true;
+        cmds.retain(|c| !matches!(c, Command::OpenThread(_)));
+        cmds
     }
 
     pub fn action_done(&mut self, r: &ActionRecord) {
@@ -1439,8 +1527,8 @@ impl App {
         if self.modal != Modal::None {
             return self.on_modal_key(k);
         }
-        if !matches!(self.ask, AskState::Idle) {
-            return self.on_ask_key(k);
+        if self.tab == Tab::Ask && (self.ask.typing || (k.code == KeyCode::Esc && self.ask.pending.is_some())) {
+            return if self.ask.typing { self.on_ask_input(k) } else { self.on_ask_tab_key(k) };
         }
         if self.panel.is_some() && self.why.is_none() {
             return self.on_panel_key(k);
@@ -1534,55 +1622,77 @@ impl App {
                     Vec::new()
                 }
             },
-            Modal::AskInput(mut q) => match k.code {
-                KeyCode::Esc => Vec::new(),
-                KeyCode::Enter => {
-                    let q = q.trim().to_string();
-                    if q.is_empty() {
-                        return Vec::new();
-                    }
-                    self.ask_seq += 1;
-                    let id = self.ask_seq;
-                    self.ask = AskState::Thinking { question: q.clone(), since: self.now, id };
-                    vec![Command::Ask { id, question: q }]
-                }
-                KeyCode::Backspace => {
-                    q.pop();
-                    self.modal = Modal::AskInput(q);
-                    Vec::new()
-                }
-                KeyCode::Char(c) => {
-                    q.push(c);
-                    self.modal = Modal::AskInput(q);
-                    Vec::new()
-                }
-                _ => {
-                    self.modal = Modal::AskInput(q);
-                    Vec::new()
-                }
-            },
         }
     }
 
-    fn on_ask_key(&mut self, k: KeyEvent) -> Vec<Command> {
-        match &mut self.ask {
-            AskState::Thinking { .. } => {
-                if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
-                    self.ask = AskState::Idle;
-                    self.set_status("ask cancelled", false);
+    /// Keys while typing a question.
+    fn on_ask_input(&mut self, k: KeyEvent) -> Vec<Command> {
+        match k.code {
+            KeyCode::Esc => self.ask.typing = false,
+            KeyCode::Enter => {
+                let q = self.ask.input.trim().to_string();
+                if q.is_empty() || self.ask.pending.is_some() {
+                    return Vec::new();
+                }
+                self.ask.input.clear();
+                self.ask.typing = false;
+                self.ask_seq += 1;
+                let id = self.ask_seq;
+                let thread = self.ask.open;
+                self.ask.pending = Some(Pending { id, question: q.clone(), since: self.now, thread });
+                self.ask.scroll_up = 0;
+                return vec![Command::Ask { id, question: q, thread }];
+            }
+            KeyCode::Backspace => {
+                self.ask.input.pop();
+            }
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => self.ask.input.clear(),
+            KeyCode::Char(c) => self.ask.input.push(c),
+            KeyCode::PageUp => self.ask.scroll_up = self.ask.scroll_up.saturating_add(10),
+            KeyCode::PageDown => self.ask.scroll_up = self.ask.scroll_up.saturating_sub(10),
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// Ask tab keys when not typing.
+    fn on_ask_tab_key(&mut self, k: KeyEvent) -> Vec<Command> {
+        let n = self.ask.threads.len();
+        match k.code {
+            KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
+                let before = self.ask.sel;
+                let code = match k.code {
+                    KeyCode::Char('j') => KeyCode::Down,
+                    KeyCode::Char('k') => KeyCode::Up,
+                    c => c,
+                };
+                list_nav(&mut self.ask.sel, n, code);
+                if (self.ask.sel != before || self.ask.open.is_none())
+                    && self.ask.pending.is_none()
+                    && let Some(t) = self.ask.threads.get(self.ask.sel)
+                {
+                    return vec![Command::OpenThread(t.id)];
                 }
             }
-            AskState::Answer { scroll, .. } => match k.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.ask = AskState::Idle,
-                KeyCode::Down => *scroll = scroll.saturating_add(1),
-                KeyCode::Up => *scroll = scroll.saturating_sub(1),
-                KeyCode::PageDown | KeyCode::Char(' ') => *scroll = scroll.saturating_add(10),
-                KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
-                KeyCode::Home => *scroll = 0,
-                KeyCode::Char('?') => self.modal = Modal::AskInput(String::new()),
-                _ => {}
-            },
-            AskState::Idle => {}
+            KeyCode::Enter | KeyCode::Char('i') => self.ask.typing = true,
+            KeyCode::Char('n') => return self.ask_new(),
+            KeyCode::Char('d') => {
+                if let Some(t) = self.ask.threads.get(self.ask.sel) {
+                    self.modal = Modal::Confirm {
+                        prompt: format!("Delete the thread \"{}\" ({} turns)?", t.title, t.turns),
+                        cmd: Command::DeleteThread(t.id),
+                    };
+                }
+            }
+            KeyCode::PageUp => self.ask.scroll_up = self.ask.scroll_up.saturating_add(10),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.ask.scroll_up = self.ask.scroll_up.saturating_sub(10),
+            KeyCode::Home => self.ask.scroll_up = u16::MAX,
+            KeyCode::End => self.ask.scroll_up = 0,
+            KeyCode::Esc if self.ask.pending.is_some() => {
+                self.ask.pending = None;
+                self.set_status("stopped waiting; the answer will still be saved to its thread", false);
+            }
+            _ => {}
         }
         Vec::new()
     }
@@ -1650,6 +1760,17 @@ impl App {
                 vec![self.events_refresh()]
             }
             Tab::Fleet => self.fleet_poll_if_due(self.now, false).into_iter().collect(),
+            Tab::Ask => {
+                let mut v = vec![Command::Threads];
+                if self.ask.open.is_none()
+                    && self.ask.pending.is_none()
+                    && self.ask.turns.is_empty()
+                    && let Some(t) = self.ask.threads.get(self.ask.sel)
+                {
+                    v.push(Command::OpenThread(t.id));
+                }
+                v
+            }
             Tab::Fs => {
                 // Opening the tab is what starts the storage engines (never before).
                 self.fs.opened = true;
@@ -1694,10 +1815,7 @@ impl App {
                 self.modal = Modal::Help;
                 return Vec::new();
             }
-            KeyCode::Char('?') => {
-                self.modal = Modal::AskInput(String::new());
-                return Vec::new();
-            }
+            KeyCode::Char('?') => return self.ask_new(),
             KeyCode::Char('L') => {
                 self.go_live();
                 return Vec::new();
@@ -1742,6 +1860,7 @@ impl App {
                 Vec::new()
             }
             Tab::Doctor => self.on_doctor_key(k),
+            Tab::Ask => self.on_ask_tab_key(k),
             Tab::Services => self.on_services_key(k),
             Tab::Events => self.on_events_key(k),
         }
@@ -2951,14 +3070,14 @@ pub(crate) mod tests {
         let mut a = app();
         assert_eq!(a.tab, Tab::Procs, "the first screen is the process list");
         assert_eq!((a.sort, a.sort_desc), (SortKey::Cpu, true), "sorted by cpu, hottest first");
-        // No Fleet without containers or hosts: five tabs, BackTab wraps to Doctor.
-        assert_eq!(a.tabs(), vec![Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor]);
+        // No Fleet without containers or hosts: six tabs, BackTab wraps to Ask.
+        assert_eq!(a.tabs(), vec![Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Ask]);
         a.on_key(code(KeyCode::BackTab));
-        assert_eq!(a.tab, Tab::Doctor);
+        assert_eq!(a.tab, Tab::Ask);
         a.on_key(code(KeyCode::Tab));
         assert_eq!(a.tab, Tab::Procs);
-        assert!(a.on_key(key('6')).is_empty());
-        assert_eq!(a.tab, Tab::Procs, "6 does nothing while Fleet is hidden");
+        assert!(a.on_key(key('7')).is_empty());
+        assert_eq!(a.tab, Tab::Procs, "7 does nothing while Fleet is hidden");
         a.on_key(key('2'));
         assert_eq!(a.tab, Tab::Ports);
         a.on_key(code(KeyCode::Tab));
@@ -2968,16 +3087,18 @@ pub(crate) mod tests {
         assert_eq!(a.tab, Tab::Timeline);
         a.on_key(key('5'));
         assert_eq!(a.tab, Tab::Doctor);
-        // A running container makes Fleet appear as 6, after Doctor.
+        // A running container makes Fleet appear as 7, after Ask.
         a.set_fleet(Some(vec![Container { id: "abc".into(), name: "pg".into(), ..Default::default() }]));
         a.on_key(code(KeyCode::Tab));
+        assert_eq!(a.tab, Tab::Ask);
+        a.on_key(code(KeyCode::Tab));
         assert_eq!(a.tab, Tab::Fleet);
-        a.on_key(key('6'));
+        a.on_key(key('7'));
         assert_eq!(a.tab, Tab::Fleet);
         // ... and disappear when it stops (the view falls back to Procs).
         a.set_fleet(Some(vec![]));
         assert_eq!(a.tab, Tab::Procs);
-        assert_eq!(Tab::DESKTOP.map(|t| t.title()), ["Procs", "Ports", "Fs", "Timeline", "Doctor", "Fleet"]);
+        assert_eq!(Tab::DESKTOP.map(|t| t.title()), ["Procs", "Ports", "Fs", "Timeline", "Doctor", "Ask", "Fleet"]);
         // The action log is an overlay on any view, not a tab.
         a.on_key(key('3'));
         assert_eq!(a.on_key(key('a')), vec![Command::RefreshLog]);
@@ -3116,42 +3237,117 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn ask_flow() {
-        let mut a = app();
-        a.on_key(key('?'));
-        for c in "why slow".chars() {
-            a.on_key(key(c));
-        }
-        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Ask { id: 1, question: "why slow".into() }]);
-        assert!(matches!(a.ask, AskState::Thinking { .. }));
-        // keys don't leak to the table while thinking
-        assert!(a.on_key(key('k')).is_empty());
-        a.set_answer(1, "line\n".repeat(50));
-        assert!(matches!(a.ask, AskState::Answer { .. }));
-        a.on_key(code(KeyCode::PageDown));
-        assert!(matches!(a.ask, AskState::Answer { scroll: 10, .. }));
-        a.on_key(code(KeyCode::Esc));
-        assert_eq!(a.ask, AskState::Idle);
+    fn asked(thread: i64, turns: &[(&str, &str)]) -> crate::threads::Asked {
+        let turns: Vec<crate::threads::Turn> = turns
+            .iter()
+            .enumerate()
+            .map(|(i, (q, ans))| crate::threads::Turn {
+                id: i as i64 + 1,
+                thread,
+                question: q.to_string(),
+                answer: ans.to_string(),
+                via: "test".into(),
+                ..Default::default()
+            })
+            .collect();
+        let t = crate::threads::Thread {
+            id: thread,
+            title: turns[0].question.clone(),
+            turns: turns.len() as u32,
+            ..Default::default()
+        };
+        crate::threads::Asked { thread: Some(thread), turns, threads: vec![t], ..Default::default() }
     }
 
     #[test]
-    fn cancelled_ask_answer_is_not_shown_under_the_next_question() {
+    fn ask_tab_flow() {
         let mut a = app();
-        let ask = |a: &mut App, q: &str| {
-            a.on_key(key('?'));
-            for c in q.chars() {
-                a.on_key(key(c));
-            }
-            a.on_key(code(KeyCode::Enter))
-        };
-        assert_eq!(ask(&mut a, "q1"), vec![Command::Ask { id: 1, question: "q1".into() }]);
-        a.on_key(code(KeyCode::Esc)); // cancel; q1's thread keeps running
-        assert_eq!(ask(&mut a, "q2"), vec![Command::Ask { id: 2, question: "q2".into() }]);
-        a.set_answer(1, "answer to q1".into());
-        assert!(matches!(a.ask, AskState::Thinking { id: 2, .. }), "late q1 answer must be dropped");
-        a.set_answer(2, "answer to q2".into());
-        assert_eq!(a.ask, AskState::Answer { question: "q2".into(), text: "answer to q2".into(), scroll: 0 });
+        // `?` from any tab opens the Ask tab on a new thread, typing.
+        let cmds = a.on_key(key('?'));
+        assert_eq!(a.tab, Tab::Ask);
+        assert_eq!(cmds, vec![Command::Threads]);
+        assert!(a.ask.typing && a.ask.open.is_none());
+        // While typing, keys are text: q doesn't quit, digits don't switch tabs.
+        for c in "why q1 slow".chars() {
+            assert!(a.on_key(key(c)).is_empty());
+        }
+        assert!(!a.quit && a.tab == Tab::Ask);
+        assert_eq!(
+            a.on_key(code(KeyCode::Enter)),
+            vec![Command::Ask { id: 1, question: "why q1 slow".into(), thread: None }]
+        );
+        assert!(a.ask.pending.is_some() && !a.ask.typing && a.ask.input.is_empty());
+        a.answered(1, asked(7, &[("why q1 slow", "node is busy")]));
+        assert!(a.ask.pending.is_none());
+        assert_eq!((a.ask.open, a.ask.turns.len(), a.ask.threads.len()), (Some(7), 1, 1));
+        // Enter follows up in the open thread.
+        a.on_key(code(KeyCode::Enter));
+        for c in "since when".chars() {
+            a.on_key(key(c));
+        }
+        assert_eq!(
+            a.on_key(code(KeyCode::Enter)),
+            vec![Command::Ask { id: 2, question: "since when".into(), thread: Some(7) }]
+        );
+        a.answered(2, asked(7, &[("why q1 slow", "node is busy"), ("since when", "10 minutes")]));
+        assert_eq!(a.ask.turns.len(), 2);
+        // n starts a new thread; d asks before deleting.
+        a.on_key(key('n'));
+        assert!(a.ask.typing && a.ask.open.is_none() && a.ask.turns.is_empty());
+        a.on_key(code(KeyCode::Esc));
+        assert!(!a.ask.typing);
+        a.on_key(key('d'));
+        assert!(matches!(&a.modal, Modal::Confirm { cmd: Command::DeleteThread(7), .. }));
+        a.on_key(key('n'));
+        a.on_key(code(KeyCode::Esc));
+        // Up/Down open threads.
+        a.set_threads(Ok(vec![
+            crate::threads::Thread { id: 9, title: "b".into(), ..Default::default() },
+            crate::threads::Thread { id: 7, title: "a".into(), ..Default::default() },
+        ]));
+        assert_eq!(a.on_key(code(KeyCode::Down)), vec![Command::OpenThread(7)]);
+        a.set_thread(7, vec![]);
+        assert_eq!(a.ask.open, Some(7));
+        // Outside typing, q still quits.
+        a.on_key(key('q'));
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn a_stopped_ask_is_saved_but_not_shown() {
+        let mut a = app();
+        a.on_key(key('?'));
+        for c in "q1".chars() {
+            a.on_key(key(c));
+        }
+        a.on_key(code(KeyCode::Enter));
+        a.on_key(code(KeyCode::Esc)); // stop waiting; q1 keeps running and is saved
+        assert!(a.ask.pending.is_none());
+        a.on_key(key('?'));
+        for c in "q2".chars() {
+            a.on_key(key(c));
+        }
+        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Ask { id: 2, question: "q2".into(), thread: None }]);
+        a.answered(1, asked(1, &[("q1", "answer to q1")]));
+        assert!(a.ask.pending.as_ref().is_some_and(|p| p.id == 2), "late q1 answer must not replace q2");
+        assert_eq!(a.ask.threads.len(), 1, "but its thread is listed");
+        a.answered(2, asked(2, &[("q2", "answer to q2")]));
+        assert_eq!(a.ask.turns[0].answer, "answer to q2");
+        // An answer that could not be saved is still shown, with the reason.
+        a.on_key(key('?'));
+        a.on_key(key('x'));
+        a.on_key(code(KeyCode::Enter));
+        a.answered(
+            3,
+            crate::threads::Asked {
+                question: "x".into(),
+                answer: "y".into(),
+                error: Some("disk full".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(a.ask.turns.last().unwrap().answer, "y");
+        assert!(a.status.as_ref().is_some_and(|s| s.error && s.text.contains("disk full")));
     }
 
     #[test]

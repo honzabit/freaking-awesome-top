@@ -39,8 +39,24 @@ there, and evidence: fsevents/watch = exact paths seen changing, open_files = fi
 scan_diff = two scans compared, mtime = recently modified, an upper bound), writers (bytes each process wrote in \
 the window), deleted_open (space held by deleted files still open) and notes (what evidence was unavailable). \
 Name the paths and the processes from it; say which evidence backs each claim. \
+Earlier turns of the same thread may come before the question: answer the follow-up in that light. \
+<past_threads>, when present, holds excerpts of earlier conversations about this host, with when they happened: \
+use them to notice recurring problems, but treat their numbers as history, not as the current state; current \
+numbers come only from the snapshot. \
 Format the answer as GitHub-flavored Markdown for a terminal: short paragraphs, `-` bullet lists, **bold** for the \
 key finding, `code` for commands, paths, pids and units. No tables and no headings above level 3.";
+
+/// What a question carries besides the snapshot: the earlier turns of its thread (question,
+/// answer), and excerpts of recent threads on this host.
+#[derive(Debug, Clone, Default)]
+pub struct Conversation {
+    pub prior: Vec<(String, String)>,
+    pub memory: Vec<crate::threads::Memory>,
+}
+
+/// Earlier turns sent with a follow-up, at most, and how much of each answer.
+const PRIOR_TURNS: usize = 6;
+const PRIOR_ANSWER_CHARS: usize = 3_000;
 
 /// Answer a question. Uses the model `[ask]` configures (the Claude API with
 /// ANTHROPIC_API_KEY by default, or a self-hosted server), else a rule-based answer built
@@ -52,38 +68,90 @@ pub fn ask(
     storage: Option<&Storage>,
     cfg: &crate::config::AskCfg,
 ) -> String {
+    ask_in(question, &Conversation::default(), snap, findings, storage, cfg).0
+}
+
+/// [`ask`] within a thread. Returns the answer and where it came from (the destination, or
+/// "offline (…)" when answered by rules).
+pub fn ask_in(
+    question: &str,
+    conv: &Conversation,
+    snap: &Snapshot,
+    findings: &[Finding],
+    storage: Option<&Storage>,
+    cfg: &crate::config::AskCfg,
+) -> (String, String) {
     let offline = || offline_answer(question, snap, findings, storage);
     if !cfg.enabled {
-        return offline();
+        return (offline(), "offline ([ask] enabled = false)".into());
     }
     match crate::llm::resolve(cfg) {
         Ok(ep) if ep.usable() => {
-            let body = request_json(question, snap, findings, storage, &ep);
+            let body = request_json_in(question, conv, snap, findings, storage, &ep);
             let headers: &[(&str, &str)] = match ep.provider {
                 crate::llm::Provider::Anthropic => &[("anthropic-version", API_VERSION), ("anthropic-beta", API_BETA)],
                 _ => &[],
             };
             match ep.send(&body, headers) {
-                Ok(answer) => answer,
-                Err(e) => format!("{e}\n\nOffline answer instead:\n{}", offline()),
+                Ok(answer) => (answer, ep.describe()),
+                Err(e) => (format!("{e}\n\nOffline answer instead:\n{}", offline()), format!("offline ({e})")),
             }
         }
-        Ok(_) => offline(),
-        Err(e) => format!("{e}\n\nOffline answer instead:\n{}", offline()),
+        Ok(ep) => (offline(), format!("offline ({} is not set)", ep.key_env)),
+        Err(e) => (format!("{e}\n\nOffline answer instead:\n{}", offline()), format!("offline ({e})")),
     }
 }
 
-// ---------- Claude API ----------
+// ---------- requests ----------
 
-/// The user turn: the redacted question after the digest.
-fn user_content(question: &str, context: &str) -> String {
+fn redacted(text: &str, minimal: Option<&Snapshot>) -> String {
     let (home, user) = identity();
-    let mut q = Value::String(question.trim().to_string());
-    redact_value(&mut q, home.as_deref(), user.as_deref());
-    format!("<snapshot>\n{context}\n</snapshot>\n\nQuestion: {}", q.as_str().unwrap_or_default())
+    let mut v = Value::String(text.trim().to_string());
+    redact_value(&mut v, home.as_deref(), user.as_deref());
+    if let Some(snap) = minimal {
+        minimize(&mut v, snap);
+    }
+    v.as_str().unwrap_or_default().to_string()
 }
 
-pub(crate) fn request_body(question: &str, context: &str, model: &str) -> Value {
+/// The conversation as chat messages: earlier turns of the thread, then the digest (with
+/// past-thread excerpts before it) and the question. Every string is redacted.
+fn messages(question: &str, context: &str, conv: &Conversation, minimal: Option<&Snapshot>) -> Vec<Value> {
+    let mut out = Vec::new();
+    let skip = conv.prior.len().saturating_sub(PRIOR_TURNS);
+    for (q, a) in &conv.prior[skip..] {
+        let a: String = a.chars().take(PRIOR_ANSWER_CHARS).collect();
+        out.push(json!({"role": "user", "content": redacted(q, minimal)}));
+        out.push(json!({"role": "assistant", "content": redacted(&a, minimal)}));
+    }
+    let mut content = String::new();
+    if !conv.memory.is_empty() {
+        content.push_str("<past_threads>\n");
+        for m in &conv.memory {
+            let when = chrono::DateTime::from_timestamp_millis(m.ts)
+                .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default();
+            content.push_str(&format!(
+                "- {when}: asked \"{}\"; concluded: {}\n",
+                redacted(&m.question, minimal),
+                redacted(&m.answer, minimal).replace('\n', " ")
+            ));
+        }
+        content.push_str("</past_threads>\n\n");
+    }
+    content.push_str(&format!("<snapshot>\n{context}\n</snapshot>\n\nQuestion: {}", redacted(question, minimal)));
+    out.push(json!({"role": "user", "content": content}));
+    out
+}
+
+/// Bytes the conversation adds besides the digest, so the digest can shrink to make room.
+fn conversation_bytes(conv: &Conversation) -> usize {
+    let skip = conv.prior.len().saturating_sub(PRIOR_TURNS);
+    conv.prior[skip..].iter().map(|(q, a)| q.len() + a.len().min(PRIOR_ANSWER_CHARS * 4)).sum::<usize>()
+        + conv.memory.iter().map(|m| m.question.len() + m.answer.len() + 40).sum::<usize>()
+}
+
+fn anthropic_body(model: &str, messages: Vec<Value>) -> Value {
     let model = if model.trim().is_empty() { crate::llm::DEFAULT_CLAUDE_MODEL } else { model };
     json!({
         "model": model,
@@ -91,14 +159,17 @@ pub(crate) fn request_body(question: &str, context: &str, model: &str) -> Value 
         "fallbacks": "default",
         "output_config": { "effort": "low" },
         "system": SYSTEM_PROMPT,
-        "messages": [{
-            "role": "user",
-            "content": user_content(question, context),
-        }],
+        "messages": messages,
     })
 }
 
+#[cfg(test)]
+pub(crate) fn request_body(question: &str, context: &str, model: &str) -> Value {
+    anthropic_body(model, messages(question, context, &Conversation::default(), None))
+}
+
 /// The exact bytes `ask` would POST to `ep` for this question (redacted; see [`redact`]).
+#[cfg(test)]
 pub fn request_json(
     question: &str,
     snap: &Snapshot,
@@ -106,10 +177,24 @@ pub fn request_json(
     storage: Option<&Storage>,
     ep: &crate::llm::Endpoint,
 ) -> String {
-    let context = build_context_for(snap, findings, storage, ep.context_bytes, ep.minimal);
+    request_json_in(question, &Conversation::default(), snap, findings, storage, ep)
+}
+
+/// [`request_json`] within a thread.
+pub fn request_json_in(
+    question: &str,
+    conv: &Conversation,
+    snap: &Snapshot,
+    findings: &[Finding],
+    storage: Option<&Storage>,
+    ep: &crate::llm::Endpoint,
+) -> String {
+    let budget = ep.context_bytes.saturating_sub(conversation_bytes(conv)).max(3_000);
+    let context = build_context_for(snap, findings, storage, budget, ep.minimal);
+    let msgs = messages(question, &context, conv, ep.minimal.then_some(snap));
     match ep.provider {
-        crate::llm::Provider::Anthropic => request_body(question, &context, &ep.model),
-        _ => ep.body(SYSTEM_PROMPT, &user_content(question, &context)),
+        crate::llm::Provider::Anthropic => anthropic_body(&ep.model, msgs),
+        _ => ep.body(SYSTEM_PROMPT, msgs),
     }
     .to_string()
 }
@@ -117,6 +202,7 @@ pub fn request_json(
 /// `fat ask --dry-run`: the request body that would be sent, and nothing is sent.
 pub fn dry_run(
     question: &str,
+    conv: &Conversation,
     snap: &Snapshot,
     findings: &[Finding],
     storage: Option<&Storage>,
@@ -137,7 +223,7 @@ pub fn dry_run(
         ),
         (true, true) => format!("dry run: this body would be POSTed to {to}; nothing was sent"),
     };
-    (request_json(question, snap, findings, storage, &ep), note)
+    (request_json_in(question, conv, snap, findings, storage, &ep), note)
 }
 
 /// Turn a non-2xx response into "Claude API error 401 (authentication_error): invalid x-api-key".
@@ -1563,7 +1649,7 @@ mod tests {
         // Still useful: names, pids, the question's intent.
         assert!(body.contains("server.js") && body.contains(r#"pid\":500"#) && body.contains("slow"), "{body}");
         // dry run prints exactly that body and sends nothing (no key in tests).
-        let (dry, note) = dry_run(&q, &s, &f, None, &crate::config::AskCfg::default());
+        let (dry, note) = dry_run(&q, &Conversation::default(), &s, &f, None, &crate::config::AskCfg::default());
         assert_eq!(dry, body);
         assert!(note.contains("dry run"), "{note}");
     }
@@ -1902,16 +1988,56 @@ mod tests {
             model: "m".into(),
             ..Default::default()
         };
-        let (body, note) = dry_run("q", &snap(), &[], None, &cfg);
+        let (body, note) = dry_run("q", &Conversation::default(), &snap(), &[], None, &cfg);
         assert!(note.contains("http://10.0.0.9:11434/api/chat") && note.contains("nothing was sent"), "{note}");
         assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["model"], "m");
         let (body, note) = dry_run(
             "q",
+            &Conversation::default(),
             &snap(),
             &[],
             None,
             &crate::config::AskCfg { provider: "ollama".into(), ..Default::default() },
         );
         assert!(body.is_empty() && note.contains("needs url"), "{note}");
+    }
+
+    #[test]
+    fn follow_ups_carry_the_thread_and_past_threads() {
+        let conv = Conversation {
+            prior: vec![("what writes under /var?".into(), "**prometheus** (pid 1810) writes the WAL.".into())],
+            memory: vec![crate::threads::Memory {
+                ts: 1_794_000_000_000,
+                question: "disk filling?".into(),
+                answer: "/var/log/app grew 2G".into(),
+            }],
+        };
+        let ep = crate::llm::resolve(&crate::config::AskCfg {
+            provider: "openai".into(),
+            url: "http://127.0.0.1:1".into(),
+            model: "m".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let b: Value = serde_json::from_str(&request_json_in("since when?", &conv, &snap(), &[], None, &ep)).unwrap();
+        let m = b["messages"].as_array().unwrap();
+        let roles: Vec<&str> = m.iter().map(|x| x["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
+        assert_eq!(m[1]["content"], "what writes under /var?");
+        assert!(m[2]["content"].as_str().unwrap().contains("prometheus"));
+        let last = m[3]["content"].as_str().unwrap();
+        assert!(
+            last.starts_with("<past_threads>")
+                && last.contains("asked \"disk filling?\"; concluded: /var/log/app grew 2G")
+        );
+        assert!(last.contains("<snapshot>") && last.ends_with("Question: since when?"));
+        // Anthropic gets the same turns (system separately).
+        let a = anthropic_body("m", messages("q", "{}", &conv, None));
+        assert_eq!(a["messages"].as_array().unwrap().len(), 3);
+        // Long threads keep only the last turns.
+        let long = Conversation { prior: (0..20).map(|i| (format!("q{i}"), "a".into())).collect(), memory: vec![] };
+        let msgs = messages("q", "{}", &long, None);
+        assert_eq!(msgs.len(), PRIOR_TURNS * 2 + 1);
+        assert_eq!(msgs[0]["content"], "q14");
     }
 }

@@ -45,8 +45,10 @@ fat fs --volumes [--json]                                 # capacity, fill rate,
 fat fs --largest 20 PATH                                  # biggest files / dirs below PATH
 fat why <pid> [--json]      # blame chain + evidence + suggested fixes
 fat doctor [--json]         # whole-machine diagnosis, ranked crit > warn > info
-fat ask "why is this machine hot"
-fat ask --dry-run "why is this machine hot"   # print the exact (redacted) API request; send nothing
+fat ask "why is this machine hot"              # starts a thread, kept locally
+fat ask -c "since when?"                       # follow up in the latest thread (--thread N for another)
+fat ask --list | --show N | --delete N         # your threads
+fat ask --dry-run "why is this machine hot"   # print the exact (redacted) request and where it goes; send nothing
 
 # Actions (journaled)
 fat pause <pid>             # SIGSTOP; undoable
@@ -78,7 +80,7 @@ fat mcp                     # MCP server on stdio
 
 | Key | Action |
 | --- | --- |
-| `1`–`5`, `Tab` | views: Procs · Ports · Fs · Timeline · Doctor (`6` Fleet appears only when containers run or hosts are configured). The server profile numbers them Services · Procs · Events · Ports · Fs · Timeline · Doctor · Fleet (`1`–`8`) |
+| `1`–`6`, `Tab` | views: Procs · Ports · Fs · Timeline · Doctor · Ask (`7` Fleet appears only when containers run or hosts are configured). The server profile numbers them Services · Procs · Events · Ports · Fs · Timeline · Doctor · Ask · Fleet (`1`–`9`) |
 | `↑↓ PgUp PgDn g G` | move |
 | `c m p n d i N` | sort by cpu · mem · power · net · disk · pid · name (press again to reverse) |
 | `t` | process tree |
@@ -92,7 +94,8 @@ fat mcp                     # MCP server on stdio
 | `← → [ ] { }` | in Timeline (`4`): time travel through history (`{ }` = ×10) |
 | `s` · `+`/`-` | in Timeline (`4`): jump to the next spike · zoom the window (5m … 24h) |
 | `L` / `Esc` | back to live |
-| `?` | ask in plain language |
+| `?` | ask in plain language: opens the Ask tab on a new thread |
+| `Enter` / `i` · `n` · `↑↓` · `d` | in Ask: type a follow-up in the open thread · new thread · open another thread · delete one (`Esc` leaves the input line, or stops waiting for an answer, which is still saved) |
 | `h` | help |
 | `q` / `Ctrl-C` | quit |
 
@@ -463,6 +466,8 @@ provider = "anthropic"     # "anthropic" | "openai" (any OpenAI-compatible serve
 # context_bytes = 20000    # digest size bound; lower it for small or CPU-only models
 # num_ctx  = 0             # ollama: context window (0 = sized to the digest)
 # timeout_s = 0            # 0 = 90 s for anthropic, 300 s for self-hosted
+# memory   = true          # send excerpts of recent threads on this host with a question
+# keep_days = 90           # delete threads untouched this long (0 = keep)
 
 [mcp]
 allow_actions = []         # side-effect tools agents may use: "pause", "resume", "renice", "kill", "undo", or "all"
@@ -1083,6 +1088,20 @@ URLs (`user:pass@`), and long hex or base64 blobs; your home directory becomes `
 `fat ask --dry-run QUESTION` prints exactly the body that would be sent, and where, and sends nothing. Without a
 model, `ask` answers offline from rules. Every answer says where the question went (`→ ollama · qwen3:32b ·
 http://…` on stderr, in the TUI's ask box, and as `via` in the MCP result).
+
+### Threads
+
+Each question starts a **thread**; follow-ups (`Enter` in the Ask tab, `fat ask -c`) are sent with the thread's
+earlier turns (the last six), so "since when?" makes sense. Threads are kept per user in
+`<data dir>/fat/threads.db` (`~/.local/share/fat` on Linux, `~/Library/Application Support/fat` on macOS;
+`FAT_THREADS_DB` overrides), readable only by you, and deleted after `[ask] keep_days` (90) without activity.
+`fat ask --no-save` keeps nothing. Questions agents ask through MCP are not kept.
+
+With `[ask] memory = true` (the default), a question also carries short excerpts of up to three recent threads
+on the same host from the last 30 days: the first question and the start of the last answer, so the model can
+notice "this looks like Tuesday's /var/log growth". They are sent as past conclusions with their dates; the
+current numbers always come from the fresh snapshot. They go through the same redaction (and `detail =
+"minimal"` shortening) as everything else. Set `memory = false` to send none.
 
 ### Keep `ask` inside your network
 
