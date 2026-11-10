@@ -23,9 +23,18 @@
 //! enabled = true          # uses ANTHROPIC_API_KEY when set
 //!
 //! [[hosts]]
-//! name = "devbox"
-//! ssh = "me@devbox.local" # defaults to name
-//! fat_path = "~/.cargo/bin/fat" # defaults to "fat"
+//! name = "web-01"
+//! ssh = "admin@web-01.example.com" # defaults to name; passed to ssh verbatim
+//! fat_path = "/usr/local/bin/fat"  # default: probe PATH and the usual install dirs
+//! groups = ["web"]
+//! tags = ["prod"]
+//!
+//! [fleet]                          # all optional; see server::FleetCfg for every key
+//! hosts_file = "~/fleet.txt"       # lines: name [ssh=DEST] [fat=PATH] [groups=a,b] [tags=x,y]
+//! concurrency = 64
+//!
+//! [fleet.groups]
+//! db = ["db-*"]
 //! ```
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -44,6 +53,10 @@ pub struct Config {
     /// Days of history to keep.
     pub history_days: u32,
     pub ask: AskCfg,
+    /// `[server]`: server-mode sampling, recorder bounds, Prometheus export.
+    pub server: crate::server::ServerCfg,
+    /// `[fleet]`: inventory sources and fan-out limits.
+    pub fleet: crate::server::FleetCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -53,6 +66,11 @@ pub struct HostCfg {
     pub ssh: Option<String>,
     /// Path to fat on the remote. Defaults to "fat".
     pub fat_path: Option<String>,
+    /// Fleet groups/tags for selection (`fat fleet --group web`).
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +86,7 @@ impl Default for AskCfg {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { interval_ms: 1500, hosts: vec![], containers: true, history_path: None, history_days: 3, ask: AskCfg::default() }
+        Self { interval_ms: 1500, hosts: vec![], containers: true, history_path: None, history_days: 3, ask: AskCfg::default(), server: Default::default(), fleet: Default::default() }
     }
 }
 
@@ -136,6 +154,18 @@ mod tests {
         let c = Config::parse("[ask]\nenabled = false\n").unwrap();
         assert!(!c.ask.enabled);
         assert_eq!(c.ask.model, "claude-opus-5-5");
+    }
+
+    #[test]
+    fn parse_fleet_section() {
+        let c = Config::parse("[[hosts]]\nname = \"web-01\"\ngroups = [\"web\"]\ntags = [\"prod\"]\n[fleet]\nconcurrency = 8\nssh_options = [\"ServerAliveInterval=5\"]\n[fleet.groups]\ndb = [\"db-*\"]\n").unwrap();
+        assert_eq!(c.hosts[0].groups, vec!["web"]);
+        assert_eq!(c.hosts[0].tags, vec!["prod"]);
+        assert_eq!(c.fleet.concurrency, 8);
+        assert_eq!(c.fleet.connect_timeout_s, 5, "unset keys keep their defaults");
+        assert_eq!(c.fleet.groups["db"], vec!["db-*"]);
+        assert_eq!(c.fleet.ssh_options, vec!["ServerAliveInterval=5"]);
+        assert!(c.fleet.control_master);
     }
 
     #[test]

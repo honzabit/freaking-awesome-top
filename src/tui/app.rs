@@ -5,6 +5,11 @@
 use crate::fs::{DirEntry, Evidence, Grower, Growth, Listing, Volume};
 use crate::history::Point;
 use crate::model::{ActionKind, ActionRecord, Container, Explanation, Finding, Proc, Snapshot, Ts};
+use crate::server::{Event, FleetHost, FleetSummary, Incident, Profile, ServerCfg, Severity};
+use crate::tui::server::{
+    DrillView, EventsView, FleetSort, FleetView, HostDrill, Panel, ServicesView, UnitSort, EVENTS_REFRESH_MS, EVENT_RING, EVENT_WINDOWS,
+    EVENT_WINDOW_NAMES, INCIDENT_WINDOW_MS,
+};
 use crate::tui::widgets::{DELETED_MIN_BYTES, DeletedGroup, contains_ci, group_deleted};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::cmp::Ordering;
@@ -22,9 +27,14 @@ const RING_PROCS_CPU: usize = 60;
 const RING_PROCS_MEM: usize = 30;
 const RING_PROCS_POWER: usize = 20;
 const RING_CMD_MAX: usize = 160;
+const RING_UNITS: usize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
+    /// Server profile: systemd units, containers, pods and cgroups (first tab there).
+    Services,
+    /// Server profile: the event timeline and incident explanations.
+    Events,
     Procs,
     Ports,
     Fs,
@@ -35,10 +45,18 @@ pub enum Tab {
 }
 
 impl Tab {
-    /// Number keys 1-6 in this order. Fleet is last so hiding it never renumbers the others.
-    pub const ALL: [Tab; 6] = [Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
+    /// Every tab (tests iterate it). Which ones a profile shows, and their number keys, come
+    /// from [`App::tab_order`].
+    #[cfg(test)]
+    pub const ALL: [Tab; 8] = [Tab::Services, Tab::Events, Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
+    /// Desktop: today's layout, number keys 1-6. Fleet is last so hiding it never renumbers.
+    pub const DESKTOP: [Tab; 6] = [Tab::Procs, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
+    /// Server: services first, the event timeline next to processes.
+    pub const SERVER: [Tab; 8] = [Tab::Services, Tab::Procs, Tab::Events, Tab::Ports, Tab::Fs, Tab::Timeline, Tab::Doctor, Tab::Fleet];
     pub fn title(self) -> &'static str {
         match self {
+            Tab::Services => "Services",
+            Tab::Events => "Events",
             Tab::Procs => "Procs",
             Tab::Ports => "Ports",
             Tab::Fs => "Fs",
@@ -46,10 +64,6 @@ impl Tab {
             Tab::Doctor => "Doctor",
             Tab::Fleet => "Fleet",
         }
-    }
-    /// Position in [`Tab::ALL`] (the number key is this + 1).
-    pub fn index(self) -> usize {
-        Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
 }
 
@@ -107,6 +121,18 @@ pub enum Command {
     FsLargest(String),
     /// Recorded directory sizes below `path` and volume use near `ts` (time travel).
     FsAt { ts: Ts, path: String },
+    /// Server profile: recorded events in [from, to] (falls back to the live ring).
+    LoadEvents { from: Ts, to: Ts },
+    /// Explain one event ("what happened around it"); `id` ties the answer to the panel.
+    ExplainEvent { id: u64, event: Box<Event> },
+    /// What happened at `at` (None = now) within `window_ms`.
+    WhatHappened { id: u64, at: Option<Ts>, window_ms: i64 },
+    /// Header counters from the recorder (OOM kills in the last 24h).
+    RefreshCounts,
+    /// Poll every inventory host once (read-only), streaming rows back.
+    FleetPoll,
+    /// Fetch one host's snapshot (read-only) for the drill-in view.
+    FleetDrill(String),
     Quit,
 }
 
@@ -128,18 +154,6 @@ pub enum AskState {
     Idle,
     Thinking { question: String, since: Ts, id: u64 },
     Answer { question: String, text: String, scroll: u16 },
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct HostRow {
-    pub name: String,
-    pub ok: bool,
-    pub cpu: f32,
-    pub mem_used: u64,
-    pub mem_total: u64,
-    pub procs: usize,
-    pub ports: usize,
-    pub error: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -666,8 +680,23 @@ pub struct App {
     pub findings_loaded: bool,
     pub log: Vec<ActionRecord>,
     pub containers: Vec<Container>,
-    pub hosts: Vec<HostRow>,
     pub fleet_loaded: bool,
+
+    // server profile
+    pub profile: Profile,
+    /// Thresholds for colours and "problem" flags (exhaustion, disk await).
+    pub server_cfg: ServerCfg,
+    pub svc: ServicesView,
+    pub ev: EventsView,
+    /// Events seen in live samples this session, oldest first (bounded by [`EVENT_RING`]).
+    pub event_ring: VecDeque<Event>,
+    pub fleet: FleetView,
+    /// Explanation overlay (unit why, incident).
+    pub panel: Option<Panel>,
+    incident_seq: u64,
+    /// OOM kills in the last 24h according to the recorder (None = unknown).
+    pub oom_24h: Option<u64>,
+    last_counts: Ts,
 
     pub why: Option<Explanation>,
     pub why_scroll: u16,
@@ -730,8 +759,17 @@ impl App {
             findings_loaded: false,
             log: Vec::new(),
             containers: Vec::new(),
-            hosts: Vec::new(),
             fleet_loaded: false,
+            profile: Profile::Desktop,
+            server_cfg: ServerCfg::default(),
+            svc: ServicesView::default(),
+            ev: EventsView::default(),
+            event_ring: VecDeque::new(),
+            fleet: FleetView::default(),
+            panel: None,
+            incident_seq: 0,
+            oom_24h: None,
+            last_counts: i64::MIN / 2,
             why: None,
             why_scroll: 0,
             ask: AskState::Idle,
@@ -772,10 +810,129 @@ impl App {
         while self.ring_points.front().is_some_and(|p| p.ts < cutoff) {
             self.ring_points.pop_front();
         }
+        if !snap.events.is_empty() {
+            self.event_ring.extend(snap.events.iter().cloned());
+            while self.event_ring.len() > EVENT_RING {
+                self.event_ring.pop_front();
+            }
+            self.ev.dirty = true;
+        }
         self.live = Some(snap);
         self.collector_error = None;
         if !self.rewound() {
             self.rows_dirty = true;
+            self.svc.dirty = true;
+        }
+    }
+
+    /// Choose the profile's views and thresholds (called once at startup).
+    pub fn set_profile(&mut self, p: Profile, server: ServerCfg, fleet_refresh_s: u64) {
+        self.profile = p;
+        self.server_cfg = server;
+        self.fleet.refresh_ms = (fleet_refresh_s.max(1) * 1000) as i64;
+        if p == Profile::Server {
+            self.tab = Tab::Services;
+        }
+    }
+
+    pub fn server(&self) -> bool {
+        self.profile == Profile::Server
+    }
+
+    /// Units of the viewed snapshot (empty in the desktop profile).
+    pub fn units(&self) -> &[crate::server::Unit] {
+        self.view().map(|s| s.units.as_slice()).unwrap_or(&[])
+    }
+
+    /// Rebuild the server views' row caches (cheap when nothing changed).
+    pub fn ensure_server_rows(&mut self) {
+        let warn = self.server_cfg.exhaustion_warn;
+        let units: &[crate::server::Unit] = match if self.cursor.is_some() { self.past.as_ref() } else { self.live.as_ref() } {
+            Some(s) => &s.units,
+            None => &[],
+        };
+        self.svc.ensure_rows(units, warn);
+        self.ev.ensure_rows(&self.event_ring, self.now);
+        self.fleet.ensure_rows();
+    }
+
+    // ---------------------------------------------------------------- server data in
+
+    /// Recorder events for the Events window (None = no recorder: the live ring is used).
+    pub fn set_events(&mut self, from: Ts, events: Option<Vec<Event>>) {
+        // A late answer for an older request (another window) is dropped.
+        if from != self.ev.req_from {
+            return;
+        }
+        self.ev.recorded = events;
+        self.ev.dirty = true;
+    }
+
+    /// Incident answer for request `id`; ignored unless that panel is still waiting.
+    pub fn set_incident(&mut self, id: u64, r: Result<Incident, String>) {
+        let Some(p) = self.panel.as_ref() else { return };
+        if p.pending != Some(id) {
+            return;
+        }
+        match r {
+            Ok(inc) => self.panel = Some(crate::tui::server::incident_panel(&inc)),
+            Err(e) => {
+                let title = p.title.clone();
+                self.panel = Some(Panel {
+                    title,
+                    headline: format!("could not explain this: {e}"),
+                    severity: Severity::Warn,
+                    sections: vec![("Missing data".into(), vec!["the incident engine or the recorder is unavailable; the event list and unit view still work".into()])],
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    pub fn set_counts(&mut self, oom_24h: Option<u64>) {
+        self.oom_24h = oom_24h;
+    }
+
+    /// Inventory size (or why it could not be read).
+    pub fn set_fleet_inventory(&mut self, r: Result<usize, String>) {
+        match r {
+            Ok(n) => {
+                self.fleet.targets = Some(n);
+                self.fleet.inventory_error = None;
+                self.configured_hosts = n;
+            }
+            Err(e) => {
+                self.fleet.targets = Some(0);
+                self.fleet.inventory_error = Some(e);
+            }
+        }
+    }
+
+    pub fn fleet_host(&mut self, h: FleetHost) {
+        self.fleet.upsert(h);
+    }
+
+    pub fn fleet_done(&mut self, s: FleetSummary) {
+        self.fleet.done(s, self.now);
+    }
+
+    /// The poll could not run at all.
+    pub fn fleet_failed(&mut self, e: String) {
+        self.fleet.polling = false;
+        self.fleet.last_done = self.now;
+        self.set_status(format!("fleet poll failed: {e}"), true);
+    }
+
+    /// Drill-in answer; ignored if the user closed it or moved to another host.
+    pub fn set_fleet_drill(&mut self, name: &str, r: Result<(Snapshot, Vec<Finding>), String>) {
+        let Some(d) = self.fleet.drill.as_mut().filter(|d| d.name == name) else { return };
+        match r {
+            Ok((s, f)) => {
+                d.snap = Some(Box::new(s));
+                d.findings = f;
+                d.error = None;
+            }
+            Err(e) => d.error = Some(e),
         }
     }
 
@@ -791,15 +948,12 @@ impl App {
         self.doctor_sel = self.doctor_sel.min(self.findings.len().saturating_sub(1));
     }
 
-    pub fn set_fleet(&mut self, containers: Option<Vec<Container>>, hosts: Option<Vec<HostRow>>) {
+    pub fn set_fleet(&mut self, containers: Option<Vec<Container>>) {
         if let Some(c) = containers {
             if !self.filter.is_empty() && c != self.containers {
                 self.rows_dirty = true; // the filter also matches container names
             }
             self.containers = c;
-        }
-        if let Some(h) = hosts {
-            self.hosts = h;
         }
         self.fleet_loaded = true;
         if self.tab == Tab::Fleet && !self.fleet_visible() {
@@ -810,12 +964,25 @@ impl App {
     /// The Fleet tab exists only when there is something beyond this machine: configured
     /// hosts, or local containers running.
     pub fn fleet_visible(&self) -> bool {
-        self.configured_hosts > 0 || !self.hosts.is_empty() || !self.containers.is_empty()
+        self.configured_hosts > 0 || self.fleet.active() || !self.containers.is_empty()
+    }
+
+    /// The profile's tabs in number-key order (Fleet included even while hidden).
+    pub fn tab_order(&self) -> &'static [Tab] {
+        match self.profile {
+            Profile::Desktop => &Tab::DESKTOP,
+            Profile::Server => &Tab::SERVER,
+        }
+    }
+
+    /// Number key of a tab in this profile (1-based; 0 = not in this profile).
+    pub fn tab_number(&self, t: Tab) -> usize {
+        self.tab_order().iter().position(|x| *x == t).map_or(0, |i| i + 1)
     }
 
     /// The tabs on screen, in order.
     pub fn tabs(&self) -> Vec<Tab> {
-        Tab::ALL.into_iter().filter(|t| *t != Tab::Fleet || self.fleet_visible()).collect()
+        self.tab_order().iter().copied().filter(|t| *t != Tab::Fleet || self.fleet_visible()).collect()
     }
 
     pub fn set_log(&mut self, log: Vec<ActionRecord>) {
@@ -916,6 +1083,56 @@ impl App {
         if self.status.as_ref().is_some_and(|s| now - s.at > STATUS_MS) {
             self.status = None;
         }
+        let mut server = self.server_tick(now);
+        if !server.is_empty() {
+            server.extend(self.view_tick(now));
+            return server;
+        }
+        self.view_tick(now)
+    }
+
+    /// Refreshes the server views need: recorder events while Events is on screen, header
+    /// counters, and fleet polls while Fleet is on screen (never overlapping).
+    fn server_tick(&mut self, now: Ts) -> Vec<Command> {
+        let mut out = Vec::new();
+        if self.server() && now - self.last_counts >= 30_000 {
+            self.last_counts = now;
+            out.push(Command::RefreshCounts);
+        }
+        if self.tab == Tab::Events && now - self.ev.last_req >= EVENTS_REFRESH_MS {
+            out.push(self.events_refresh());
+        }
+        if self.tab == Tab::Events {
+            // The window slides with the clock even without new events.
+            self.ev.dirty = true;
+        }
+        if self.tab == Tab::Fleet && self.fleet.drill.is_none() {
+            out.extend(self.fleet_poll_if_due(now, false));
+        }
+        out
+    }
+
+    fn fleet_poll_if_due(&mut self, now: Ts, force: bool) -> Option<Command> {
+        let f = &mut self.fleet;
+        if f.polling || f.targets.is_none_or(|n| n == 0) {
+            return None;
+        }
+        if !force && now - f.last_done < f.refresh_ms {
+            return None;
+        }
+        f.polling = true;
+        f.poll_started = now;
+        f.answered = 0;
+        Some(Command::FleetPoll)
+    }
+
+    fn events_refresh(&mut self) -> Command {
+        self.ev.last_req = self.now;
+        self.ev.req_from = self.now - self.ev.window_ms();
+        Command::LoadEvents { from: self.ev.req_from, to: self.now }
+    }
+
+    fn view_tick(&mut self, now: Ts) -> Vec<Command> {
         if self.tab == Tab::Timeline && now - self.last_timeline_refresh >= TIMELINE_REFRESH_MS {
             return vec![self.timeline_refresh()];
         }
@@ -1064,8 +1281,9 @@ impl App {
         s.ports.get(*self.port_rows.get(self.port_sel)?)
     }
 
+    /// Rows of the local Fleet view (this machine and its containers).
     pub fn fleet_len(&self) -> usize {
-        1 + self.containers.len() + self.hosts.len()
+        1 + self.containers.len()
     }
 
     // ---------------------------------------------------------------- time travel
@@ -1161,6 +1379,9 @@ impl App {
         }
         if !matches!(self.ask, AskState::Idle) {
             return self.on_ask_key(k);
+        }
+        if self.panel.is_some() && self.why.is_none() {
+            return self.on_panel_key(k);
         }
         if self.why.is_some() {
             match k.code {
@@ -1316,13 +1537,26 @@ impl App {
         self.fs.rows_dirty = true;
     }
 
-    /// The filter the `/` prompt edits: the Fs tab has its own (paths, not processes).
+    /// The filter the `/` prompt edits: Fs, Services, Events and Fleet each have their own
+    /// (paths, units, events, hosts); the rest filter processes.
     pub fn active_filter(&self) -> &str {
-        if self.tab == Tab::Fs { &self.fs.filter } else { &self.filter }
+        match self.tab {
+            Tab::Fs => &self.fs.filter,
+            Tab::Services => &self.svc.filter,
+            Tab::Events => &self.ev.filter,
+            Tab::Fleet if self.fleet.active() => &self.fleet.filter,
+            _ => &self.filter,
+        }
     }
 
     fn set_active_filter(&mut self, f: String) {
-        if self.tab == Tab::Fs { self.set_fs_filter(f) } else { self.set_filter(f) }
+        match self.tab {
+            Tab::Fs => self.set_fs_filter(f),
+            Tab::Services => self.svc.set_filter(f),
+            Tab::Events => self.ev.set_filter(f),
+            Tab::Fleet if self.fleet.active() => self.fleet.set_filter(f),
+            _ => self.set_filter(f),
+        }
     }
 
     pub fn switch_tab(&mut self, t: Tab) -> Vec<Command> {
@@ -1330,12 +1564,21 @@ impl App {
             self.why = None;
         }
         if t == Tab::Fleet && !self.fleet_visible() {
-            self.set_status("no Fleet yet: start a container or add [[hosts]] to the config", false);
+            self.set_status("no Fleet yet: start a container or add hosts ([[hosts]] or [fleet] hosts_file) to the config", false);
+            return Vec::new();
+        }
+        if !self.tab_order().contains(&t) {
+            self.set_status(format!("{} is part of the server profile (FAT_PROFILE=server or profile = \"server\" in [server])", t.title()), false);
             return Vec::new();
         }
         self.tab = t;
         match t {
             Tab::Timeline => vec![self.timeline_refresh()],
+            Tab::Events => {
+                self.ev.dirty = true;
+                vec![self.events_refresh()]
+            }
+            Tab::Fleet => self.fleet_poll_if_due(self.now, false).into_iter().collect(),
             Tab::Fs => {
                 // Opening the tab is what starts the storage engines (never before).
                 self.fs.opened = true;
@@ -1350,12 +1593,21 @@ impl App {
     }
 
     fn on_global_key(&mut self, k: KeyEvent) -> Vec<Command> {
+        // The fleet drill-in uses `u` for its Units view (global `u` is undo).
+        if self.tab == Tab::Fleet && self.fleet.drill.is_some() && k.code == KeyCode::Char('u') {
+            return self.on_drill_key(k);
+        }
         match k.code {
             KeyCode::Char('q') => {
                 self.quit = true;
                 return vec![Command::Quit];
             }
-            KeyCode::Char(c @ '1'..='6') => return self.switch_tab(Tab::ALL[(c as u8 - b'1') as usize]),
+            KeyCode::Char(c @ '1'..='9') => {
+                return match self.tab_order().get((c as u8 - b'1') as usize) {
+                    Some(&t) => self.switch_tab(t),
+                    None => Vec::new(),
+                };
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 let tabs = self.tabs();
                 let n = tabs.len();
@@ -1381,6 +1633,9 @@ impl App {
             }
             KeyCode::Char('u') => return vec![Command::Undo],
             KeyCode::Esc => {
+                if let Some(done) = self.server_esc() {
+                    return done;
+                }
                 if self.tab == Tab::Fs {
                     if !self.fs.filter.is_empty() {
                         self.set_fs_filter(String::new());
@@ -1409,12 +1664,15 @@ impl App {
             Tab::Timeline => self.on_timeline_key(k),
             Tab::Ports => self.on_ports_key(k),
             Tab::Fs => self.on_fs_key(k),
+            Tab::Fleet if self.fleet.active() => self.on_fleet_key(k),
             Tab::Fleet => {
                 let n = self.fleet_len();
                 list_nav(&mut self.fleet_sel, n, k.code);
                 Vec::new()
             }
             Tab::Doctor => self.on_doctor_key(k),
+            Tab::Services => self.on_services_key(k),
+            Tab::Events => self.on_events_key(k),
         }
     }
 
@@ -1721,11 +1979,291 @@ impl App {
             _ => Vec::new(),
         }
     }
+
+    // ---------------------------------------------------------------- server keys
+
+    /// Esc in the server views: close the drill-in, then clear that view's filter / focus.
+    /// None = not handled here (fall through to the generic Esc).
+    fn server_esc(&mut self) -> Option<Vec<Command>> {
+        match self.tab {
+            Tab::Fleet if self.fleet.drill.is_some() => self.fleet.drill = None,
+            Tab::Fleet if self.fleet.active() && !self.fleet.filter.is_empty() => self.fleet.set_filter(String::new()),
+            Tab::Fleet if self.fleet.only.is_some() => {
+                self.fleet.only = None;
+                self.fleet.dirty = true;
+            }
+            Tab::Fleet if self.fleet.focus_findings => self.fleet.focus_findings = false,
+            Tab::Services if !self.svc.filter.is_empty() => self.svc.set_filter(String::new()),
+            Tab::Events if !self.ev.filter.is_empty() => self.ev.set_filter(String::new()),
+            _ => return None,
+        }
+        Some(Vec::new())
+    }
+
+    /// Keys while an explanation panel is open: scroll, `w` explains its process, Esc closes.
+    fn on_panel_key(&mut self, k: KeyEvent) -> Vec<Command> {
+        let Some(p) = self.panel.as_mut() else { return Vec::new() };
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.panel = None,
+            KeyCode::Down | KeyCode::Char('j') => p.scroll = p.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => p.scroll = p.scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => p.scroll = p.scroll.saturating_add(10),
+            KeyCode::PageUp => p.scroll = p.scroll.saturating_sub(10),
+            KeyCode::Home | KeyCode::Char('g') => p.scroll = 0,
+            KeyCode::Char('w') => match p.pid {
+                Some(pid) => {
+                    self.panel = None;
+                    return vec![Command::Explain(pid)];
+                }
+                None => self.set_status("no process to explain here", false),
+            },
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn next_incident_id(&mut self) -> u64 {
+        self.incident_seq += 1;
+        self.incident_seq
+    }
+
+    /// `W`: what happened in the last INCIDENT_WINDOW (or around the rewind cursor).
+    fn what_happened_now(&mut self) -> Vec<Command> {
+        let id = self.next_incident_id();
+        let at = self.cursor;
+        let when = at.map(crate::tui::widgets::fmt_clock).unwrap_or_else(|| "now".into());
+        self.panel = Some(Panel::loading(format!("What happened · {when}"), id));
+        vec![Command::WhatHappened { id, at, window_ms: INCIDENT_WINDOW_MS }]
+    }
+
+    fn on_services_key(&mut self, k: KeyEvent) -> Vec<Command> {
+        self.ensure_server_rows();
+        // Field access (not self.view()) so the selection can move while units are borrowed.
+        let units_ref: &[crate::server::Unit] = match if self.cursor.is_some() { self.past.as_ref() } else { self.live.as_ref() } {
+            Some(s) => &s.units,
+            None => &[],
+        };
+        let delta = match k.code {
+            KeyCode::Up => Some(-1),
+            KeyCode::Down => Some(1),
+            KeyCode::PageUp => Some(-15),
+            KeyCode::PageDown => Some(15),
+            KeyCode::Home | KeyCode::Char('g') => Some(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => Some(isize::MAX / 2),
+            _ => None,
+        };
+        if let Some(d) = delta {
+            self.svc.move_sel(d, units_ref);
+            return Vec::new();
+        }
+        if k.code == KeyCode::Enter {
+            let warn = self.server_cfg.exhaustion_warn;
+            let Some(u) = self.svc.selected(units_ref) else { return Vec::new() };
+            let mut evs: Vec<Event> = self.event_ring.iter().cloned().collect();
+            evs.extend(self.ev.recorded.iter().flatten().cloned());
+            self.panel = Some(crate::tui::server::unit_panel(u, self.view(), &evs, warn, self.now));
+            return Vec::new();
+        }
+        if k.code == KeyCode::Char('w') {
+            return match self.svc.selected(units_ref).and_then(|u| u.main_pid) {
+                Some(pid) => vec![Command::Explain(pid)],
+                None => {
+                    self.set_status("this unit has no main process right now", false);
+                    Vec::new()
+                }
+            };
+        }
+        match k.code {
+            KeyCode::Char('c') => self.svc.set_sort(UnitSort::Cpu),
+            KeyCode::Char('m') => self.svc.set_sort(UnitSort::Mem),
+            KeyCode::Char('d') => self.svc.set_sort(UnitSort::Io),
+            KeyCode::Char('r') => self.svc.set_sort(UnitSort::Restarts),
+            KeyCode::Char('s') => self.svc.set_sort(UnitSort::State),
+            KeyCode::Char('N') => self.svc.set_sort(UnitSort::Name),
+            KeyCode::Char('t') => {
+                self.svc.group = !self.svc.group;
+                self.svc.dirty = true;
+            }
+            KeyCode::Char('f') => {
+                self.svc.problems_only = !self.svc.problems_only;
+                self.svc.dirty = true;
+            }
+            KeyCode::Char('i') => {
+                self.svc.show_inactive = !self.svc.show_inactive;
+                self.svc.dirty = true;
+            }
+            KeyCode::Char('W') => return self.what_happened_now(),
+            KeyCode::Char('/') => self.modal = Modal::Filter,
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn on_events_key(&mut self, k: KeyEvent) -> Vec<Command> {
+        self.ensure_server_rows();
+        let delta = match k.code {
+            KeyCode::Up => Some(-1),
+            KeyCode::Down => Some(1),
+            KeyCode::PageUp => Some(-15),
+            KeyCode::PageDown => Some(15),
+            KeyCode::Home | KeyCode::Char('g') => Some(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => Some(isize::MAX / 2),
+            _ => None,
+        };
+        if let Some(d) = delta {
+            self.ev.move_sel(d);
+            return Vec::new();
+        }
+        match k.code {
+            KeyCode::Enter => {
+                let Some(e) = self.ev.selected().cloned() else { return Vec::new() };
+                let id = self.next_incident_id();
+                self.panel = Some(Panel::loading(format!("What happened · {} {}", crate::tui::widgets::fmt_clock(e.ts), e.kind.as_str()), id));
+                return vec![Command::ExplainEvent { id, event: Box::new(e) }];
+            }
+            KeyCode::Char('W') => return self.what_happened_now(),
+            KeyCode::Char('f') => {
+                self.ev.min_sev = match self.ev.min_sev {
+                    Severity::Info => Severity::Warn,
+                    Severity::Warn => Severity::Crit,
+                    Severity::Crit => Severity::Info,
+                };
+                self.ev.dirty = true;
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('-') | KeyCode::Char('_') => {
+                let n = EVENT_WINDOWS.len();
+                let up = matches!(k.code, KeyCode::Char('+') | KeyCode::Char('='));
+                self.ev.window = if up { (self.ev.window + 1).min(n - 1) } else { self.ev.window.saturating_sub(1) };
+                self.ev.recorded = None;
+                self.ev.dirty = true;
+                self.set_status(format!("events: last {}", EVENT_WINDOW_NAMES[self.ev.window]), false);
+                return vec![self.events_refresh()];
+            }
+            KeyCode::Char('r') => return vec![self.events_refresh()],
+            KeyCode::Char('/') => self.modal = Modal::Filter,
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// Fleet table (remote hosts). Read-only: nothing here can act on a remote host.
+    fn on_fleet_key(&mut self, k: KeyEvent) -> Vec<Command> {
+        if self.fleet.drill.is_some() {
+            return self.on_drill_key(k);
+        }
+        self.fleet.ensure_rows();
+        if self.fleet.focus_findings {
+            let n = self.fleet.findings.len();
+            if list_nav(&mut self.fleet.finding_sel, n, k.code) {
+                return Vec::new();
+            }
+            match k.code {
+                KeyCode::Left => self.fleet.focus_findings = false,
+                KeyCode::Enter => {
+                    if let Some(f) = self.fleet.findings.get(self.fleet.finding_sel).cloned() {
+                        let hosts = f.hosts.iter().cloned().collect();
+                        self.set_status(format!("hosts with: {} ({}) · Esc shows all", f.title, f.count), false);
+                        self.fleet.only = Some((f.title, hosts));
+                        self.fleet.focus_findings = false;
+                        self.fleet.sel = 0;
+                        self.fleet.dirty = true;
+                    }
+                }
+                KeyCode::Char('r') => return self.fleet_poll_if_due(self.now, true).into_iter().collect(),
+                KeyCode::Char('/') => self.modal = Modal::Filter,
+                _ => {}
+            }
+            return Vec::new();
+        }
+        let delta = match k.code {
+            KeyCode::Up => Some(-1),
+            KeyCode::Down => Some(1),
+            KeyCode::PageUp => Some(-15),
+            KeyCode::PageDown => Some(15),
+            KeyCode::Home | KeyCode::Char('g') => Some(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => Some(isize::MAX / 2),
+            _ => None,
+        };
+        if let Some(d) = delta {
+            self.fleet.move_sel(d);
+            return Vec::new();
+        }
+        match k.code {
+            KeyCode::Enter => {
+                let Some(h) = self.fleet.selected() else { return Vec::new() };
+                let name = h.name.clone();
+                self.fleet.drill = Some(HostDrill {
+                    name: name.clone(),
+                    requested: self.now,
+                    snap: None,
+                    findings: Vec::new(),
+                    error: None,
+                    view: DrillView::Doctor,
+                    scroll: 0,
+                });
+                return vec![Command::FleetDrill(name)];
+            }
+            KeyCode::Right => {
+                if self.fleet.findings.is_empty() {
+                    self.set_status("no fleet findings yet (they appear when a poll completes)", false);
+                } else {
+                    self.fleet.focus_findings = true;
+                }
+            }
+            KeyCode::Char('H') => self.fleet.set_sort(FleetSort::Health),
+            KeyCode::Char('c') => self.fleet.set_sort(FleetSort::Cpu),
+            KeyCode::Char('m') => self.fleet.set_sort(FleetSort::Mem),
+            KeyCode::Char('d') => self.fleet.set_sort(FleetSort::Disk),
+            KeyCode::Char('f') => self.fleet.set_sort(FleetSort::Findings),
+            KeyCode::Char('n') | KeyCode::Char('N') => self.fleet.set_sort(FleetSort::Name),
+            KeyCode::Char('l') => self.fleet.set_sort(FleetSort::Latency),
+            KeyCode::Char('s') => {
+                let next = self.fleet.sort.next();
+                self.fleet.set_sort(next);
+            }
+            KeyCode::Char('r') => {
+                if self.fleet.polling {
+                    self.set_status("a poll is already running", false);
+                }
+                return self.fleet_poll_if_due(self.now, true).into_iter().collect();
+            }
+            KeyCode::Char('/') => self.modal = Modal::Filter,
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn on_drill_key(&mut self, k: KeyEvent) -> Vec<Command> {
+        let Some(d) = self.fleet.drill.as_mut() else { return Vec::new() };
+        let n = d.len();
+        if list_nav(&mut d.scroll, n, k.code) {
+            return Vec::new();
+        }
+        let views = [DrillView::Doctor, DrillView::Units, DrillView::Procs];
+        let i = views.iter().position(|v| *v == d.view).unwrap_or(0);
+        match k.code {
+            KeyCode::Right => d.view = views[(i + 1) % views.len()],
+            KeyCode::Left => d.view = views[(i + views.len() - 1) % views.len()],
+            KeyCode::Char('d') => d.view = DrillView::Doctor,
+            KeyCode::Char('u') => d.view = DrillView::Units,
+            KeyCode::Char('p') => d.view = DrillView::Procs,
+            KeyCode::Char('r') => {
+                let name = d.name.clone();
+                d.snap = None;
+                d.error = None;
+                d.requested = self.now;
+                return vec![Command::FleetDrill(name)];
+            }
+            _ => return Vec::new(),
+        }
+        d.scroll = 0;
+        Vec::new()
+    }
 }
 
 // -------------------------------------------------------------------- pure helpers
 
-fn step(cur: usize, delta: isize, len: usize) -> usize {
+pub(crate) fn step(cur: usize, delta: isize, len: usize) -> usize {
     if len == 0 {
         return 0;
     }
@@ -1733,7 +2271,7 @@ fn step(cur: usize, delta: isize, len: usize) -> usize {
 }
 
 /// Up/Down/PgUp/PgDn/Home/End on a plain list. Returns true if handled.
-fn list_nav(sel: &mut usize, len: usize, code: KeyCode) -> bool {
+pub(crate) fn list_nav(sel: &mut usize, len: usize, code: KeyCode) -> bool {
     let delta = match code {
         KeyCode::Up => -1,
         KeyCode::Down => 1,
@@ -1806,7 +2344,41 @@ pub fn reduce(s: &Snapshot) -> Snapshot {
             }
         })
         .collect();
-    Snapshot { ts: s.ts, host: s.host.clone(), system: s.system.clone(), procs, ports: s.ports.clone(), containers: Vec::new() }
+    Snapshot {
+        ts: s.ts,
+        host: s.host.clone(),
+        system: s.system.clone(),
+        procs,
+        ports: s.ports.clone(),
+        containers: Vec::new(),
+        units: reduce_units(&s.units),
+        kernel: s.kernel.clone(),
+        meta: s.meta.clone(),
+        // Events live in App::event_ring, not in every ring entry; volumes in FsView.
+        ..Default::default()
+    }
+}
+
+/// Units kept per ring entry: every unit with a problem or not plain active/inactive, plus
+/// the top ones by cpu and memory. Bounds ring memory on hosts with thousands of units.
+fn reduce_units(units: &[crate::server::Unit]) -> Vec<crate::server::Unit> {
+    if units.len() <= RING_UNITS * 2 {
+        return units.to_vec();
+    }
+    let mut keep: HashSet<usize> = units
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| u.is_failed() || u.flapping || u.recent_restarts > 0 || !matches!(u.state.as_str(), "active" | "inactive"))
+        .map(|(i, _)| i)
+        .collect();
+    let mut idx: Vec<usize> = (0..units.len()).collect();
+    idx.sort_by(|&a, &b| units[b].cpu.total_cmp(&units[a].cpu));
+    keep.extend(idx.iter().take(RING_UNITS));
+    idx.sort_by(|&a, &b| units[b].mem.cmp(&units[a].mem));
+    keep.extend(idx.iter().take(RING_UNITS));
+    let mut kept: Vec<usize> = keep.into_iter().collect();
+    kept.sort_unstable();
+    kept.into_iter().map(|i| units[i].clone()).collect()
 }
 
 /// Fallback spike detection over a timeline: sharp CPU or power jumps.
@@ -2046,6 +2618,7 @@ pub(crate) mod tests {
                 Port { proto: Proto::Tcp, addr: "*".into(), port: 3000, pid: 200, process: "node".into(), state: "LISTEN".into(), orphan: true, note: "vite dev server in ~/proj".into() },
             ],
             containers: vec![],
+            ..Default::default()
         }
     }
 
@@ -2259,15 +2832,15 @@ pub(crate) mod tests {
         a.on_key(key('5'));
         assert_eq!(a.tab, Tab::Doctor);
         // A running container makes Fleet appear as 6, after Doctor.
-        a.set_fleet(Some(vec![Container { id: "abc".into(), name: "pg".into(), ..Default::default() }]), None);
+        a.set_fleet(Some(vec![Container { id: "abc".into(), name: "pg".into(), ..Default::default() }]));
         a.on_key(code(KeyCode::Tab));
         assert_eq!(a.tab, Tab::Fleet);
         a.on_key(key('6'));
         assert_eq!(a.tab, Tab::Fleet);
         // ... and disappear when it stops (the view falls back to Procs).
-        a.set_fleet(Some(vec![]), None);
+        a.set_fleet(Some(vec![]));
         assert_eq!(a.tab, Tab::Procs);
-        assert_eq!(Tab::ALL.map(|t| t.title()), ["Procs", "Ports", "Fs", "Timeline", "Doctor", "Fleet"]);
+        assert_eq!(Tab::DESKTOP.map(|t| t.title()), ["Procs", "Ports", "Fs", "Timeline", "Doctor", "Fleet"]);
         // The action log is an overlay on any view, not a tab.
         a.on_key(key('3'));
         assert_eq!(a.on_key(key('a')), vec![Command::RefreshLog]);

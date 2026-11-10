@@ -191,6 +191,7 @@ impl Collector {
             procs: list,
             ports,
             containers: Vec::new(),
+            ..Default::default()
         }
     }
 

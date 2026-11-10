@@ -457,6 +457,18 @@ fn handler_for(name: &str) -> Option<Handler> {
         "fs_list" => tool_fs_list,
         "fs_largest" => tool_fs_largest,
         "fs_growth" => tool_fs_growth,
+        // --- server mode: kernel ---
+        "kernel" => tool_kernel,
+        // --- server mode: services ---
+        "services" => tool_services,
+        // --- server mode: doctor-incident ---
+        "events" => tool_events,
+        "what_happened" => tool_what_happened,
+        // --- server mode: fleet (read-only; bodies in src/fleet/cli.rs) ---
+        "fleet_summary" => |s, a| crate::fleet::cli::mcp_fleet_summary(&s.config, a),
+        "fleet_doctor" => |s, a| crate::fleet::cli::mcp_fleet_doctor(&s.config, a),
+        "host_snapshot" => |s, a| crate::fleet::cli::mcp_host_snapshot(&s.config, a),
+        "host_what_happened" => |s, a| crate::fleet::cli::mcp_host_what_happened(&s.config, a),
         _ => return None,
     })
 }
@@ -694,6 +706,150 @@ pub fn tools() -> Vec<Value> {
                     "under": { "type": "string", "description": "Only paths below this absolute directory." }
                 }),
                 &[],
+            ),
+            false,
+        ),
+        // --- server mode: kernel ---
+        tool(
+            "kernel",
+            "Kernel health (Linux)",
+            "Linux kernel health over a 1 s interval plus recent kernel log events. Answers 'load is high but CPU is idle' (`procs_blocked`, `d_state_now` with the kernel \
+             function each D-state process waits in), 'is it the hypervisor' (`steal_pct`), iowait/irq/softirq, PSI some/full, per-disk util/await/queue/iops, \
+             fd / conntrack / ephemeral-port usage against their limits, TCP retransmits and listen-queue overflows, swap rates, OOM kills since boot, NUMA free memory, \
+             filesystems that went read-only or logged errors, degraded md RAID, kernel taint and clock sync. `events` are classified kernel log lines \
+             (oom_kill with victim, cgroup and rss; hung_task; disk_error; ro_remount; exhaustion; kernel_warn for lockups, oopses, segfaults). \
+             The kernel log needs root (or kernel.dmesg_restrict=0); `notes` say what was unavailable. Read-only. Null `kernel` off Linux.",
+            schema(
+                json!({
+                    "since": { "type": "string", "default": "24h", "description": "Kernel log events from this far back, e.g. 15m, 2h, 24h (max 30d)." },
+                    "max_events": { "type": "integer", "minimum": 0, "maximum": 1000, "default": 50, "description": "Newest kernel log events to return." }
+                }),
+                &[],
+            ),
+            false,
+        ),
+        // --- server mode: services ---
+        tool(
+            "services",
+            "Services (units, containers, pods)",
+            "Services as the unit of thought: systemd units (services, scopes, and any failed unit), containers of any runtime, Kubernetes pods, and plain cgroups that hold processes. \
+             Each has a normalised `state` (active/activating/deactivating/reloading/inactive/failed/unknown), `sub_state`, systemd `result` (exit-code, signal, oom-kill, start-limit-hit...) and `exit_code`, \
+             lifetime `restarts`, `recent_restarts` and `flapping` (restarting repeatedly within the configured window), cgroup totals: `cpu` (100 = one core), `mem` / `mem_limit` / `mem_peak` bytes, \
+             `oom_kills` (memory.events), `cpu_throttled_pct` (share of CPU periods throttled by its own cpu.max, a noisy-neighbour/undersized-limit sign), `cpu_quota` cores, io bytes/s and per-unit PSI. \
+             Failed and flapping units sort first. `events` are transitions seen since the previous call (unit_failed, unit_restart, unit_flapping, oom_kill, throttle, exhaustion, deploy_burst). \
+             `notes` say what was unavailable (no systemd, cgroup v1, names that need root). Read-only; on macOS only containers are listed.",
+            schema(
+                json!({
+                    "failed": { "type": "boolean", "default": false, "description": "Only failed or flapping units." },
+                    "kind": { "type": "string", "enum": ["systemd", "container", "k8s-pod", "cgroup"], "description": "Only units of this kind." },
+                    "filter": { "type": "string", "description": "Case-insensitive substring of the unit name, description or cgroup." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 5000, "default": 200, "description": "Max units to return (failed/flapping first)." }
+                }),
+                &[],
+            ),
+            false,
+        ),
+        // --- server mode: doctor-incident ---
+        tool(
+            "events",
+            "Event timeline",
+            "What happened on this host, in time order: oom_kill (victim, cgroup, rss), unit_failed / unit_restart / unit_flapping / unit_start / unit_stop, deploy_burst \
+             (many processes started in one unit), proc_spike, disk_latency_spike, disk_error, fs_fill, ro_remount, kernel_warn, hung_task, throttle (cpu.max), \
+             pressure_spike (PSI), exhaustion (fds, conntrack, ephemeral ports, memory.max) and clock_unsynced. Each event has ts (epoch ms), severity, subject \
+             (`unit:`, `container:`, `pod:`, `disk:`, `mount:`, `kernel`, `host`), unit, pid, a one-line detail and a value. From the flight recorder when it covers \
+             the window (`source: recorder`); otherwise the current unit/kernel state plus the kernel log (`source: live`), with `gaps` saying what is missing. Read-only.",
+            schema(
+                json!({
+                    "since": { "type": "string", "default": "2h", "description": "How far back: a duration (30m, 2h, 1d) or a time (03:00, 2026-11-10 03:00, RFC 3339). Max 31d." },
+                    "kinds": { "type": "array", "items": { "type": "string" }, "description": "Only these event kinds (e.g. [\"oom_kill\", \"unit_failed\"]); empty = all." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 300, "description": "Newest events to return." }
+                }),
+                &[],
+            ),
+            false,
+        ),
+        tool(
+            "what_happened",
+            "What happened and who did it",
+            "Explain an incident: \"what happened at 03:12 and who did it?\". Picks the most important event in the window (or near `at`) and returns a causal `chain` \
+             (symptom first, cause last), `culprits` (unit/process/kernel/external with the numbers that implicate them), `evidence` (including a confidence \
+             level), read-only `suggestions` (journalctl/systemctl/docker/kubectl commands for a human or agent to run; fat runs none of them), the window's `events` \
+             and `gaps` (missing recorder data, unreadable kernel log). Covers OOM kills (who held the memory at that moment, host-wide vs cgroup limit), restart \
+             loops and failed units (exit status, OOM, package updates or deploys just before), load-high-but-CPU-idle (D state, iowait, steal), disk latency \
+             (the unit whose I/O rose and the job that started it: backup, cron/timer, deploy), fs filling, fd/conntrack/port exhaustion and noisy neighbours \
+             (cpu.max throttling, PSI). `text` is the same as plain text. Read-only.",
+            schema(
+                json!({
+                    "at": { "type": "string", "description": "Moment of interest: 03:12, 03:12:30, 2026-11-10 03:12, RFC 3339, epoch seconds, -2h or '2h ago'. Omit for 'the last `window`'." },
+                    "window": { "type": "string", "default": "15m", "description": "How much time before `at` (or now) to examine, e.g. 15m, 1h. Max 31d." }
+                }),
+                &[],
+            ),
+            false,
+        ),
+        // --- server mode: fleet ---
+        tool(
+            "fleet_summary",
+            "Fleet health summary",
+            "Poll every configured fleet host (or a selection) over ssh, read-only, in parallel, and summarise: per-host health 0-100 (worst first), cpu/mem/load/worst disk, \
+             failed units, OOM kills in 24h, findings aggregated by title across hosts (`Disk / is #% full: 12 hosts [...]`), hosts that could not be polled grouped by \
+             reason (unreachable, auth, host-key, fat-missing, timeout), and outliers far from their group's median. Results are reused for fleet.cache_ttl_s unless `refresh`. \
+             The best first call for 'is anything wrong across my servers?'.",
+            schema(
+                json!({
+                    "group": { "type": "string", "description": "Only hosts in this inventory group." },
+                    "tag": { "type": "string", "description": "Only hosts with this tag." },
+                    "host": { "type": "string", "description": "Only hosts whose name matches this glob (web-*)." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 50, "description": "Max host rows returned (findings always cover every host)." },
+                    "refresh": { "type": "boolean", "default": false, "description": "Poll again even if a recent result is cached." }
+                }),
+                &[],
+            ),
+            false,
+        ),
+        tool(
+            "fleet_doctor",
+            "Fleet diagnosis",
+            "Findings for every selected fleet host, computed locally with this fat's rules from each host's snapshot: aggregated fleet findings, outliers, then hosts with \
+             warn/crit findings (worst first) with title, detail and involved pids. Read-only; suggested actions are advice for the host's operator.",
+            schema(
+                json!({
+                    "group": { "type": "string", "description": "Only hosts in this inventory group." },
+                    "tag": { "type": "string", "description": "Only hosts with this tag." },
+                    "host": { "type": "string", "description": "Only hosts whose name matches this glob." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 20, "description": "Max hosts with findings returned." },
+                    "refresh": { "type": "boolean", "default": false, "description": "Poll again even if a recent result is cached." }
+                }),
+                &[],
+            ),
+            false,
+        ),
+        tool(
+            "host_snapshot",
+            "One fleet host's state",
+            "Read-only snapshot of one fleet host (exact inventory name): system totals, top processes by cpu and memory, failed or flapping units, kernel health, recent \
+             events, and findings. Use after fleet_summary/fleet_doctor points at a host.",
+            schema(
+                json!({
+                    "host": { "type": "string", "description": "Exact inventory host name." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 25, "description": "Processes per top list." }
+                }),
+                &["host"],
+            ),
+            false,
+        ),
+        tool(
+            "host_what_happened",
+            "Incident on one fleet host",
+            "'What happened at TIME on HOST and who did it?': runs the host's own `fat what-happened` (from its flight recorder, falling back to live state) and returns the \
+             incident: headline, causal chain, evidence, ranked culprits, read-only suggestions, events and data gaps. `at` is read on this machine's clock and timezone.",
+            schema(
+                json!({
+                    "host": { "type": "string", "description": "Exact inventory host name." },
+                    "at": { "type": "string", "description": "03:12, '2026-01-31 03:12', RFC 3339, -2h or '2h ago'. Default: the most severe recent event." },
+                    "window": { "type": "string", "default": "15m", "description": "Window examined around `at`, e.g. 15m, 1h." }
+                }),
+                &["host"],
             ),
             false,
         ),
@@ -937,8 +1093,10 @@ fn tool_why(state: &mut State, args: &Value) -> Result<Value> {
 fn tool_doctor(state: &mut State, _args: &Value) -> Result<Value> {
     state.snapshot()?;
     let facts = state.fs_facts();
-    let snap = &state.last.as_ref().expect("snapshot cached").1;
-    let findings = crate::blame::diagnose_with_fs(snap, state.history.as_ref(), &facts);
+    let mut snap = state.last.as_ref().expect("snapshot cached").1.clone();
+    // doctor-incident: server profile adds unit, kernel and event findings.
+    crate::server::rules::fill_for_doctor(&state.config.server, &mut snap);
+    let findings = crate::blame::diagnose_with_fs(&snap, state.history.as_ref(), &facts);
     Ok(json!({ "count": findings.len(), "findings": findings }))
 }
 
@@ -1426,6 +1584,70 @@ pub fn growth_json(g: &crate::fs::Growth, window_ms: i64) -> Value {
     })
 }
 
+// --- server mode: services ---
+fn tool_services(state: &mut State, args: &Value) -> Result<Value> {
+    use crate::server::services as svc;
+    let failed = args.get("failed").and_then(Value::as_bool).unwrap_or(false);
+    let kind = match arg_str(args, "kind")? {
+        Some(k) => Some(svc::parse_kind(k).ok_or_else(|| anyhow!("`kind` must be systemd, container, k8s-pod or cgroup"))?),
+        None => None,
+    };
+    let needle = arg_str(args, "filter")?.map(str::to_lowercase).filter(|s| !s.is_empty());
+    let limit = arg_u64(args, "limit")?.unwrap_or(200).clamp(1, 5000) as usize;
+    if !cfg!(target_os = "linux") && state.config.containers {
+        let _ = crate::fleet::containers();
+    }
+    let procs = state.snapshot().map(|s| s.procs.clone()).unwrap_or_default();
+    let (units, notes, events) = svc::shared_sample(&state.config.server, &procs);
+    let total = units.len();
+    let failed_n = units.iter().filter(|u| u.is_failed()).count();
+    let flapping_n = units.iter().filter(|u| u.flapping).count();
+    let mut units = svc::filter(units, failed, kind);
+    if let Some(n) = &needle {
+        units.retain(|u| u.name.to_lowercase().contains(n) || u.description.to_lowercase().contains(n) || u.cgroup.to_lowercase().contains(n));
+    }
+    let matched = units.len();
+    units.truncate(limit);
+    Ok(json!({ "total": total, "failed": failed_n, "flapping": flapping_n, "matched": matched, "units": units, "events": events, "notes": notes }))
+}
+
+// --- server mode: doctor-incident ---
+fn tool_events(state: &mut State, args: &Value) -> Result<Value> {
+    use crate::server::incident as inc;
+    let now = now_ms();
+    let from = inc::parse_since(arg_str(args, "since")?.unwrap_or("2h"), now).map_err(|e| anyhow!("`since`: {e}"))?;
+    let kinds: Vec<String> = match args.get("kinds") {
+        None | Some(Value::Null) => vec![],
+        Some(Value::Array(a)) => a.iter().map(|k| k.as_str().map(str::to_string).ok_or_else(|| anyhow!("`kinds` must be an array of strings"))).collect::<Result<_>>()?,
+        Some(Value::String(k)) => vec![k.clone()],
+        Some(_) => bail!("`kinds` must be an array of strings"),
+    };
+    let kinds = inc::parse_kinds(&kinds)?;
+    let limit = arg_u64(args, "limit")?.unwrap_or(300).clamp(1, 10_000) as usize;
+    let (source, events, gaps) = inc::events_report(&state.config, from, &kinds, limit);
+    Ok(json!({ "source": source, "from": from, "to": now, "count": events.len(), "events": events, "gaps": gaps }))
+}
+
+fn tool_what_happened(state: &mut State, args: &Value) -> Result<Value> {
+    let inc = crate::server::incident::what_happened_for(&state.config, arg_str(args, "at")?, arg_str(args, "window")?.unwrap_or("15m"))?;
+    let mut v = serde_json::to_value(&inc)?;
+    v["text"] = json!(crate::server::incident::render(&inc));
+    Ok(v)
+}
+
+// --- server mode: kernel ---
+fn tool_kernel(state: &mut State, args: &Value) -> Result<Value> {
+    let since = arg_str(args, "since")?.unwrap_or("24h");
+    let secs = crate::budget::parse_duration(since).map_err(|e| anyhow!("`since`: {e}"))?;
+    if secs == 0 || secs > 30 * 86_400 {
+        bail!("`since` must be between 1s and 30d");
+    }
+    let max = args.get("max_events").and_then(Value::as_u64).unwrap_or(50).min(1000) as usize;
+    let procs = state.snapshot().map(|s| s.procs.clone()).unwrap_or_default();
+    let r = crate::server::kernel::report(&state.config.server, &procs, &[], std::time::Duration::from_secs(1), crate::model::now_ms() - secs as i64 * 1000, max);
+    Ok(serde_json::to_value(r)?)
+}
+
 fn tool_fs_growth(state: &mut State, args: &Value) -> Result<Value> {
     let since = arg_str(args, "since")?.unwrap_or("10m");
     let secs = crate::budget::parse_duration(since).map_err(|e| anyhow!("`since`: {e}"))?;
@@ -1641,12 +1863,13 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         for n in [
             "snapshot", "process", "ports", "why", "doctor", "history", "find_port_owner", "pause", "resume", "renice", "kill",
-            "undo", "containers", "ask", "fs_volumes", "fs_list", "fs_largest", "fs_growth",
+            "undo", "containers", "ask", "fs_volumes", "fs_list", "fs_largest", "fs_growth", "kernel", "events", "what_happened",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
             assert!(handler_for(n).is_some(), "no handler for {n}");
         }
-        assert_eq!(names.len(), 18);
+        // Server-mode agents add tools; every listed name is checked above and below.
+        assert!(names.len() >= 19, "{names:?}");
         for t in tools {
             assert!(t["description"].as_str().unwrap().len() > 20);
             let s = &t["inputSchema"];

@@ -19,6 +19,8 @@
 //! degrades to a status message instead of tearing down the terminal.
 
 pub mod app;
+pub mod server;
+mod server_ui;
 pub mod ui;
 pub mod widgets;
 
@@ -28,7 +30,10 @@ use crate::history::History;
 use crate::history::Point;
 use crate::fs::{DirEntry, Growth, Listing, Volume};
 use crate::model::{Container, Explanation, Finding, Snapshot, Ts, now_ms};
-use app::{App, Command, HostRow};
+use app::{App, Command};
+use crate::fleet::fanout::{self, Transport};
+use crate::fleet::inventory::Target;
+use crate::server::{FleetHost, FleetSummary, Incident};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -49,7 +54,17 @@ enum Msg {
     CollectorError(String),
     /// Findings plus the start time of every pid they mention (from the same snapshot).
     Findings(Vec<Finding>, HashMap<u32, u64>),
-    Fleet { containers: Option<Vec<Container>>, hosts: Option<Vec<HostRow>> },
+    Fleet { containers: Option<Vec<Container>> },
+    /// Server profile: recorder events for the window starting at `from` (None = no recorder).
+    Events(Ts, Option<Vec<crate::server::Event>>),
+    Incident(u64, Result<Incident, String>),
+    /// OOM kills in the last 24h from the recorder (None = unknown).
+    Counts(Option<u64>),
+    FleetInventory(Result<usize, String>),
+    FleetHost(Box<FleetHost>),
+    FleetDone(Box<FleetSummary>),
+    FleetFailed(String),
+    FleetDrill(String, Result<(Box<Snapshot>, Vec<Finding>), String>),
     Answer(u64, String),
     /// None = no recorded history for this window (fall back to the in-memory ring).
     Timeline(Option<(Vec<Point>, Vec<Ts>)>),
@@ -99,6 +114,11 @@ enum HistReq {
     Timeline { from: Ts, to: Ts },
     LoadAt(Ts),
     Explain(Box<Snapshot>, u32),
+    /// Server profile requests (incident engine and recorder event tables).
+    Events { from: Ts, to: Ts },
+    ExplainEvent { id: u64, live: Box<Snapshot>, event: Box<crate::server::Event> },
+    WhatHappened { id: u64, live: Box<Snapshot>, at: Option<Ts>, window_ms: i64 },
+    Counts,
 }
 
 // ------------------------------------------------------------------ panic safety
@@ -231,8 +251,13 @@ fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
 
 // ------------------------------------------------------------------ background threads
 
-fn spawn_sampler(cfg: Config, tx: Sender<Msg>, fs: Arc<FsShared>) {
+fn spawn_sampler(cfg: Config, profile: crate::server::Profile, tx: Sender<Msg>, fs: Arc<FsShared>) {
     thread::spawn(move || {
+        // Server profile: units, kernel health and events on top of every sample. A panic in
+        // it (an engine bug, an odd /proc) disables it and the process view carries on.
+        let mut server = (profile == crate::server::Profile::Server)
+            .then(|| guarded(|| crate::server::ServerSampler::new(&cfg.server)).ok())
+            .flatten();
         let interval = Duration::from_millis(cfg.interval_ms.max(250));
         let mut col = match guarded(crate::collect::Collector::new) {
             Ok(c) => c,
@@ -242,6 +267,11 @@ fn spawn_sampler(cfg: Config, tx: Sender<Msg>, fs: Arc<FsShared>) {
             }
         };
         let mut hist = guarded(|| History::open(cfg.history_path.as_deref())).ok().and_then(Result::ok);
+        if server.is_some()
+            && let Some(h) = hist.as_mut()
+        {
+            let _ = guarded(|| h.set_server_limits(&cfg.server));
+        }
         let keep_days = cfg.history_days.max(1);
         // Retention runs where the writing happens: at startup and hourly, like `fat record`.
         let mut last_prune: Option<Instant> = None;
@@ -256,13 +286,19 @@ fn spawn_sampler(cfg: Config, tx: Sender<Msg>, fs: Arc<FsShared>) {
                     return;
                 }
             };
+            if let Some(ss) = server.as_mut()
+                && guarded(|| ss.fill(&mut snap)).is_err()
+            {
+                server = None;
+                let _ = tx.send(Msg::CollectorError("server sampling (services, kernel, events) failed and was turned off".into()));
+            }
             let now = now_ms();
             if now - last_rec >= 2000 {
                 last_rec = now;
                 if let Some(h) = hist.as_mut() {
                     // A panic means the recorder is unusable; stop trying. Errors are ignored.
                     // record() is a no-op while another fat (e.g. `fat record`) holds the lease.
-                    if guarded(|| h.record(&snap)).is_err() {
+                    if guarded(|| h.record(&snap).and_then(|_| h.record_server(&snap))).is_err() {
                         hist = None;
                     } else if h.is_writer() {
                         // Same storage rows `fat record` keeps, so time travel shows volume use.
@@ -348,11 +384,34 @@ fn spawn_history(hist: Option<History>, tx: Sender<Msg>) -> Sender<HistReq> {
             // Coalesce a burst (held arrow keys, repeated refreshes): only the newest
             // timeline and time-travel requests matter.
             let (mut timeline, mut load_at, mut explain) = (None, None, None);
+            let (mut events, mut incident, mut counts) = (None, None, false);
             for req in std::iter::once(first).chain(req_rx.try_iter()) {
                 match req {
                     HistReq::Timeline { from, to } => timeline = Some((from, to)),
                     HistReq::LoadAt(ts) => load_at = Some(ts),
                     HistReq::Explain(s, pid) => explain = Some((s, pid)),
+                    HistReq::Events { from, to } => events = Some((from, to)),
+                    r @ (HistReq::ExplainEvent { .. } | HistReq::WhatHappened { .. }) => incident = Some(r),
+                    HistReq::Counts => counts = true,
+                }
+            }
+            if let Some(r) = incident {
+                let (id, res) = run_incident(hist.as_ref(), r);
+                if tx.send(Msg::Incident(id, res)).is_err() {
+                    return;
+                }
+            }
+            if let Some((from, to)) = events {
+                let got = hist.as_ref().and_then(|h| guarded(|| crate::server::incident::timeline(h, from, to, &[])).ok()?.ok());
+                if tx.send(Msg::Events(from, got)).is_err() {
+                    return;
+                }
+            }
+            if counts {
+                let from = now_ms() - 86_400_000;
+                let n = hist.as_ref().and_then(|h| guarded(|| h.event_count(crate::server::EventKind::OomKill, from)).ok()?.ok());
+                if tx.send(Msg::Counts(n)).is_err() {
+                    return;
                 }
             }
             if let Some((s, pid)) = explain {
@@ -400,27 +459,86 @@ fn spawn_history(hist: Option<History>, tx: Sender<Msg>) -> Sender<HistReq> {
     req_tx
 }
 
-fn host_row(h: &crate::config::HostCfg) -> HostRow {
-    match guarded(|| crate::fleet::remote(h)) {
-        Ok(Ok(s)) => HostRow {
-            name: h.name.clone(),
-            ok: true,
-            cpu: s.system.cpu,
-            mem_used: s.system.mem_used,
-            mem_total: s.system.mem_total,
-            procs: s.procs.len(),
-            ports: s.ports.len(),
-            error: String::new(),
-        },
-        Ok(Err(e)) => HostRow { name: h.name.clone(), error: e.to_string(), ..Default::default() },
-        Err(e) => HostRow { name: h.name.clone(), error: format!("unavailable: {e}"), ..Default::default() },
+/// An incident request answered on the history thread. The engine falls back to the live
+/// snapshot and the kernel log when the recorder has nothing, and lists what it lacked.
+fn run_incident(hist: Option<&History>, r: HistReq) -> (u64, Result<Incident, String>) {
+    match r {
+        HistReq::ExplainEvent { id, live, event } => (id, guarded(|| crate::server::incident::explain_event(hist, &live, &event))),
+        HistReq::WhatHappened { id, live, at, window_ms } => {
+            (id, guarded(|| crate::server::incident::what_happened(hist, &live, at, window_ms)).and_then(|r| r.map_err(|e| e.to_string())))
+        }
+        _ => (0, Err("not an incident request".into())),
     }
+}
+
+/// The remote hosts the Fleet tab shows: the inventory, read once per TUI session.
+type Inventory = Arc<Mutex<Option<Vec<Target>>>>;
+
+/// Read the inventory on its own thread (a hosts file or ~/.ssh/config may be slow to read on
+/// a network home) and report its size.
+fn spawn_inventory(cfg: Config, inv: Inventory, tx: Sender<Msg>) {
+    let _ = thread::Builder::new().name("fat-inventory".into()).spawn(move || {
+        let r = guarded(|| crate::fleet::inventory::inventory(&cfg)).map_err(|e| format!("inventory unavailable ({e})")).and_then(|r| r.map_err(|e| e.to_string()));
+        let msg = match r {
+            Ok(t) => {
+                let n = t.len();
+                if let Ok(mut g) = inv.lock() {
+                    *g = Some(t);
+                }
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        };
+        let _ = tx.send(Msg::FleetInventory(msg));
+    });
+}
+
+/// One read-only poll of every target, streaming each host's row as it answers and finishing
+/// with the grouped summary. Snapshots are not kept (memory stays bounded by the host count
+/// times one row); findings are computed locally from each snapshot as it arrives.
+fn fleet_poll(targets: &[Target], cfg: &crate::server::FleetCfg, tr: &dyn Transport, tx: &Sender<Msg>) {
+    let start = Instant::now();
+    let txs = Mutex::new(tx.clone());
+    let on_row = |h: &FleetHost| {
+        if let Ok(t) = txs.lock() {
+            let _ = t.send(Msg::FleetHost(Box::new(h.clone())));
+        }
+    };
+    let polled = match guarded(|| fanout::poll_detailed(targets, cfg, tr, false, &on_row)) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = tx.send(Msg::FleetFailed(e));
+            return;
+        }
+    };
+    let findings: Vec<(String, Vec<Finding>)> = polled.iter().map(|p| (p.host.name.clone(), p.findings.clone())).collect();
+    let rows: Vec<FleetHost> = polled.into_iter().map(|p| p.host).collect();
+    // Every affected host is kept: the panel shows as many names as fit, and ⏎ on a finding
+    // filters the table to all of them.
+    match guarded(|| fanout::summarize(rows, &findings, usize::MAX)) {
+        Ok(mut s) => {
+            s.elapsed_ms = start.elapsed().as_millis() as u64;
+            let _ = tx.send(Msg::FleetDone(Box::new(s)));
+        }
+        Err(e) => {
+            let _ = tx.send(Msg::FleetFailed(format!("summary failed ({e})")));
+        }
+    }
+}
+
+/// Fetch one host's snapshot (read-only allowlisted command) and diagnose it locally.
+fn fleet_drill(t: &Target, cfg: &crate::server::FleetCfg, tr: &dyn Transport) -> Result<(Box<Snapshot>, Vec<Finding>), String> {
+    let args: Vec<String> = ["snapshot", "--json", "--fast"].iter().map(|s| s.to_string()).collect();
+    let out = guarded(|| fanout::remote_read_only(t, &args, cfg, tr)).and_then(|r| r.map_err(|e| e.to_string()))?;
+    let snap = crate::fleet::parse_remote_snapshot(&out, &t.name).map_err(|e| e.to_string())?;
+    let findings = guarded(|| fanout::findings_of(&snap)).unwrap_or_default();
+    Ok((Box::new(snap), findings))
 }
 
 fn spawn_fleet(cfg: Config, tx: Sender<Msg>) {
     thread::spawn(move || {
         let mut containers_ok = cfg.containers;
-        let (mut last_c, mut last_h) = (i64::MIN / 2, i64::MIN / 2);
+        let mut last_c = i64::MIN / 2;
         loop {
             let now = now_ms();
             let containers = if containers_ok && now - last_c >= 5000 {
@@ -438,17 +556,11 @@ fn spawn_fleet(cfg: Config, tx: Sender<Msg>) {
             } else {
                 None
             };
-            let hosts = if now - last_h >= 10_000 {
-                last_h = now;
-                Some(cfg.hosts.iter().map(host_row).collect())
-            } else {
-                None
-            };
-            if (containers.is_some() || hosts.is_some()) && tx.send(Msg::Fleet { containers, hosts }).is_err() {
+            if containers.is_some() && tx.send(Msg::Fleet { containers }).is_err() {
                 return;
             }
-            if !containers_ok && cfg.hosts.is_empty() {
-                return; // nothing left to poll
+            if !containers_ok {
+                return; // nothing left to poll (remote hosts are polled on demand)
             }
             thread::sleep(Duration::from_millis(1000));
         }
@@ -702,6 +814,9 @@ struct Ctx {
     fs_shared: Arc<FsShared>,
     /// Storage thread, started by the first Fs command.
     fs: Option<Sender<FsReq>>,
+    inventory: Inventory,
+    /// Transport for fleet polls (ssh through the operator's own ssh config).
+    transport: Arc<dyn Transport>,
 }
 
 impl Ctx {
@@ -725,6 +840,22 @@ impl Ctx {
         }
     }
 
+    /// Incident requests go to the history thread (the recorder lives there); without one the
+    /// engine still answers from the live snapshot, on a short-lived thread.
+    fn incident(&mut self, app: &mut App, req: HistReq) {
+        if let Some(h) = &self.hist
+            && app.history_ok
+        {
+            let _ = h.send(req);
+            return;
+        }
+        let tx = self.tx.clone();
+        let _ = thread::Builder::new().name("fat-incident".into()).spawn(move || {
+            let (id, r) = run_incident(None, req);
+            let _ = tx.send(Msg::Incident(id, r));
+        });
+    }
+
     fn exec(&mut self, app: &mut App, cmd: Command) {
         match cmd {
             Command::FsList { path, explicit } => self.fs_send(app, FsReq::List { path, explicit }),
@@ -733,6 +864,50 @@ impl Ctx {
             Command::FsLargest(p) => self.fs_send(app, FsReq::Largest(p)),
             Command::FsAt { ts, path } => self.fs_send(app, FsReq::At { ts, path }),
             Command::Quit => app.quit = true,
+            Command::LoadEvents { from, to } => match &self.hist {
+                Some(h) if app.history_ok => {
+                    let _ = h.send(HistReq::Events { from, to });
+                }
+                _ => app.set_events(from, None),
+            },
+            Command::ExplainEvent { id, event } => {
+                let live = Box::new(app.live.clone().unwrap_or_default());
+                self.incident(app, HistReq::ExplainEvent { id, live, event });
+            }
+            Command::WhatHappened { id, at, window_ms } => {
+                let live = Box::new(app.live.clone().unwrap_or_default());
+                self.incident(app, HistReq::WhatHappened { id, live, at, window_ms });
+            }
+            Command::RefreshCounts => match &self.hist {
+                Some(h) if app.history_ok => {
+                    let _ = h.send(HistReq::Counts);
+                }
+                _ => app.set_counts(None),
+            },
+            Command::FleetPoll => {
+                let targets = self.inventory.lock().ok().and_then(|g| g.clone()).unwrap_or_default();
+                if targets.is_empty() {
+                    app.fleet_failed("no hosts in the inventory".into());
+                    return;
+                }
+                let (cfg, tr, tx) = (self.cfg.fleet.clone(), self.transport.clone(), self.tx.clone());
+                let spawned = thread::Builder::new().name("fat-fleet-poll".into()).spawn(move || fleet_poll(&targets, &cfg, tr.as_ref(), &tx));
+                if let Err(e) = spawned {
+                    app.fleet_failed(e.to_string());
+                }
+            }
+            Command::FleetDrill(name) => {
+                let target = self.inventory.lock().ok().and_then(|g| g.as_ref()?.iter().find(|t| t.name == name).cloned());
+                let Some(t) = target else {
+                    app.set_fleet_drill(&name, Err("not in the inventory".into()));
+                    return;
+                };
+                let (cfg, tr, tx) = (self.cfg.fleet.clone(), self.transport.clone(), self.tx.clone());
+                let _ = thread::Builder::new().name("fat-fleet-drill".into()).spawn(move || {
+                    let r = fleet_drill(&t, &cfg, tr.as_ref());
+                    let _ = tx.send(Msg::FleetDrill(t.name.clone(), r));
+                });
+            }
             Command::Act { kind, pid, nice, start } => {
                 let Some(live) = app.live.clone() else {
                     app.set_status("no live snapshot yet", true);
@@ -823,7 +998,15 @@ fn apply_msg(app: &mut App, msg: Msg) {
         Msg::Snap(s) => app.on_snapshot(*s),
         Msg::CollectorError(e) => app.collector_error = Some(e),
         Msg::Findings(f, starts) => app.set_findings_with_starts(f, starts),
-        Msg::Fleet { containers, hosts } => app.set_fleet(containers, hosts),
+        Msg::Fleet { containers } => app.set_fleet(containers),
+        Msg::Events(from, ev) => app.set_events(from, ev),
+        Msg::Incident(id, r) => app.set_incident(id, r),
+        Msg::Counts(n) => app.set_counts(n),
+        Msg::FleetInventory(r) => app.set_fleet_inventory(r),
+        Msg::FleetHost(h) => app.fleet_host(*h),
+        Msg::FleetDone(s) => app.fleet_done(*s),
+        Msg::FleetFailed(e) => app.fleet_failed(e),
+        Msg::FleetDrill(name, r) => app.set_fleet_drill(&name, r.map(|(s, f)| (*s, f))),
         Msg::Answer(id, a) => app.set_answer(id, a),
         Msg::Timeline(Some((pts, spikes))) => app.set_timeline(pts, spikes),
         Msg::Timeline(None) => app.use_ring_timeline(),
@@ -893,7 +1076,8 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
 
     let (tx, rx) = mpsc::channel::<Msg>();
     let fs_shared = Arc::new(FsShared::default());
-    spawn_sampler(cfg.clone(), tx.clone(), fs_shared.clone());
+    let profile = guarded(|| crate::server::Profile::detect(&cfg.server)).unwrap_or_default();
+    spawn_sampler(cfg.clone(), profile, tx.clone(), fs_shared.clone());
     spawn_fleet(cfg.clone(), tx.clone());
     spawn_volumes(cfg.interval_ms, cfg.history_path.clone(), tx.clone(), fs_shared.clone());
 
@@ -901,8 +1085,12 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
     app.config_path = config_path;
     app.history_ok = hist.is_some();
     app.configured_hosts = cfg.hosts.len();
+    app.set_profile(profile, cfg.server.clone(), cfg.fleet.tui_refresh_s);
     let hist_tx = spawn_history(hist, tx.clone());
-    let mut ctx = Ctx { cfg, hist: Some(hist_tx), actions: None, actions_failed: false, tx, fs_shared, fs: None };
+    let inventory: Inventory = Arc::default();
+    spawn_inventory(cfg.clone(), inventory.clone(), tx.clone());
+    let transport: Arc<dyn Transport> = Arc::new(fanout::SshTransport { cfg: cfg.fleet.clone() });
+    let mut ctx = Ctx { cfg, hist: Some(hist_tx), actions: None, actions_failed: false, tx, fs_shared, fs: None, inventory, transport };
     // Nothing else runs before the first frame: the journal is read when the action log (`a`)
     // opens or an action runs, samples arrive from the sampler thread.
 
@@ -930,8 +1118,8 @@ mod tests {
         assert_eq!(guarded(|| 2 + 2), Ok(4));
         let e = guarded(|| -> u32 { panic!("boom {}", 1) }).unwrap_err();
         assert!(e.contains("boom 1"));
-        let e = guarded(|| -> u32 { todo!() }).unwrap_err();
-        assert!(e.contains("not yet implemented"));
+        let e = guarded(|| -> u32 { unreachable!("engine gap") }).unwrap_err();
+        assert!(e.contains("engine gap"));
         // nested guards keep the depth balanced
         let r = guarded(|| guarded(|| -> u8 { panic!("inner") }).is_err());
         assert_eq!(r, Ok(true));
@@ -942,7 +1130,17 @@ mod tests {
     fn exec_degrades_without_backends() {
         // Other modules may be stubs; executing commands must never panic.
         let (tx, _rx) = mpsc::channel();
-        let mut ctx = Ctx { cfg: Config::default(), hist: None, actions: None, actions_failed: false, tx, fs_shared: Arc::default(), fs: None };
+        let mut ctx = Ctx {
+            cfg: Config::default(),
+            hist: None,
+            actions: None,
+            actions_failed: false,
+            tx,
+            fs_shared: Arc::default(),
+            fs: None,
+            inventory: Arc::default(),
+            transport: Arc::new(fanout::LocalTransport { program: "true".into(), prefix: vec![] }),
+        };
         let mut app = App::new(1000);
         ctx.exec(&mut app, Command::RefreshTimeline { from: 0, to: 1 });
         ctx.exec(&mut app, Command::LoadAt(5));

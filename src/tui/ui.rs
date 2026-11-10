@@ -4,6 +4,7 @@
 use crate::model::{Container, Proc};
 use crate::fs::Volume;
 use crate::tui::app::{App, AskState, FsMode, GrowthRow, Modal, SortKey, Tab, ZOOMS, ZOOM_NAMES};
+use crate::tui::server_ui;
 use crate::tui::widgets::*;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
@@ -15,12 +16,13 @@ use ratatui::widgets::{
     Row, Table, Tabs, Wrap,
 };
 
-const SEL_BG: Color = Color::Indexed(236);
-const ACCENT: Color = Color::Cyan;
+pub(super) const SEL_BG: Color = Color::Indexed(236);
+pub(super) const ACCENT: Color = Color::Cyan;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.ensure_rows();
+    app.ensure_server_rows();
     let area = f.area();
     let header_h = if area.height < 16 { 2 } else { 4 };
     let [header, tabs, main, footer] =
@@ -42,11 +44,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Tab::Procs => draw_procs(f, app, main),
         Tab::Ports => draw_ports(f, app, main),
         Tab::Fs => draw_fs(f, app, main),
+        Tab::Fleet if app.fleet.active() => server_ui::draw_fleet(f, app, main),
         Tab::Fleet => draw_fleet(f, app, main),
         Tab::Timeline => draw_timeline(f, app, main),
         Tab::Doctor => draw_doctor(f, app, main),
+        Tab::Services => server_ui::draw_services(f, app, main),
+        Tab::Events => server_ui::draw_events(f, app, main),
     }
 
+    if let Some(p) = &app.panel {
+        server_ui::draw_panel(f, p, main);
+    }
     if app.why.is_some() {
         let r = side.unwrap_or_else(|| centered(main.width.saturating_sub(4), main.height, main));
         draw_why(f, app, r);
@@ -86,7 +94,14 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         l1.push(Span::styled(format!(" {} ", if sys.hostname.is_empty() { &s.host } else { &sys.hostname }), Style::default().bold()));
         l1.push(Span::styled(format!(" up {}", fmt_dur(sys.uptime)), dim()));
         l1.push(Span::raw(format!("  load {:.2} {:.2} {:.2}", sys.load[0], sys.load[1], sys.load[2])));
+        if app.server() {
+            // Load means little without the core count (and the D-state count on line 2).
+            l1.push(Span::styled(format!("/{}c", sys.cores), dim()));
+        }
         l1.push(Span::styled(format!("  {} procs", s.procs.len()), dim()));
+        if app.server() && !s.units.is_empty() {
+            l1.push(Span::styled(format!(" · {} units", s.units.len()), dim()));
+        }
     } else {
         l1.push(Span::styled(" sampling…", dim()));
     }
@@ -105,6 +120,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let sys = &s.system;
+    if app.server() {
+        let n = area.height.saturating_sub(1) as usize;
+        lines.extend(server_ui::header_lines(app, s, w, n));
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
 
     // line 2: cpu sparkline + per-core
     let cores_w = if sys.per_core.len() + 12 < w / 2 { sys.per_core.len() } else { 0 };
@@ -178,7 +199,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 /// "PSI cpu▃12 mem▁0 io▆31": avg10 stall percentages as one-cell gauges. Stalls are bad well
 /// below 100%, so the gauge saturates at 25% (10% some-pressure is already noticeable).
-fn psi_spans(psi: &crate::model::Psi) -> Vec<Span<'static>> {
+pub(super) fn psi_spans(psi: &crate::model::Psi) -> Vec<Span<'static>> {
     let mut v = vec![Span::styled("  PSI", Style::default().fg(ACCENT))];
     for (label, val) in [("cpu", psi.cpu_some), ("mem", psi.mem_some.max(psi.mem_full)), ("io", psi.io_some)] {
         let st = Style::default().fg(psi_color(val));
@@ -240,7 +261,10 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let titles: Vec<Line> = tabs
         .iter()
         .map(|t| {
-            let mut spans = vec![Span::styled(format!("{}", t.index() + 1), Style::default().fg(Color::Yellow)), Span::raw(t.title())];
+            let mut spans = vec![Span::styled(format!("{}", app.tab_number(*t)), Style::default().fg(Color::Yellow)), Span::raw(t.title())];
+            if let Some(b) = server_ui::tab_badge(app, *t) {
+                spans.push(b);
+            }
             if *t == Tab::Doctor {
                 let crit = app.findings.iter().filter(|x| x.severity == "crit").count();
                 let warn = app.findings.iter().filter(|x| x.severity == "warn").count();
@@ -274,12 +298,15 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
             Line::from(spans)
         })
         .collect();
+    // Eight tabs with badges do not fit 80 columns with padding: drop it rather than a tab.
+    let need: usize = titles.iter().map(|l| l.width() + 3).sum();
+    let pad = if need <= area.width as usize { " " } else { "" };
     let tabs = Tabs::new(titles)
         .select(tabs.iter().position(|t| *t == app.tab).unwrap_or(0))
         .style(dim())
         .highlight_style(Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
         .divider("│")
-        .padding(" ", " ");
+        .padding(pad, pad);
     f.render_widget(tabs, area);
 }
 
@@ -358,7 +385,7 @@ fn col_title(c: Col, sort: SortKey, desc: bool) -> Cell<'static> {
     Cell::from(if right { line.alignment(Alignment::Right) } else { line })
 }
 
-fn num(s: String, style: Style) -> Cell<'static> {
+pub(super) fn num(s: String, style: Style) -> Cell<'static> {
     Cell::from(Line::styled(s, style).alignment(Alignment::Right))
 }
 
@@ -423,7 +450,7 @@ fn proc_cell<'a>(c: Col, p: &'a Proc, depth: u16, tree: bool, containers: &[Cont
 }
 
 /// Keep `sel` inside the visible window of `height` rows.
-fn scroll_into_view(sel: usize, offset: &mut usize, height: usize, len: usize) {
+pub(super) fn scroll_into_view(sel: usize, offset: &mut usize, height: usize, len: usize) {
     let height = height.max(1);
     if sel < *offset {
         *offset = sel;
@@ -1092,26 +1119,11 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
             Cell::from(Span::styled(detail, dim())),
         ]));
     }
-    for h in &app.hosts {
-        let (status, st) = if h.ok {
-            ("online".to_string(), Style::default().fg(Color::Green))
-        } else {
-            (format!("✗ {}", clip(&h.error, 40)), Style::default().fg(Color::Red))
-        };
-        rows.push(Row::new(vec![
-            Cell::from(Span::styled(format!("● {}", h.name), Style::default().fg(if h.ok { ACCENT } else { Color::Red }).bold())),
-            Cell::from("ssh"),
-            Cell::from(Span::styled(status, st)),
-            if h.ok { num(format!("{:.0}", h.cpu), Style::default().fg(pct_color(h.cpu))) } else { Cell::from("") },
-            Cell::from(if h.ok { format!("{}/{}", fmt_bytes(h.mem_used), fmt_bytes(h.mem_total)) } else { String::new() }),
-            Cell::from(Span::styled(if h.ok { format!("{} procs · {} ports", h.procs, h.ports) } else { String::new() }, dim())),
-        ]));
-    }
     let n_rows = rows.len();
     let rows = rows.into_iter().enumerate().map(|(i, r)| if i == app.fleet_sel { r.style(Style::default().bg(SEL_BG)) } else { r });
     let title = Line::from(vec![
         Span::styled(" Fleet ", Style::default().bold()),
-        Span::styled(format!("1 local · {nc} containers · {} hosts ", app.hosts.len()), dim()),
+        Span::styled(format!("1 local · {nc} containers "), dim()),
     ]);
     let table = Table::new(
         rows,
@@ -1123,7 +1135,7 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(table, area);
 
     let used = n_rows as u16 + 2;
-    if nc == 0 && app.hosts.is_empty() && area.height > used + 2 {
+    if nc == 0 && area.height > used + 2 {
         let r = Rect { y: area.y + used + 1, height: area.height - used - 1, ..area }.inner(Margin { horizontal: 2, vertical: 0 });
         let mut t = Text::default();
         if !app.fleet_loaded {
@@ -1139,6 +1151,7 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
             t.lines.push(Line::styled("      [[hosts]]", Style::default().fg(Color::Green)));
             t.lines.push(Line::styled("      name = \"devbox\"", Style::default().fg(Color::Green)));
             t.lines.push(Line::styled("      ssh  = \"me@devbox\"   # needs `fat` installed there", Style::default().fg(Color::Green)));
+            t.lines.push(Line::raw("  or list many hosts in a file: [fleet] hosts_file = \"~/.config/fat/hosts\""));
         }
         f.render_widget(Paragraph::new(t).wrap(Wrap { trim: false }), r);
     }
@@ -1521,7 +1534,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
 }
 
 const HELP: &[(&str, &str)] = &[
-    ("1-6 / Tab", "switch view: Procs Ports Fs Timeline Doctor (Fleet when containers/hosts exist)"),
+    ("1-8 / Tab", "switch view: Procs Ports Fs Timeline Doctor (Fleet when containers/hosts exist); the server profile adds Services first and Events"),
     ("↑↓ PgUp PgDn g G", "move selection"),
     ("c m p n d i N", "sort by cpu mem power net disk pid name (again = reverse)"),
     ("t", "toggle process tree"),
@@ -1537,6 +1550,12 @@ const HELP: &[(&str, &str)] = &[
     ("Fs: ⏎ → l  ← ⌫", "storage: open directory · go up (⏎ on a 🔒 dir reads it once)"),
     ("Fs: s g w", "sort size/growth/io/name/files/age · growth view · window 10m/1h/24h"),
     ("Fs: b r", "biggest entries below here · rescan this directory (fat never deletes)"),
+    ("Services: ⏎ w W", "explain the unit (state, limits, processes, events, read-only next steps) · why its main pid · what happened recently"),
+    ("Services: sort", "s state (problems first) · c cpu · m mem · d io · r restarts · N name"),
+    ("Services: t f i", "group by kind · problems only · show inactive units"),
+    ("Events: ⏎ W f +/-", "what happened around the event (chain, culprits, evidence) · … recently · min severity · window 15m-7d"),
+    ("Fleet: ⏎ → r", "drill into a host (read-only snapshot: doctor, units, procs) · fleet findings panel · poll now"),
+    ("Fleet: sort", "H health · c cpu · m mem · d disk · f findings · n name · l latency (nothing in Fleet acts on a host)"),
     ("L / Esc", "return to live"),
     ("?", "ask in plain language"),
     ("h", "this help"),
@@ -1611,11 +1630,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Tab::Ports => &[("⏎", "why"), ("k", "kill tree"), ("␣", "pause"), ("u", "undo"), ("a", "log"), ("?", "ask"), ("h", "help"), ("q", "quit")],
         Tab::Fs if app.fs.mode == FsMode::Growth => &[("⏎", "open / why"), ("w", "window"), ("g", "dirs"), ("/", "filter"), ("Esc", "back"), ("?", "ask"), ("h", "help"), ("q", "quit")],
         Tab::Fs => &[("⏎", "open"), ("←", "up"), ("s", "sort"), ("g", "growth"), ("w", "window"), ("b", "biggest"), ("r", "rescan"), ("/", "filter"), ("?", "ask"), ("h", "help"), ("q", "quit")],
+        Tab::Fleet if app.fleet.drill.is_some() => &[("←→", "doctor/units/procs"), ("↑↓", "move"), ("r", "refresh"), ("Esc", "back"), ("h", "help"), ("q", "quit")],
+        Tab::Fleet if app.fleet.focus_findings => &[("↑↓", "move"), ("⏎", "show hosts"), ("←", "hosts"), ("r", "poll"), ("Esc", "back"), ("h", "help")],
+        Tab::Fleet if app.fleet.active() => &[("⏎", "drill in"), ("→", "findings"), ("H c m d f n l", "sort"), ("/", "filter"), ("r", "poll"), ("?", "ask"), ("h", "help"), ("q", "quit")],
         Tab::Fleet => &[("↑↓", "move"), ("?", "ask"), ("h", "help"), ("q", "quit")],
+        Tab::Services => &[("⏎", "explain"), ("w", "why pid"), ("W", "what happened"), ("s c m d r N", "sort"), ("t", "by kind"), ("f", "problems"), ("i", "inactive"), ("/", "filter"), ("h", "help"), ("q", "quit")],
+        Tab::Events => &[("⏎", "what happened"), ("W", "now"), ("f", "severity"), ("+/-", "window"), ("/", "filter"), ("r", "refresh"), ("h", "help"), ("q", "quit")],
         Tab::Timeline => &[("←→", "scrub"), ("s", "spike"), ("+/-", "zoom"), ("L", "live"), ("⏎", "why"), ("?", "ask"), ("h", "help"), ("q", "quit")],
         Tab::Doctor => &[("⏎", "run action"), ("w", "why"), ("a", "log"), ("?", "ask"), ("h", "help"), ("q", "quit")],
     };
-    let hints: &[(&str, &str)] = if app.modal == Modal::Log { &[("↑↓", "move"), ("⏎", "undo selected"), ("u", "undo last"), ("Esc", "close")] } else { hints };
+    let hints: &[(&str, &str)] = if app.panel.is_some() {
+        &[("↑↓", "scroll"), ("w", "why pid"), ("Esc", "close")]
+    } else if app.modal == Modal::Log { &[("↑↓", "move"), ("⏎", "undo selected"), ("u", "undo last"), ("Esc", "close")] } else { hints };
     let mut spans = Vec::with_capacity(hints.len() * 3);
     if app.rewound() && app.tab != Tab::Timeline {
         spans.push(Span::styled(" ⏪ L live ", Style::default().fg(Color::White).bg(Color::Magenta).bold()));
@@ -1627,7 +1653,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn centered(w: u16, h: u16, area: Rect) -> Rect {
+pub(super) fn centered(w: u16, h: u16, area: Rect) -> Rect {
     let w = w.min(area.width);
     let h = h.min(area.height);
     Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h }
@@ -1638,7 +1664,7 @@ mod tests {
     use super::*;
     use crate::model::{ActionKind, ActionRecord, Container, Explanation, Finding};
     use crate::tui::app::tests::{linux_snap, proc, snap};
-    use crate::tui::app::{HostRow, Modal};
+    use crate::tui::app::Modal;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1720,7 +1746,7 @@ mod tests {
     #[test]
     fn fleet_tab_empty_state_and_rows() {
         let mut a = full_app();
-        a.set_fleet(Some(vec![]), Some(vec![]));
+        a.set_fleet(Some(vec![]));
         // Nothing beyond this machine: no Fleet tab at all.
         assert!(!a.fleet_visible());
         a.switch_tab(Tab::Fleet);
@@ -1733,15 +1759,26 @@ mod tests {
         assert_eq!(a.tab, Tab::Fleet);
         let out = render(&mut a, 80, 24);
         assert!(out.contains("6Fleet"), "{out}");
+        assert!(out.contains("contacting 1 remote host"), "{out}");
         a.configured_hosts = 0;
-        a.set_fleet(
-            Some(vec![Container { id: "abc".into(), name: "pg".into(), image: "postgres:16".into(), runtime: "docker".into(), status: "Up 3 hours".into(), cpu: 1.5, mem: 200 << 20, ports: "5432".into() }]),
-            Some(vec![HostRow { name: "devbox".into(), ok: true, cpu: 12.0, mem_used: 1 << 30, mem_total: 8 << 30, procs: 99, ports: 3, error: String::new() }, HostRow { name: "dead".into(), ok: false, error: "ssh: timeout".into(), ..Default::default() }]),
-        );
+        a.set_fleet(Some(vec![Container { id: "abc".into(), name: "pg".into(), image: "postgres:16".into(), runtime: "docker".into(), status: "Up 3 hours".into(), cpu: 1.5, mem: 200 << 20, ports: "5432".into() }]));
         for (w, h) in SIZES {
             let out = render(&mut a, w, h);
             if h >= 24 {
-                assert!(out.contains("pg") && out.contains("devbox") && out.contains("timeout"), "{out}");
+                assert!(out.contains("pg") && out.contains("postgres:16"), "{out}");
+            }
+        }
+        // Remote hosts in the inventory: the fleet health table (both profiles).
+        a.set_fleet_inventory(Ok(2));
+        a.fleet_host(crate::server::FleetHost { name: "devbox".into(), ok: true, health: 90, cpu: 12.0, ..Default::default() });
+        a.fleet_host(crate::server::FleetHost { name: "dead".into(), ok: false, error: Some("ssh: timeout".into()), ..Default::default() });
+        for (w, h) in SIZES {
+            let out = render(&mut a, w, h);
+            if h >= 24 {
+                assert!(out.contains("devbox") && out.contains("✗ down") && out.contains("2 hosts"), "{w}x{h}\n{out}");
+            }
+            if w >= 76 && h >= 24 {
+                assert!(out.contains("timeout"), "{w}x{h}\n{out}");
             }
         }
     }
@@ -1965,7 +2002,7 @@ mod tests {
     #[test]
     fn linux_fleet_counts_container_procs() {
         let mut a = linux_app();
-        a.set_fleet(Some(a.live.as_ref().unwrap().containers.clone()), Some(vec![]));
+        a.set_fleet(Some(a.live.as_ref().unwrap().containers.clone()));
         a.switch_tab(Tab::Fleet);
         let out = render(&mut a, 80, 24);
         assert!(out.contains("db-1") && out.contains("2 procs"), "{out}");

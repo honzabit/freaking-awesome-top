@@ -12,6 +12,7 @@ mod fs;
 mod history;
 mod mcp;
 mod model;
+mod server;
 mod sys;
 mod tui;
 
@@ -35,6 +36,10 @@ enum Cmd {
         /// Max processes to print in text mode.
         #[arg(long, default_value_t = 25)]
         top: usize,
+        /// Serve the recorder's newest sample if fresh, else sample live with services and
+        /// kernel; adds version/profile/volumes metadata (what `fat fleet` polls). [fleet]
+        #[arg(long)]
+        fast: bool,
     },
     /// What's listening, who owns it, is it orphaned.
     Ports {
@@ -63,7 +68,22 @@ enum Cmd {
         question: Vec<String>,
     },
     /// Run the always-on flight recorder (foreground).
-    Record,
+    ///
+    /// The server profile (auto-detected on headless Linux, or `--server`) also records units,
+    /// kernel health and events, and as root writes to /var/lib/fat/history.db. `--export
+    /// prometheus` serves /metrics on 127.0.0.1:9877 (or --listen) from the newest sample.
+    // --- recorder-export ---
+    Record {
+        /// Record units, kernel health and events too (default: when the server profile is detected).
+        #[arg(long)]
+        server: bool,
+        /// Serve the newest sample as metrics. Only "prometheus".
+        #[arg(long, value_name = "FORMAT", value_parser = ["prometheus"])]
+        export: Option<String>,
+        /// Listen address for --export: IP:PORT or a port (default [server] export_listen, loopback).
+        #[arg(long, value_name = "ADDR", requires = "export")]
+        listen: Option<String>,
+    },
     /// Query the recorder: timeline, spikes, or a past snapshot.
     History {
         /// How far back, e.g. 10m, 2h, 1d.
@@ -123,11 +143,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Containers and remote hosts.
-    Fleet {
-        #[arg(long)]
-        json: bool,
-    },
+    /// Fleet: health, findings, events and incidents across hosts over ssh (read-only).
+    Fleet(fleet::cli::FleetArgs),
     /// Disk usage: what eats storage, and what is filling it right now. Read-only.
     ///
     /// `fat fs [PATH]` lists the children of PATH (default "/") by size from the cached
@@ -136,6 +153,56 @@ enum Cmd {
     Fs(FsArgs),
     /// Serve the MCP protocol on stdio (for agents).
     Mcp,
+    // === server mode (contract: src/server/mod.rs). Each agent adds its variants below its
+    // own marker only: services | kernel | doctor-incident | recorder-export | fleet. ===
+    // --- services ---
+    /// Services: systemd units, containers, pods and cgroups with state, restarts, flapping, OOM kills, throttling.
+    Services {
+        /// Only failed or flapping units.
+        #[arg(long)]
+        failed: bool,
+        /// Only one kind: systemd, container, k8s-pod or cgroup.
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    // --- kernel ---
+    /// Kernel health (Linux): steal/iowait, PSI, disk latency, D state, fd/conntrack/port limits, kernel log events.
+    Kernel {
+        /// Kernel log events from this far back (e.g. 15m, 2h, 24h).
+        #[arg(long, default_value = "24h")]
+        since: String,
+        #[arg(long)]
+        json: bool,
+        /// Stream kernel events as they happen (JSON lines with --json) until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+    },
+    // --- doctor-incident ---
+    /// Event timeline: OOM kills, unit failures/restarts, disk latency, exhaustion, kernel errors (recorder, else live + kernel log).
+    Events {
+        /// How far back: a duration (2h, 30m, 1d) or a time (03:00, "2026-11-10 03:00").
+        #[arg(long, default_value = "2h")]
+        since: String,
+        /// Only these kinds (repeatable or comma-separated): oom-kill, unit-failed, unit-restart, disk-latency-spike, ...
+        #[arg(long)]
+        kind: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// What happened and who did it: an incident's causal chain, culprits and next steps.
+    #[command(name = "what-happened")]
+    WhatHappened {
+        /// Moment of interest: 03:12, 03:12:30, "2026-11-10 03:12", RFC 3339, epoch seconds, -2h or "2h ago". Default: the last --window.
+        #[arg(long)]
+        at: Option<String>,
+        /// How much time before --at to examine (e.g. 15m, 1h).
+        #[arg(long, default_value = "15m")]
+        window: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Top-level help groups (clap has no per-subcommand headings, so the list is rendered here
@@ -144,7 +211,8 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ("Everyday", &["snapshot", "ports", "fs", "why", "doctor", "ask"]),
     ("Actions (pause/resume can be undone, renice as root; kill cannot)", &["pause", "resume", "renice", "kill", "undo", "log"]),
     ("Flight recorder", &["record", "history"]),
-    ("Advanced", &["run", "fleet", "mcp"]),
+    ("Advanced", &["run", "mcp"]),
+    ("Server", &["services", "kernel", "events", "what-happened", "fleet"]),
 ];
 
 fn cli_command() -> clap::Command {
@@ -155,7 +223,9 @@ fn cli_command() -> clap::Command {
         groups.push_str(&format!("\n{title}:\n"));
         for n in *names {
             let about = cmd.find_subcommand(n).and_then(|c| c.get_about()).map(|a| a.to_string()).unwrap_or_default();
-            groups.push_str(&format!("  {n:<10}{about}\n"));
+            // Names of 10+ chars ("what-happened") keep two spaces before their text.
+            let name = if n.len() >= 10 { format!("{n}  ") } else { format!("{n:<10}") };
+            groups.push_str(&format!("  {name}{about}\n"));
         }
     }
     groups.push_str("  help      Print help for a command (fat help <command>)\n");
@@ -171,12 +241,27 @@ fn parse_cli() -> Cli {
 /// Two samples 600ms apart (rates need an interval). Containers, when wanted and enabled,
 /// are fetched concurrently because `docker stats` alone can take ~2s.
 fn sample_with(containers: bool) -> Snapshot {
-    let want = containers && config::Config::load().containers;
+    let cfg = config::Config::load();
+    let want = containers && cfg.containers;
     let fetch = want.then(|| std::thread::spawn(fleet::containers));
+    // [integrator] Server profile: units, kernel and events ride along in every live snapshot.
+    // The sampler's first (baseline) pass overlaps the 600 ms rate interval.
+    let mut sampler = (server::Profile::detect(&cfg.server) == server::Profile::Server)
+        .then(|| server::ServerSampler::new(&cfg.server));
+    let fill = |sampler: &mut Option<server::ServerSampler>, s: &mut Snapshot| {
+        if let Some(sm) = sampler.as_mut()
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sm.fill(s))).is_err()
+        {
+            *sampler = None;
+        }
+    };
     let mut c = collect::Collector::new();
-    let _ = c.sample();
-    std::thread::sleep(std::time::Duration::from_millis(600));
+    let started = std::time::Instant::now();
+    let mut first = c.sample();
+    fill(&mut sampler, &mut first);
+    std::thread::sleep(std::time::Duration::from_millis(600).saturating_sub(started.elapsed()));
     let mut s = c.sample();
+    fill(&mut sampler, &mut s);
     if let Some(h) = fetch {
         s.containers = h.join().unwrap_or_default();
     }
@@ -624,9 +709,12 @@ fn main() -> Result<()> {
     let cfg = config::Config::load();
     match cli.cmd {
         None => tui::run(cfg)?,
-        Some(Cmd::Snapshot { json, top }) => {
-            let s = sample_with(json);
-            if json {
+        Some(Cmd::Snapshot { json, top, fast }) => {
+            // [fleet] --fast: recorder sample or live server sample, with fleet metadata.
+            let s = if fast { fleet::cli::fast_snapshot(&cfg) } else { sample_with(json) };
+            if json && fast {
+                println!("{}", serde_json::to_string(&s)?); // compact: this is what fleet polls carry
+            } else if json {
                 print_json(&s)?;
             } else {
                 let sys = &s.system;
@@ -704,6 +792,8 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Doctor { json }) => {
             let mut s = sample();
+            // doctor-incident: server profile adds unit, kernel and event findings.
+            server::rules::fill_for_doctor(&cfg.server, &mut s);
             // Container names for container findings and VM-host advice, fetched only when
             // something runs in a container or hosts them (OrbStack, Docker Desktop, dockerd).
             if cfg.containers && blame::hosts_containers(&s) {
@@ -737,7 +827,15 @@ fn main() -> Result<()> {
                 println!("{}", ask::ask(&q, &s, &f, &cfg.ask));
             }
         }
-        Some(Cmd::Record) => history::record_forever(&cfg)?,
+        // --- recorder-export ---
+        Some(Cmd::Record { server: server_flag, export, listen }) => {
+            let export = match (export, listen) {
+                (Some(_), Some(l)) => Some(server::export::parse_listen(&l)?),
+                (Some(_), None) => Some(server::export::parse_listen(&cfg.server.export_listen)?),
+                (None, _) => None,
+            };
+            history::record_with(&cfg, &server::export::RecordOpts { server: server_flag, export })?
+        }
         Some(Cmd::History { since, at, spikes, json }) => {
             let h = history::History::open(cfg.history_path.as_deref())?;
             let now = model::now_ms();
@@ -838,32 +936,17 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Some(Cmd::Fleet { json }) => {
-            let mut out: Vec<serde_json::Value> = Vec::new();
-            let cs = fleet::containers();
-            for h in &cfg.hosts {
-                match fleet::remote(h) {
-                    Ok(s) => out.push(serde_json::json!({"host": h.name, "ok": true, "cpu": s.system.cpu, "mem_used": s.system.mem_used, "mem_total": s.system.mem_total, "procs": s.procs.len(), "ports": s.ports.len()})),
-                    Err(e) => out.push(serde_json::json!({"host": h.name, "ok": false, "error": e.to_string()})),
-                }
-            }
-            if json {
-                print_json(&serde_json::json!({"containers": cs, "hosts": out}))?;
-            } else {
-                println!("containers: {}", cs.len());
-                for c in &cs {
-                    println!("  {:<24} {:<28} {:>5.1}% {:>8}  {}", c.name, c.image, c.cpu, fmt_bytes(c.mem), c.status);
-                }
-                println!("hosts: {}", out.len());
-                for h in &out {
-                    println!("  {h}");
-                }
-                if cfg.hosts.is_empty() {
-                    println!("  (add [[hosts]] to {})", config::Config::path().display());
-                }
-            }
-        }
+        // [fleet] inventory, parallel read-only polls, findings across hosts.
+        Some(Cmd::Fleet(a)) => fleet::cli::run(a, &cfg)?,
         Some(Cmd::Mcp) => mcp::serve()?,
+        // === server mode dispatch: one arm per variant, each under its owner's marker. ===
+        // --- services ---
+        Some(Cmd::Services { failed, kind, json }) => server::services::cli(&cfg.server, failed, kind.as_deref(), json)?,
+        // --- kernel ---
+        Some(Cmd::Kernel { since, json, watch }) => server::kernel::run_cli(&cfg, &since, json, watch)?,
+        // --- doctor-incident ---
+        Some(Cmd::Events { since, kind, json }) => server::incident::cli_events(&cfg, &since, &kind, json)?,
+        Some(Cmd::WhatHappened { at, window, json }) => server::incident::cli_what_happened(&cfg, at.as_deref(), &window, json)?,
         Some(Cmd::Fs(a)) => run_fs(a, &cfg)?,
     }
     Ok(())

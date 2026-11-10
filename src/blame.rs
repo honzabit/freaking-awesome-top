@@ -287,6 +287,10 @@ pub fn diagnose(snap: &Snapshot, hist: Option<&History>) -> Vec<Finding> {
         rule_dstate(snap, os, hist, now, &mut out);
     }
     rule_containers(snap, &mut out);
+    // Server profile: units, kernel health and recent events (doctor-incident).
+    if !snap.units.is_empty() || snap.kernel.is_some() {
+        out.extend(crate::server::rules::diagnose_server(snap, hist));
+    }
 
     out.sort_by_key(|f| std::cmp::Reverse(severity_rank(&f.severity)));
     out
@@ -1351,6 +1355,68 @@ const LINUX_CRITICAL: &[&str] = &[
     "gdm-session-worker", "sddm", "lightdm", "NetworkManager", "wpa_supplicant", "containerd", "dockerd", "kubelet",
     "pipewire", "wireplumber", "udisksd", "accounts-daemon", "agetty",
 ];
+
+/// Databases: never suggest pausing or killing them, on any OS; suggest investigating.
+const DATABASES: &[&str] = &[
+    "postgres", "postmaster", "mysqld", "mariadbd", "mongod", "mongos", "redis-server", "valkey-server", "keydb-server",
+    "clickhouse-server", "clickhouse", "etcd", "memcached", "influxd", "cockroach", "sqlservr", "fdbserver", "scylla",
+    "couchdb", "rethinkdb", "tarantool", "dragonfly",
+];
+
+/// Server plumbing (Linux) whose loss cuts off access or other services: the logger, device
+/// manager, message bus, time sync, audit, storage daemons and VM guest agents. systemd-* is
+/// matched by prefix; the sshd *listener* is matched separately (its per-connection children
+/// are sessions).
+const SERVER_PLUMBING: &[(&str, &str)] = &[
+    ("rsyslogd", "system logger"), ("syslog-ng", "system logger"), ("journald", "system logger"),
+    ("udevd", "device manager"), ("dbus-daemon", "message bus"), ("dbus-broker", "message bus"),
+    ("dbus-broker-launch", "message bus"), ("chronyd", "time sync daemon"), ("ntpd", "time sync daemon"),
+    ("auditd", "audit daemon"), ("multipathd", "storage multipath daemon"), ("iscsid", "iSCSI daemon"),
+    ("lvmetad", "LVM daemon"), ("dmeventd", "device-mapper event daemon"),
+    ("amazon-ssm-agent", "VM guest agent"), ("ssm-agent-worker", "VM guest agent"), ("google_guest_agent", "VM guest agent"),
+    ("google_osconfig_agent", "VM guest agent"), ("waagent", "VM guest agent"), ("qemu-ga", "VM guest agent"),
+    ("vmtoolsd", "VM guest agent"), ("hv_kvp_daemon", "VM guest agent"), ("oracle-cloud-agent", "VM guest agent"),
+];
+
+/// A database or server-plumbing process: (description). Databases on every OS; plumbing on
+/// Linux only. Hubs check this so the hard gate refuses pause/kill (MCP) and advice says
+/// "investigate" instead.
+fn protected_service(p: &Proc, os: Os) -> Option<&'static str> {
+    if name_in(DATABASES, &p.name) || p.name.starts_with("ora_pmon") {
+        return Some("database");
+    }
+    if os != Os::Linux {
+        return None;
+    }
+    let n = p.name.as_str();
+    if n == "sshd" && !["@", "[priv]", "[net]", "[accepted]", "[preauth]"].iter().any(|m| p.cmd.contains(m)) {
+        return Some("SSH daemon (remote access to this host)");
+    }
+    if n.starts_with("systemd-") {
+        return Some("systemd system service");
+    }
+    SERVER_PLUMBING.iter().find(|(k, _)| name_in(&[k], n)).map(|(_, w)| *w)
+}
+
+/// Unit/package names of databases whose process name differs ("postgresql@16-main.service"
+/// runs `postgres`, "mysql.service" runs `mysqld`).
+const DATABASE_UNITS: &[&str] = &[
+    "postgresql", "mysql", "mariadb", "mongodb", "redis", "valkey", "keydb", "elasticsearch", "opensearch", "cassandra",
+    "scylla-server", "influxdb", "couchdb", "clickhouse-server", "etcd", "memcached", "cockroach", "mssql-server",
+];
+/// Unit names of server plumbing whose process name differs.
+const PLUMBING_UNITS: &[&str] = &["ssh", "sshd", "dbus", "dbus-broker", "rsyslog", "syslog-ng", "chrony", "chronyd", "ntp", "ntpd", "auditd", "containerd", "docker", "kubelet", "crio"];
+
+/// True for a database or server-plumbing process or unit name ("postgres",
+/// "postgresql@16-main.service", "ssh.service", "systemd-journald"): incident and unit advice
+/// says "investigate", never "restart"/"kill".
+pub fn is_protected_server_name(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let base = [".service", ".scope", ".socket"].iter().fold(base, |b, s| b.strip_suffix(s).unwrap_or(b));
+    let base = base.split('@').next().unwrap_or(base);
+    let p = Proc { name: base.to_string(), ..Default::default() };
+    protected_service(&p, Os::Linux).is_some() || name_in(DATABASE_UNITS, base) || name_in(PLUMBING_UNITS, base)
+}
 
 fn name_in(list: &[&str], name: &str) -> bool {
     list.iter().any(|full| {
@@ -2794,6 +2860,7 @@ mod tests {
             procs,
             ports: vec![],
             containers: vec![],
+            ..Default::default()
         }
     }
 

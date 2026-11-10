@@ -49,10 +49,16 @@ fat record                  # foreground; see "Run the flight recorder always-on
 fat history --since 1h      # timeline (avg cpu/mem/power, top process per bucket)
 fat history --since 1h --spikes
 fat history --at 10m        # the machine as it was 10 minutes ago
+fat services [--failed] [--kind systemd|container|k8s-pod|cgroup] [--json]   # services: state, restarts, flapping, OOM kills, throttling
+fat events [--since 2h] [--kind oom-kill,unit-failed]... [--json]   # what happened, in order
+fat what-happened [--at 03:12] [--window 15m] [--json]         # the incident: causal chain, who did it, next steps
 
 # Advanced
 fat run --cpu 150 --mem 2G --time 10m --procs 64 --on-violation pause|kill|warn -- <cmd...>
-fat fleet [--json]          # containers + ssh hosts
+fat fleet [--group G] [--tag T] [--host GLOB] [--sort health|cpu|mem|disk] [--json]   # every host's health, findings across hosts
+fat fleet doctor | events --since 2h | hosts | containers
+fat fleet --host db-01 what-happened --at 03:12           # one host's incident, read-only
+fat fleet exec-readonly kernel --json                     # one allowlisted read-only fat command everywhere
 fat mcp                     # MCP server on stdio
 ```
 
@@ -60,7 +66,7 @@ fat mcp                     # MCP server on stdio
 
 | Key | Action |
 | --- | --- |
-| `1`–`5`, `Tab` | views: Procs · Ports · Fs · Timeline · Doctor (`6` Fleet appears only when containers run or `[[hosts]]` are configured) |
+| `1`–`5`, `Tab` | views: Procs · Ports · Fs · Timeline · Doctor (`6` Fleet appears only when containers run or hosts are configured). The server profile numbers them Services · Procs · Events · Ports · Fs · Timeline · Doctor · Fleet (`1`–`8`) |
 | `↑↓ PgUp PgDn g G` | move |
 | `c m p n d i N` | sort by cpu · mem · power · net · disk · pid · name (press again to reverse) |
 | `t` | process tree |
@@ -82,6 +88,46 @@ In the **Fs** tab: `⏎` / `→` / `l` opens a directory, `←` / `Backspace` go
 io · name · files · age), `g` toggles the growth view, `w` (or `+`/`-`) cycles the window (10m · 1h · 24h), `b` lists the
 biggest entries below here, `r` rescans this directory, `/` filters, and `⏎` on a writer row explains that process.
 `h` stays help and `L` stays "back to live", as in every other view.
+
+#### Server profile in the TUI
+
+On a server (see "Servers" below for how the profile is chosen) the TUI opens on **Services** and the header shows
+what matters at 3am instead of laptop gauges: CPU with steal (`st`), iowait (`wa`) and irq shares plus the run and
+blocked queues (`R` / `D`: a high load with an idle CPU is usually `D`), memory with MemAvailable, PSI some/full and
+swap traffic, then OOM kills (last 24h from the recorder, or this session), failed / flapping units, fd, conntrack and
+ephemeral-port use, the worst disk await, and read-only remounts, degraded RAID or an unsynced clock when present.
+Colours follow `[server] exhaustion_warn` and `disk_await_warn_ms`, not built-in numbers.
+
+**Services** lists systemd units, containers (any runtime), pods and plain cgroups as rows: state, CPU, memory and its
+limit, I/O, restarts (recent / total), CPU throttling, processes. Failed units come first (`✗`, red), then flapping
+ones (`⟳`), then units in transition; inactive units are hidden until `i` (the title says how many). `⏎` explains the
+unit: what it is (cgroup, main pid, container image / pod), its resources against its limits, its processes, its
+recent events, and read-only commands to look closer (`journalctl -u …`, `<runtime> logs …`, `kubectl describe pod …`,
+chosen from what was detected). `w` explains the unit's main process, `W` asks what happened in the last 15 minutes.
+
+| Key (Services) | Action |
+| --- | --- |
+| `s c m d r N` | sort by state (problems first) · cpu · mem · io · restarts · name (again reverses) |
+| `t` · `f` · `i` | group by kind · problems only · show inactive units |
+| `/` | filter by name, description, state, kind, runtime, image, pod or cgroup |
+
+**Events** is the incident timeline: OOM kills, failed / restarting / flapping units, deploy bursts, disk latency
+spikes and errors, filling or read-only filesystems, hung tasks and kernel warnings, throttling, pressure spikes,
+exhaustion of fds / conntrack / ports / memory limits, clock problems. It merges the recorder's events (when
+`fat record --server` runs) with the ones this session saw. `⏎` on an event asks the incident engine what happened
+around it and shows the chain from symptom to cause, who is to blame, the evidence, read-only next steps and which
+data was missing. `f` cycles the minimum severity, `+`/`-` the window (15m · 1h · 6h · 24h · 7d), `W` explains
+the last 15 minutes (or the rewind moment), `/` filters.
+
+**Fleet** (any profile, as soon as the inventory has hosts: `[[hosts]]`, `[fleet] hosts_file`, or ssh config
+entries when enabled) is a health table of every host. Polls run only while the tab is on screen, every
+`[fleet] tui_refresh_s` seconds after the previous one ends (`r` polls now), never two at once, with at most
+`[fleet] concurrency` ssh sessions; rows stream in as hosts answer. Sort with `H` health (worst first, unreachable
+hosts lowest) · `c` cpu · `m` mem · `d` disk · `f` findings · `n` name · `l` latency, filter with `/` (name,
+group, tag, finding, error). `→` moves to the fleet findings panel (findings grouped across hosts, worst first);
+`⏎` there narrows the table to the affected hosts. `⏎` on a host drills into its snapshot, fetched read-only with
+the same allowlisted `fat snapshot` call (`d` doctor · `u` units · `p` procs, `r` refresh, `Esc` back). Nothing in
+the Fleet tab can act on a remote host.
 
 While you are rewinding, every view shows a big `⏪ REWIND hh:mm:ss` badge, and actions are refused because they would hit processes from the past.
 In the Doctor view, `Enter` runs a finding's suggested action after you confirm it.
@@ -170,8 +216,166 @@ loginctl enable-linger "$USER"   # keep recording while you are logged out, and 
   `systemctl --user daemon-reload` (and `loginctl disable-linger "$USER"` if you enabled it only for this). The
   history stays in `~/.local/share/fat/history.db`.
 
-For a whole-machine recorder that sees every user's io and power, run the same unit as a system service
-(`/etc/systemd/system/`, `ExecStart=/usr/local/bin/fat record`) as root.
+<!-- recorder-export -->
+### Servers: system-wide recorder with Prometheus export (Linux)
+
+On a server, run the recorder once for the whole machine, as a system service. In the **server profile** it
+records more than processes:
+
+- every unit: systemd services, containers from any runtime, Kubernetes pods, and plain cgroups.
+  Each unit's state, restarts, CPU, memory and its limit, I/O, CPU throttling, PSI and OOM kills are recorded.
+- kernel health: steal, iowait, PSI, disk latency, D-state processes, and fd, conntrack and ephemeral-port use.
+- an **event log**: OOM kills with victim and cgroup, unit failures, restarts and flapping, kernel warnings, hung
+  tasks, disk errors, read-only remounts, throttling, pressure, exhaustion, and per-unit CPU or memory spikes. A
+  volume about to fill is logged too. On start the recorder imports the kernel log backlog, so OOM kills from
+  before the daemon started are on the timeline.
+
+fat picks the server profile by itself on a Linux host with no graphical session and no battery. To choose it
+yourself, pass `--server`, set `[server] profile = "server"`, or set `FAT_PROFILE=server`.
+
+When the recorder runs as root in the server profile it writes to `/var/lib/fat/history.db`. If that file exists,
+every user's `fat` reads it: `fat history`, `fat events`, `fat what-happened`, the TUI, and `fat snapshot --fast`.
+`fat snapshot --fast` opens it read-only and returns the newest sample, so a fleet poll costs one SQLite read
+instead of a live sample. Readers need read access to the database and its `-wal`/`-shm` files. They are
+world-readable by default (umask 022). Process command lines in them are already visible in `/proc` to every user
+unless `/proc` is mounted with `hidepid`; on such hosts set `UMask=0077` in the unit and read as root.
+
+Save this as `/etc/systemd/system/fat-record.service` (adjust the `ExecStart` path):
+
+```ini
+[Unit]
+Description=fat flight recorder (server profile)
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/fat record --server --export prometheus
+# Optional config (e.g. [server] record_interval_ms); without it the defaults apply.
+Environment=XDG_CONFIG_HOME=/etc
+# Creates /var/lib/fat (the only writable path below).
+StateDirectory=fat
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+Restart=on-failure
+RestartSec=10
+# Hardening: read-only system, no privilege gain, only the capabilities fat reads with.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SYSLOG
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# Safety net, well above the measured footprint below.
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now fat-record
+curl -s 127.0.0.1:9877/metrics | head     # if you kept --export
+```
+
+Why each capability is kept (fat never signals anything from the recorder, so it needs only read access):
+
+| Capability | What it reads | Without it |
+|---|---|---|
+| `CAP_SYS_PTRACE` | passes the kernel's ptrace access check on `/proc/<pid>/{io,fd,exe,cwd}` of other users' processes: per-process disk I/O, executable and cwd, and which process owns a port | those fields only for root's own processes |
+| `CAP_DAC_READ_SEARCH` | files owned by other users without read permission for others, such as `/proc/<pid>/io` (mode 0400, owned by the process's user) and container runtime state | the same fields stay empty (it is needed together with `CAP_SYS_PTRACE` for `/proc/<pid>/io`) |
+| `CAP_SYSLOG` | `/dev/kmsg` when `kernel.dmesg_restrict=1`: OOM kills (victim, cgroup, RSS), hung tasks, I/O and filesystem errors | no kernel-log events; OOM kills are still counted from `/proc/vmstat`, without a victim |
+
+Some hardening options are left out on purpose. `ProtectKernelLogs` and `PrivateDevices` hide `/dev/kmsg`.
+`ProtectClock` blocks the read-only `adjtimex` call that tells whether the clock is synchronised.
+`IOSchedulingClass=idle` and `Nice=19` would starve the recorder during exactly the I/O or CPU storm you want
+recorded.
+
+**Prometheus export.** `--export prometheus` serves `GET /metrics` (text format 0.0.4) from the recorder's newest
+in-memory sample. It binds `127.0.0.1:9877`. Use `--listen ADDR` or `[server] export_listen` to change that, or
+`[server] export_enabled = true` to serve without the flag. A non-loopback address prints a warning: the metrics
+name units, disks and mounts, so exposing them is your decision, behind your own firewall. The server is one
+thread on `std::net`, one request at a time, with 5 s timeouts. It is not TLS; put a proxy in front if you need TLS.
+
+Metrics, all prefixed `fat_`:
+
+- host: `up`, `info{version,profile}`, `cpu_percent`, `cpu_steal_percent`, `cpu_iowait_percent`, `load{period}`,
+  `memory_{total,used,available}_bytes`, `swap_used_bytes`, `pressure_percent{resource,kind}`
+- kernel: `oom_kills_total`, `procs_blocked`, `dstate_procs`, `fd_{used,max}`, `conntrack_{used,max}`,
+  `ephemeral_ports_used`, `ephemeral_ports_range_size`, `tcp_retrans_per_second`, `listen_drops_per_second`
+- disks and volumes: `disk_util_percent{disk}`, `disk_await_ms{disk,op}`, `disk_queue_depth{disk}`,
+  `volume_used_ratio{mount}`
+- per unit, labels `{unit,kind}`: `unit_up`, `unit_cpu_percent`, `unit_memory_bytes`, `unit_memory_limit_bytes`,
+  `unit_io_bytes_per_second{op}`, `unit_restarts_total`, `unit_cpu_throttled_percent`,
+  `unit_pressure_percent{resource}`, `unit_oom_kills_total`
+- also `units{kind,state}`, `findings{severity}` (current `fat doctor` findings), and `events_total{kind}`
+  (events since the recorder started)
+
+Label cardinality is bounded. Units are capped by `[server] max_units`. There is no pid or command-line label.
+Disk and mount labels are the host's own.
+
+```yaml
+# prometheus.yml (a Prometheus on the same host; for a remote one, --listen on an internal address)
+scrape_configs:
+  - job_name: fat
+    static_configs:
+      - targets: ["127.0.0.1:9877"]
+```
+
+**Footprint and bounds.** The server profile samples every `[server] record_interval_ms` (default 5000).
+Directory scanning is off unless `[server] fs_scan = true`; volumes are still recorded. Cardinality per sample is
+bounded:
+
+- processes: the existing interesting-process selection plus the top `record_top_procs` (default 50) by CPU,
+  memory and I/O and every unit's main pid; at most 200, or 3 x `record_top_procs` when that is larger. Not
+  every pid.
+- units: at most `max_units`, inactive ones dropped first. Units are change-point encoded: a row when state or
+  numbers move, and every unit every 15 minutes.
+- events: at most `max_events_per_sample`. Repeats of a persisting condition for the same subject are recorded at
+  most once per `spike_cooldown_s`.
+- disks: a row only while busy.
+
+Measured with the unit above on a systemd test host with about 200 units (including one CPU-throttled unit and
+two units that crash and restart every 20 s) and 125 processes:
+
+| | measured | budget |
+|---|---|---|
+| CPU, 5-minute average | 0.66% of one core | < 1% |
+| memory | 11 MiB RSS, 13 MiB peak | < 60 MB |
+| disk, whole database | 15.5 MB/day, about 45 MB for the default 3 days | bounded by `history_days` |
+| `fat snapshot --json --fast`, as a non-root user | 12 ms (28 ms cold), against about 760 ms for a live sample | |
+| one `/metrics` scrape | about 5 ms | |
+
+The disk is split roughly like this: units 26%, events 23% (almost all from the two restarting units), kernel and
+disks 10%, processes, system and volumes 41%. A quiet host writes less. A host with many restarting units writes
+more, within `max_events_per_sample`. Most of the CPU left is the periodic systemd refresh; on hosts with thousands
+of units, raise `[server] unit_refresh_s`.
+
+| `[server]` key | default | meaning |
+|---|---|---|
+| `record_interval_ms` | 5000 | server-profile sample interval |
+| `max_units` | 2000 | units sampled, recorded and exported per sample |
+| `max_events_per_sample` | 100 | events kept per sample; the rest are summarised in one `other` event |
+| `spike_cooldown_s` | 300 | minimum gap between repeats of a level event (throttle, pressure, spikes...) per subject |
+| `spike_cpu_pct` | 25 | unit CPU spike: rise above its 1-minute median, in % of host capacity (at least half a core) |
+| `spike_mem_pct` | 10 | unit memory spike: growth within a minute, in % of host RAM |
+| `fs_fill_eta_s` | 21600 | `fs_fill` when a volume is projected full sooner than this (crit below a sixth of it, or above 95% used) |
+| `fs_scan` | false | run the directory scanner in the server recorder |
+| `export_listen` / `export_enabled` | `127.0.0.1:9877` / false | Prometheus export |
+
+Set `FAT_RECORD_PROFILE=1` to make the recorder print the average time per phase every 60 samples, for sizing it on
+a new kind of host.
+<!-- /recorder-export -->
 
 Only one fat records at a time: a TUI opened while the service runs reads the service's history instead of writing
 its own, and a second `fat record` waits until the first stops.
@@ -241,9 +445,14 @@ model   = "claude-opus-5-5"
 allow_actions = []         # side-effect tools agents may use: "pause", "resume", "renice", "kill", "undo", or "all"
 
 [[hosts]]
-name     = "devbox"
-ssh      = "me@devbox.local"   # defaults to name; uses BatchMode, 3s connect timeout
-fat_path = "~/.cargo/bin/fat"  # defaults to "fat"
+name     = "web-01"
+ssh      = "admin@web-01.example.com"   # defaults to name; passed to ssh verbatim
+fat_path = "/usr/local/bin/fat"         # default: fat on PATH, then the usual install dirs
+groups   = ["web"]
+tags     = ["prod"]
+
+[fleet]                    # see "Fleets" below; every key is optional
+# hosts_file = "~/fleet.txt"
 ```
 
 ## Everything else it does
@@ -356,6 +565,26 @@ kernel's own accounting. fat reads procfs and sysfs directly. A sample of about 
 container's network namespace; versus 2–19 ms for the `ss` it replaced). The only child processes
 are the container CLIs (cached), and `ss` only if netlink is unavailable.
 
+### Target environments
+
+Server mode assumes as little as possible about the host. Every source below is optional: when it is missing,
+the matching fields stay empty and a note says why (often "needs root"); nothing fails.
+
+- **Distribution and kernel:** any Linux distribution and any kernel version still in common use. Features that
+  newer kernels add (PSI, cgroup v2, `memory.peak`) are used when present.
+- **Init:** systemd is used when it is PID 1. Other inits and minimal containers work too: the cgroups that hold
+  processes become the units.
+- **Containers:** docker, containerd, CRI-O, podman and Kubernetes pods are recognised from the cgroup tree when
+  present. None is required.
+- **CPU architecture:** any target Rust supports. `scripts/build-static.sh` builds a static binary to copy to hosts.
+- **Privileges:** root is optional. Without it, other users' process details, the kernel log and some
+  per-cgroup files may be unreadable, and the output says so.
+- **Fleets:** fat runs your `ssh` with your ssh config. It adds no network topology of its own.
+- **Overhead budget for the always-on recorder:** under 1% of one core on average, under 60 MB RSS, and disk
+  bounded by `history_days` (measured numbers are in the recorder section). Every limit is a config value.
+
+macOS keeps the desktop profile and behaves as before.
+
 ### What you get on Linux
 
 - **PSI (pressure stall information).** The header shows `PSI cpu▂3 mem▁0 io▅12`: the share of the last 10
@@ -425,6 +654,112 @@ are the container CLIs (cached), and `ss` only if netlink is unavailable.
 On a kernel without PSI, RAPL, hwmon or a battery (many VMs and containers), those fields are simply absent.
 The header leaves them out and nothing errors.
 
+<!-- services -->
+### Services (`fat services`)
+
+```sh
+fat services                       # every unit: systemd services and scopes, containers, pods, plain cgroups
+fat services --failed              # failed or flapping only
+fat services --kind container --json
+```
+
+Services are the unit of thought on a server, not pids. Every unit gets a state normalised to systemd's words
+(active, activating, deactivating, reloading, inactive, failed), the runtime's own sub-state, systemd's result
+(exit-code, signal, oom-kill, start-limit-hit...) and exit code, lifetime restarts, restarts within
+`flap_window_s` and a `flapping` flag. Each unit also gets cgroup totals for all its processes: CPU, memory and its
+limit and peak, OOM kills, the share of CPU periods it was throttled by its own `cpu.max`, its CPU quota, io bytes/s and
+its own PSI. Failed and flapping units sort first. The MCP tool `services` returns the same data, plus the
+transitions seen since the previous call.
+
+Sources, each optional:
+
+- cgroup v2 files, read every sample. cgroup v1 hosts give memory, CPU and pids best effort, with no per-unit io or PSI.
+- systemd, when it is PID 1. One `systemctl list-units` runs every `unit_refresh_s`. After it, one batched
+  `systemctl show` reads only the units whose state, sub-state or main pid changed. Every `unit_full_refresh_s` it
+  reads every unit that is not inactive.
+- Containers of any runtime (docker, podman, containerd, CRI-O), found from their cgroups. Names, images, restart
+  counts and Kubernetes pod and namespace come from the runtime's own state files, which need root. Without them the
+  short id is the name, and a note says so.
+- Without systemd (other inits, minimal containers), the cgroups that hold processes are the units.
+
+Events are created on transitions:
+
+- `unit_start`, `unit_stop` and `unit_failed` (crit for oom-kill, start-limit-hit, core-dump and watchdog).
+- `unit_restart`, from the restart counter, or for a container that comes back after it went away. While a unit
+  keeps flapping, its restarts are summed into one event per `spike_cooldown_s` (the event's value is the count),
+  so a restart loop does not flood the recorder.
+- `unit_flapping`, once, when `flap_restarts` restarts land within `flap_window_s`.
+- `oom_kill`, from the cgroup's `memory.events`, or from systemd's `Result=oom-kill` when the cgroup died between
+  samples.
+- `throttle`, when a unit is throttled in `throttle_warn_pct` of its CPU periods.
+- `exhaustion`, at `exhaustion_warn` of `memory.max`, not counting reclaimable page cache, or of `pids.max`.
+- `deploy_burst`, when `burst_procs` new processes appear in one unit within one sample.
+
+Level events re-arm only after the value drops well below the threshold. Session scopes do not produce start or stop
+events. At most `max_units` units are kept, and inactive units are dropped first.
+
+| `[server]` key | default | meaning |
+|---|---|---|
+| `unit_refresh_s` | 10 | list units, walk the cgroup tree and re-read limits this often |
+| `unit_full_refresh_s` | 300 | re-read every non-inactive unit's systemd properties this often |
+| `flap_restarts`, `flap_window_s` | 3, 600 | a unit with at least this many restarts within this window is flapping |
+| `throttle_warn_pct` | 25 | share of CPU periods throttled that raises a `throttle` event |
+| `exhaustion_warn` | 0.85 | share of `memory.max` or `pids.max` that raises an `exhaustion` event |
+| `burst_procs` | 20 | number of new processes in one unit within one sample that raises a `deploy_burst` event |
+| `max_units` | 2000 | upper bound on units per sample |
+
+Measured cost, release build, 5 s samples, on an aarch64 VM with about 200 units (133 active): 2–7 ms per sample,
+plus 5–14 ms of `systemctl` every `unit_refresh_s`. That averages 0.28% of one core, and systemd itself adds about
+0.07%. A full pass costs systemd and systemctl together about 1.7 ms per unit. On a host without systemd running 7
+containers, a sample costs 0.5–2 ms (0.02% of a core).
+
+<!-- kernel -->
+### Kernel health and kernel events (`fat kernel`)
+
+```sh
+fat kernel                  # 1 s sample + kernel log events of the last 24h
+fat kernel --since 2h --json
+fat kernel --watch [--json] # stream kernel events as they happen (Ctrl-C to stop)
+```
+
+It answers the classic "load is high but the CPU is idle" questions. Steal, iowait, irq and softirq come from
+`/proc/stat`, and `procs_blocked` too. For processes in D state you get the kernel function they wait in and their
+unit. PSI is reported as some and full, and each whole disk gets util %, read/write await, queue depth and iops.
+Swap rates come from `/proc/vmstat`. File handles, conntrack entries and ephemeral ports are shown against their
+limits. For ports, the count is the larger of distinct local ports and the connections to the busiest remote endpoint
+from one local address. You also get TCP retransmits, listen overflows and drops, mounts that went read-only, ext4
+error counters, degraded md arrays, kernel taint and clock sync. Clock sync uses adjtimex, with the same rule as
+systemd: a maximum error under 16 s. The MCP tool `kernel` returns the same report.
+
+Kernel log lines become events:
+
+- `oom_kill`, with the victim pid and name, its rss, the constraint, the cgroup whose limit was hit, its unit and the
+  invoking task.
+- `hung_task`.
+- `disk_error` (I/O, ext4, xfs, btrfs, nvme, ata errors).
+- `ro_remount`.
+- `exhaustion` (conntrack table full, file-max, SYN backlog, neighbour table, pids controller).
+- `kernel_warn` (lockups, oopses, WARN, segfaults and traps, machine checks).
+- NIC link up/down.
+
+fat reads the kernel log from `/dev/kmsg`. That needs root or `kernel.dmesg_restrict=0`. Without it, fat tries
+`journalctl -k`, which needs read access to the system journal and runs at most every `unit_refresh_s`. Without either,
+a note says so, and OOM kills are still counted from `/proc/vmstat`, but without a victim.
+
+Events are edge-triggered: one event when a condition starts, and re-armed once it falls below half the threshold.
+Identical kernel-log lines within one sample are collapsed into one event with a `repeats` count. Measured cost: 0.25–1 ms
+per sample on an aarch64 VM with a 7.2 kernel. The TCP socket table is rescanned at most every
+`unit_refresh_s`, and a 100k-socket table scans in 9–34 ms.
+
+| `[server]` key | default | meaning |
+|---|---|---|
+| `kmsg` | true | read the kernel log |
+| `dstate_min_s` | 5 | report D-state processes blocked at least this long (`hung_task` event once per episode) |
+| `disk_await_warn_ms` | 100 | `disk_latency_spike` when a busy disk's read or write await exceeds this |
+| `exhaustion_warn` | 0.85 | `exhaustion` when fds, conntrack or ephemeral ports reach this fraction of their limit |
+| `pressure_full_warn` | 10 | `pressure_spike` when PSI `full` avg10 for cpu, memory or io reaches this % |
+<!-- /kernel -->
+
 ### Root vs non-root
 
 fat never needs root on Linux. As a normal user:
@@ -474,6 +809,185 @@ In Kubernetes the equivalent is a DaemonSet with `hostPID: true` and `hostNetwor
 ### Keep the flight recorder running
 
 See [Run the flight recorder always-on](#run-the-flight-recorder-always-on-optional) (systemd user unit).
+
+### What happened at 03:12, and who did it?
+
+`fat what-happened --at 03:12` (or the MCP tool `what_happened`) picks the most important event near that time and
+explains it as a chain from symptom to cause, with the numbers behind each step, the culprits, a confidence level and
+read-only next steps (fat never runs them). Without `--at` it explains the last `--window` (default 15m). It reads
+the flight recorder (`fat record --server`); without one it uses the current state plus the kernel log and lists
+what it could not know under "Gaps". `fat events` prints the raw timeline.
+
+| incident | what the chain shows |
+| --- | --- |
+| OOM kill | the victim and its unit; a cgroup limit (`memory.max`) or the whole host out of memory; which unit held the most memory just before and how fast it grew; what started shortly before |
+| restart loop, failed unit | restarts in the window, result and exit status, OOM kills inside it, a package update, deploy burst, scheduled job or backup just before the first failure |
+| disk latency, load high but CPU idle | the device's await before and at the peak, queue and util, processes in D state and the kernel function they wait in, iowait and steal, the unit whose I/O rose and the job that started it |
+| disk filling | growth rate and time to full, the writers whose command line points at that mount, grouped |
+| fd, conntrack or ephemeral-port exhaustion | usage against the limit over time, what started as it grew, the commands that show who holds them |
+| noisy neighbour | a unit throttled by its own `cpu.max` (quota too small or bursty) versus another unit whose CPU or memory rose at the same time; per-unit PSI |
+| read-only remount, I/O or fs errors, degraded RAID | the kernel's messages around it (crit) |
+
+Advice is unit-oriented: `journalctl -u <unit>`, `systemctl status`, `docker|podman logs`, `kubectl describe pod`.
+Databases (postgres, mysqld, mongod, redis-server, clickhouse, ...) and server plumbing (the sshd listener,
+systemd-*, the logger, the message bus, time sync, VM guest agents, container runtimes) are never offered for
+pause or kill, not even to an MCP agent; for a database the advice is to investigate its workload.
+
+`fat doctor` in the server profile adds findings for failed units, restart loops, units near `memory.max` or
+throttled by `cpu.max`, load high with idle CPU, slow disks, fd/conntrack/port exhaustion, accept-queue drops,
+swap thrashing, read-only remounts, filesystem and I/O errors, degraded RAID, an unsynchronised clock, a tainted
+kernel, and OOM kills, restarts and hung tasks in the last 24 hours. Thresholds an operator may want to change
+(`disk_await_warn_ms`, `exhaustion_warn`, `flap_restarts`, `flap_window_s`) live in `[server]`.
+
+## Fleets: one host to thousands, over ssh
+
+`fat fleet` asks every host for one snapshot over ssh, in parallel, read-only, and summarises the fleet: a
+health score per host (worst first), findings aggregated by title across hosts, hosts that could not be polled
+grouped by reason, and outliers that are far from their group's median.
+
+```sh
+fat fleet                                   # summary: findings across hosts, outliers, host table
+fat fleet --group web --sort cpu --top 20   # a group, busiest first, 20 rows
+fat fleet doctor --json                     # findings per host
+fat fleet events --since 2h --kind oom_kill --kind unit_failed   # merged timeline, needs `fat record --server`
+fat fleet --host db-01 what-happened --at 03:12 --window 30m     # "what happened and who did it", on one host
+fat fleet hosts                             # the inventory, no network
+```
+
+```
+fleet: 120 hosts · 118 ok · 2 not polled · 2.1s (concurrency 64)
+
+findings across hosts:
+  CRIT  Disk /var is #% full: 3 hosts [web-07, web-12, db-02]
+  warn  not polled: auth: 1 host [cache-03]
+  warn  postgres is writing #M/s: 2 hosts [db-01, db-02]
+
+outliers (far from their group's median):
+  web-07               mem_pct                94  (group web median 41, z 6.2)
+```
+
+**Inventory.** Hosts come from `[[hosts]]` in the config, an optional hosts file, and (opt-in) the `Host` aliases
+of `~/.ssh/config`. They are merged by name; groups and tags select them (`--group` any of, `--tag` all of,
+`--host`/`--exclude` globs). A hosts file has one host per line:
+
+```
+# name   [ssh=DEST]                 [fat=PATH]            [groups=a,b]   [tags=x,y]
+web-01   ssh=admin@web-01.example.com                      groups=web     tags=prod
+db-01                               fat=/opt/fat/bin/fat  groups=db
+```
+
+**ssh.** fat runs your `ssh` and leaves everything about reaching a host (users, ports, keys, jump hosts, proxies,
+certificates) to your ssh config: the destination is passed verbatim and fat adds no proxy or routing options of
+its own. It adds `BatchMode=yes` (never prompts), `ConnectTimeout`, connection sharing (`ControlMaster=auto`,
+socket in `$XDG_RUNTIME_DIR/fat/ssh` or `~/.cache/fat/ssh`, `ControlPersist`) and `-C`; all of these are
+configurable, and `ssh_options` you set take precedence. The remote command is `fat snapshot --json --fast`:
+one SQLite read when the host runs the recorder, a ~0.6 s live sample otherwise. Older remote fats without
+`--fast` get a plain `fat snapshot --json`. Findings are computed locally, so every host gets this fat's rules.
+
+**Errors are structured**: `unreachable`, `auth`, `host-key`, `fat-missing`, `version`, `timeout`, `too-large`,
+`bad-output`, `remote-error`, each with a hint. fat never accepts host keys for you.
+
+**Read-only.** The fleet runs only `snapshot`, `doctor`, `why`, `ports`, `services`, `kernel`, `events`,
+`what-happened`, `history` and `fs` on remote hosts. There are no fleet-wide actions. One reversible action on
+one host is possible, and needs three separate opt-ins:
+
+```sh
+fat fleet --host web-01 act --allow-actions pause 4242 --name backup-job
+```
+
+It talks to that host's `fat mcp`, so the host's own `[mcp] allow_actions` must allow it, and the host's pid-reuse
+check refuses the pid if it no longer runs `backup-job`. Only `pause`, `resume`, `renice` and `undo`; kill is
+done on the host itself.
+
+**Cost.** One poll takes about `hosts / concurrency x per-host round trip` of wall time. Local memory is bounded by
+`concurrency` replies of at most `max_output_bytes` each, because snapshots are reduced to a row plus findings as
+they arrive. Every limit is a config value:
+
+```toml
+[fleet]
+concurrency           = 64      # parallel ssh sessions; bounded by your fd/process limits and sshd MaxStartups
+connect_timeout_s     = 5
+command_timeout_s     = 20      # per host: connect + run + transfer
+control_master        = true    # reuse connections between polls
+control_persist       = "60s"
+compress              = true    # ssh -C
+ssh_options           = []      # e.g. ["ServerAliveInterval=5"]; yours win over fat's
+hosts_file            = "~/fleet.txt"
+ssh_config_hosts      = false   # also use ~/.ssh/config Host aliases...
+ssh_config_filter     = []      # ...matching these globs
+max_output_bytes      = 8388608
+fast_max_age_ms       = 10000   # `snapshot --fast` serves a recorder sample this fresh
+default_fat_path      = "/usr/local/bin/fat"
+cache_ttl_s           = 15      # MCP fleet tools reuse a poll this long
+tui_refresh_s         = 30      # the TUI Fleet tab re-polls this often while visible
+max_hosts_per_finding = 10
+outlier_min_group     = 5
+outlier_z             = 3.5     # robust z-score (median absolute deviation)
+outlier_min_delta     = 20      # and at least this many points from the median
+
+[fleet.groups]                  # groups by glob, in addition to per-host groups
+web = ["web-*"]
+db  = ["db-*", "replica-*"]
+```
+
+MCP: `fleet_summary`, `fleet_doctor`, `host_snapshot {host}` and `host_what_happened {host, at?, window?}`, all
+read-only.
+
+### Deploy to a fleet
+
+fat is a single binary. A static musl build has no libc dependency and runs on any Linux distribution and kernel
+in common use:
+
+```sh
+scripts/build-static.sh x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+# -> dist/fat-<version>-<target> (+ .sha256). Uses cargo-zigbuild, a musl C compiler, or docker/podman,
+#    whichever is available; installs nothing.
+```
+
+Plain ssh, any number of hosts (`hosts.txt` holds one ssh destination per line; parallelism is up to you):
+
+```sh
+v=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+while read -r h; do
+  arch=$(ssh -n "$h" uname -m) &&
+  scp -q "dist/fat-$v-$arch-unknown-linux-musl" "$h:/tmp/fat" &&
+  ssh -n "$h" 'sudo install -m755 /tmp/fat /usr/local/bin/fat && rm /tmp/fat'
+done < hosts.txt
+```
+
+The recorder as a system service (optional; needed for `events`, `what-happened` and fast polls). Run as root it
+writes `/var/lib/fat/history.db`, which every local user's fat reads, so the account fleet logs in with sees it.
+E.g. `/etc/systemd/system/fat-record.service`:
+
+```ini
+[Unit]
+Description=fat flight recorder
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/fat record --server
+Restart=on-failure
+Nice=10
+# A guard at about twice the documented budget, not a tuning knob.
+MemoryHigh=128M
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The same with Ansible:
+
+```yaml
+- hosts: all
+  become: true
+  tasks:
+    - copy: { src: "dist/fat-{{ fat_version }}-{{ ansible_architecture }}-unknown-linux-musl", dest: /usr/local/bin/fat, mode: "0755" }
+    - copy: { src: fat-record.service, dest: /etc/systemd/system/fat-record.service }
+    - systemd: { name: fat-record, enabled: true, state: restarted, daemon_reload: true }
+```
+
+Without systemd, run `fat record --server` under whatever supervises services on that host. fat needs no
+agent, port or account of its own: polling is ssh, the recorder writes one SQLite file.
 
 ## Design notes
 

@@ -38,8 +38,12 @@
 //! Everything for one sample is written in a single transaction with cached
 //! prepared statements, WAL journal, and `synchronous=NORMAL`.
 use crate::model::{Container, Gpu, Port, Proc, Snapshot, System, Ts};
+use crate::server::{
+    ContainerMeta, DStateProc, DiskStat, Event, EventKind, FsErrorStat, Kernel, MdArray, NumaNode, Pressure, Profile,
+    ServerCfg, Severity, SnapMeta, Unit, UnitKind, UnitPoint,
+};
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -63,6 +67,11 @@ pub struct Point {
 
 /// A full set of interesting procs is written at least this often.
 pub const KEYFRAME_MS: i64 = 120_000;
+/// Every unit and disk gets a row at least this often (and at the start of every writer
+/// stream); in between only changes, departures ("gone" rows) and busy disks are written.
+/// Units outnumber busy processes on servers and mostly sit idle, so a long key interval is
+/// what keeps their cost near zero. Readers look back at most this far for a unit's value.
+pub const SERVER_KEY_MS: i64 = 15 * 60_000;
 /// `at()` returns None when the nearest sample is further away than this.
 pub const MAX_AT_GAP_MS: i64 = 15 * 60_000;
 
@@ -161,6 +170,81 @@ CREATE TABLE IF NOT EXISTS fs_dirs (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS fs_dirs_ts ON fs_dirs(ts);
 ";
+
+/// Server-mode tables (recorder-export). Additive like the fs tables: older DBs gain them on
+/// open, no version bump, nothing dropped.
+const SERVER_SCHEMA: &str = "
+-- Everything that happened at an instant. Deduplicated on (ts, kind, subject); the unique
+-- index also serves time-range scans.
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY,
+    ts INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    severity INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    unit TEXT,
+    pid INTEGER,
+    value REAL,
+    detail TEXT NOT NULL,
+    source TEXT NOT NULL,
+    extra TEXT,
+    UNIQUE (ts, kind, subject)
+);
+CREATE INDEX IF NOT EXISTS events_kind_ts ON events(kind, ts);
+-- Interned unit identities; meta = latest slow-changing JSON (description, cgroup, container).
+CREATE TABLE IF NOT EXISTS unit_ids (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    meta TEXT,
+    last_seen INTEGER NOT NULL,
+    UNIQUE (name, kind)
+);
+-- Every unit and disk gets a row at each server keyframe (SERVER_KEY_MS, and when a writer
+-- starts); in between only on change.
+CREATE TABLE IF NOT EXISTS server_keys (ts INTEGER PRIMARY KEY);
+-- Unit change points. state: 0 unknown, 1 active, 2 activating, 3 deactivating, 4 reloading,
+-- 5 inactive, 6 failed, -1 gone. cpu/throttle in tenths of a percent, memory in KiB,
+-- psi = 'cs,cf,ms,mf,is,if' in tenths.
+CREATE TABLE IF NOT EXISTS units (
+    uid INTEGER NOT NULL,
+    ts INTEGER NOT NULL,
+    state INTEGER NOT NULL,
+    sub TEXT, result TEXT, exit_code INTEGER, main_pid INTEGER, since INTEGER,
+    restarts INTEGER, recent INTEGER, flags INTEGER,
+    cpu10 INTEGER, mem_kb INTEGER, limit_kb INTEGER, peak_kb INTEGER, pids INTEGER,
+    io_r INTEGER, io_w INTEGER, thr10 INTEGER, quota100 INTEGER, psi TEXT, oom INTEGER,
+    PRIMARY KEY (uid, ts)
+) WITHOUT ROWID;
+-- One row per sample: the scalar part of Kernel (percentages and rates in tenths).
+CREATE TABLE IF NOT EXISTS kernel (
+    ts INTEGER PRIMARY KEY,
+    steal10 INTEGER, iowait10 INTEGER, irq10 INTEGER, softirq10 INTEGER,
+    running INTEGER, blocked INTEGER, psi TEXT, avail_kb INTEGER,
+    swin10 INTEGER, swout10 INTEGER, oom_total INTEGER,
+    fd_used INTEGER, fd_max INTEGER, ct_used INTEGER, ct_max INTEGER,
+    eph_used INTEGER, eph_lo INTEGER, eph_hi INTEGER,
+    retrans10 INTEGER, overflows10 INTEGER, drops10 INTEGER,
+    taint INTEGER, ntp INTEGER, dstate TEXT
+);
+-- Per-disk rows, written while a disk is busy (and once when it goes idle), and at keyframes.
+CREATE TABLE IF NOT EXISTS disks (
+    ts INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    util10 INTEGER, r_await10 INTEGER, w_await10 INTEGER, qd10 INTEGER,
+    r_iops10 INTEGER, w_iops10 INTEGER, r_bps INTEGER, w_bps INTEGER, errors INTEGER,
+    PRIMARY KEY (ts, name)
+) WITHOUT ROWID;
+";
+
+/// Every table `open` must find for the schema to count as current.
+const ALL_TABLES: &str = "'system','changes','keyframes','proc_info','procs','volume_ids','volumes','fs_snaps','fs_dirs',\
+    'events','unit_ids','server_keys','units','kernel','disks'";
+const ALL_TABLES_N: i64 = 15;
+
+/// System-wide recorder database (Linux, root, server profile). FHS location for variable
+/// state, present on every distribution.
+pub const SYSTEM_DB: &str = "/var/lib/fat/history.db";
 
 /// Last volume row written: (ts, used, avail, read_bps, write_bps).
 type VolRow = (Ts, i64, i64, i64, i64);
@@ -468,6 +552,10 @@ pub struct History {
     /// Dir sizes in effect since the last key snapshot (path -> size), and that key's ts.
     last_dirs: HashMap<String, i64>,
     last_dir_key: Option<Ts>,
+    /// Opened with [`History::open_read_only`]: never takes the lease, never writes.
+    read_only: bool,
+    /// Server tables (units/kernel/disks) write caches; see [`History::record_server`].
+    srv: ServerCache,
 }
 
 /// Lock file guarding the single-writer rule for `db`.
@@ -478,8 +566,18 @@ fn writer_lock_path(db: &Path) -> PathBuf {
 }
 
 impl History {
-    /// Default DB location: `<data_local_dir>/fat/history.db`.
+    /// Default DB location. On Linux, when a system-wide recorder exists ([`SYSTEM_DB`], made by
+    /// `fat record` running as root in the server profile) every user reads that one;
+    /// otherwise `<data_local_dir>/fat/history.db`.
     pub fn default_path() -> PathBuf {
+        if cfg!(target_os = "linux") && Path::new(SYSTEM_DB).exists() {
+            return PathBuf::from(SYSTEM_DB);
+        }
+        Self::user_path()
+    }
+
+    /// Per-user DB location: `<data_local_dir>/fat/history.db`.
+    pub fn user_path() -> PathBuf {
         dirs::data_local_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("fat")
@@ -491,39 +589,15 @@ impl History {
         &self.path
     }
 
-    /// Open (create) the DB. None path -> default under dirs::data_local_dir()/fat/history.db.
-    pub fn open(path: Option<&str>) -> anyhow::Result<History> {
-        let path = match path {
+    fn resolve(path: Option<&str>) -> PathBuf {
+        match path {
             Some(p) if !p.is_empty() => PathBuf::from(expand_tilde(p)),
             _ => Self::default_path(),
-        };
-        if let Some(dir) = path.parent()
-            && !dir.as_os_str().is_empty() {
-                std::fs::create_dir_all(dir)
-                    .with_context(|| format!("creating {}", dir.display()))?;
-            }
-        let conn = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        conn.busy_timeout(Duration::from_secs(2))?;
-        // auto_vacuum must be set before the first table is created to take effect.
-        conn.execute_batch(
-            "PRAGMA auto_vacuum = INCREMENTAL;
-             PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA temp_store = MEMORY;",
-        )?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != SCHEMA_VERSION {
-            // Pre-release layouts are not migrated; start fresh.
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS system; DROP TABLE IF EXISTS changes; DROP TABLE IF EXISTS keyframes;
-                 DROP TABLE IF EXISTS proc_info; DROP TABLE IF EXISTS procs;
-                 DROP TABLE IF EXISTS volume_ids; DROP TABLE IF EXISTS volumes;
-                 DROP TABLE IF EXISTS fs_snaps; DROP TABLE IF EXISTS fs_dirs;",
-            )?;
         }
-        conn.execute_batch(SCHEMA).context("creating history schema")?;
-        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
-        Ok(History {
+    }
+
+    fn with_conn(conn: Connection, path: PathBuf, read_only: bool) -> History {
+        History {
             conn,
             path,
             last_key: None,
@@ -535,7 +609,64 @@ impl History {
             vol_ids: HashMap::new(),
             last_dirs: HashMap::new(),
             last_dir_key: None,
-        })
+            read_only,
+            srv: ServerCache::default(),
+        }
+    }
+
+    /// Open (create) the DB. None path -> [`History::default_path`]. Older databases gain the
+    /// server tables in place (additive, no data loss). When the schema is already current the
+    /// open performs no write, so readers of a DB they cannot write (another user's recorder)
+    /// still work.
+    pub fn open(path: Option<&str>) -> anyhow::Result<History> {
+        let path = Self::resolve(path);
+        if let Some(dir) = path.parent()
+            && !dir.as_os_str().is_empty()
+            && !dir.exists()
+        {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let conn = Connection::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(2))?;
+        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let tables: i64 = conn.query_row(
+            &format!("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ({})", ALL_TABLES),
+            [],
+            |r| r.get(0),
+        )?;
+        if version != SCHEMA_VERSION || tables != ALL_TABLES_N {
+            // auto_vacuum must be set before the first table is created to take effect.
+            conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL;")?;
+            if version != SCHEMA_VERSION {
+                // Pre-release layouts are not migrated; start fresh.
+                conn.execute_batch(
+                    "DROP TABLE IF EXISTS system; DROP TABLE IF EXISTS changes; DROP TABLE IF EXISTS keyframes;
+                     DROP TABLE IF EXISTS proc_info; DROP TABLE IF EXISTS procs;
+                     DROP TABLE IF EXISTS volume_ids; DROP TABLE IF EXISTS volumes;
+                     DROP TABLE IF EXISTS fs_snaps; DROP TABLE IF EXISTS fs_dirs;",
+                )?;
+            }
+            conn.execute_batch(SCHEMA).context("creating history schema")?;
+            conn.execute_batch(SERVER_SCHEMA).context("creating server history schema")?;
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+        }
+        Ok(Self::with_conn(conn, path, false))
+    }
+
+    /// Open an existing DB strictly read-only: no schema changes, no writer lease, no file
+    /// creation. For queries that must not disturb (or wait for) a running recorder, e.g.
+    /// `fat snapshot --fast`. Err when the file does not exist.
+    pub fn open_read_only(path: Option<&str>) -> anyhow::Result<History> {
+        let path = Self::resolve(path);
+        anyhow::ensure!(path.exists(), "no recorder database at {}", path.display());
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("opening {} read-only", path.display()))?;
+        conn.busy_timeout(Duration::from_millis(500))?;
+        Ok(Self::with_conn(conn, path, true))
     }
 
     /// True while this instance holds the writer lease.
@@ -548,6 +679,9 @@ impl History {
     pub fn try_become_writer(&mut self) -> bool {
         if self.writer.is_some() {
             return true;
+        }
+        if self.read_only {
+            return false;
         }
         use std::io::Write;
         use std::os::fd::AsRawFd;
@@ -575,6 +709,7 @@ impl History {
         self.last_vols.clear();
         self.last_dirs.clear();
         self.last_dir_key = None;
+        self.srv.reset();
         self.writer = Some(f);
         true
     }
@@ -639,7 +774,8 @@ impl History {
             }
 
             let sticky: HashSet<u32> = self.last_rows.keys().copied().collect();
-            let interesting = select_interesting(snap, &sticky, is_key);
+            let server_top = if snap.units.is_empty() { None } else { self.srv.top_procs };
+            let interesting = select_interesting(snap, &sticky, is_key, server_top);
             let mut upsert_info = tx.prepare_cached(
                 "INSERT INTO proc_info (hash, pid, start_time, name, cmd, exe, cwd, user, last_seen)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -755,8 +891,10 @@ impl History {
         let ports: Vec<Port> = self.change_at(KIND_PORTS, sts)?.unwrap_or_default();
         let containers: Vec<Container> = self.change_at(KIND_CONTAINERS, sts)?.unwrap_or_default();
         let procs = self.procs_at(sts)?;
+        let units = self.units_at_sample(sts)?;
+        let kernel = self.kernel_at(sts)?;
 
-        Ok(Some(Snapshot { ts: sts, host: "local".into(), system, procs, ports, containers }))
+        Ok(Some(Snapshot { ts: sts, host: "local".into(), system, procs, ports, containers, units, kernel, ..Default::default() }))
     }
 
     /// Downsampled system timeline in [from, to], at most `max_points` points.
@@ -886,12 +1024,23 @@ impl History {
         let deff = dkey.unwrap_or(cutoff).min(cutoff);
         tx.execute("DELETE FROM fs_dirs WHERE ts < ?1", [deff])?;
         tx.execute("DELETE FROM fs_snaps WHERE ts < ?1", [deff])?;
+        // Server tables: unit/disk rows are change points against the server keyframe.
+        let skey: Option<Ts> =
+            tx.query_row("SELECT max(ts) FROM server_keys WHERE ts <= ?1", [cutoff], |r| r.get(0))?;
+        let seff = skey.unwrap_or(cutoff).min(cutoff);
+        tx.execute("DELETE FROM units WHERE ts < ?1", [seff])?;
+        tx.execute("DELETE FROM disks WHERE ts < ?1", [seff])?;
+        tx.execute("DELETE FROM server_keys WHERE ts < ?1", [seff])?;
+        tx.execute("DELETE FROM unit_ids WHERE last_seen < ?1", [seff - 2 * SERVER_KEY_MS])?;
+        tx.execute("DELETE FROM kernel WHERE ts < ?1", [cutoff])?;
+        tx.execute("DELETE FROM events WHERE ts < ?1", [cutoff])?;
         tx.commit()?;
         if removed > 0 {
             // Return freed pages to the filesystem; harmless if auto_vacuum is off.
             let _ = self.conn.execute_batch("PRAGMA incremental_vacuum;");
         }
         self.known_info.clear();
+        self.srv.uids.clear();
         Ok(removed)
     }
 
@@ -1302,6 +1451,922 @@ impl History {
     }
 }
 
+// ---- server mode (recorder-export) --------------------------------------------------------------
+
+/// Write-side caches for the server tables. Like the proc caches they are only valid for the
+/// current writer stream and are reset whenever the lease is (re)taken.
+#[derive(Default)]
+struct ServerCache {
+    /// Last server keyframe written.
+    last_key: Option<Ts>,
+    /// (kind, name) -> unit_ids.id.
+    uids: HashMap<(UnitKind, String), i64>,
+    /// uid -> meta JSON last written.
+    meta: HashMap<i64, String>,
+    /// uid -> last row written since the current keyframe.
+    rows: HashMap<i64, UnitRow>,
+    /// disk -> whether its last written row was busy.
+    disks: HashMap<String, bool>,
+    /// Bounds (from ServerCfg): units per sample, events per sample.
+    max_units: Option<usize>,
+    max_events: Option<usize>,
+    /// `ServerCfg::record_top_procs`: in server snapshots the top-N by cpu/mem/io plus every
+    /// unit's main pid are always recorded (see [`crate::server::top_procs`]).
+    top_procs: Option<usize>,
+}
+
+impl ServerCache {
+    fn reset(&mut self) {
+        let (mu, me, tp) = (self.max_units, self.max_events, self.top_procs);
+        *self = ServerCache { max_units: mu, max_events: me, top_procs: tp, ..Default::default() };
+    }
+}
+
+const STATES: [&str; 7] = ["unknown", "active", "activating", "deactivating", "reloading", "inactive", "failed"];
+const STATE_GONE: i64 = -1;
+
+fn state_code(s: &str) -> i64 {
+    STATES.iter().position(|x| *x == s).map_or(0, |i| i as i64)
+}
+
+fn state_name(c: i64) -> &'static str {
+    if c == STATE_GONE { "gone" } else { STATES.get(c as usize).copied().unwrap_or("unknown") }
+}
+
+fn kind_name(k: UnitKind) -> &'static str {
+    k.as_str()
+}
+
+fn kind_parse(s: &str) -> UnitKind {
+    match s {
+        "container" => UnitKind::Container,
+        "k8s-pod" => UnitKind::Pod,
+        "cgroup" => UnitKind::Cgroup,
+        _ => UnitKind::Systemd,
+    }
+}
+
+fn psi_enc(p: &Option<Pressure>) -> Option<String> {
+    p.map(|p| {
+        [p.cpu_some, p.cpu_full, p.mem_some, p.mem_full, p.io_some, p.io_full].iter().map(|v| q10(*v).to_string()).collect::<Vec<_>>().join(",")
+    })
+}
+
+fn psi_dec(s: Option<String>) -> Option<Pressure> {
+    let v: Vec<f32> = s?.split(',').map(|x| x.parse::<i64>().unwrap_or(0) as f32 / 10.0).collect();
+    (v.len() == 6).then(|| Pressure { cpu_some: v[0], cpu_full: v[1], mem_some: v[2], mem_full: v[3], io_some: v[4], io_full: v[5] })
+}
+
+/// Slow-changing per-unit fields, stored once per change in unit_ids.meta.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+struct UnitMeta {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    description: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    cgroup: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container: Option<ContainerMeta>,
+}
+
+/// Quantized unit values as stored in `units` (also the change-detection cache).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct UnitRow {
+    state: i64,
+    sub: String,
+    result: String,
+    exit_code: Option<i64>,
+    main_pid: Option<i64>,
+    since: Option<i64>,
+    restarts: i64,
+    recent: i64,
+    flags: i64,
+    cpu10: i64,
+    mem_kb: i64,
+    limit_kb: Option<i64>,
+    peak_kb: Option<i64>,
+    pids: i64,
+    io_r: i64,
+    io_w: i64,
+    thr10: i64,
+    quota100: Option<i64>,
+    psi: Option<String>,
+    oom: i64,
+}
+
+impl UnitRow {
+    fn from_unit(u: &Unit) -> UnitRow {
+        let kb = |b: u64| clamp_i64(b / 1024);
+        UnitRow {
+            state: state_code(&u.state),
+            sub: cap(&u.sub_state, 64).to_string(),
+            result: cap(&u.result, 64).to_string(),
+            exit_code: u.exit_code.map(i64::from),
+            main_pid: u.main_pid.map(i64::from),
+            since: u.since,
+            restarts: u.restarts as i64,
+            recent: u.recent_restarts as i64,
+            flags: u.flapping as i64,
+            cpu10: q10(u.cpu),
+            mem_kb: kb(u.mem),
+            limit_kb: u.mem_limit.map(kb),
+            peak_kb: u.mem_peak.map(kb),
+            pids: u.pids as i64,
+            io_r: clamp_i64(u.io_read_bps),
+            io_w: clamp_i64(u.io_write_bps),
+            thr10: q10(u.cpu_throttled_pct),
+            quota100: u.cpu_quota.map(|q| (q.max(0.0) * 100.0).round() as i64),
+            psi: psi_enc(&u.psi),
+            oom: clamp_i64(u.oom_kills),
+        }
+    }
+
+    fn gone() -> UnitRow {
+        UnitRow { state: STATE_GONE, ..Default::default() }
+    }
+
+    /// Worth a new change-point row? Identity/state fields on any change; resource numbers
+    /// only when they moved noticeably (same thresholds spirit as ProcRow).
+    fn differs_from(&self, p: &UnitRow) -> bool {
+        let psi_moved = match (&self.psi, &p.psi) {
+            (Some(a), Some(b)) => a.split(',').zip(b.split(',')).any(|(x, y)| {
+                (x.parse::<i64>().unwrap_or(0) - y.parse::<i64>().unwrap_or(0)).abs() >= 50
+            }),
+            (None, None) => false,
+            _ => true,
+        };
+        self.state != p.state
+            || self.sub != p.sub
+            || self.result != p.result
+            || self.exit_code != p.exit_code
+            || self.main_pid != p.main_pid
+            || self.since != p.since
+            || self.restarts != p.restarts
+            || self.recent != p.recent
+            || self.flags != p.flags
+            || self.limit_kb != p.limit_kb
+            || self.quota100 != p.quota100
+            || self.oom != p.oom
+            || rel_changed(self.cpu10, p.cpu10, 0.30, 30)
+            || rel_changed(self.mem_kb, p.mem_kb, 0.05, 4096)
+            || rel_changed(self.peak_kb.unwrap_or(0), p.peak_kb.unwrap_or(0), 0.05, 4096)
+            || rel_changed(self.pids, p.pids, 0.20, 2)
+            || rel_changed(self.io_r, p.io_r, 0.50, 256 * 1024)
+            || rel_changed(self.io_w, p.io_w, 0.50, 256 * 1024)
+            || (self.thr10 - p.thr10).abs() >= 50
+            || psi_moved
+    }
+}
+
+const UNIT_COLS: &str = "state, sub, result, exit_code, main_pid, since, restarts, recent, flags, cpu10, mem_kb, \
+    limit_kb, peak_kb, pids, io_r, io_w, thr10, quota100, psi, oom";
+
+/// Read a UnitRow from columns starting at `o` (in UNIT_COLS order).
+fn unit_row_at(r: &rusqlite::Row, o: usize) -> rusqlite::Result<UnitRow> {
+    let i = |k: usize| -> rusqlite::Result<i64> { Ok(r.get::<_, Option<i64>>(o + k)?.unwrap_or(0)) };
+    Ok(UnitRow {
+        state: i(0)?,
+        sub: r.get::<_, Option<String>>(o + 1)?.unwrap_or_default(),
+        result: r.get::<_, Option<String>>(o + 2)?.unwrap_or_default(),
+        exit_code: r.get(o + 3)?,
+        main_pid: r.get(o + 4)?,
+        since: r.get(o + 5)?,
+        restarts: i(6)?,
+        recent: i(7)?,
+        flags: i(8)?,
+        cpu10: i(9)?,
+        mem_kb: i(10)?,
+        limit_kb: r.get(o + 11)?,
+        peak_kb: r.get(o + 12)?,
+        pids: i(13)?,
+        io_r: i(14)?,
+        io_w: i(15)?,
+        thr10: i(16)?,
+        quota100: r.get(o + 17)?,
+        psi: r.get(o + 18)?,
+        oom: i(19)?,
+    })
+}
+
+fn unit_from_row(name: String, kind: UnitKind, meta: UnitMeta, r: UnitRow) -> Unit {
+    let b = |kb: i64| kb.max(0) as u64 * 1024;
+    Unit {
+        name,
+        kind,
+        state: state_name(r.state).into(),
+        sub_state: r.sub,
+        description: meta.description,
+        result: r.result,
+        exit_code: r.exit_code.map(|c| c as i32),
+        restarts: r.restarts.max(0) as u32,
+        recent_restarts: r.recent.max(0) as u32,
+        flapping: r.flags & 1 != 0,
+        since: r.since,
+        cgroup: meta.cgroup,
+        main_pid: r.main_pid.map(|p| p as u32),
+        pids: r.pids.max(0) as u32,
+        cpu: r.cpu10 as f32 / 10.0,
+        mem: b(r.mem_kb),
+        mem_limit: r.limit_kb.map(b),
+        mem_peak: r.peak_kb.map(b),
+        io_read_bps: r.io_r.max(0) as u64,
+        io_write_bps: r.io_w.max(0) as u64,
+        cpu_throttled_pct: r.thr10 as f32 / 10.0,
+        cpu_quota: r.quota100.map(|q| q as f32 / 100.0),
+        psi: psi_dec(r.psi),
+        oom_kills: r.oom.max(0) as u64,
+        container: meta.container,
+        notes: vec![],
+    }
+}
+
+fn unit_point(ts: Ts, r: &UnitRow) -> UnitPoint {
+    UnitPoint {
+        ts,
+        state: state_name(r.state).into(),
+        restarts: r.restarts.max(0) as u32,
+        cpu: r.cpu10 as f32 / 10.0,
+        mem: r.mem_kb.max(0) as u64 * 1024,
+        mem_limit: r.limit_kb.map(|k| k.max(0) as u64 * 1024),
+        pids: r.pids.max(0) as u32,
+        io_read_bps: r.io_r.max(0) as u64,
+        io_write_bps: r.io_w.max(0) as u64,
+        cpu_throttled_pct: r.thr10 as f32 / 10.0,
+        psi: psi_dec(r.psi.clone()),
+        oom_kills: r.oom.max(0) as u64,
+    }
+}
+
+/// Kernel fields that rarely change; stored in `changes` under kind "kernel".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+struct KernelSlow {
+    numa: Vec<NumaNode>,
+    ro_remounts: Vec<String>,
+    fs_errors: Vec<FsErrorStat>,
+    taint_flags: String,
+    mdraid: Vec<MdArray>,
+    notes: Vec<String>,
+}
+
+const KIND_KERNEL: &str = "kernel";
+const KIND_META: &str = "meta";
+
+const KERNEL_COLS: &str = "steal10, iowait10, irq10, softirq10, running, blocked, psi, avail_kb, swin10, swout10, \
+    oom_total, fd_used, fd_max, ct_used, ct_max, eph_used, eph_lo, eph_hi, retrans10, overflows10, drops10, taint, ntp, dstate";
+
+/// Kernel scalars from columns starting at `o` (KERNEL_COLS order).
+fn kernel_row_at(r: &rusqlite::Row, o: usize) -> rusqlite::Result<Kernel> {
+    let i = |k: usize| -> rusqlite::Result<i64> { Ok(r.get::<_, Option<i64>>(o + k)?.unwrap_or(0)) };
+    let opt = |k: usize| -> rusqlite::Result<Option<u64>> { Ok(r.get::<_, Option<i64>>(o + k)?.map(|v| v.max(0) as u64)) };
+    let t = |k: usize| -> rusqlite::Result<f32> { Ok(i(k)? as f32 / 10.0) };
+    let range = match (r.get::<_, Option<i64>>(o + 16)?, r.get::<_, Option<i64>>(o + 17)?) {
+        (Some(a), Some(b)) => Some((a.clamp(0, 65535) as u16, b.clamp(0, 65535) as u16)),
+        _ => None,
+    };
+    let dstate: Option<String> = r.get(o + 23)?;
+    Ok(Kernel {
+        steal_pct: t(0)?,
+        iowait_pct: t(1)?,
+        irq_pct: t(2)?,
+        softirq_pct: t(3)?,
+        procs_running: i(4)?.max(0) as u32,
+        procs_blocked: i(5)?.max(0) as u32,
+        pressure: psi_dec(r.get(o + 6)?),
+        mem_available: i(7)?.max(0) as u64 * 1024,
+        swap_in_ps: t(8)?,
+        swap_out_ps: t(9)?,
+        oom_kills_total: i(10)?.max(0) as u64,
+        fd_used: opt(11)?,
+        fd_max: opt(12)?,
+        conntrack_used: opt(13)?,
+        conntrack_max: opt(14)?,
+        ephemeral_used: opt(15)?,
+        ephemeral_range: range,
+        tcp_retrans_ps: t(18)?,
+        listen_overflows_ps: t(19)?,
+        listen_drops_ps: t(20)?,
+        taint: i(21)?.max(0) as u64,
+        ntp_synced: r.get::<_, Option<i64>>(o + 22)?.map(|v| v != 0),
+        d_state: dstate.and_then(|j| serde_json::from_str::<Vec<DStateProc>>(&j).ok()).unwrap_or_default(),
+        ..Default::default()
+    })
+}
+
+fn disk_busy(d: &DiskStat) -> bool {
+    d.r_iops > 0.0 || d.w_iops > 0.0 || d.util_pct > 0.0 || d.queue_depth > 0.0 || d.r_bps > 0 || d.w_bps > 0
+}
+
+const DISK_COLS: &str = "name, util10, r_await10, w_await10, qd10, r_iops10, w_iops10, r_bps, w_bps, errors";
+
+fn disk_row_at(r: &rusqlite::Row, o: usize) -> rusqlite::Result<DiskStat> {
+    let t = |k: usize| -> rusqlite::Result<f32> { Ok(r.get::<_, Option<i64>>(o + k)?.unwrap_or(0) as f32 / 10.0) };
+    let u = |k: usize| -> rusqlite::Result<u64> { Ok(r.get::<_, Option<i64>>(o + k)?.unwrap_or(0).max(0) as u64) };
+    Ok(DiskStat {
+        name: r.get(o)?,
+        util_pct: t(1)?,
+        r_await_ms: t(2)?,
+        w_await_ms: t(3)?,
+        queue_depth: t(4)?,
+        r_iops: t(5)?,
+        w_iops: t(6)?,
+        r_bps: u(7)?,
+        w_bps: u(8)?,
+        io_errors: r.get::<_, Option<i64>>(o + 9)?.map(|v| v.max(0) as u64),
+    })
+}
+
+fn sev_code(s: Severity) -> i64 {
+    match s {
+        Severity::Info => 0,
+        Severity::Warn => 1,
+        Severity::Crit => 2,
+    }
+}
+
+fn sev_of(c: i64) -> Severity {
+    match c {
+        2 => Severity::Crit,
+        1 => Severity::Warn,
+        _ => Severity::Info,
+    }
+}
+
+/// Insert events (deduplicated on (ts, kind, subject)); returns rows inserted.
+fn insert_events(tx: &rusqlite::Transaction, events: &[Event]) -> anyhow::Result<usize> {
+    let mut st = tx.prepare_cached(
+        "INSERT OR IGNORE INTO events (ts, kind, severity, subject, unit, pid, value, detail, source, extra)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
+    let mut n = 0;
+    for e in events {
+        let extra = if e.extra.is_empty() { None } else { Some(serde_json::to_string(&e.extra)?) };
+        n += st.execute(params![
+            e.ts,
+            e.kind.as_str(),
+            sev_code(e.severity),
+            cap(&e.subject, 256),
+            e.unit.as_deref().map(|u| cap(u, 256)),
+            e.pid,
+            e.value.filter(|v| v.is_finite()),
+            cap(&e.detail, 1024),
+            cap(&e.source, 32),
+            extra
+        ])?;
+    }
+    Ok(n)
+}
+
+fn event_from_row(r: &rusqlite::Row) -> rusqlite::Result<Event> {
+    let kind: String = r.get(1)?;
+    let extra: Option<String> = r.get(9)?;
+    Ok(Event {
+        ts: r.get(0)?,
+        kind: EventKind::parse(&kind).unwrap_or(EventKind::Other),
+        severity: sev_of(r.get(2)?),
+        subject: r.get(3)?,
+        unit: r.get(4)?,
+        pid: r.get::<_, Option<i64>>(5)?.map(|p| p as u32),
+        value: r.get(6)?,
+        detail: r.get(7)?,
+        source: r.get(8)?,
+        extra: extra.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default(),
+    })
+}
+
+/// Events kept per sample: the most severe first, then oldest; the rest are summarised.
+fn cap_events(mut ev: Vec<Event>, max: usize, ts: Ts) -> Vec<Event> {
+    if ev.len() <= max {
+        return ev;
+    }
+    let total = ev.len();
+    ev.sort_by(|a, b| b.severity.cmp(&a.severity).then(a.ts.cmp(&b.ts)));
+    let keep = max.saturating_sub(1);
+    let dropped = ev.split_off(keep);
+    let mut kinds: Vec<&str> = dropped.iter().map(|e| e.kind.as_str()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    ev.push(Event {
+        ts,
+        kind: EventKind::Other,
+        severity: Severity::Warn,
+        subject: "host".into(),
+        detail: format!("{} of {total} events in one sample not recorded (cap {max}): {}", dropped.len(), kinds.join(", ")),
+        value: Some(dropped.len() as f64),
+        source: "recorder".into(),
+        ..Default::default()
+    });
+    ev.sort_by_key(|e| e.ts);
+    ev
+}
+
+/// Keep at most `max` units: active/failed ones first (failed always kept), inactive dropped first.
+fn cap_units(units: &[Unit], max: usize) -> Vec<&Unit> {
+    let mut v: Vec<&Unit> = units.iter().collect();
+    if v.len() > max {
+        let rank = |u: &Unit| match u.state.as_str() {
+            "failed" => 0,
+            "inactive" | "unknown" => 2,
+            _ => 1,
+        };
+        v.sort_by(|a, b| rank(a).cmp(&rank(b)).then(b.cpu.total_cmp(&a.cpu)).then(b.mem.cmp(&a.mem)));
+        v.truncate(max);
+    }
+    v
+}
+
+impl History {
+    /// Apply the recorder bounds of `[server]` (units and events per sample).
+    pub fn set_server_limits(&mut self, cfg: &ServerCfg) {
+        self.srv.max_units = Some(cfg.max_units.max(1));
+        self.srv.max_events = Some(cfg.max_events_per_sample.max(1));
+        self.srv.top_procs = Some(cfg.record_top_procs);
+    }
+
+    /// Persist units, kernel and events of a snapshot filled by ServerSampler. Cheap no-op when
+    /// snap.units/kernel/events are all empty (desktop profile). Events are de-duplicated on
+    /// (ts, kind, subject). A no-op while another process holds the writer lease.
+    ///
+    /// Units and disks are change-point encoded against a keyframe every [`SERVER_KEY_MS`]
+    /// and at the start of each writer stream (every unit and disk gets a row there); in between a unit gets a row only when its state
+    /// changed or its numbers moved noticeably, and a "gone" row when it disappears. Idle disks
+    /// get no rows between keyframes. The kernel's scalars get one narrow row per sample; its
+    /// slow parts (numa, mdraid, notes...) and the snapshot meta go to `changes` on change.
+    pub fn record_server(&mut self, snap: &Snapshot) -> anyhow::Result<()> {
+        if snap.units.is_empty() && snap.kernel.is_none() && snap.events.is_empty() {
+            return Ok(());
+        }
+        if !self.try_become_writer() {
+            return Ok(());
+        }
+        let ts = snap.ts;
+        let is_key = match self.srv.last_key {
+            None => true,
+            Some(k) => ts < k || ts - k >= SERVER_KEY_MS,
+        };
+        let max_units = self.srv.max_units.unwrap_or(ServerCfg::default().max_units);
+        let max_events = self.srv.max_events.unwrap_or(ServerCfg::default().max_events_per_sample);
+        let mut rows = if is_key { HashMap::new() } else { self.srv.rows.clone() };
+        let mut disks_state = if is_key { HashMap::new() } else { self.srv.disks.clone() };
+        let mut new_uids: Vec<((UnitKind, String), i64)> = Vec::new();
+        let mut new_meta: Vec<(i64, String)> = Vec::new();
+        let mut new_changes: Vec<(&'static str, String)> = Vec::new();
+
+        let tx = self.conn.transaction()?;
+        {
+            if is_key {
+                tx.prepare_cached("INSERT OR REPLACE INTO server_keys (ts) VALUES (?1)")?.execute(params![ts])?;
+            }
+            // ---- units
+            let mut get_uid = tx.prepare_cached(
+                "INSERT INTO unit_ids (name, kind, last_seen) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(name, kind) DO UPDATE SET last_seen = excluded.last_seen RETURNING id",
+            )?;
+            let mut touch = tx.prepare_cached("UPDATE unit_ids SET last_seen = ?1 WHERE id = ?2")?;
+            let mut set_meta = tx.prepare_cached("UPDATE unit_ids SET meta = ?1 WHERE id = ?2")?;
+            let mut ins = tx.prepare_cached(&format!(
+                "INSERT OR REPLACE INTO units (uid, ts, {UNIT_COLS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"
+            ))?;
+            let write = |ins: &mut rusqlite::CachedStatement, uid: i64, r: &UnitRow| -> rusqlite::Result<usize> {
+                ins.execute(params![
+                    uid, ts, r.state, r.sub, r.result, r.exit_code, r.main_pid, r.since, r.restarts, r.recent, r.flags,
+                    r.cpu10, r.mem_kb, r.limit_kb, r.peak_kb, r.pids, r.io_r, r.io_w, r.thr10, r.quota100, r.psi, r.oom
+                ])
+            };
+            let mut present: HashSet<i64> = HashSet::new();
+            for u in cap_units(&snap.units, max_units) {
+                let key = (u.kind, cap(&u.name, 512).to_string());
+                let uid = match self.srv.uids.get(&key) {
+                    Some(&id) => {
+                        if is_key {
+                            touch.execute(params![ts, id])?;
+                        }
+                        id
+                    }
+                    None => {
+                        let id: i64 = get_uid.query_row(params![key.1, kind_name(u.kind), ts], |r| r.get(0))?;
+                        new_uids.push((key, id));
+                        id
+                    }
+                };
+                if !present.insert(uid) {
+                    continue; // duplicate name within one sample
+                }
+                let meta = UnitMeta { description: cap(&u.description, 256).into(), cgroup: cap(&u.cgroup, 512).into(), container: u.container.clone() };
+                let mj = serde_json::to_string(&meta)?;
+                if self.srv.meta.get(&uid) != Some(&mj) {
+                    set_meta.execute(params![mj, uid])?;
+                    new_meta.push((uid, mj));
+                }
+                let row = UnitRow::from_unit(u);
+                let changed = match rows.get(&uid) {
+                    Some(prev) if prev.state != STATE_GONE => row.differs_from(prev),
+                    _ => true,
+                };
+                if changed {
+                    write(&mut ins, uid, &row)?;
+                    rows.insert(uid, row);
+                }
+            }
+            // Departed units get a "gone" row (also across a keyframe, where `rows` restarts
+            // empty, so a series shows where the unit ended).
+            let gone: Vec<i64> = rows
+                .iter()
+                .chain(self.srv.rows.iter())
+                .filter(|(id, r)| r.state != STATE_GONE && !present.contains(id))
+                .map(|(id, _)| *id)
+                .collect::<HashSet<i64>>()
+                .into_iter()
+                .collect();
+            for uid in gone {
+                write(&mut ins, uid, &UnitRow::gone())?;
+                rows.remove(&uid);
+            }
+
+            // ---- kernel
+            if let Some(k) = &snap.kernel {
+                let opt = |v: Option<u64>| v.map(clamp_i64);
+                let dstate = if k.d_state.is_empty() { None } else { Some(serde_json::to_string(&k.d_state)?) };
+                tx.prepare_cached(&format!(
+                    "INSERT OR REPLACE INTO kernel (ts, {KERNEL_COLS})
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                ))?
+                .execute(params![
+                    ts,
+                    q10(k.steal_pct),
+                    q10(k.iowait_pct),
+                    q10(k.irq_pct),
+                    q10(k.softirq_pct),
+                    k.procs_running,
+                    k.procs_blocked,
+                    psi_enc(&k.pressure),
+                    clamp_i64(k.mem_available / 1024),
+                    q10(k.swap_in_ps),
+                    q10(k.swap_out_ps),
+                    clamp_i64(k.oom_kills_total),
+                    opt(k.fd_used),
+                    opt(k.fd_max),
+                    opt(k.conntrack_used),
+                    opt(k.conntrack_max),
+                    opt(k.ephemeral_used),
+                    k.ephemeral_range.map(|r| r.0),
+                    k.ephemeral_range.map(|r| r.1),
+                    q10(k.tcp_retrans_ps),
+                    q10(k.listen_overflows_ps),
+                    q10(k.listen_drops_ps),
+                    clamp_i64(k.taint),
+                    k.ntp_synced.map(i64::from),
+                    dstate
+                ])?;
+                let mut dins = tx.prepare_cached(&format!(
+                    "INSERT OR REPLACE INTO disks (ts, {DISK_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                ))?;
+                for d in &k.disks {
+                    let busy = disk_busy(d);
+                    let was_busy = disks_state.get(&d.name).copied();
+                    if is_key || busy || was_busy != Some(false) {
+                        dins.execute(params![
+                            ts,
+                            cap(&d.name, 64),
+                            q10(d.util_pct),
+                            q10(d.r_await_ms),
+                            q10(d.w_await_ms),
+                            q10(d.queue_depth),
+                            q10(d.r_iops),
+                            q10(d.w_iops),
+                            clamp_i64(d.r_bps),
+                            clamp_i64(d.w_bps),
+                            d.io_errors.map(clamp_i64)
+                        ])?;
+                        disks_state.insert(d.name.clone(), busy);
+                    }
+                }
+                let slow = KernelSlow {
+                    numa: k.numa.clone(),
+                    ro_remounts: k.ro_remounts.clone(),
+                    fs_errors: k.fs_errors.clone(),
+                    taint_flags: k.taint_flags.clone(),
+                    mdraid: k.mdraid.clone(),
+                    notes: k.notes.clone(),
+                };
+                new_changes.push((KIND_KERNEL, serde_json::to_string(&slow)?));
+            }
+            if let Some(m) = &snap.meta {
+                // Only the identity of the writer; per-serve fields (age, source...) are not stored.
+                let m = serde_json::json!({ "version": m.version, "profile": m.profile, "root": m.root });
+                new_changes.push((KIND_META, m.to_string()));
+            }
+            new_changes.retain(|(k, j)| self.last_changes.get(k) != Some(j));
+            let mut chg = tx.prepare_cached("INSERT OR REPLACE INTO changes (kind, ts, json) VALUES (?1, ?2, ?3)")?;
+            for (k, j) in &new_changes {
+                chg.execute(params![k, ts, j])?;
+            }
+
+            // ---- events
+            if !snap.events.is_empty() {
+                insert_events(&tx, &cap_events(snap.events.clone(), max_events, ts))?;
+            }
+        }
+        tx.commit()?;
+        if is_key {
+            self.srv.last_key = Some(ts);
+        }
+        self.srv.rows = rows;
+        self.srv.disks = disks_state;
+        if self.srv.uids.len() > INFO_CACHE_MAX {
+            self.srv.uids.clear();
+            self.srv.meta.clear();
+        }
+        self.srv.uids.extend(new_uids);
+        self.srv.meta.extend(new_meta);
+        for (k, j) in new_changes {
+            self.last_changes.insert(k, j);
+        }
+        Ok(())
+    }
+
+    /// Append events directly (kmsg backlog import on daemon start). Returns rows inserted
+    /// (duplicates of recorded events are skipped). A no-op (0) without the writer lease.
+    pub fn record_events(&mut self, events: &[Event]) -> anyhow::Result<usize> {
+        if events.is_empty() || !self.try_become_writer() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let n = insert_events(&tx, events)?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Events with from <= ts <= to, oldest first; `kinds` empty = all kinds. When more than
+    /// `limit` match, the newest `limit` are returned (still oldest first).
+    pub fn events(&self, from: Ts, to: Ts, kinds: &[EventKind], limit: usize) -> anyhow::Result<Vec<Event>> {
+        if to < from || limit == 0 {
+            return Ok(vec![]);
+        }
+        let kind_filter = if kinds.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = kinds.iter().map(|k| format!("'{}'", k.as_str())).collect();
+            format!(" AND kind IN ({})", names.join(","))
+        };
+        let mut st = self.conn.prepare_cached(&format!(
+            "SELECT ts, kind, severity, subject, unit, pid, value, detail, source, extra FROM events
+             WHERE ts BETWEEN ?1 AND ?2{kind_filter} ORDER BY ts DESC, id DESC LIMIT ?3"
+        ))?;
+        let mut v = st
+            .query_map(params![from, to, limit.min(i64::MAX as usize) as i64], event_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        v.reverse();
+        Ok(v)
+    }
+
+    /// Count of events of `kind` since `from` (header gauges: OOM kills in 24h).
+    pub fn event_count(&self, kind: EventKind, from: Ts) -> anyhow::Result<u64> {
+        let n: i64 = self.conn.prepare_cached("SELECT count(*) FROM events WHERE kind = ?1 AND ts >= ?2")?.query_row(
+            params![kind.as_str(), from],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// uids recorded under `name` (any kind).
+    fn uids_named(&self, name: &str) -> anyhow::Result<Vec<i64>> {
+        let mut st = self.conn.prepare_cached("SELECT id FROM unit_ids WHERE name = ?1")?;
+        let v = st.query_map([name], |r| r.get(0))?.collect::<Result<Vec<i64>, _>>()?;
+        Ok(v)
+    }
+
+    /// One unit over time, oldest first. Rows are change points (a value holds until the next
+    /// point); the value in effect at `from` is included as a point at `from`. A point with
+    /// state "gone" means the unit disappeared there.
+    pub fn unit_series(&self, name: &str, from: Ts, to: Ts) -> anyhow::Result<Vec<UnitPoint>> {
+        if to < from {
+            return Ok(vec![]);
+        }
+        let mut out: Vec<UnitPoint> = Vec::new();
+        for uid in self.uids_named(name)? {
+            let carry: Option<(Ts, UnitRow)> = self
+                .conn
+                .prepare_cached(&format!("SELECT ts, {UNIT_COLS} FROM units WHERE uid = ?1 AND ts < ?2 ORDER BY ts DESC LIMIT 1"))?
+                .query_row(params![uid, from], |r| Ok((r.get(0)?, unit_row_at(r, 1)?)))
+                .optional()?;
+            let mut st =
+                self.conn.prepare_cached(&format!("SELECT ts, {UNIT_COLS} FROM units WHERE uid = ?1 AND ts BETWEEN ?2 AND ?3 ORDER BY ts"))?;
+            let rows = st.query_map(params![uid, from, to], |r| Ok((r.get::<_, Ts>(0)?, unit_row_at(r, 1)?)))?.collect::<Result<Vec<_>, _>>()?;
+            if let Some((t, r)) = carry
+                && r.state != STATE_GONE
+                && from - t <= SERVER_KEY_MS + KEYFRAME_MS
+                && rows.first().is_none_or(|x| x.0 > from)
+            {
+                out.push(unit_point(from, &r));
+            }
+            out.extend(rows.iter().map(|(t, r)| unit_point(*t, r)));
+        }
+        out.sort_by_key(|p| p.ts);
+        Ok(out)
+    }
+
+    /// All units as recorded at the sample nearest to `ts` (within [`KEYFRAME_MS`]), else empty.
+    pub fn units_at(&self, ts: Ts) -> anyhow::Result<Vec<Unit>> {
+        match self.nearest_sample(ts, KEYFRAME_MS)? {
+            Some(sts) => self.units_at_sample(sts),
+            None => Ok(vec![]),
+        }
+    }
+
+    /// Nearest recorded sample (system or kernel row) to `ts`, if within `max_gap`.
+    fn nearest_sample(&self, ts: Ts, max_gap: i64) -> anyhow::Result<Option<Ts>> {
+        let q = |sql: &str| -> anyhow::Result<Option<Ts>> { Ok(self.conn.prepare_cached(sql)?.query_row([ts], |r| r.get(0))?) };
+        let before = [q("SELECT max(ts) FROM system WHERE ts <= ?1")?, q("SELECT max(ts) FROM kernel WHERE ts <= ?1")?].into_iter().flatten().max();
+        let after = [q("SELECT min(ts) FROM system WHERE ts >= ?1")?, q("SELECT min(ts) FROM kernel WHERE ts >= ?1")?].into_iter().flatten().min();
+        let best = match (before, after) {
+            (Some(b), Some(a)) => Some(if ts - b <= a - ts { b } else { a }),
+            (b, a) => b.or(a),
+        };
+        Ok(best.filter(|s| (s - ts).abs() <= max_gap))
+    }
+
+    /// Units in effect at exactly the recorded sample `sts`.
+    fn units_at_sample(&self, sts: Ts) -> anyhow::Result<Vec<Unit>> {
+        let key: Option<Ts> = self.conn.prepare_cached("SELECT max(ts) FROM server_keys WHERE ts <= ?1")?.query_row([sts], |r| r.get(0))?;
+        let Some(key) = key else { return Ok(vec![]) };
+        let ids: Vec<(i64, String, String, Option<String>)> = {
+            let mut st = self.conn.prepare_cached("SELECT id, name, kind, meta FROM unit_ids WHERE last_seen >= ?1")?;
+            st.query_map([key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut st = self.conn.prepare_cached(&format!("SELECT ts, {UNIT_COLS} FROM units WHERE uid = ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT 1"))?;
+        let mut out = Vec::new();
+        for (uid, name, kind, meta) in ids {
+            let Some((t, row)) = st.query_row(params![uid, sts], |r| Ok((r.get::<_, Ts>(0)?, unit_row_at(r, 1)?))).optional()? else {
+                continue;
+            };
+            if t < key || row.state == STATE_GONE {
+                continue;
+            }
+            let meta: UnitMeta = meta.and_then(|m| serde_json::from_str(&m).ok()).unwrap_or_default();
+            out.push(unit_from_row(name, kind_parse(&kind), meta, row));
+        }
+        out.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
+        Ok(out)
+    }
+
+    /// Kernel state recorded at exactly `sts` (scalars, slow parts, disks), if any.
+    fn kernel_at(&self, sts: Ts) -> anyhow::Result<Option<Kernel>> {
+        let k = self
+            .conn
+            .prepare_cached(&format!("SELECT {KERNEL_COLS} FROM kernel WHERE ts = ?1"))?
+            .query_row([sts], |r| kernel_row_at(r, 0))
+            .optional()?;
+        let Some(mut k) = k else { return Ok(None) };
+        if let Some(slow) = self.change_at::<KernelSlow>(KIND_KERNEL, sts)? {
+            k.numa = slow.numa;
+            k.ro_remounts = slow.ro_remounts;
+            k.fs_errors = slow.fs_errors;
+            k.taint_flags = slow.taint_flags;
+            k.mdraid = slow.mdraid;
+            k.notes = slow.notes;
+        }
+        // Disks: the latest row per disk since the keyframe; idle disks read as zero.
+        let key: Option<Ts> = self.conn.prepare_cached("SELECT max(ts) FROM server_keys WHERE ts <= ?1")?.query_row([sts], |r| r.get(0))?;
+        if let Some(key) = key {
+            let mut st = self.conn.prepare_cached(&format!("SELECT max(ts), {DISK_COLS} FROM disks WHERE ts BETWEEN ?1 AND ?2 GROUP BY name ORDER BY name"))?;
+            k.disks = st
+                .query_map(params![key, sts], |r| Ok((r.get::<_, Ts>(0)?, disk_row_at(r, 1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|(t, d)| if t == sts { d } else { DiskStat { name: d.name, io_errors: d.io_errors, ..Default::default() } })
+                .collect();
+        }
+        Ok(Some(k))
+    }
+
+    /// Kernel state over time, oldest first, downsampled to at most `max_points` buckets:
+    /// rates and gauges averaged, counters (oom total, taint) and procs_blocked / await /
+    /// util maxed per bucket so short spikes survive downsampling. Disks per bucket; slow
+    /// parts (numa, mdraid, notes) and D-state lists are not part of the series.
+    pub fn kernel_series(&self, from: Ts, to: Ts, max_points: usize) -> anyhow::Result<Vec<(Ts, Kernel)>> {
+        if to < from || max_points == 0 {
+            return Ok(vec![]);
+        }
+        let n = max_points.min(1_000_000) as i128;
+        let span = (to - from) as i128 + 1;
+        let bucket = |ts: Ts| (((ts - from) as i128 * n) / span) as i64;
+        let rows: Vec<(Ts, Kernel)> = {
+            let mut st = self.conn.prepare_cached(&format!("SELECT ts, {KERNEL_COLS} FROM kernel WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts"))?;
+            st.query_map(params![from, to], |r| Ok((r.get(0)?, kernel_row_at(r, 1)?)))?.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut out: Vec<(Ts, Kernel)> = Vec::new();
+        let mut group: Vec<(Ts, Kernel)> = Vec::new();
+        let flush = |group: &mut Vec<(Ts, Kernel)>, out: &mut Vec<(Ts, Kernel)>| {
+            if group.is_empty() {
+                return;
+            }
+            let c = group.len() as f32;
+            let avg = |f: &dyn Fn(&Kernel) -> f32| group.iter().map(|(_, k)| f(k)).sum::<f32>() / c;
+            let last = group.last().map(|g| g.1.clone()).unwrap_or_default();
+            let ts = group.iter().map(|g| g.0 as i128).sum::<i128>() / group.len() as i128;
+            let psi = last.pressure.map(|_| Pressure {
+                cpu_some: avg(&|k| k.pressure.map_or(0.0, |p| p.cpu_some)),
+                cpu_full: avg(&|k| k.pressure.map_or(0.0, |p| p.cpu_full)),
+                mem_some: avg(&|k| k.pressure.map_or(0.0, |p| p.mem_some)),
+                mem_full: avg(&|k| k.pressure.map_or(0.0, |p| p.mem_full)),
+                io_some: avg(&|k| k.pressure.map_or(0.0, |p| p.io_some)),
+                io_full: avg(&|k| k.pressure.map_or(0.0, |p| p.io_full)),
+            });
+            let k = Kernel {
+                steal_pct: avg(&|k| k.steal_pct),
+                iowait_pct: avg(&|k| k.iowait_pct),
+                irq_pct: avg(&|k| k.irq_pct),
+                softirq_pct: avg(&|k| k.softirq_pct),
+                procs_running: avg(&|k| k.procs_running as f32).round() as u32,
+                procs_blocked: group.iter().map(|g| g.1.procs_blocked).max().unwrap_or(0),
+                pressure: psi,
+                mem_available: group.iter().map(|g| g.1.mem_available).min().unwrap_or(0),
+                swap_in_ps: avg(&|k| k.swap_in_ps),
+                swap_out_ps: avg(&|k| k.swap_out_ps),
+                tcp_retrans_ps: avg(&|k| k.tcp_retrans_ps),
+                listen_overflows_ps: avg(&|k| k.listen_overflows_ps),
+                listen_drops_ps: avg(&|k| k.listen_drops_ps),
+                fd_used: group.iter().filter_map(|g| g.1.fd_used).max(),
+                conntrack_used: group.iter().filter_map(|g| g.1.conntrack_used).max(),
+                ephemeral_used: group.iter().filter_map(|g| g.1.ephemeral_used).max(),
+                d_state: vec![],
+                ..last
+            };
+            out.push((ts as Ts, k));
+            group.clear();
+        };
+        for (ts, k) in rows {
+            if group.last().is_some_and(|g| bucket(g.0) != bucket(ts)) {
+                flush(&mut group, &mut out);
+            }
+            group.push((ts, k));
+        }
+        flush(&mut group, &mut out);
+        // Disks: per bucket and name, max await/util/queue, average rates.
+        let mut st = self.conn.prepare_cached(&format!("SELECT ts, {DISK_COLS} FROM disks WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts"))?;
+        let disk_rows = st.query_map(params![from, to], |r| Ok((r.get::<_, Ts>(0)?, disk_row_at(r, 1)?)))?;
+        let mut per: HashMap<(i64, String), (DiskStat, u32)> = HashMap::new();
+        for d in disk_rows {
+            let (ts, d) = d?;
+            let e = per.entry((bucket(ts), d.name.clone())).or_insert_with(|| (DiskStat { name: d.name.clone(), ..Default::default() }, 0));
+            let a = &mut e.0;
+            a.util_pct = a.util_pct.max(d.util_pct);
+            a.r_await_ms = a.r_await_ms.max(d.r_await_ms);
+            a.w_await_ms = a.w_await_ms.max(d.w_await_ms);
+            a.queue_depth = a.queue_depth.max(d.queue_depth);
+            a.r_iops += d.r_iops;
+            a.w_iops += d.w_iops;
+            a.r_bps += d.r_bps;
+            a.w_bps += d.w_bps;
+            a.io_errors = d.io_errors.or(a.io_errors);
+            e.1 += 1;
+        }
+        for (ts, k) in out.iter_mut() {
+            let b = bucket(*ts);
+            let mut ds: Vec<DiskStat> = per
+                .iter()
+                .filter(|((bb, _), _)| *bb == b)
+                .map(|(_, (d, c))| {
+                    let c = (*c).max(1);
+                    DiskStat { r_iops: d.r_iops / c as f32, w_iops: d.w_iops / c as f32, r_bps: d.r_bps / c as u64, w_bps: d.w_bps / c as u64, ..d.clone() }
+                })
+                .collect();
+            ds.sort_by(|a, b| a.name.cmp(&b.name));
+            k.disks = ds;
+        }
+        Ok(out)
+    }
+
+    /// The newest recorded sample as a full Snapshot (system, recorded procs, ports, units,
+    /// kernel, events of the last interval) if it is younger than `max_age_ms`; used by
+    /// `fat snapshot --fast` so a fleet poll costs one SQLite read instead of a live sample.
+    /// meta.source = "recorder", meta.age_ms = now - ts.
+    pub fn latest(&self, max_age_ms: i64) -> anyhow::Result<Option<Snapshot>> {
+        let newest: Option<Ts> = self.conn.query_row("SELECT max(ts) FROM system", [], |r| r.get(0))?;
+        let Some(ts) = newest else { return Ok(None) };
+        let now = crate::model::now_ms();
+        if now - ts > max_age_ms {
+            return Ok(None);
+        }
+        let Some(mut s) = self.at(ts)? else { return Ok(None) };
+        let prev: Option<Ts> = self.conn.query_row("SELECT max(ts) FROM system WHERE ts < ?1", [ts], |r| r.get(0))?;
+        let since = prev.map_or(ts - KEYFRAME_MS, |p| p.max(ts - KEYFRAME_MS)) + 1;
+        s.events = self.events(since, ts, &[], 1000)?;
+        let recorded: Option<SnapMeta> = self.change_at(KIND_META, ts)?;
+        let mut meta = recorded.unwrap_or_else(|| SnapMeta {
+            version: env!("CARGO_PKG_VERSION").into(),
+            profile: if s.units.is_empty() && s.kernel.is_none() { Profile::Desktop } else { Profile::Server },
+            ..Default::default()
+        });
+        meta.source = "recorder".into();
+        meta.age_ms = (now - ts).max(0);
+        s.meta = Some(meta);
+        Ok(Some(s))
+    }
+}
+
 fn write_system_row(tx: &rusqlite::Transaction, snap: &Snapshot) -> anyhow::Result<()> {
     let s = &snap.system;
     let top = snap.procs.iter().max_by(|a, b| a.cpu.total_cmp(&b.cpu));
@@ -1365,7 +2430,15 @@ fn row_to_point(r: &rusqlite::Row) -> rusqlite::Result<Point> {
 /// Between keyframes the set only grows (procs leave it only by exiting), which
 /// avoids tombstone/re-entry churn at the rank boundary; keyframes re-select and
 /// keep previously recorded procs only while they are still somewhat active.
-fn select_interesting<'a>(snap: &'a Snapshot, sticky: &HashSet<u32>, is_key: bool) -> Vec<&'a Proc> {
+///
+/// `server_top` (server profile): also the union of the top N by cpu/mem/io and every unit's
+/// main pid, and the per-sample cap grows to fit 3N so the configured N is honoured.
+fn select_interesting<'a>(
+    snap: &'a Snapshot,
+    sticky: &HashSet<u32>,
+    is_key: bool,
+    server_top: Option<usize>,
+) -> Vec<&'a Proc> {
     let procs = &snap.procs;
     let mut idx: Vec<usize> = (0..procs.len()).collect();
     let mut chosen: Vec<usize> = Vec::new();
@@ -1395,6 +2468,14 @@ fn select_interesting<'a>(snap: &'a Snapshot, sticky: &HashSet<u32>, is_key: boo
         .for_each(|&i| take(i, &mut chosen));
     idx.sort_by(|&a, &b| procs[b].mem.cmp(&procs[a].mem));
     idx.iter().take(TOP_MEM).for_each(|&i| take(i, &mut chosen));
+    if let Some(n) = server_top {
+        let pos: HashMap<u32, usize> = procs.iter().enumerate().map(|(i, p)| (p.pid, i)).collect();
+        for p in crate::server::top_procs(procs, &snap.units, n) {
+            if let Some(&i) = pos.get(&p.pid) {
+                take(i, &mut chosen);
+            }
+        }
+    }
     // Hysteresis: procs recorded last time stay while they are still somewhat
     // active or memory-heavy, so the set doesn't churn at the rank boundary.
     for (rank, &i) in idx.iter().enumerate() {
@@ -1430,7 +2511,7 @@ fn select_interesting<'a>(snap: &'a Snapshot, sticky: &HashSet<u32>, is_key: boo
         }
     }
 
-    chosen.truncate(MAX_RECORDED);
+    chosen.truncate(MAX_RECORDED.max(server_top.map_or(0, |n| n.saturating_mul(3))));
     chosen.into_iter().map(|i| &procs[i]).collect()
 }
 
@@ -1538,6 +2619,8 @@ pub struct FsRecorder {
     vols: crate::fs::volumes::Volumes,
     scanner: Option<crate::fs::scan::Scanner>,
     last_dirs: Option<Instant>,
+    /// Volumes of the last tick (for the fs_fill detector and the exporter).
+    last: Vec<crate::fs::Volume>,
 }
 
 impl FsRecorder {
@@ -1555,7 +2638,7 @@ impl FsRecorder {
                 .ok()
             })
             .flatten();
-        FsRecorder { vols: crate::fs::volumes::Volumes::new(), scanner, last_dirs: None }
+        FsRecorder { vols: crate::fs::volumes::Volumes::new(), scanner, last_dirs: None, last: Vec::new() }
     }
 
     /// Seed fill-rate windows from recorded history so ETAs are available right after start.
@@ -1563,14 +2646,20 @@ impl FsRecorder {
         hist.seed_volumes(&mut self.vols, now);
     }
 
+    /// Volumes sampled by the last [`FsRecorder::tick`].
+    pub fn volumes(&self) -> &[crate::fs::Volume] {
+        &self.last
+    }
+
     pub fn tick(&mut self, hist: &mut History, ts: Ts) -> anyhow::Result<()> {
-        let vols = self.vols.sample();
-        hist.record_volumes(ts, &vols)?;
+        self.last = self.vols.sample();
+        let vols = &self.last;
+        hist.record_volumes(ts, vols)?;
         if self.last_dirs.is_none_or(|t| t.elapsed() >= DIR_SNAPSHOT_EVERY)
             && let Some(sc) = &self.scanner
         {
             let sc = sc.clone();
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dir_snapshot(&sc, &vols))) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dir_snapshot(&sc, vols))) {
                 Ok(Some(rows)) => {
                     self.last_dirs = Some(Instant::now());
                     if !rows.is_empty() {
@@ -1631,17 +2720,60 @@ pub fn dir_snapshot(sc: &crate::fs::scan::Scanner, vols: &[crate::fs::Volume]) -
     Some(out)
 }
 
-/// `fat record`: sample forever, writing to history. Blocks.
+/// `fat record` with default options (profile from config/auto-detection, no export). Blocks.
+/// Kept as the stable entry point for embedders; the CLI calls [`record_with`].
+#[allow(dead_code)]
 pub fn record_forever(cfg: &crate::config::Config) -> anyhow::Result<()> {
-    let interval = Duration::from_millis(cfg.interval_ms.max(1000));
+    record_with(cfg, &crate::server::export::RecordOpts::default())
+}
+
+/// Consecutive sampler panics after which server sampling is switched off for this run.
+const MAX_SAMPLER_PANICS: u32 = 5;
+
+/// `fat record` loop with server options. Desktop profile: exactly the classic recorder
+/// (`interval_ms`, procs/system/ports/volumes, directory scanner). Server profile (auto-detected,
+/// configured, or `--server`): additionally units, kernel and events via ServerSampler, the
+/// recorder-side detectors ([`SpikeDetector`]), `record_interval_ms`, no directory scanner
+/// unless `[server] fs_scan`, and the system-wide DB ([`SYSTEM_DB`]) when running as root
+/// without a configured `history_path`. With `opts.export` (or `[server] export_enabled`) the
+/// newest sample is also served as Prometheus metrics. Blocks until SIGINT/SIGTERM.
+pub fn record_with(cfg: &crate::config::Config, opts: &crate::server::export::RecordOpts) -> anyhow::Result<()> {
+    use crate::server::{LatestSnapshot, ServerSampler, export};
+    let profile = if opts.server { Profile::Server } else { Profile::detect(&cfg.server) };
+    let server = profile == Profile::Server;
+    let interval = Duration::from_millis(if server { cfg.server.record_interval_ms } else { cfg.interval_ms }.max(1000));
     let keep_days = cfg.history_days.max(1);
-    let mut hist = History::open(cfg.history_path.as_deref())?;
+    let configured = cfg.history_path.as_deref().filter(|p| !p.is_empty()).map(str::to_string);
+    let path = configured.or_else(|| {
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        let dir = Path::new(SYSTEM_DB).parent()?;
+        (server && cfg!(target_os = "linux") && root && std::fs::create_dir_all(dir).is_ok()).then(|| SYSTEM_DB.to_string())
+    });
+    let mut hist = History::open(path.as_deref())?;
+    hist.set_server_limits(&cfg.server);
     install_stop_handlers();
     STOP.store(false, Ordering::SeqCst);
 
+    let latest: LatestSnapshot = Default::default();
+    let export_addr = opts.export.or_else(|| {
+        cfg.server.export_enabled.then(|| cfg.server.export_listen.parse().ok()).flatten()
+    });
+    if let Some(addr) = export_addr {
+        if !addr.ip().is_loopback() {
+            eprintln!(
+                "fat record: WARNING: metrics on {addr} are reachable from other hosts (process names, units, \
+                 disk and mount names). Bind 127.0.0.1 unless that is intended."
+            );
+        }
+        let bound = export::serve(addr, latest.clone())?;
+        println!("fat record: Prometheus metrics on http://{bound}/metrics");
+    }
+
     let pruned = hist.prune(keep_days).unwrap_or(0);
     println!(
-        "fat record: writing to {} every {}ms, keeping {}d{} (Ctrl-C to stop)",
+        "fat record: {} profile, writing to {} every {}ms, keeping {}d{} (Ctrl-C to stop)",
+        profile.as_str(),
         hist.path().display(),
         interval.as_millis(),
         keep_days,
@@ -1649,12 +2781,26 @@ pub fn record_forever(cfg: &crate::config::Config) -> anyhow::Result<()> {
     );
 
     let mut collector = crate::collect::Collector::new();
-    let mut fsrec = FsRecorder::new(true);
+    let mut fsrec = FsRecorder::new(if server { cfg.server.fs_scan } else { true });
     fsrec.seed_from(&hist, crate::model::now_ms());
+    let mut sampler = server.then(|| ServerSampler::new(&cfg.server));
+    let mut detector = server.then(|| SpikeDetector::new(&cfg.server));
+    let mut sampler_panics: u32 = 0;
+    let mut kmsg_imported = !(server && cfg.server.kmsg);
     let mut last_prune = Instant::now();
     let mut recorded: u64 = 0;
     let mut errors: u64 = 0;
     let mut waiting = false;
+    // FAT_RECORD_PROFILE=1: print the average wall time of each phase every 60 samples
+    // (sizing the daemon on a new kind of host without a profiler).
+    let mut prof = std::env::var_os("FAT_RECORD_PROFILE").map(|_| PhaseProfile::default());
+    let report = |what: &str, e: &anyhow::Error, errors: &mut u64| {
+        *errors += 1;
+        // Don't flood the terminal/journal if the disk is full or the DB is locked.
+        if *errors <= 5 || errors.is_multiple_of(100) {
+            eprintln!("fat record: {what} failed ({errors} total): {e:#}");
+        }
+    };
     while !STOP.load(Ordering::SeqCst) {
         let started = Instant::now();
         if !hist.try_become_writer() {
@@ -1674,21 +2820,51 @@ pub fn record_forever(cfg: &crate::config::Config) -> anyhow::Result<()> {
         if std::mem::take(&mut waiting) {
             eprintln!("fat record: recording");
         }
-        let snap = collector.sample();
-        if let Err(e) = fsrec.tick(&mut hist, snap.ts) {
-            errors += 1;
-            if errors <= 5 || errors.is_multiple_of(100) {
-                eprintln!("fat record: storage write failed ({errors} total): {e:#}");
+        if !kmsg_imported {
+            kmsg_imported = true;
+            match import_kmsg_backlog(&mut hist) {
+                Ok(n) if n > 0 => println!("fat record: imported {n} kernel log events"),
+                Ok(_) => {}
+                Err(e) => eprintln!("fat record: kernel log not imported: {e:#}"),
             }
         }
-        match hist.record(&snap) {
+        let t_collect = Instant::now();
+        let mut snap = collector.sample();
+        let t_server = Instant::now();
+        if let Some(s) = sampler.as_mut() {
+            let filled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.fill(&mut snap)));
+            if filled.is_ok() {
+                sampler_panics = 0;
+            } else {
+                sampler_panics += 1;
+                eprintln!("fat record: server sampler failed ({sampler_panics} in a row)");
+                // Start over with fresh state; give up on server data after repeated failures
+                // (the classic recorder keeps running either way).
+                sampler = (sampler_panics < MAX_SAMPLER_PANICS).then(|| ServerSampler::new(&cfg.server));
+            }
+        }
+        let t_fs = Instant::now();
+        if let Err(e) = fsrec.tick(&mut hist, snap.ts) {
+            report("storage write", &e, &mut errors);
+        }
+        let t_detect = Instant::now();
+        if let Some(d) = detector.as_mut() {
+            let mut ev = std::mem::take(&mut snap.events);
+            ev.extend(d.detect(&snap, fsrec.volumes()));
+            snap.events = d.filter(ev);
+        }
+        let t_write = Instant::now();
+        match hist.record(&snap).and_then(|_| hist.record_server(&snap)) {
             Ok(()) => recorded += 1,
-            Err(e) => {
-                errors += 1;
-                // Don't flood the terminal if the disk is full or the DB is locked.
-                if errors <= 5 || errors.is_multiple_of(100) {
-                    eprintln!("fat record: write failed ({errors} total): {e:#}");
-                }
+            Err(e) => report("write", &e, &mut errors),
+        }
+        if let Some(p) = prof.as_mut() {
+            p.add([t_server - t_collect, t_fs - t_server, t_detect - t_fs, t_write - t_detect, t_write.elapsed()]);
+        }
+        if export_addr.is_some() {
+            export::note_sample(&snap, fsrec.volumes());
+            if let Ok(mut w) = latest.write() {
+                *w = Some(std::sync::Arc::new(snap));
             }
         }
         if last_prune.elapsed() >= Duration::from_secs(3600) {
@@ -1705,6 +2881,296 @@ pub fn record_forever(cfg: &crate::config::Config) -> anyhow::Result<()> {
     }
     println!("fat record: stopped after {recorded} samples ({errors} errors)");
     Ok(())
+}
+
+/// Average wall time per recorder phase (FAT_RECORD_PROFILE=1).
+#[derive(Default)]
+struct PhaseProfile {
+    sum: [Duration; 5],
+    n: u32,
+}
+
+impl PhaseProfile {
+    fn add(&mut self, d: [Duration; 5]) {
+        for (s, d) in self.sum.iter_mut().zip(d) {
+            *s += d;
+        }
+        self.n += 1;
+        if self.n == 60 {
+            let avg = |i: usize| self.sum[i] / self.n;
+            eprintln!(
+                "fat record: avg per sample over 60: collect {:?}, server {:?}, volumes {:?}, detect {:?}, write {:?}",
+                avg(0),
+                avg(1),
+                avg(2),
+                avg(3),
+                avg(4)
+            );
+            *self = PhaseProfile::default();
+        }
+    }
+}
+
+/// Import kernel log events newer than the newest recorded one (the whole ring buffer on a
+/// fresh DB), so OOM kills and I/O errors from before the daemon started are on the timeline.
+/// Duplicates are skipped by the events table's (ts, kind, subject) key.
+fn import_kmsg_backlog(hist: &mut History) -> anyhow::Result<usize> {
+    let since: Option<Ts> = hist.conn.query_row("SELECT max(ts) FROM events WHERE source = 'kmsg'", [], |r| r.get(0))?;
+    let ev = std::panic::catch_unwind(|| crate::server::kernel::read_kmsg_since(since))
+        .map_err(|_| anyhow::anyhow!("kernel log reader panicked"))??;
+    hist.record_events(&ev)
+}
+
+/// A live snapshot: two samples `gap` apart (rates need an interval), filled by ServerSampler
+/// in the server profile (a failing sampler leaves units/kernel empty instead of failing).
+/// Used when no recorder sample covers the moment asked about.
+pub fn live_snapshot(cfg: &crate::config::Config, gap: Duration) -> Snapshot {
+    let profile = Profile::detect(&cfg.server);
+    let mut c = crate::collect::Collector::new();
+    let mut first = c.sample();
+    let mut sampler = (profile == Profile::Server).then(|| crate::server::ServerSampler::new(&cfg.server));
+    let fill = |s: &mut Snapshot, sampler: &mut Option<crate::server::ServerSampler>| {
+        if let Some(sm) = sampler.as_mut()
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sm.fill(s))).is_err()
+        {
+            *sampler = None;
+        }
+    };
+    fill(&mut first, &mut sampler);
+    std::thread::sleep(gap);
+    let mut s = c.sample();
+    fill(&mut s, &mut sampler);
+    s.meta = Some(SnapMeta::live(profile));
+    s
+}
+
+/// Trailing window of the per-unit spike detectors.
+const SPIKE_WINDOW_MS: i64 = 60_000;
+
+/// Recorder-side detectors that need state across samples: per-unit CPU and memory spikes,
+/// disk latency (when the kernel sampler did not report it itself) and volumes filling up.
+/// Also rate-limits "level" events per subject (`[server] spike_cooldown_s`).
+pub struct SpikeDetector {
+    cfg: ServerCfg,
+    cpu: HashMap<String, std::collections::VecDeque<(Ts, f32)>>,
+    mem: HashMap<String, std::collections::VecDeque<(Ts, u64)>>,
+    /// Current fs_fill level per mount (events fire on entering or escalating).
+    fs: HashMap<String, Severity>,
+    /// Cooldown key -> (last recorded ts, severity).
+    fired: HashMap<String, (Ts, Severity)>,
+}
+
+fn unit_subject(u: &Unit) -> String {
+    let p = match u.kind {
+        UnitKind::Container => "container",
+        UnitKind::Pod => "pod",
+        UnitKind::Systemd | UnitKind::Cgroup => "unit",
+    };
+    format!("{p}:{}", u.name)
+}
+
+fn fmt_b(b: u64) -> String {
+    let f = b as f64;
+    match b {
+        0..=1023 => format!("{b} B"),
+        1024..=1_048_575 => format!("{:.0} KiB", f / 1024.0),
+        1_048_576..=1_073_741_823 => format!("{:.0} MiB", f / 1_048_576.0),
+        _ => format!("{:.1} GiB", f / 1_073_741_824.0),
+    }
+}
+
+fn fmt_dur(s: u64) -> String {
+    match s {
+        0..=119 => format!("{s}s"),
+        120..=7199 => format!("{}m", s / 60),
+        _ => format!("{:.1}h", s as f64 / 3600.0),
+    }
+}
+
+/// Kinds that describe a persisting condition (subject to the cooldown) rather than a
+/// transition (always recorded).
+fn is_level_kind(k: EventKind) -> bool {
+    matches!(
+        k,
+        EventKind::DiskLatencySpike
+            | EventKind::Throttle
+            | EventKind::PressureSpike
+            | EventKind::Exhaustion
+            | EventKind::ProcSpike
+            | EventKind::FsFill
+            | EventKind::ClockUnsynced
+    )
+}
+
+impl SpikeDetector {
+    pub fn new(cfg: &ServerCfg) -> SpikeDetector {
+        SpikeDetector { cfg: cfg.clone(), cpu: HashMap::new(), mem: HashMap::new(), fs: HashMap::new(), fired: HashMap::new() }
+    }
+
+    /// New events for this sample (not yet cooldown-filtered).
+    pub fn detect(&mut self, snap: &Snapshot, vols: &[crate::fs::Volume]) -> Vec<Event> {
+        let ts = snap.ts;
+        let mut out = Vec::new();
+        let ev = |kind, severity, subject: String, u: Option<&Unit>, detail: String, value: f64, metric: &str| {
+            let mut extra = std::collections::BTreeMap::new();
+            if !metric.is_empty() {
+                extra.insert("metric".to_string(), metric.to_string());
+            }
+            Event {
+                ts,
+                kind,
+                severity,
+                subject,
+                unit: u.map(|u| u.name.clone()),
+                pid: u.and_then(|u| u.main_pid),
+                detail,
+                value: Some(value),
+                source: "recorder".into(),
+                extra,
+            }
+        };
+        // ---- per-unit cpu / memory spikes, relative to host capacity
+        let capacity = snap.system.cores.max(1) as f32 * 100.0;
+        let cpu_thr = (self.cfg.spike_cpu_pct / 100.0 * capacity).max(50.0);
+        let mem_thr = (self.cfg.spike_mem_pct.max(0.0) as f64 / 100.0 * snap.system.mem_total as f64) as u64;
+        let mut seen: HashSet<String> = HashSet::with_capacity(snap.units.len());
+        for u in &snap.units {
+            let key = unit_subject(u);
+            let w = self.cpu.entry(key.clone()).or_default();
+            while w.front().is_some_and(|x| x.0 < ts - SPIKE_WINDOW_MS || x.0 >= ts) {
+                w.pop_front();
+            }
+            if w.len() >= 3 {
+                let med = median(w.iter().map(|x| x.1));
+                if u.cpu - med >= cpu_thr {
+                    out.push(ev(
+                        EventKind::ProcSpike,
+                        Severity::Warn,
+                        key.clone(),
+                        Some(u),
+                        format!("{} CPU jumped to {:.0}% (median {:.0}% over the previous minute)", u.name, u.cpu, med),
+                        u.cpu as f64,
+                        "cpu",
+                    ));
+                }
+            }
+            w.push_back((ts, u.cpu));
+            let m = self.mem.entry(key.clone()).or_default();
+            while m.front().is_some_and(|x| x.0 < ts - SPIKE_WINDOW_MS || x.0 >= ts) {
+                m.pop_front();
+            }
+            if mem_thr > 0
+                && let Some(&(t0, low)) = m.iter().min_by_key(|x| x.1)
+                && u.mem.saturating_sub(low) >= mem_thr
+            {
+                out.push(ev(
+                    EventKind::ProcSpike,
+                    Severity::Warn,
+                    key.clone(),
+                    Some(u),
+                    format!("{} memory grew {} in {}s to {}", u.name, fmt_b(u.mem - low), (ts - t0) / 1000, fmt_b(u.mem)),
+                    u.mem as f64,
+                    "mem",
+                ));
+            }
+            m.push_back((ts, u.mem));
+            seen.insert(key);
+        }
+        self.cpu.retain(|k, _| seen.contains(k));
+        self.mem.retain(|k, _| seen.contains(k));
+
+        // ---- disk latency the kernel sampler did not already report
+        if let Some(k) = &snap.kernel {
+            let thr = self.cfg.disk_await_warn_ms.max(1.0);
+            for d in &k.disks {
+                let aw = d.r_await_ms.max(d.w_await_ms);
+                let subject = format!("disk:{}", d.name);
+                if aw >= thr && !snap.events.iter().any(|e| e.kind == EventKind::DiskLatencySpike && e.subject == subject) {
+                    let sev = if aw >= 5.0 * thr { Severity::Crit } else { Severity::Warn };
+                    out.push(ev(
+                        EventKind::DiskLatencySpike,
+                        sev,
+                        subject,
+                        None,
+                        format!(
+                            "disk {} await {:.0} ms (read {:.0}, write {:.0}; threshold {:.0}), util {:.0}%, queue {:.1}",
+                            d.name, aw, d.r_await_ms, d.w_await_ms, thr, d.util_pct, d.queue_depth
+                        ),
+                        aw as f64,
+                        "",
+                    ));
+                }
+            }
+        }
+
+        // ---- volumes filling: projected time to full, or nearly full
+        let eta_warn = self.cfg.fs_fill_eta_s.max(1);
+        let mut mounts: HashSet<&str> = HashSet::new();
+        for v in vols.iter().filter(|v| !v.hidden && !v.read_only && v.used + v.avail > 0) {
+            mounts.insert(&v.mount);
+            let pct = v.used as f64 * 100.0 / (v.used + v.avail) as f64;
+            let eta = v.eta_full_s;
+            let level = if pct >= 95.0 || eta.is_some_and(|e| e < eta_warn / 6) {
+                Some(Severity::Crit)
+            } else if eta.is_some_and(|e| e < eta_warn) {
+                Some(Severity::Warn)
+            } else {
+                None
+            };
+            let prev = self.fs.get(&v.mount).copied();
+            match level {
+                Some(l) if prev.is_none_or(|p| l > p) => {
+                    let rate = v.fill_bps.filter(|r| *r > 0.0).map(|r| format!(", growing {}/s", fmt_b(r as u64))).unwrap_or_default();
+                    let when = eta.map(|e| format!(", full in ~{}", fmt_dur(e))).unwrap_or_default();
+                    out.push(ev(
+                        EventKind::FsFill,
+                        l,
+                        format!("mount:{}", v.mount),
+                        None,
+                        format!("{} {:.0}% full ({} free){rate}{when}", v.mount, pct, fmt_b(v.avail)),
+                        pct,
+                        "",
+                    ));
+                    self.fs.insert(v.mount.clone(), l);
+                }
+                Some(_) => {}
+                // Hysteresis: the condition clears only well below the thresholds.
+                None if prev.is_some() && pct < 93.0 && eta.is_none_or(|e| e > eta_warn * 3 / 2) => {
+                    self.fs.remove(&v.mount);
+                }
+                None => {}
+            }
+        }
+        self.fs.retain(|m, _| mounts.contains(m.as_str()));
+        out
+    }
+
+    /// Apply the per-subject cooldown to level events (an escalation in severity always
+    /// passes); transitions pass unchanged. Returns events sorted by ts.
+    pub fn filter(&mut self, events: Vec<Event>) -> Vec<Event> {
+        let cool = self.cfg.spike_cooldown_s as i64 * 1000;
+        let mut out = Vec::with_capacity(events.len());
+        for e in events {
+            if !is_level_kind(e.kind) {
+                out.push(e);
+                continue;
+            }
+            let key = format!("{}|{}|{}", e.kind.as_str(), e.subject, e.extra.get("metric").map(String::as_str).unwrap_or(""));
+            let pass = match self.fired.get(&key) {
+                Some(&(t, sev)) => e.ts - t >= cool || e.ts < t || e.severity > sev,
+                None => true,
+            };
+            if pass {
+                self.fired.insert(key, (e.ts, e.severity));
+                out.push(e);
+            }
+        }
+        if let Some(newest) = out.iter().map(|e| e.ts).max() {
+            self.fired.retain(|_, (t, _)| newest - *t < cool.max(1));
+        }
+        out.sort_by_key(|e| e.ts);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -1788,6 +3254,7 @@ mod tests {
                 note: "vite".into(),
             }],
             containers: vec![],
+            ..Default::default()
         }
     }
 
@@ -2255,6 +3722,446 @@ mod tests {
         assert!(!mounts.is_empty());
         drop(h);
         cleanup(&path);
+    }
+
+    // ---- server mode (recorder-export) ----
+
+    /// A server with `n_units` units (a few busy), kernel state with two disks, and `nprocs` procs.
+    #[test]
+    fn server_top_procs_are_recorded() {
+        let procs: Vec<Proc> =
+            (1..=400u32).map(|i| Proc { pid: i, ppid: 0, cpu: 0.3, mem: i as u64 * 1_000_000, ..Default::default() }).collect();
+        let snap = Snapshot {
+            procs,
+            units: vec![Unit { name: "idle.service".into(), main_pid: Some(7), ..Default::default() }],
+            ..Default::default()
+        };
+        let none = HashSet::new();
+        let desktop = select_interesting(&snap, &none, true, None);
+        assert!(!desktop.iter().any(|p| p.pid == 7));
+        let server = select_interesting(&snap, &none, true, Some(100));
+        assert!(server.iter().any(|p| p.pid == 7), "unit main pid kept");
+        assert!(server.iter().any(|p| p.pid == 301), "top 100 by mem kept");
+        assert!(server.len() >= 100 && server.len() <= 300, "{}", server.len());
+    }
+
+    fn server_snap(ts: Ts, n_units: usize, nprocs: u32, rng: &mut Rng) -> Snapshot {
+        let mut s = synth(ts, nprocs, 20.0, 0.0, 6 << 30, rng);
+        s.system.mem_total = 16 << 30;
+        s.units = (0..n_units)
+            .map(|i| Unit {
+                name: format!("svc{i}.service"),
+                kind: if i % 10 == 9 { UnitKind::Container } else { UnitKind::Systemd },
+                state: if i % 17 == 16 { "failed".into() } else { "active".into() },
+                sub_state: "running".into(),
+                description: format!("Service number {i}"),
+                cgroup: format!("/system.slice/svc{i}.service"),
+                main_pid: Some(1000 + i as u32),
+                pids: 3,
+                cpu: if i % 20 == 0 { 30.0 + rng.next() * 20.0 } else { 0.0 },
+                mem: (50 << 20) + (i as u64) * 1_000_000 + if i % 20 == 0 { (rng.next() * 4_000_000.0) as u64 } else { 0 },
+                mem_limit: (i % 5 == 0).then_some(1 << 30),
+                restarts: (i % 7) as u32,
+                psi: (i % 3 == 0).then_some(Pressure { cpu_some: 0.0, ..Default::default() }),
+                container: (i % 10 == 9).then(|| ContainerMeta { id: format!("{i:012}"), name: format!("svc{i}"), runtime: "docker".into(), ..Default::default() }),
+                ..Default::default()
+            })
+            .collect();
+        s.kernel = Some(Kernel {
+            steal_pct: 0.5,
+            iowait_pct: rng.next() * 3.0,
+            procs_running: 2,
+            procs_blocked: 0,
+            pressure: Some(Pressure { cpu_some: 1.0, io_some: 2.0, ..Default::default() }),
+            mem_available: 10 << 30,
+            oom_kills_total: 1,
+            fd_used: Some(3000),
+            fd_max: Some(1 << 20),
+            ephemeral_range: Some((32768, 60999)),
+            ephemeral_used: Some(40),
+            disks: vec![
+                DiskStat { name: "vda".into(), util_pct: 3.0 + rng.next(), w_await_ms: 1.5, w_iops: 20.0, w_bps: 400_000, ..Default::default() },
+                DiskStat { name: "vdb".into(), ..Default::default() },
+            ],
+            taint_flags: String::new(),
+            notes: vec!["no conntrack module".into()],
+            ..Default::default()
+        });
+        s.meta = Some(SnapMeta::live(Profile::Server));
+        s
+    }
+
+    fn ev(ts: Ts, kind: EventKind, subject: &str) -> Event {
+        Event { ts, kind, severity: Severity::Warn, subject: subject.into(), detail: format!("{} {subject}", kind.as_str()), source: "test".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn server_record_roundtrip() {
+        let path = tmp_db("srv");
+        let mut h = History::open(Some(path.to_str().unwrap())).unwrap();
+        let mut rng = Rng(5);
+        let n = 120i64; // 4 minutes at 2 s: two server keyframes
+        for i in 0..n {
+            let ts = T0 + i * 2000;
+            let mut s = server_snap(ts, 40, 80, &mut rng);
+            if i >= 60 {
+                // svc3 restarts and fails at 2 min; svc4 disappears.
+                s.units[3].state = "failed".into();
+                s.units[3].result = "exit-code".into();
+                s.units[3].exit_code = Some(1);
+                s.units[3].restarts = 9;
+                s.units.retain(|u| u.name != "svc4.service");
+            }
+            if i == 61 {
+                s.events = vec![ev(ts, EventKind::UnitFailed, "unit:svc3.service"), ev(ts, EventKind::UnitFailed, "unit:svc3.service")];
+                let mut oom = ev(ts, EventKind::OomKill, "unit:svc5.service");
+                oom.extra.insert("victim".into(), "worker".into());
+                oom.pid = Some(4242);
+                oom.value = Some(1.5e9);
+                s.events.push(oom);
+            }
+            h.record(&s).unwrap();
+            h.record_server(&s).unwrap();
+        }
+        // Units at a time before and after the change.
+        let before = h.units_at(T0 + 30 * 2000).unwrap();
+        assert_eq!(before.len(), 40);
+        let u3 = before.iter().find(|u| u.name == "svc3.service").unwrap();
+        assert_eq!((u3.state.as_str(), u3.restarts), ("active", 3));
+        let u9 = before.iter().find(|u| u.name == "svc9.service").unwrap();
+        assert_eq!(u9.kind, UnitKind::Container);
+        assert_eq!(u9.container.as_ref().unwrap().runtime, "docker");
+        assert_eq!(u9.description, "Service number 9");
+        let after = h.units_at(T0 + 100 * 2000).unwrap();
+        assert_eq!(after.len(), 39, "svc4 is gone");
+        let u3 = after.iter().find(|u| u.name == "svc3.service").unwrap();
+        assert_eq!((u3.state.as_str(), u3.result.as_str(), u3.exit_code, u3.restarts), ("failed", "exit-code", Some(1), 9));
+        let u0 = after.iter().find(|u| u.name == "svc0.service").unwrap();
+        assert!(u0.cpu >= 20.0 && u0.mem_limit == Some(1 << 30) && u0.psi.is_some());
+        assert!(h.units_at(T0 - 10 * 60_000).unwrap().is_empty(), "nothing recorded then");
+
+        // Series: change points with the restart visible, plus a "gone" point.
+        let s3 = h.unit_series("svc3.service", T0 + 10_000, T0 + n * 2000).unwrap();
+        assert_eq!(s3.first().unwrap().ts, T0 + 10_000, "value in effect at `from`");
+        assert!(s3.iter().any(|p| p.state == "failed" && p.restarts == 9));
+        assert!(s3.len() < 10, "idle unit is change-point encoded: {} points", s3.len());
+        let s4 = h.unit_series("svc4.service", T0, T0 + n * 2000).unwrap();
+        assert_eq!(s4.last().unwrap().state, "gone");
+        assert!(h.unit_series("nope.service", T0, T0 + n * 2000).unwrap().is_empty());
+
+        // Kernel through at(): scalars, slow parts, both disks (idle one reads zero).
+        let snap = h.at(T0 + 50 * 2000).unwrap().unwrap();
+        let k = snap.kernel.as_ref().unwrap();
+        assert_eq!(k.fd_used, Some(3000));
+        assert_eq!(k.ephemeral_range, Some((32768, 60999)));
+        assert_eq!(k.notes, vec!["no conntrack module".to_string()]);
+        assert_eq!(k.pressure.unwrap().io_some, 2.0);
+        assert_eq!(k.disks.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["vda", "vdb"]);
+        assert!(k.disks[0].w_bps == 400_000 && k.disks[1].w_bps == 0);
+        assert_eq!(snap.units.len(), 40);
+
+        // Events: dedup, kind filter, limit keeps the newest, count.
+        let all = h.events(T0, T0 + n * 2000, &[], 100).unwrap();
+        assert_eq!(all.len(), 2, "duplicate (ts, kind, subject) stored once");
+        let oom = h.events(T0, T0 + n * 2000, &[EventKind::OomKill], 10).unwrap();
+        assert_eq!(oom.len(), 1);
+        assert_eq!((oom[0].pid, oom[0].value, oom[0].extra.get("victim").map(String::as_str)), (Some(4242), Some(1.5e9), Some("worker")));
+        assert_eq!(h.event_count(EventKind::OomKill, T0).unwrap(), 1);
+        assert_eq!(h.event_count(EventKind::OomKill, T0 + n * 2000).unwrap(), 0);
+        let lim = h.events(T0, T0 + n * 2000, &[], 1).unwrap();
+        assert_eq!(lim.len(), 1);
+        assert_eq!(h.record_events(&[ev(T0 + 5, EventKind::KernelWarn, "kernel"), ev(T0 + 61 * 2000, EventKind::UnitFailed, "unit:svc3.service")]).unwrap(), 1);
+
+        // Kernel series downsampled.
+        let ks = h.kernel_series(T0, T0 + n * 2000, 10).unwrap();
+        assert!(ks.len() <= 10 && ks.len() >= 9, "{}", ks.len());
+        assert!(ks.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(ks[0].1.disks.iter().any(|d| d.name == "vda" && d.w_bps > 0));
+
+        // Prune keeps what later samples need.
+        let cutoff = T0 + 70 * 2000;
+        h.prune_before(cutoff).unwrap();
+        assert_eq!(h.units_at(cutoff + 2000).unwrap().len(), 39);
+        assert!(h.events(T0, cutoff - 1, &[], 100).unwrap().is_empty());
+        drop(h);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn server_tables_migrate_into_existing_db() {
+        let path = tmp_db("migrate");
+        {
+            // A database as written by the previous release: schema v2 without server tables.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            c.execute_batch("PRAGMA user_version = 2;").unwrap();
+            c.execute("INSERT INTO system (ts, cpu10, mem_used, power) VALUES (?1, 123, 456, 0)", [T0]).unwrap();
+        }
+        let mut h = History::open(Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(h.read_system(T0).unwrap().unwrap().cpu, 12.3, "old data kept");
+        let n: i64 = h.conn.query_row(&format!("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ({ALL_TABLES})"), [], |r| r.get(0)).unwrap();
+        assert_eq!(n, ALL_TABLES_N);
+        let mut rng = Rng(1);
+        let s = server_snap(T0 + 2000, 5, 10, &mut rng);
+        h.record(&s).unwrap();
+        h.record_server(&s).unwrap();
+        assert_eq!(h.units_at(T0 + 2000).unwrap().len(), 5);
+        drop(h);
+        // A current DB opens without any write (works for readers without write access).
+        let c = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        drop(c);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn desktop_snapshots_write_no_server_rows() {
+        let path = tmp_db("desk");
+        let mut h = History::open(Some(path.to_str().unwrap())).unwrap();
+        let mut rng = Rng(2);
+        let s = synth(T0, 20, 5.0, 100.0, 1 << 30, &mut rng);
+        h.record(&s).unwrap();
+        h.record_server(&s).unwrap();
+        let rows: i64 = h.conn.query_row("SELECT (SELECT count(*) FROM units) + (SELECT count(*) FROM kernel) + (SELECT count(*) FROM server_keys)", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0);
+        let at = h.at(T0).unwrap().unwrap();
+        assert!(at.units.is_empty() && at.kernel.is_none());
+        let v = serde_json::to_value(&at).unwrap();
+        assert!(v.get("units").is_none() && v.get("kernel").is_none(), "desktop JSON unchanged");
+        drop(h);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn read_only_open_and_latest() {
+        let path = tmp_db("ro");
+        let p = path.to_str().unwrap();
+        assert!(History::open_read_only(Some(p)).is_err(), "no file: no creation");
+        assert!(!path.exists());
+        let mut h = History::open(Some(p)).unwrap();
+        let mut rng = Rng(9);
+        let now = crate::model::now_ms();
+        for i in 0..5 {
+            let mut s = server_snap(now - (4 - i) * 2000, 10, 30, &mut rng);
+            if i == 4 {
+                s.events = vec![ev(s.ts, EventKind::UnitRestart, "unit:svc1.service")];
+            }
+            if i == 3 {
+                s.events = vec![ev(s.ts, EventKind::UnitStart, "unit:svc2.service")];
+            }
+            h.record(&s).unwrap();
+            h.record_server(&s).unwrap();
+        }
+        let r = History::open_read_only(Some(p)).unwrap();
+        let mut r2 = History::open_read_only(Some(p)).unwrap();
+        assert!(!r2.try_become_writer(), "read-only never takes the lease");
+        let l = r.latest(60_000).unwrap().expect("fresh sample");
+        assert_eq!(l.ts, now);
+        let m = l.meta.as_ref().unwrap();
+        assert_eq!((m.source.as_str(), m.profile), ("recorder", Profile::Server));
+        assert!(m.age_ms >= 0 && m.age_ms < 60_000);
+        assert_eq!(l.units.len(), 10);
+        assert!(l.kernel.is_some() && !l.procs.is_empty());
+        assert_eq!(l.events.len(), 1, "only the last interval's events");
+        assert_eq!(l.events[0].kind, EventKind::UnitRestart);
+        assert!(r.latest(-1).unwrap().is_none(), "too old");
+        drop((h, r, r2));
+        cleanup(&path);
+    }
+
+    /// `fat snapshot --fast` budget: open read-only + latest + JSON for a server with 600 procs
+    /// and 150 units must stay far below a live sample (< 50 ms release; debug is slower).
+    #[test]
+    fn latest_is_fast() {
+        let path = tmp_db("fast");
+        let p = path.to_str().unwrap();
+        let mut h = History::open(Some(p)).unwrap();
+        let mut rng = Rng(21);
+        let now = crate::model::now_ms();
+        let n = 150i64; // 5 min at 2 s: replay crosses a keyframe
+        for i in 0..n {
+            let s = server_snap(now - (n - 1 - i) * 2000, 150, 600, &mut rng);
+            h.record(&s).unwrap();
+            h.record_server(&s).unwrap();
+        }
+        drop(h);
+        let mut best = Duration::MAX;
+        for _ in 0..5 {
+            let t = Instant::now();
+            let r = History::open_read_only(Some(p)).unwrap();
+            let s = r.latest(600_000).unwrap().unwrap();
+            let json = serde_json::to_string(&s).unwrap();
+            best = best.min(t.elapsed());
+            assert!(json.len() > 10_000 && s.units.len() == 150);
+        }
+        let budget = if cfg!(debug_assertions) { Duration::from_millis(400) } else { Duration::from_millis(50) };
+        eprintln!("latest(): open + query + json best of 5: {best:?}");
+        assert!(best < budget, "{best:?}");
+        cleanup(&path);
+    }
+
+    /// Server tables' disk cost: 100 units (5 busy), kernel + 2 disks, 300 procs, at 5 s.
+    #[test]
+    fn server_bytes_per_day() {
+        let path = tmp_db("srvsize");
+        let mut h = History::open(Some(path.to_str().unwrap())).unwrap();
+        let mut rng = Rng(77);
+        let n = 360i64; // 30 min at 5 s
+        let mut base = 0;
+        for i in 0..n {
+            if i == 60 {
+                h.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+                base = std::fs::metadata(&path).unwrap().len();
+            }
+            let s = server_snap(T0 + i * 5000, 100, 300, &mut rng);
+            h.record(&s).unwrap();
+            h.record_server(&s).unwrap();
+        }
+        h.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        let bytes = std::fs::metadata(&path).unwrap().len() - base;
+        let per_day = bytes as f64 / (n - 60) as f64 * 17_280.0 / 1e6;
+        let unit_rows: i64 = h.conn.query_row("SELECT count(*) FROM units", [], |r| r.get(0)).unwrap();
+        eprintln!("server profile: {per_day:.1} MB/day at 5 s ({unit_rows} unit rows for {n} samples x 100 units)");
+        assert!(unit_rows < n * 100 / 4, "units are change-point encoded: {unit_rows}");
+        assert!(per_day < 40.0, "{per_day:.1} MB/day");
+        drop(h);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn caps_bound_units_and_events() {
+        let path = tmp_db("caps");
+        let mut h = History::open(Some(path.to_str().unwrap())).unwrap();
+        h.set_server_limits(&ServerCfg { max_units: 10, max_events_per_sample: 5, ..Default::default() });
+        let mut rng = Rng(4);
+        let mut s = server_snap(T0, 50, 10, &mut rng);
+        s.events = (0..40).map(|i| ev(T0 + i, EventKind::KernelWarn, &format!("pid:{i}"))).collect();
+        s.events[7].severity = Severity::Crit;
+        h.record(&s).unwrap();
+        h.record_server(&s).unwrap();
+        let units = h.units_at(T0).unwrap();
+        assert_eq!(units.len(), 10);
+        assert!(units.iter().filter(|u| u.state == "failed").count() >= 2, "failed units kept first");
+        let evs = h.events(T0, T0 + 100, &[], 100).unwrap();
+        assert_eq!(evs.len(), 5);
+        assert!(evs.iter().any(|e| e.severity == Severity::Crit && e.subject == "pid:7"));
+        assert!(evs.iter().any(|e| e.kind == EventKind::Other && e.detail.contains("36 of 40")));
+        drop(h);
+        cleanup(&path);
+    }
+
+    fn unit(name: &str, cpu: f32, mem: u64) -> Unit {
+        Unit { name: name.into(), state: "active".into(), cpu, mem, main_pid: Some(7), ..Default::default() }
+    }
+
+    #[test]
+    fn spike_detector() {
+        let cfg = ServerCfg::default();
+        let mut d = SpikeDetector::new(&cfg);
+        let base = |ts: Ts, units: Vec<Unit>| Snapshot {
+            ts,
+            system: System { cores: 4, mem_total: 8 << 30, ..Default::default() },
+            units,
+            ..Default::default()
+        };
+        // Quiet minute, then a CPU jump of 2 cores (threshold: 25% of 400 = 100) and +1 GiB (10% of 8 GiB = 819 MiB).
+        for i in 0..6 {
+            assert!(d.detect(&base(T0 + i * 5000, vec![unit("a.service", 5.0, 1 << 30)]), &[]).is_empty());
+        }
+        let e = d.detect(&base(T0 + 30_000, vec![unit("a.service", 210.0, 2 << 30)]), &[]);
+        assert_eq!(e.len(), 2, "{e:?}");
+        assert!(e.iter().all(|e| e.kind == EventKind::ProcSpike && e.subject == "unit:a.service" && e.pid == Some(7)));
+        assert!(e.iter().any(|e| e.extra.get("metric").map(String::as_str) == Some("cpu") && e.detail.contains("210%")));
+        assert!(e.iter().any(|e| e.extra.get("metric").map(String::as_str) == Some("mem") && e.detail.contains("1.0 GiB")));
+        // Cooldown: a repeat right after is dropped, a different metric/subject is not.
+        let f = d.filter(e.clone());
+        assert_eq!(f.len(), 2);
+        let mut again = e.clone();
+        for x in again.iter_mut() {
+            x.ts += 5000;
+        }
+        assert!(d.filter(again.clone()).is_empty());
+        let mut escalated = again[0].clone();
+        escalated.severity = Severity::Crit;
+        assert_eq!(d.filter(vec![escalated]).len(), 1, "escalation passes the cooldown");
+        let mut later = again[1].clone();
+        later.ts += cfg.spike_cooldown_s as i64 * 1000;
+        assert_eq!(d.filter(vec![later]).len(), 1);
+        let transition = ev(T0 + 40_000, EventKind::UnitRestart, "unit:a.service");
+        assert_eq!(d.filter(vec![transition.clone(), transition]).len(), 2, "transitions never suppressed");
+
+        // Disk latency: reported unless the kernel sampler already did.
+        let mut s = base(T0 + 50_000, vec![]);
+        s.kernel = Some(Kernel { disks: vec![DiskStat { name: "sdb".into(), w_await_ms: 700.0, ..Default::default() }], ..Default::default() });
+        let e = d.detect(&s, &[]);
+        assert_eq!((e.len(), e[0].kind, e[0].severity), (1, EventKind::DiskLatencySpike, Severity::Crit));
+        s.events = vec![ev(s.ts, EventKind::DiskLatencySpike, "disk:sdb")];
+        assert!(d.detect(&s, &[]).is_empty());
+
+        // Volumes: fires on entering a level and on escalation only.
+        let vol = |used: u64, avail: u64, eta: Option<u64>| crate::fs::Volume {
+            mount: "/data".into(),
+            total: used + avail,
+            used,
+            avail,
+            fill_bps: Some(1e6),
+            eta_full_s: eta,
+            ..Default::default()
+        };
+        let s = base(T0 + 60_000, vec![]);
+        assert!(d.detect(&s, &[vol(50, 50, None)]).is_empty());
+        let e = d.detect(&s, &[vol(50, 50, Some(3 * 3600))]);
+        assert_eq!((e.len(), e[0].kind, e[0].severity, e[0].subject.as_str()), (1, EventKind::FsFill, Severity::Warn, "mount:/data"));
+        assert!(d.detect(&s, &[vol(51, 49, Some(3 * 3600))]).is_empty(), "same level: no repeat");
+        let e = d.detect(&s, &[vol(96, 4, Some(600))]);
+        assert_eq!(e[0].severity, Severity::Crit);
+        assert!(d.detect(&s, &[vol(50, 50, None)]).is_empty(), "clearing is silent");
+        assert_eq!(d.detect(&s, &[vol(50, 50, Some(3600))]).len(), 1, "re-arms after clearing");
+    }
+
+    /// CPU per recorder component on a real host (self + children, via getrusage):
+    /// `FAT_SAMPLES=60 cargo test --release --bin fat history::tests::real_server_cpu -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_server_cpu() {
+        fn cpu() -> (Duration, Duration) {
+            let get = |who| {
+                // SAFETY: getrusage writes into a zeroed rusage we own.
+                let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+                unsafe { libc::getrusage(who, &mut r) };
+                let tv = |t: libc::timeval| Duration::from_secs(t.tv_sec as u64) + Duration::from_micros(t.tv_usec as u64);
+                tv(r.ru_utime) + tv(r.ru_stime)
+            };
+            (get(libc::RUSAGE_SELF), get(libc::RUSAGE_CHILDREN))
+        }
+        let n: u32 = std::env::var("FAT_SAMPLES").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        let cfg = ServerCfg::default();
+        let mut c = crate::collect::Collector::new();
+        let mut sv = crate::server::services::Services::new(&cfg);
+        let mut k = crate::server::kernel::KernelSampler::new(&cfg);
+        let mut acc = [(Duration::ZERO, Duration::ZERO); 3];
+        let mut units = 0;
+        for _ in 0..n {
+            let mut step = |i: usize, f: &mut dyn FnMut()| {
+                let a = cpu();
+                f();
+                let b = cpu();
+                acc[i].0 += b.0 - a.0;
+                acc[i].1 += b.1 - a.1;
+            };
+            let mut snap = Snapshot::default();
+            step(0, &mut || snap = c.sample());
+            step(1, &mut || snap.units = sv.sample(&snap.procs));
+            step(2, &mut || snap.kernel = k.sample(&snap.procs, &snap.units));
+            units = snap.units.len();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        for (i, name) in ["collect", "services", "kernel"].iter().enumerate() {
+            eprintln!("{name}: self {:?}/sample, children {:?}/sample", acc[i].0 / n, acc[i].1 / n);
+        }
+        eprintln!("({units} units)");
     }
 
     /// Real-machine size/latency check: `cargo test --bin fat history::tests::real_machine -- --ignored --nocapture`

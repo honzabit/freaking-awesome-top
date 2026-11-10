@@ -8,7 +8,11 @@
 //! daemon is down). Container results are cached so the TUI can call `containers()` on every
 //! refresh: a fresh cache is returned directly, a stale one is returned immediately while a
 //! background thread refreshes it.
-use crate::config::HostCfg;
+// Server-mode fleet (contract in src/server/mod.rs): inventory + parallel read-only fan-out.
+pub mod cli;
+pub mod fanout;
+pub mod inventory;
+
 use crate::model::{Container, Snapshot};
 use serde_json::Value;
 use std::io::Read;
@@ -19,7 +23,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const CMD_TIMEOUT: Duration = Duration::from_millis(2500);
-const SSH_TIMEOUT: Duration = Duration::from_secs(8);
 const CACHE_TTL: Duration = Duration::from_secs(5);
 
 static CACHE: Mutex<Option<(Instant, Vec<Container>)>> = Mutex::new(None);
@@ -181,7 +184,6 @@ fn find_bin(name: &str) -> Option<PathBuf> {
 pub(crate) struct CmdOut {
     pub status: ExitStatus,
     pub stdout: String,
-    pub stderr: String,
 }
 
 impl CmdOut {
@@ -227,7 +229,8 @@ pub(crate) fn run_with_timeout(prog: &str, args: &[&str], timeout: Duration) -> 
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     };
-    Ok(CmdOut { status, stdout: out_t.join().unwrap_or_default(), stderr: err_t.join().unwrap_or_default() })
+    let _ = err_t.join(); // drained so a chatty child cannot block; not used
+    Ok(CmdOut { status, stdout: out_t.join().unwrap_or_default() })
 }
 
 // ---------- parsing ----------
@@ -371,33 +374,7 @@ pub(crate) fn parse_size(s: &str) -> u64 {
     (n * mult) as u64
 }
 
-// ---------- remote hosts ----------
-
-/// Snapshot of a remote host via ssh (BatchMode, ConnectTimeout=3). host field set to cfg.name.
-pub fn remote(host: &HostCfg) -> anyhow::Result<Snapshot> {
-    let dest = host.ssh.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| host.name.clone());
-    if dest.trim().is_empty() {
-        anyhow::bail!("host has no name or ssh destination");
-    }
-    if dest.starts_with('-') {
-        anyhow::bail!("refusing ssh destination that looks like an option: {dest}");
-    }
-    let remote_cmd = remote_command(host.fat_path.as_deref());
-    let out = run_with_timeout("ssh", &["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", &dest, &remote_cmd], SSH_TIMEOUT)?;
-    if !out.success() {
-        let err = out.stderr.trim().lines().last().unwrap_or("").to_string();
-        anyhow::bail!("ssh {dest} failed ({}): {}", out.status, if err.is_empty() { "no output" } else { &err });
-    }
-    parse_remote_snapshot(&out.stdout, &host.name)
-}
-
-/// With the default "fat", fall back to ~/.cargo/bin/fat since non-login ssh shells often lack it on PATH.
-fn remote_command(fat_path: Option<&str>) -> String {
-    match fat_path.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(p) => format!("{p} snapshot --json"),
-        None => "command -v fat >/dev/null 2>&1 && exec fat snapshot --json || exec ~/.cargo/bin/fat snapshot --json".into(),
-    }
-}
+// ---------- remote hosts (polling lives in fleet/fanout.rs) ----------
 
 /// Parse snapshot JSON, tolerating login banners before the first '{'.
 pub(crate) fn parse_remote_snapshot(stdout: &str, name: &str) -> anyhow::Result<Snapshot> {
@@ -521,11 +498,5 @@ not json
         assert!(!is_podman_shim(&real));
         assert!(!is_podman_shim(&dir.join("missing")));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn remote_cmd_default_and_custom() {
-        assert!(remote_command(None).contains("~/.cargo/bin/fat"));
-        assert_eq!(remote_command(Some("/opt/fat")), "/opt/fat snapshot --json");
     }
 }

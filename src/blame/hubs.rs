@@ -39,6 +39,10 @@ pub(super) enum Hub {
     Display,
     /// The kernel itself or a kernel thread.
     Kernel,
+    /// A database or a piece of server plumbing (sshd listener, journald, udevd, the message
+    /// bus, time sync, guest agents): others depend on it, so fat never offers to pause/kill it.
+    /// `what` is "database" or a short description.
+    Service { what: &'static str },
 }
 
 /// The GUI app a process belongs to.
@@ -395,6 +399,9 @@ impl<'a> Ctx<'a> {
         {
             return Some(Hub::Runtime);
         }
+        if let Some(what) = super::protected_service(p, self.os) {
+            return Some(Hub::Service { what });
+        }
         if matches!(l.as_str(), "windowserver" | "xorg" | "xwayland" | "gnome-shell" | "plasmashell" | "mutter" | "sway" | "hyprland" | "weston")
             || l.starts_with("kwin_")
         {
@@ -590,6 +597,13 @@ impl<'a> Ctx<'a> {
             }
             Hub::Display => format!("{} draws every window; the cause is an app redrawing a lot", p.name),
             Hub::Kernel => format!("{} is the kernel; the cause is elsewhere", p.name),
+            Hub::Service { what: "database" } => format!(
+                "{} is a database: pausing or killing it drops every client and may force crash recovery; investigate instead (the queries it runs, connections, maintenance or backup jobs)",
+                p.name
+            ),
+            Hub::Service { what } => {
+                format!("{} is the {what}; other services depend on it: inspect or restart it through its service manager, don't pause or kill it", p.name)
+            }
         }
     }
 
@@ -844,6 +858,17 @@ impl<'a> Ctx<'a> {
                 sugg.push(format!("stop a job from its terminal (Ctrl-C) instead of killing the {what}"));
             }
             Hub::Display | Hub::Kernel => {}
+            Hub::Service { what: "database" } => {
+                steps.push(format!("it is a database server: its CPU, memory and I/O are the work its clients send it, not {} misbehaving on its own", p.name));
+                sugg.push("investigate the workload: its slow-query/activity views (e.g. pg_stat_activity, SHOW PROCESSLIST, SLOWLOG, system.processes), connection count, and any backup, vacuum or compaction running".into());
+                sugg.push(format!("check its own log and the service log: journalctl _PID={} -n 100 --no-pager", p.pid));
+                sugg.push(format!("don't pause or kill {}: every client loses its connection and recovery can take long", p.name));
+            }
+            Hub::Service { what } => {
+                steps.push(format!("it is the {what}: other services depend on it"));
+                sugg.push(format!("inspect it: journalctl _PID={} -n 100 --no-pager; restart it through its service manager if it misbehaves", p.pid));
+                sugg.push(format!("don't pause or kill {}", p.name));
+            }
         }
         (steps, sugg)
     }
@@ -923,6 +948,7 @@ mod tests {
             procs,
             ports: vec![],
             containers: vec![],
+            ..Default::default()
         }
     }
 

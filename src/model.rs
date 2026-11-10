@@ -159,6 +159,24 @@ pub struct Snapshot {
     pub ports: Vec<Port>,
     #[serde(default)]
     pub containers: Vec<Container>,
+    // --- server mode (contract: src/server/mod.rs). Empty/None in the desktop profile, and
+    // omitted from JSON then, so desktop output is unchanged. ---
+    /// Services (systemd units, containers, pods, cgroups). Filled by server::ServerSampler.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub units: Vec<crate::server::Unit>,
+    /// Kernel health (Linux, server profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<crate::server::Kernel>,
+    /// Events detected since the previous sample.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<crate::server::Event>,
+    /// Version/profile/source of this snapshot (set by server sampling and `snapshot --fast`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<crate::server::SnapMeta>,
+    /// [fleet] Mounted filesystems, filled by `fat snapshot --fast` so a fleet poll sees disk
+    /// fill (and the disk rules can run on it) without a second remote call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<crate::fs::Volume>,
 }
 
 impl Snapshot {
