@@ -77,7 +77,8 @@ pub fn ask(
 
 /// How to set up a model, for messages (TUI, CLI and MCP all read it).
 pub const SETUP_HELP: &str = "Ask answers with a language model, in the cloud or on your own network:\n\
-- **Claude:** set `ANTHROPIC_API_KEY` in fat's environment.\n\
+- **An AI tool you're signed in to** (Claude Code, Codex, Cursor): in the TUI press `,`, open **Ask** and pick it.\n\
+- **Claude API:** set `ANTHROPIC_API_KEY` in fat's environment.\n\
 - **Your own server** (Ollama, LM Studio, vLLM, llama.cpp…): in the TUI press `,` and open **Ask**: set Provider, \
 Server URL and Model (`m` lists the server's models, `t` tests it). Or set `FAT_ASK_PROVIDER`, `FAT_ASK_URL` and \
 `FAT_ASK_MODEL`, or `[ask]` in fat's config file.";
@@ -106,6 +107,9 @@ Enabled, or in fat's config file. Nothing was sent."
         }
     };
     if !ep.usable() {
+        if let crate::llm::Provider::Tool(_) = ep.provider {
+            return Err(format!("**{}.**\n\n{SETUP_HELP}\n\nNothing was sent.", ep.unusable_reason()));
+        }
         return Err(format!("**No model is set up for Ask.**\n\n{SETUP_HELP}\n\nNothing was sent."));
     }
     let body = request_json_in(question, conv, snap, findings, storage, &ep);
@@ -235,8 +239,8 @@ pub fn dry_run(
             format!("dry run: [ask] enabled = false, so `fat ask` sends nothing; this is what it would send to {to}")
         }
         (true, false) => format!(
-            "dry run: {} is not set, so `fat ask` has no model and sends nothing; this is what it would send to {to}",
-            ep.key_env
+            "dry run: {}, so `fat ask` has no model and sends nothing; this is what it would send to {to}",
+            ep.unusable_reason()
         ),
         (true, true) => format!("dry run: this body would be POSTed to {to}; nothing was sent"),
     };

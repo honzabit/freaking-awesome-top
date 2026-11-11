@@ -11,6 +11,7 @@ mod fleet;
 mod fs;
 mod history;
 mod llm;
+mod llm_cli;
 mod mcp;
 mod model;
 mod server;
@@ -71,6 +72,9 @@ enum Cmd {
         /// Print the request body that would be sent, and send nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Check the configured model with a tiny question (nothing about the machine is sent).
+        #[arg(long, conflicts_with_all = ["dry_run", "list", "show", "delete", "continue_", "thread"])]
+        test: bool,
         /// Follow up in the most recent thread.
         #[arg(long = "continue", short = 'c', conflicts_with = "thread")]
         continue_: bool,
@@ -1009,7 +1013,20 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Some(Cmd::Ask { question, dry_run, continue_, thread, no_save, list, show, delete, json }) => {
+        Some(Cmd::Ask { question, dry_run, test, continue_, thread, no_save, list, show, delete, json }) => {
+            if test {
+                eprintln!("→ {}", llm::destination(&cfg.ask));
+                return match llm::test_connection(&cfg.ask) {
+                    Ok((took, reply)) => {
+                        println!("ok: answered in {:.1}s: {reply}", took.as_secs_f64());
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("failed: {e}");
+                        std::process::exit(1);
+                    }
+                };
+            }
             return run_ask(AskArgs { question, dry_run, continue_, thread, no_save, list, show, delete, json }, &cfg);
         }
         // --- recorder-export ---

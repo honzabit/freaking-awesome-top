@@ -22,7 +22,9 @@ history_days = 3           # flight-recorder retention
 
 [ask]
 enabled  = true            # false: ask is off, nothing is sent
-provider = "anthropic"     # "anthropic" | "openai" (any OpenAI-compatible server) | "ollama"
+provider = "anthropic"     # "anthropic" | "openai" (OpenAI-compatible server) | "ollama"
+                           # | "claude-code" | "codex" | "cursor" (signed-in tools) | "command"
+# command  = ""            # provider = "command": a program reading the question on stdin
 # url      = ""            # required for openai/ollama, e.g. "http://HOST:11434"
 # model    = ""            # default claude-opus-5-5 for anthropic; required otherwise
 # key_env  = ""            # env var holding the key: ANTHROPIC_API_KEY / FAT_ASK_KEY by default
@@ -30,7 +32,7 @@ provider = "anthropic"     # "anthropic" | "openai" (any OpenAI-compatible serve
 # detail   = "full"        # "minimal": no command lines, short paths, hostnames replaced
 # context_bytes = 20000    # digest size bound; lower it for small or CPU-only models
 # num_ctx  = 0             # ollama: context window (0 = sized to the digest)
-# timeout_s = 0            # 0 = 90 s for anthropic, 300 s for self-hosted
+# timeout_s = 0            # 0 = 90 s for anthropic, 180 s for tools, 300 s for self-hosted
 # memory   = true          # send excerpts of recent threads on this host with a question
 # keep_days = 90           # delete threads untouched this long (0 = keep)
 

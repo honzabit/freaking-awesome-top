@@ -172,9 +172,12 @@ fat's evidence attached; follow-ups stay in a thread.
 
 ![Ask view: past threads on the left, an answer explaining an OOM kill on the right](docs/img/ask.svg)
 
-- **Claude:** set `ANTHROPIC_API_KEY`.
-- **Your own model server** (Ollama, LM Studio, vLLM, llama.cpp…): press `,` and set it up in **Ask**, with
-  `local_only` so nothing ever leaves your network.
+- **An AI tool you're signed in to:** Claude Code, Codex or Cursor, through their own command-line tools and your
+  account. No API key needed.
+- **Claude API:** set `ANTHROPIC_API_KEY`.
+- **Your own model server** (Ollama, LM Studio, vLLM, llama.cpp…), with `local_only` so nothing ever leaves your
+  network.
+- Press `,` and open **Ask**: it lists what it finds on this machine; pick one and press `t` to test it.
 - Without a model, ask sends nothing and says how to set one up.
 - Secrets, your home directory and your user name are redacted from every request; `fat ask --dry-run` shows
   exactly what would be sent.

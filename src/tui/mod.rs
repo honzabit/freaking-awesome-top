@@ -74,6 +74,8 @@ enum Msg {
     /// Settings: a check's result (message, is_error).
     SettingsNote(String, bool),
     SettingsModels(Result<Vec<String>, String>),
+    /// The ways to connect ask found on this machine.
+    AskOptions(Vec<crate::llm::AskOption>),
     /// None = no recorded history for this window (fall back to the in-memory ring).
     Timeline(Option<(Vec<Point>, Vec<Ts>)>),
     Past(Ts, Option<Box<Snapshot>>),
@@ -977,6 +979,8 @@ impl Ctx {
         };
         let sel = app.settings.sel;
         let host_form = app.settings.host_form.take();
+        let ask_options = std::mem::take(&mut app.settings.ask_options);
+        let ask_advanced = app.settings.ask_advanced;
         let mut ui = settings_ui(&self.cfg, Some(path));
         // Settings other than ask apply at the next start: show the file's values for them.
         if let Ok(text) = std::fs::read_to_string(path)
@@ -988,6 +992,8 @@ impl Ctx {
         }
         ui.sel = sel.min(ui.rows().len().saturating_sub(1));
         ui.host_form = host_form;
+        ui.ask_options = ask_options;
+        ui.ask_advanced = ask_advanced;
         ui.note = Some(note);
         app.settings = ui;
     }
@@ -1202,6 +1208,18 @@ impl Ctx {
             Command::LoadSettings => {
                 let keep = std::mem::take(&mut app.settings);
                 let mut ui = settings_ui(&self.cfg, self.settings_path.as_deref());
+                ui.ask_options = keep.ask_options.clone();
+                ui.ask_advanced = keep.ask_advanced;
+                if self.settings_path.is_some() {
+                    ui.ask_detecting = true;
+                    let tx = self.tx.clone();
+                    thread::spawn(move || {
+                        let env = |k: &str| std::env::var(k).ok();
+                        if let Ok(opts) = guarded(|| crate::llm::detect(&env)) {
+                            let _ = tx.send(Msg::AskOptions(opts));
+                        }
+                    });
+                }
                 ui.sel = keep.sel.min(ui.rows().len().saturating_sub(1));
                 ui.note = keep.note.or_else(|| {
                     Some(("⏎ change · r reset to default · t test · m pick a model · ←→ groups".into(), false))
@@ -1234,6 +1252,44 @@ impl Ctx {
                 let Some(path) = self.settings_path.clone() else { return };
                 let r = crate::settings::write_host(&path, Some(i), None).map_err(|e| format!("{e:#}"));
                 self.after_settings_write(app, &path, r.map(|c| (c, "the host removal".to_string())), "hosts");
+            }
+            Command::ApplyAskOption(o) => {
+                let Some(path) = self.settings_path.clone() else { return };
+                let mut writes: Vec<(&str, Option<toml_edit::Value>)> = Vec::new();
+                if o.key == "off" {
+                    writes.push(("enabled", Some(false.into())));
+                } else {
+                    // enabled defaults to true: drop an explicit false.
+                    writes.push(("enabled", None));
+                    writes.push(("provider", Some(o.key.as_str().into())));
+                    if let Some(u) = &o.url {
+                        writes.push(("url", Some(u.as_str().into())));
+                    }
+                }
+                let mut result = Err("nothing to change".to_string());
+                for (key, v) in writes {
+                    result = crate::settings::write(&path, "ask", key, v).map_err(|e| format!("{e:#}"));
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                let label = o.label.clone();
+                self.after_settings_write(app, &path, result.map(|c| (c, format!("ask → {label}"))), "ask");
+                // A choice that still needs its address or command: go type it.
+                let need = match o.key.as_str() {
+                    "openai" | "ollama" if app.settings.ask_value("url").is_empty() => Some("url"),
+                    "command" if app.settings.ask_value("command").is_empty() => Some("command"),
+                    _ => None,
+                };
+                if let Some(key) = need {
+                    let rows = app.settings.rows();
+                    if let Some(i) = rows.iter().position(|r| matches!(r, app::SRow::Field(f) if app.settings.fields[*f].key == key && app.settings.fields[*f].section == "ask")) {
+                        app.settings.sel = i;
+                        app.settings.editing = Some(String::new());
+                    }
+                } else if o.key != "off" && app.ask_ready {
+                    app.settings.note = Some((format!("ask → {label}. Press t to test it."), false));
+                }
             }
             Command::TestHost(h) => {
                 let tx = self.tx.clone();
@@ -1326,6 +1382,10 @@ fn apply_msg(app: &mut App, msg: Msg) {
                 ui.busy = None;
                 ui.note = Some((text, err));
             }
+        }
+        Msg::AskOptions(opts) => {
+            app.settings.ask_options = opts;
+            app.settings.ask_detecting = false;
         }
         Msg::SettingsModels(r) => {
             if let Some(ui) = app.settings_ui() {
@@ -1541,16 +1601,26 @@ mod tests {
         }
         assert_eq!(app.tab, app::Tab::Settings);
         // Choices cycle and save at once.
-        select(&mut app, "provider");
+        select(&mut app, "detail");
         let cmds = app.on_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(
             cmds,
-            vec![Command::SetSetting { section: "ask".into(), key: "provider".into(), value: Some("openai".into()) }]
+            vec![Command::SetSetting { section: "ask".into(), key: "detail".into(), value: Some("minimal".into()) }]
         );
         for c in cmds {
             ctx.exec(&mut app, c);
         }
-        assert_eq!(ctx.cfg.ask.provider, "openai", "applied live");
+        assert_eq!(ctx.cfg.ask.detail, "minimal", "applied live");
+        // Picking a way to connect writes it; one that needs an address opens it for typing.
+        let server =
+            crate::llm::AskOption { key: "openai".into(), label: "Another model server".into(), ..Default::default() };
+        app.settings.ask_options = vec![server.clone()];
+        ctx.exec(&mut app, Command::ApplyAskOption(server));
+        assert_eq!(ctx.cfg.ask.provider, "openai");
+        assert_eq!(app.settings.editing.as_deref(), Some(""), "the URL is waiting to be typed");
+        assert_eq!(app.settings.field().map(|f| f.key.as_str()), Some("url"));
+        app.settings.editing = None;
+        assert_eq!(app.settings.ask_options.len(), 1, "the detected options survive the save");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("provider = \"openai\" # for now") && text.contains("# mine"), "{text}");
         let note = app.settings.note.clone().unwrap();
@@ -1566,7 +1636,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         ctx.exec(&mut app, set("url", Some("http://127.0.0.1:1")));
         ctx.exec(&mut app, set("model", Some("m")));
-        assert_eq!(app.ask_dest, "openai · m · http://127.0.0.1:1");
+        assert_eq!(app.ask_dest, "openai · m · http://127.0.0.1:1 · minimal detail");
         // Reset removes the key; the default applies again.
         ctx.exec(&mut app, set("model", None));
         assert!(ctx.cfg.ask.model.is_empty());

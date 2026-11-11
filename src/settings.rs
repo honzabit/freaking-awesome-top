@@ -49,6 +49,9 @@ pub struct Field {
     pub optional: bool,
     /// Takes effect at once in a running fat (otherwise: the next time fat starts).
     pub live: bool,
+    /// Ask only: "connect" (chosen from the list of options, not shown as a field),
+    /// "details", "privacy" or "advanced".
+    pub sub: &'static str,
 }
 
 impl Field {
@@ -59,6 +62,29 @@ impl Field {
     /// Changing it lets agents act on this machine: confirm first.
     pub fn sensitive(&self) -> bool {
         self.section == "mcp" && self.key == "allow_actions"
+    }
+}
+
+/// Where an `[ask]` key goes on the Ask page (see [`Field::sub`]).
+pub fn ask_sub(key: &str) -> &'static str {
+    match key {
+        "provider" | "enabled" => "connect",
+        "local_only" | "detail" | "memory" | "keep_days" => "privacy",
+        "context_bytes" | "num_ctx" | "timeout_s" => "advanced",
+        _ => "details",
+    }
+}
+
+/// Whether a details/advanced `[ask]` key matters for `provider`.
+pub fn ask_relevant(key: &str, provider: &str) -> bool {
+    let tool = crate::llm_cli::Tool::from_key(provider);
+    match key {
+        "url" => matches!(provider, "ollama" | "openai" | "openai-compatible" | "lmstudio" | "vllm"),
+        "model" => tool != Some(crate::llm_cli::Tool::Command),
+        "key_env" => tool.is_none(),
+        "command" => tool == Some(crate::llm_cli::Tool::Command),
+        "num_ctx" => provider == "ollama",
+        _ => true,
     }
 }
 
@@ -164,6 +190,7 @@ pub fn fields(cfg: &Config, file_text: &str, env: &dyn Fn(&str) -> Option<String
             source,
             optional,
             live,
+            sub: "",
         });
     };
     let n = |v: u64| v.to_string();
@@ -313,6 +340,19 @@ pub fn fields(cfg: &Config, file_text: &str, env: &dyn Fn(&str) -> Option<String
         true,
     );
 
+    push(
+        g,
+        "ask",
+        "command",
+        "Command",
+        "a program that reads the question on stdin and prints the answer, e.g. a CLI for another model",
+        Kind::Text,
+        a.command.clone(),
+        None,
+        true,
+        true,
+    );
+
     let g = "Recording";
     push(
         g,
@@ -434,6 +474,9 @@ pub fn fields(cfg: &Config, file_text: &str, env: &dyn Fn(&str) -> Option<String
         false,
         false,
     );
+    for f in out.iter_mut().filter(|f| f.section == "ask") {
+        f.sub = ask_sub(&f.key);
+    }
     out
 }
 

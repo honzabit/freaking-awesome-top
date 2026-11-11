@@ -1987,7 +1987,14 @@ fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if a.typing { Color::DarkGray } else { ACCENT }))
-        .title(Line::styled(title, Style::default().bold()));
+        .title(Line::styled(title, Style::default().bold()))
+        .title(
+            Line::styled(
+                format!(" {} ", clip(&app.ask_dest, (body.width as usize).saturating_sub(30))),
+                if app.ask_ready { dim() } else { Style::default().fg(Color::Yellow) },
+            )
+            .right_aligned(),
+        );
     let inner_w = body.width.saturating_sub(2);
     let mut lines: Vec<Line> = Vec::new();
     let you = |ts: crate::model::Ts| {
@@ -2149,9 +2156,25 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
         let src_w = 20usize;
         let val_w = (list.width as usize).saturating_sub(label_w + src_w + 3).max(8);
         if cur_group == "Ask" {
-            lines.push(Line::styled(format!("  key: {}", ui.key_status), dim()));
-            lines.push(Line::styled(format!("  now: {}", crate::llm::destination(&ask_cfg_of(ui))), dim()));
+            // Always-visible status: ready or not, and why.
+            let cfg = ask_cfg_of(ui);
+            let ready = cfg.enabled && crate::llm::resolve(&cfg).is_ok_and(|e| e.usable());
+            let (mark, st) = if ready {
+                ("● Ready", Style::default().fg(Color::Green).bold())
+            } else if !cfg.enabled {
+                ("○ Off", dim())
+            } else {
+                ("○ Not ready", Style::default().fg(Color::Yellow).bold())
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {mark}  "), st),
+                Span::raw(crate::llm::destination(&cfg)),
+            ]));
             lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                if ui.ask_detecting { "  Connect ask to:   (looking at this machine…)" } else { "  Connect ask to:" },
+                Style::default().bold(),
+            ));
         }
         if cur_group == "Hosts" && ui.hosts.is_empty() {
             lines.push(Line::styled(
@@ -2160,9 +2183,30 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
             ));
             lines.push(Line::raw(""));
         }
+        let mut last_sub = "";
+        let current_opt = ui.current_ask_option();
         for (ri, r) in rows.iter().enumerate() {
             if ui.group_of(*r) != cur_group {
                 continue;
+            }
+            // Ask: a heading before details and privacy.
+            if let SRow::Field(i) = *r
+                && ui.fields[i].section == "ask"
+                && ui.fields[i].sub != last_sub
+            {
+                last_sub = ui.fields[i].sub;
+                let head = match last_sub {
+                    "details" => "Details",
+                    "privacy" => "Privacy",
+                    _ => "",
+                };
+                if !head.is_empty() {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::styled(format!("  {head}"), Style::default().bold()));
+                }
+            }
+            if *r == SRow::AskAdvanced {
+                lines.push(Line::raw(""));
             }
             let selected = ri == ui.sel;
             if selected {
@@ -2190,6 +2234,26 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
                     ])
                 }
                 SRow::AddHost => Line::styled("  + add a host", Style::default().fg(ACCENT)),
+                SRow::AskOption(i) => {
+                    let o = &ui.ask_options[i];
+                    let on = current_opt == Some(i);
+                    let st = if o.ready { Style::default().fg(Color::Green) } else { dim() };
+                    Line::from(vec![
+                        Span::styled(if on { "  ● " } else { "  ○ " }, Style::default().fg(ACCENT).bold()),
+                        Span::styled(
+                            format!("{:<width$}", clip(&o.label, label_w - 4), width = label_w - 4),
+                            if on { Style::default().bold() } else { Style::default() },
+                        ),
+                        Span::styled(
+                            format!(" {}", clip(&o.status, (list.width as usize).saturating_sub(label_w + 2))),
+                            st,
+                        ),
+                    ])
+                }
+                SRow::AskAdvanced => Line::styled(
+                    if ui.ask_advanced { "  ▾ Advanced" } else { "  ▸ Advanced (digest size, context, timeout)" },
+                    Style::default().bold(),
+                ),
                 SRow::Field(i) => {
                     let fd = &ui.fields[i];
                     let value = match (&ui.editing, selected) {
@@ -2239,6 +2303,29 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), list);
 
     let mut foot_lines = Vec::new();
+    match ui.selected() {
+        Some(SRow::AskOption(i)) if ui.host_form.is_none() => {
+            let o = &ui.ask_options[i];
+            let how = match o.key.as_str() {
+                "off" => "⏎ turn ask off (nothing is ever sent)".to_string(),
+                "claude-code" | "codex" | "cursor" => {
+                    format!(
+                        "⏎ use {}: questions go through its own sign-in, to its vendor's cloud; t tests it",
+                        o.label
+                    )
+                }
+                "command" => "⏎ use a program you name (it gets the question on stdin); then type the command".into(),
+                _ if o.url.is_some() => format!(
+                    "⏎ use the server at {}; then pick a model (m) and test (t)",
+                    o.url.as_deref().unwrap_or("")
+                ),
+                _ => "⏎ use this; then fill in the details below and test (t)".into(),
+            };
+            foot_lines.push(Line::styled(how, dim()));
+        }
+        Some(SRow::AskAdvanced) => foot_lines.push(Line::styled("⏎ show or hide the advanced settings", dim())),
+        _ => {}
+    }
     if let Some(fd) = ui.field().filter(|_| ui.host_form.is_none()) {
         let when = if fd.live { "" } else { " (applies the next time fat starts)" };
         let help = if fd.help.is_empty() {
@@ -2300,6 +2387,7 @@ fn ask_cfg_of(ui: &crate::tui::app::SettingsUi) -> crate::config::AskCfg {
             "url" => a.url = v,
             "model" => a.model = v,
             "key_env" => a.key_env = v,
+            "command" => a.command = v,
             "local_only" => a.local_only = v == "true",
             "detail" => a.detail = v,
             _ => {}
@@ -2923,9 +3011,12 @@ mod tests {
             a.settings = ui.clone();
             let out = render(&mut a, w, h);
             if h >= 30 && w >= 100 {
-                assert!(out.contains("Settings") && out.contains("Recording") && out.contains("Provider"), "{out}");
-                assert!(out.contains("env FAT_ASK_URL") && out.contains("default"), "{out}");
-                assert!(out.contains("ANTHROPIC_API_KEY: set"), "{out}");
+                assert!(
+                    out.contains("Settings") && out.contains("Recording") && out.contains("Connect ask to"),
+                    "{out}"
+                );
+                assert!(out.contains("Privacy") && out.contains("Advanced") && out.contains("default"), "{out}");
+                assert!(out.contains("Not ready") || out.contains("Ready"), "{out}");
                 assert!(!out.contains("sk-"), "{out}");
             }
             ui.editing = Some("qwen3:32".into());

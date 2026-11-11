@@ -33,6 +33,8 @@ pub enum Provider {
     Anthropic,
     OpenAi,
     Ollama,
+    /// A signed-in AI command-line tool, or a custom command (see [`crate::llm_cli`]).
+    Tool(crate::llm_cli::Tool),
 }
 
 impl Provider {
@@ -41,6 +43,7 @@ impl Provider {
             Provider::Anthropic => "anthropic",
             Provider::OpenAi => "openai",
             Provider::Ollama => "ollama",
+            Provider::Tool(t) => t.key(),
         }
     }
 }
@@ -62,6 +65,8 @@ pub struct Endpoint {
     /// Ollama only: the context window to request.
     pub num_ctx: u32,
     pub timeout: Duration,
+    /// Tools: the program (and a custom command's arguments); empty when not installed.
+    pub program: Vec<String>,
 }
 
 /// `[ask]` with the FAT_ASK_* environment overrides applied.
@@ -97,13 +102,47 @@ pub fn resolve(cfg: &AskCfg) -> Result<Endpoint, String> {
 }
 
 fn resolve_with(c: &AskCfg, env: impl Fn(&str) -> Option<String>) -> Result<Endpoint, String> {
+    let minimal = match c.detail.trim().to_ascii_lowercase().as_str() {
+        "" | "full" => false,
+        "minimal" => true,
+        other => return Err(format!("[ask] detail = \"{other}\" is not known (full or minimal)")),
+    };
+    if let Some(tool) = crate::llm_cli::Tool::from_key(c.provider.trim().to_ascii_lowercase().as_str()) {
+        let program = match tool.binary() {
+            Some(bin) => crate::llm_cli::which(bin).map(|p| vec![p.to_string_lossy().into_owned()]).unwrap_or_default(),
+            None => {
+                let argv = crate::llm_cli::split_command(&c.command)?;
+                if argv.is_empty() {
+                    return Err("[ask] provider = \"command\" needs command, e.g. \"my-llm --model big\"".into());
+                }
+                argv
+            }
+        };
+        return Ok(Endpoint {
+            provider: Provider::Tool(tool),
+            url: String::new(),
+            model: c.model.trim().to_string(),
+            key: None,
+            key_env: String::new(),
+            local_only: c.local_only,
+            minimal,
+            context_bytes: if c.context_bytes > 0 { c.context_bytes.max(2_000) } else { DEFAULT_CONTEXT_BYTES },
+            num_ctx: 0,
+            timeout: Duration::from_secs(if c.timeout_s > 0 { c.timeout_s } else { 180 }),
+            program,
+        });
+    }
     let provider = match c.provider.trim().to_ascii_lowercase().as_str() {
         "" | "anthropic" | "claude" => Provider::Anthropic,
         "openai" | "openai-compatible" | "lmstudio" | "lm-studio" | "vllm" | "llamacpp" | "llama.cpp" => {
             Provider::OpenAi
         }
         "ollama" => Provider::Ollama,
-        other => return Err(format!("[ask] provider = \"{other}\" is not known (anthropic, openai or ollama)")),
+        other => {
+            return Err(format!(
+                "[ask] provider = \"{other}\" is not known (anthropic, openai, ollama, claude-code, codex, cursor or command)"
+            ));
+        }
     };
     let base = c.url.trim().trim_end_matches('/').to_string();
     let base = match provider {
@@ -131,6 +170,7 @@ fn resolve_with(c: &AskCfg, env: impl Fn(&str) -> Option<String>) -> Result<Endp
                 format!("{}/api/chat", base.trim_end_matches("/api"))
             }
         }
+        Provider::Tool(_) => unreachable!("tools return earlier"),
         Provider::OpenAi => {
             if base.ends_with("/chat/completions") {
                 base.clone()
@@ -152,11 +192,6 @@ fn resolve_with(c: &AskCfg, env: impl Fn(&str) -> Option<String>) -> Result<Endp
         (_, k) => k.to_string(),
     };
     let key = env(&key_env).map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
-    let minimal = match c.detail.trim().to_ascii_lowercase().as_str() {
-        "" | "full" => false,
-        "minimal" => true,
-        other => return Err(format!("[ask] detail = \"{other}\" is not known (full or minimal)")),
-    };
     let mut context_bytes = if c.context_bytes > 0 { c.context_bytes.max(2_000) } else { DEFAULT_CONTEXT_BYTES };
     let mut num_ctx = 0;
     if provider == Provider::Ollama {
@@ -186,6 +221,7 @@ fn resolve_with(c: &AskCfg, env: impl Fn(&str) -> Option<String>) -> Result<Endp
         context_bytes,
         num_ctx,
         timeout,
+        program: Vec::new(),
     })
 }
 
@@ -193,12 +229,30 @@ impl Endpoint {
     /// Whether `ask` can use this endpoint (the Anthropic API needs a key; self-hosted
     /// servers may not).
     pub fn usable(&self) -> bool {
-        self.provider != Provider::Anthropic || self.key.is_some()
+        match self.provider {
+            Provider::Anthropic => self.key.is_some(),
+            Provider::Tool(_) => !self.program.is_empty(),
+            _ => true,
+        }
+    }
+
+    /// Why [`Endpoint::usable`] is false, for messages.
+    pub fn unusable_reason(&self) -> String {
+        match self.provider {
+            Provider::Tool(t) => {
+                format!("{} is not installed ({} not found on PATH)", t.label(), t.binary().unwrap_or("the command"))
+            }
+            _ => format!("{} is not set", self.key_env),
+        }
     }
 
     /// "ollama · qwen3:32b · http://llm.internal:11434 · local only", without credentials.
     pub fn describe(&self) -> String {
-        let mut s = format!("{} · {} · {}", self.provider.name(), self.model, origin(&self.url));
+        let mut s = match self.provider {
+            Provider::Tool(t) if self.model.is_empty() => format!("{} · {}", t.label(), t.account()),
+            Provider::Tool(t) => format!("{} · {} · {}", t.label(), self.model, t.account()),
+            _ => format!("{} · {} · {}", self.provider.name(), self.model, origin(&self.url)),
+        };
         if self.local_only {
             s.push_str(" · local only");
         }
@@ -211,6 +265,11 @@ impl Endpoint {
     /// Request body for the OpenAI-compatible and Ollama APIs (the Anthropic body is built
     /// by `ask`, which owns the Messages API specifics).
     pub fn body(&self, system: &str, conversation: Vec<Value>) -> Value {
+        if let Provider::Tool(t) = self.provider {
+            // What runs, exactly: shown by --dry-run, executed by send().
+            let (argv, stdin) = crate::llm_cli::invocation(t, &self.program, &self.model, system, &conversation);
+            return json!({"run": argv, "stdin": stdin});
+        }
         let mut messages = vec![json!({"role": "system", "content": system})];
         messages.extend(conversation);
         match self.provider {
@@ -258,11 +317,18 @@ impl Endpoint {
             Provider::Ollama => format!("{}/api/tags", self.url.trim_end_matches("/api/chat")),
             Provider::OpenAi => format!("{}/models", self.url.trim_end_matches("/chat/completions")),
             Provider::Anthropic => format!("{}/models", self.url.trim_end_matches("/messages")),
+            Provider::Tool(_) => String::new(),
         }
     }
 
     /// The models the server offers, sorted.
     pub fn models(&self) -> Result<Vec<String>, String> {
+        if let Provider::Tool(t) = self.provider {
+            return Err(format!(
+                "{} uses its own default model; type a model name to override it (optional)",
+                t.label()
+            ));
+        }
         let mut req = self.agent(Duration::from_secs(15)).get(&self.models_url());
         if let Some(k) = &self.key {
             req = match self.provider {
@@ -289,6 +355,22 @@ impl Endpoint {
 
     /// POST `body` and return the answer text.
     pub fn send(&self, body: &str, extra_headers: &[(&str, &str)]) -> Result<String, String> {
+        if let Provider::Tool(t) = self.provider {
+            if self.local_only
+                && let Some(v) = t.vendor()
+            {
+                return Err(format!(
+                    "refused to send: {} sends questions to {v}'s cloud, and [ask] local_only allows only servers on your network",
+                    t.label()
+                ));
+            }
+            let v: Value = serde_json::from_str(body).map_err(|e| format!("bad request: {e}"))?;
+            let argv: Vec<String> = v["run"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            return crate::llm_cli::run(t, &argv, v["stdin"].as_str().unwrap_or(""), self.timeout);
+        }
         let who = self.describe();
         let mut req = self.agent(self.timeout).post(&self.url).set("content-type", "application/json");
         if let Some(k) = &self.key {
@@ -307,6 +389,7 @@ impl Endpoint {
                     Provider::Anthropic => crate::ask::parse_response(&v),
                     Provider::OpenAi => parse_openai(&v),
                     Provider::Ollama => parse_ollama(&v),
+                    Provider::Tool(_) => unreachable!("tools run as commands, above"),
                 }
             }
             Err(ureq::Error::Status(code, r)) => {
@@ -326,7 +409,7 @@ pub fn destination(cfg: &AskCfg) -> String {
     match resolve(cfg) {
         Ok(ep) if !cfg.enabled => format!("off ([ask] enabled = false; would use {})", ep.describe()),
         Ok(ep) if ep.usable() => ep.describe(),
-        Ok(ep) => format!("no model set up ({} is not set; press , to set one up)", ep.key_env),
+        Ok(ep) => format!("no model set up ({}; press , to set one up)", ep.unusable_reason()),
         Err(e) => format!("not usable: {e}"),
     }
 }
@@ -336,7 +419,7 @@ pub fn destination(cfg: &AskCfg) -> String {
 pub fn test_connection(cfg: &AskCfg) -> Result<(Duration, String), String> {
     let ep = resolve(cfg)?;
     if !ep.usable() {
-        return Err(format!("{} is not set", ep.key_env));
+        return Err(ep.unusable_reason());
     }
     let msgs = vec![json!({"role": "user", "content": "Reply with exactly: OK"})];
     let (body, headers): (Value, &[(&str, &str)]) = match ep.provider {
@@ -349,6 +432,88 @@ pub fn test_connection(cfg: &AskCfg) -> Result<(Duration, String), String> {
     let t0 = std::time::Instant::now();
     let reply = ep.send(&body.to_string(), headers)?;
     Ok((t0.elapsed(), reply.chars().take(60).collect()))
+}
+
+/// One way to connect ask, as found on this machine (the Settings screen's list).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AskOption {
+    /// The `[ask] provider` value, or "off".
+    pub key: String,
+    pub label: String,
+    /// "signed in · your Claude subscription", "4 models", "not installed"…
+    pub status: String,
+    /// Usable as is (installed and signed in, server answering, key set).
+    pub ready: bool,
+    /// For a model server found on this machine: its URL (set with the provider).
+    pub url: Option<String>,
+}
+
+/// What ask could use here: the signed-in AI tools, model servers on this machine's usual
+/// ports, the Claude API key, a server or command to enter by hand, and off. Looks only at
+/// this machine (PATH, the tools' own status commands, localhost); never at other apps' files.
+pub fn detect(env: &dyn Fn(&str) -> Option<String>) -> Vec<AskOption> {
+    use crate::llm_cli::Tool;
+    let mut out = Vec::new();
+    for t in Tool::PRESETS {
+        let (ready, status) = crate::llm_cli::status(t);
+        out.push(AskOption { key: t.key().into(), label: t.label().into(), status, ready, url: None });
+    }
+    let probe = |url: &str, path: &str| -> Option<usize> {
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_millis(800)).redirects(0).build();
+        let v: Value = agent.get(&format!("{url}{path}")).call().ok()?.into_json().ok()?;
+        Some(parse_models(&v).len())
+    };
+    for (key, label, url, path) in [
+        ("ollama", "Ollama on this machine", "http://127.0.0.1:11434", "/api/tags"),
+        ("openai", "LM Studio on this machine", "http://127.0.0.1:1234", "/v1/models"),
+    ] {
+        match probe(url, path) {
+            Some(n) => out.push(AskOption {
+                key: key.into(),
+                label: label.into(),
+                status: format!("{url} · {n} model{}", if n == 1 { "" } else { "s" }),
+                ready: n > 0,
+                url: Some(url.into()),
+            }),
+            None => out.push(AskOption {
+                key: key.into(),
+                label: label.into(),
+                status: format!("not running ({url})"),
+                ready: false,
+                url: Some(url.into()),
+            }),
+        }
+    }
+    let key_set = env("ANTHROPIC_API_KEY").is_some_and(|k| !k.trim().is_empty());
+    out.push(AskOption {
+        key: "anthropic".into(),
+        label: "Claude API".into(),
+        status: if key_set { "ANTHROPIC_API_KEY set".into() } else { "ANTHROPIC_API_KEY not set".into() },
+        ready: key_set,
+        url: None,
+    });
+    out.push(AskOption {
+        key: "openai".into(),
+        label: "Another model server".into(),
+        status: "Ollama, vLLM, llama.cpp, LiteLLM… on your network: enter its URL".into(),
+        ready: false,
+        url: None,
+    });
+    out.push(AskOption {
+        key: "command".into(),
+        label: "Custom command".into(),
+        status: "any program that reads the question on stdin (Gemini CLI, …)".into(),
+        ready: false,
+        url: None,
+    });
+    out.push(AskOption {
+        key: "off".into(),
+        label: "Off".into(),
+        status: "ask sends nothing".into(),
+        ready: true,
+        url: None,
+    });
+    out
 }
 
 /// scheme://host[:port], credentials dropped.
@@ -653,5 +818,50 @@ mod tests {
         assert!(parse_ollama(&json!({"error": "model 'x' not found"})).unwrap_err().contains("not found"));
         assert!(parse_ollama(&json!({"message": {"content": "<think>only thinking"}})).is_err());
         assert!(status_message("ollama", 404, r#"{"error":"model 'x' not found"}"#).contains("installed"));
+    }
+
+    #[test]
+    fn signed_in_tools_resolve_and_refuse_local_only() {
+        use crate::llm_cli::Tool;
+        let ep = resolve_with(&cfg("claude-code", "", ""), no_env).unwrap();
+        assert_eq!(ep.provider, Provider::Tool(Tool::ClaudeCode));
+        assert!(ep.model.is_empty() && ep.url.is_empty(), "no URL, model optional");
+        assert_eq!(ep.timeout, Duration::from_secs(180));
+        if ep.usable() {
+            assert_eq!(ep.describe(), "Claude Code · your Claude login");
+        } else {
+            assert!(ep.unusable_reason().contains("claude not found"));
+        }
+        // A custom command needs its command line.
+        assert!(resolve_with(&cfg("command", "", ""), no_env).unwrap_err().contains("needs command"));
+        let mut c = cfg("command", "", "");
+        c.command = "sh -c 'cat >/dev/null; echo hi from the model'".into();
+        let ep = resolve_with(&c, no_env).unwrap();
+        assert!(ep.usable() && ep.program[0] == "sh");
+        let body = ep.body("SYS", vec![json!({"role": "user", "content": "q"})]);
+        assert_eq!(body["stdin"], "SYS\n\nq");
+        assert_eq!(ep.send(&body.to_string(), &[]).unwrap(), "hi from the model");
+        // Presets go to their vendor's cloud: local_only refuses them before running anything.
+        let mut c = cfg("codex", "", "");
+        c.local_only = true;
+        let mut ep = resolve_with(&c, no_env).unwrap();
+        ep.program = vec!["/bin/false".into()];
+        let e = ep.send(&ep.body("s", vec![]).to_string(), &[]).unwrap_err();
+        assert!(e.contains("refused to send") && e.contains("local_only"), "{e}");
+        assert!(
+            resolve_with(&cfg("gemini", "", ""), no_env).unwrap_err().contains("claude-code, codex, cursor or command")
+        );
+    }
+}
+
+#[cfg(test)]
+mod detect_print {
+    #[test]
+    #[ignore = "looks at this machine; prints what ask could use"]
+    fn print_detected() {
+        let env = |k: &str| std::env::var(k).ok();
+        for o in super::detect(&env) {
+            println!("{:28} ready={:5} {}", o.label, o.ready, o.status);
+        }
     }
 }

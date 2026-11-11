@@ -221,9 +221,17 @@ end of the tab bar; neither has a number key, and `Esc` returns to the view you 
 
 ### Groups
 
-- **Ask:** provider, server URL, model, key variable, local only, detail, memory, thread retention, digest size,
-  Ollama context, timeout.
-  - The key itself is never shown or stored, only whether its variable is set.
+- **Ask:** a guided page.
+  - A status line on top: ready or not, where questions go, and why not.
+  - **Connect ask to:** the options found on this machine, each with its status: Claude Code, Codex and Cursor
+    (installed, signed in), Ollama and LM Studio on localhost (and how many models), the Claude API (whether the
+    key is set), another model server, a custom command, and Off. `⏎` picks one; one that still needs a URL or a
+    command opens it for typing.
+  - **Details:** only the fields that choice needs (a server's URL and model, the API's key variable, a tool's
+    optional model, the custom command).
+  - **Privacy:** local only, detail, memory, thread retention.
+  - **Advanced** (folded): digest size, Ollama context, timeout.
+  - The key itself is never shown or stored.
   - `t` sends a tiny "reply OK" question (nothing about the machine) and shows the time or the error.
   - `m` lists the server's models to pick from, chat models first.
   - Ask changes apply at once.

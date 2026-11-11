@@ -6,8 +6,16 @@
 
 ## How it works
 
-- **The model** is either Claude (set `ANTHROPIC_API_KEY`) or a self-hosted server: Ollama, or an
-  OpenAI-compatible one such as LM Studio, vLLM or llama.cpp. See [Keep ask inside your network](#keep-ask-inside-your-network).
+- **The model** is one of:
+  - an AI tool you're already signed in to on this machine: Claude Code, Codex or Cursor. See
+    [Use an AI tool you're signed in to](#use-an-ai-tool-youre-signed-in-to).
+  - the Claude API (set `ANTHROPIC_API_KEY`).
+  - a self-hosted server: Ollama, or an OpenAI-compatible one such as LM Studio, vLLM or llama.cpp. See
+    [Keep ask inside your network](#keep-ask-inside-your-network).
+  - any program you name that reads the question on stdin and prints the answer.
+- **The easiest setup** is the TUI: press `,` and open **Ask**. It lists what it finds on this machine (signed-in
+  tools, model servers on localhost, whether a key is set); pick one, then `t` tests it. `fat ask --test` does the
+  same check from the command line.
 - **Without a model**, `ask` sends nothing and says how to set one up. `fat ask` then exits with status 1.
 - **In the TUI**, press `?` to open the Ask tab. See [TUI keys](tui.md) and [Settings](tui.md#settings-) to
   configure the model from the TUI.
@@ -89,6 +97,38 @@ To see exactly the body that would be sent, and where, without sending anything:
 
 ```bash
 fat ask --dry-run QUESTION
+```
+
+## Use an AI tool you're signed in to
+
+Ask can go through the official command-line tool of an AI service you already use, with your own sign-in. fat
+never needs an API key for this and never reads the tool's credentials; it runs the tool's non-interactive mode
+and reads the answer back.
+
+| Tool | `provider` | How fat runs it |
+| --- | --- | --- |
+| Claude Code | `claude-code` | `claude -p` with its tools off (`--tools ""`), no MCP servers, not saved as a session |
+| Codex | `codex` | `codex exec` in its read-only sandbox, not saved as a session |
+| Cursor | `cursor` | `cursor-agent -p` with its sandbox on and without `--force`, so it can't approve commands itself |
+| Anything else | `command` | the program in `[ask] command`, question on stdin, answer on stdout |
+
+- **Each run starts in a new, empty folder,** which is deleted afterwards. The question and the redacted digest are
+  the same as for any other model (see [What ask sends](#what-ask-sends)).
+- **Model:** each tool uses its own default; set `model` to choose another.
+- **Where it goes:** to that tool's vendor, through your account and its usage limits. Codex follows its own
+  configuration, which may point at another provider.
+- **`local_only` refuses these tools,** because they send to the cloud. A custom command is your responsibility.
+- **Gemini CLI and others:** use `provider = "command"` with the tool's own non-interactive command line, e.g.
+  `command = "my-llm --model big"`.
+- **Detection stays on this machine:** the Settings screen finds the tools on your PATH and asks each one's own
+  status command whether you're signed in (Claude Code: `claude auth status`, Codex: `codex login status`;
+  Cursor's sign-in is checked when you test it).
+
+```toml
+[ask]
+provider = "claude-code"   # or "codex", "cursor", "command"
+# model  = ""              # the tool's default when empty
+# command = "my-llm --model big"   # provider = "command" only
 ```
 
 ## Threads

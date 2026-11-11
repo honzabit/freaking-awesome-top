@@ -507,8 +507,44 @@ fn screenshots() {
         note: Some(("✓ ollama · qwen3:32b · http://10.0.0.20:11434 answered in 1.4s: OK".into(), false)),
         ..Default::default()
     };
-    a.settings.sel = 2;
+    let opt = |key: &str, label: &str, status: &str, ready: bool, url: Option<&str>| crate::llm::AskOption {
+        key: key.into(),
+        label: label.into(),
+        status: status.into(),
+        ready,
+        url: url.map(str::to_string),
+    };
+    a.settings.ask_options = vec![
+        opt("claude-code", "Claude Code", "signed in · your Claude subscription", true, None),
+        opt("codex", "Codex", "installed · not signed in (run: codex login)", false, None),
+        opt("cursor", "Cursor", "not installed (cursor-agent not found)", false, None),
+        opt(
+            "ollama",
+            "Ollama on this machine",
+            "not running (http://127.0.0.1:11434)",
+            false,
+            Some("http://127.0.0.1:11434"),
+        ),
+        opt(
+            "openai",
+            "LM Studio on this machine",
+            "not running (http://127.0.0.1:1234)",
+            false,
+            Some("http://127.0.0.1:1234"),
+        ),
+        opt("anthropic", "Claude API", "ANTHROPIC_API_KEY not set", false, None),
+        opt(
+            "openai",
+            "Another model server",
+            "Ollama, vLLM, llama.cpp, LiteLLM… on your network: enter its URL",
+            false,
+            None,
+        ),
+        opt("command", "Custom command", "any program that reads the question on stdin (Gemini CLI, …)", false, None),
+        opt("off", "Off", "ask sends nothing", true, None),
+    ];
+    a.settings.sel = 6;
     a.tab = Tab::Settings;
-    let out = shot(&mut a, "settings", "fat · Settings", 24);
-    assert!(out.contains("Provider"), "{out}");
+    let out = shot(&mut a, "settings", "fat · Settings", 34);
+    assert!(out.contains("Connect ask to") && out.contains("Claude Code"), "{out}");
 }

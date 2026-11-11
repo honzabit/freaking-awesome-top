@@ -165,6 +165,8 @@ pub enum Command {
     DeleteHost(usize),
     /// ssh to the host and run `fat --version`.
     TestHost(crate::config::HostCfg),
+    /// Connect ask this way (writes provider, enabled and, for a found server, its URL).
+    ApplyAskOption(crate::llm::AskOption),
     /// Send a tiny question to the configured model.
     SettingsTest,
     /// List the configured server's models.
@@ -439,6 +441,11 @@ pub struct SettingsUi {
     /// A checklist being edited (agents' allowed actions): (option, on), highlighted row.
     pub multi: Option<(Vec<(String, bool)>, usize)>,
     pub host_form: Option<HostForm>,
+    /// The ways to connect ask found on this machine (empty while detecting).
+    pub ask_options: Vec<crate::llm::AskOption>,
+    pub ask_detecting: bool,
+    /// Show the advanced ask settings.
+    pub ask_advanced: bool,
     /// Last result: (message, is_error).
     pub note: Option<(String, bool)>,
     /// A background check is running ("testing…").
@@ -453,6 +460,10 @@ pub enum SRow {
     Field(usize),
     Host(usize),
     AddHost,
+    /// One of the detected ways to connect ask (index into `ask_options`).
+    AskOption(usize),
+    /// Show or hide the advanced ask settings.
+    AskAdvanced,
 }
 
 impl SettingsUi {
@@ -460,7 +471,9 @@ impl SettingsUi {
     pub fn rows(&self) -> Vec<SRow> {
         let mut out = Vec::new();
         for g in crate::settings::GROUPS {
-            if *g == "Hosts" {
+            if *g == "Ask" {
+                out.extend(self.ask_rows());
+            } else if *g == "Hosts" {
                 out.extend((0..self.hosts.len()).map(SRow::Host));
                 out.push(SRow::AddHost);
             } else {
@@ -473,8 +486,54 @@ impl SettingsUi {
     pub fn group_of(&self, r: SRow) -> &'static str {
         match r {
             SRow::Field(i) => self.fields.get(i).map_or("", |f| f.group),
+            SRow::AskOption(_) | SRow::AskAdvanced => "Ask",
             _ => "Hosts",
         }
+    }
+
+    /// An `[ask]` field's value as the screen shows it.
+    pub fn ask_value(&self, key: &str) -> &str {
+        self.fields.iter().find(|f| f.section == "ask" && f.key == key).map_or("", |f| f.value.as_str())
+    }
+
+    /// The Ask page: the ways to connect, then the details that choice needs, then privacy,
+    /// then (on request) the advanced settings.
+    pub fn ask_rows(&self) -> Vec<SRow> {
+        let provider = self.ask_value("provider").to_string();
+        let field_rows = |sub: &str| -> Vec<SRow> {
+            self.fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.section == "ask" && f.sub == sub && crate::settings::ask_relevant(&f.key, &provider))
+                .map(|(i, _)| SRow::Field(i))
+                .collect()
+        };
+        let mut out: Vec<SRow> = (0..self.ask_options.len()).map(SRow::AskOption).collect();
+        out.extend(field_rows("details"));
+        out.extend(field_rows("privacy"));
+        out.push(SRow::AskAdvanced);
+        if self.ask_advanced {
+            out.extend(field_rows("advanced"));
+        }
+        out
+    }
+
+    /// Which detected option the current settings are (None while detecting).
+    pub fn current_ask_option(&self) -> Option<usize> {
+        if self.ask_value("enabled") == "false" {
+            return self.ask_options.iter().position(|o| o.key == "off");
+        }
+        let provider = self.ask_value("provider");
+        let url = self.ask_value("url").trim_end_matches('/');
+        let server = matches!(provider, "ollama" | "openai" | "openai-compatible" | "lmstudio" | "vllm");
+        self.ask_options
+            .iter()
+            .position(|o| o.key == provider && o.url.as_deref().is_some_and(|u| u == url))
+            .or_else(|| self.ask_options.iter().position(|o| o.key == provider && o.url.is_none()))
+            // A server elsewhere (any kind): "Another model server".
+            .or_else(|| {
+                server.then(|| self.ask_options.iter().position(|o| o.key == "openai" && o.url.is_none())).flatten()
+            })
     }
 
     pub fn selected(&self) -> Option<SRow> {
@@ -2186,6 +2245,12 @@ impl App {
                     }
                 }
                 Some(SRow::AddHost) => ui.host_form = Some(HostForm::from(None, &Default::default())),
+                Some(SRow::AskOption(i)) => {
+                    if let Some(o) = ui.ask_options.get(i).cloned() {
+                        return vec![Command::ApplyAskOption(o)];
+                    }
+                }
+                Some(SRow::AskAdvanced) => ui.ask_advanced = !ui.ask_advanced,
                 Some(SRow::Field(i)) => {
                     let Some(f) = ui.fields.get(i).cloned() else { return Vec::new() };
                     match (&f.kind, &f.source) {
@@ -4827,5 +4892,77 @@ pub(crate) mod tests {
         assert!(a.close_wait_rising());
         a.close_wait_hist.push_back(9);
         assert!(!a.close_wait_rising(), "flat is not rising");
+    }
+
+    #[test]
+    fn the_ask_page_shows_the_choice_then_only_what_it_needs() {
+        let fields = crate::settings::fields(&crate::config::Config::default(), "", &|_: &str| None);
+        let opt = |key: &str, url: Option<&str>| crate::llm::AskOption {
+            key: key.into(),
+            label: key.into(),
+            url: url.map(str::to_string),
+            ..Default::default()
+        };
+        let mut ui = SettingsUi {
+            fields,
+            ask_options: vec![
+                opt("claude-code", None),
+                opt("ollama", Some("http://127.0.0.1:11434")),
+                opt("anthropic", None),
+                opt("off", None),
+            ],
+            ..Default::default()
+        };
+        let keys = |ui: &SettingsUi| -> Vec<String> {
+            ui.ask_rows()
+                .iter()
+                .map(|r| match r {
+                    SRow::Field(i) => ui.fields[*i].key.clone(),
+                    SRow::AskOption(i) => format!("opt:{}", ui.ask_options[*i].key),
+                    SRow::AskAdvanced => "advanced".into(),
+                    _ => "?".into(),
+                })
+                .collect()
+        };
+        // Default: the Claude API. Its details are the model and key variable; no URL, no command.
+        let k = keys(&ui);
+        assert_eq!(&k[..4], &["opt:claude-code", "opt:ollama", "opt:anthropic", "opt:off"]);
+        assert!(k.contains(&"model".into()) && k.contains(&"key_env".into()));
+        assert!(!k.contains(&"url".into()) && !k.contains(&"command".into()) && !k.contains(&"provider".into()));
+        assert!(k.contains(&"local_only".into()) && k.ends_with(&["advanced".to_string()]));
+        assert_eq!(ui.current_ask_option(), Some(2));
+        // Ollama on this machine: URL and model, and its context window under Advanced.
+        let set = |ui: &mut SettingsUi, key: &str, v: &str| {
+            ui.fields.iter_mut().find(|f| f.section == "ask" && f.key == key).unwrap().value = v.into();
+        };
+        set(&mut ui, "provider", "ollama");
+        set(&mut ui, "url", "http://10.0.0.20:11434");
+        ui.ask_options.push(opt("openai", None));
+        assert_eq!(ui.current_ask_option(), Some(4), "a server elsewhere is \"another model server\"");
+        ui.ask_options.pop();
+        set(&mut ui, "url", "http://127.0.0.1:11434");
+        ui.ask_advanced = true;
+        let k = keys(&ui);
+        assert!(k.contains(&"url".into()) && k.contains(&"num_ctx".into()), "a server may also need a key: {k:?}");
+        assert_eq!(ui.current_ask_option(), Some(1));
+        // A signed-in tool: just the optional model.
+        set(&mut ui, "provider", "claude-code");
+        let k = keys(&ui);
+        assert!(k.contains(&"model".into()) && !k.contains(&"url".into()) && !k.contains(&"key_env".into()));
+        assert_eq!(ui.current_ask_option(), Some(0));
+        set(&mut ui, "enabled", "false");
+        assert_eq!(ui.current_ask_option(), Some(3));
+        // Enter on an option applies it.
+        let mut a = app();
+        a.settings = ui;
+        a.tab = Tab::Settings;
+        a.settings.sel = 1;
+        assert_eq!(
+            a.on_key(code(KeyCode::Enter)),
+            vec![Command::ApplyAskOption(opt("ollama", Some("http://127.0.0.1:11434")))]
+        );
+        a.settings.sel = a.settings.rows().iter().position(|r| *r == SRow::AskAdvanced).unwrap();
+        a.on_key(code(KeyCode::Enter));
+        assert!(!a.settings.ask_advanced, "Enter folds Advanced");
     }
 }

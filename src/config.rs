@@ -101,6 +101,9 @@ pub struct AskCfg {
     pub num_ctx: u32,
     /// Seconds to wait for an answer. 0: 90 for the Anthropic API, 300 for self-hosted servers.
     pub timeout_s: u64,
+    /// provider = "command": the program to run, with its arguments ("my-llm --model big");
+    /// it reads the question on stdin and prints the answer.
+    pub command: String,
     /// Send short excerpts of recent threads on this host with a new question.
     pub memory: bool,
     /// Delete threads untouched for this many days (0: keep forever).
@@ -120,6 +123,7 @@ impl Default for AskCfg {
             context_bytes: 0,
             num_ctx: 0,
             timeout_s: 0,
+            command: String::new(),
             memory: true,
             keep_days: 90,
         }
