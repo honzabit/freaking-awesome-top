@@ -20,6 +20,8 @@
 
 pub mod app;
 pub mod markdown;
+#[cfg(test)]
+mod screenshots;
 pub mod server;
 mod server_ui;
 pub mod ui;

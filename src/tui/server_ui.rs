@@ -591,7 +591,7 @@ pub fn draw_events(f: &mut Frame, app: &mut App, area: Rect) {
         ));
         if app.ev.recorded.is_none() {
             t.lines.push(Line::styled(
-                "For history across restarts, keep `fat record --server` running (see README).",
+                "For history across restarts, keep `fat record --server` running (see docs/server.md).",
                 dim(),
             ));
         }

@@ -62,9 +62,10 @@ enum Cmd {
     },
     /// Ask in plain language ("why is this machine slow?").
     ///
-    /// Offline (rule-based) unless a model is configured ([ask]: ANTHROPIC_API_KEY for Claude,
-    /// or a self-hosted server); then a redacted digest is sent to it. Each question starts a
-    /// thread, kept locally; --continue / --thread N ask a follow-up in one.
+    /// Answered by a language model: Claude (ANTHROPIC_API_KEY) or a self-hosted server ([ask]
+    /// in the config, or `,` in the TUI). A redacted digest of the machine goes with the
+    /// question; without a model nothing is sent and it says how to set one up (exit status 1).
+    /// Each question starts a thread, kept locally; --continue / --thread N ask a follow-up.
     /// --dry-run prints exactly the request body and sends nothing.
     Ask {
         /// Print the request body that would be sent, and send nothing.
