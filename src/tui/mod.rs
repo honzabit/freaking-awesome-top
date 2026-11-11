@@ -965,6 +965,7 @@ impl Ctx {
                 // Live from now on: ask and the destination shown. The rest is read at start.
                 self.cfg.ask = cfg.ask.clone();
                 app.ask_dest = crate::llm::destination(&self.cfg.ask);
+                app.ask_ready = self.cfg.ask.enabled && crate::llm::resolve(&self.cfg.ask).is_ok_and(|e| e.usable());
                 // Keep the rest of the screen's view of the file current.
                 self.cfg.hosts = cfg.hosts;
                 self.cfg.history_days = cfg.history_days;
@@ -1143,6 +1144,7 @@ impl Ctx {
             }
             Command::Ask { id, question: q, thread } => {
                 app.ask_dest = crate::llm::destination(&self.cfg.ask);
+                app.ask_ready = self.cfg.ask.enabled && crate::llm::resolve(&self.cfg.ask).is_ok_and(|e| e.usable());
                 let snap = app.live.clone().unwrap_or_default();
                 let findings = app.findings.clone();
                 let ask_cfg = self.cfg.ask.clone();
@@ -1179,6 +1181,8 @@ impl Ctx {
                 });
             }
             Command::Threads => {
+                app.ask_dest = crate::llm::destination(&self.cfg.ask);
+                app.ask_ready = self.cfg.ask.enabled && crate::llm::resolve(&self.cfg.ask).is_ok_and(|e| e.usable());
                 if let Some(p) = &self.threads_path {
                     let r = guarded(|| crate::threads::Store::open(p).and_then(|s| s.threads(500)))
                         .map_err(|e| format!("threads unavailable ({e})"))

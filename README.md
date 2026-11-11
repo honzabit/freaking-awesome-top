@@ -458,7 +458,7 @@ history_days = 3           # flight-recorder retention
 # history_path = "~/.local/share/fat/history.db"
 
 [ask]
-enabled  = true            # false: always answer offline, send nothing
+enabled  = true            # false: ask is off, nothing is sent
 provider = "anthropic"     # "anthropic" | "openai" (any OpenAI-compatible server) | "ollama"
 # url      = ""            # required for openai/ollama, e.g. "http://HOST:11434"
 # model    = ""            # default claude-opus-5-5 for anthropic; required otherwise
@@ -520,7 +520,7 @@ an MCP / JSON interface for agents (every view is also a tool or a `--json` flag
   directory from `/` down (a cached, low-priority background scan), which paths grew in the last 10 minutes and which
   processes are writing there, space held by deleted-but-open files, and when each volume will be full. fat only reads:
   it never deletes, moves or truncates your files.
-- **Plain-language `ask`.** Ask "why is this machine hot?" and get an answer, offline from rules or richer through Claude if you set an API key.
+- **Plain-language `ask`.** Ask "why is this machine hot?" and get an answer from a language model: Claude with an API key, or your own model server (Ollama, LM Studio, vLLM…). Without one, ask says how to set one up.
 
 How `fat run` enforces a budget:
 
@@ -1095,7 +1095,7 @@ that request is redacted first: API keys and tokens (`sk-…`, `ghp_…`, `githu
 `password=` / `token=` / `secret=` style values, the value after `--token` / `--password` and in `-pX`, credentials in
 URLs (`user:pass@`), and long hex or base64 blobs; your home directory becomes `~` and your user name `me`.
 `fat ask --dry-run QUESTION` prints exactly the body that would be sent, and where, and sends nothing. Without a
-model, `ask` answers offline from rules. Every answer says where the question went (`→ ollama · qwen3:32b ·
+model, `ask` sends nothing and says how to set one up (`fat ask` then exits with status 1). Every answer says where the question went (`→ ollama · qwen3:32b ·
 http://…` on stderr, in the TUI's ask box, and as `via` in the MCP result).
 
 ### Settings in the TUI (`,`)

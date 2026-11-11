@@ -324,10 +324,10 @@ impl Endpoint {
 /// What `ask` would use, for the TUI and CLI to show before anything is sent.
 pub fn destination(cfg: &AskCfg) -> String {
     match resolve(cfg) {
-        Ok(ep) if !cfg.enabled => format!("offline ([ask] enabled = false; would use {})", ep.describe()),
+        Ok(ep) if !cfg.enabled => format!("off ([ask] enabled = false; would use {})", ep.describe()),
         Ok(ep) if ep.usable() => ep.describe(),
-        Ok(ep) => format!("offline ({} is not set)", ep.key_env),
-        Err(e) => format!("offline ({e})"),
+        Ok(ep) => format!("no model set up ({} is not set; press , to set one up)", ep.key_env),
+        Err(e) => format!("not usable: {e}"),
     }
 }
 

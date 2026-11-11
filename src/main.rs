@@ -763,9 +763,19 @@ fn run_ask(a: AskArgs, cfg: &config::Config) -> Result<()> {
     let save = (!a.no_save).then_some(path.as_path());
     let r = threads::ask_and_save(save, thread, &q, &s, &f, st.as_ref(), &cfg.ask);
     if a.json {
-        return print_json(&serde_json::json!({
-            "thread": r.thread, "question": r.question, "answer": r.answer, "via": r.via, "error": r.error,
-        }));
+        print_json(&serde_json::json!({
+            "answered": r.answered, "thread": r.thread, "question": r.question, "answer": r.answer, "via": r.via,
+            "error": r.error,
+        }))?;
+        if !r.answered {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if !r.answered {
+        // Why there is no answer, and how to set one up: not an answer, so not on stdout.
+        eprintln!("{}", r.answer);
+        std::process::exit(1);
     }
     println!("{}", r.answer);
     if let Some(e) = &r.error {

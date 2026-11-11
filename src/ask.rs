@@ -15,7 +15,6 @@ const API_VERSION: &str = "2026-10-21";
 const API_BETA: &str = "server-side-fallback-2026-07-01";
 #[cfg(test)]
 const MAX_CONTEXT_BYTES: usize = crate::llm::DEFAULT_CONTEXT_BYTES;
-const KEY_HINT: &str = "(set ANTHROPIC_API_KEY, or point [ask] at a self-hosted model, for richer answers)";
 
 const SYSTEM_PROMPT: &str = "You are fat's diagnostic assistant. fat is a process monitor (like htop) \
 for macOS and Linux. You receive a JSON digest of one machine snapshot (system summary, top processes \
@@ -58,9 +57,11 @@ pub struct Conversation {
 const PRIOR_TURNS: usize = 6;
 const PRIOR_ANSWER_CHARS: usize = 3_000;
 
-/// Answer a question. Uses the model `[ask]` configures (the Claude API with
-/// ANTHROPIC_API_KEY by default, or a self-hosted server), else a rule-based answer built
-/// from findings. Never panics; errors become explanatory text.
+/// Answer a question with the model `[ask]` configures (the Claude API with
+/// ANTHROPIC_API_KEY, or a self-hosted server). Without one, or when the model can't be
+/// reached, the reply says what to set up or fix; nothing else stands in for an answer.
+/// Never panics.
+#[cfg(test)]
 pub fn ask(
     question: &str,
     snap: &Snapshot,
@@ -68,11 +69,21 @@ pub fn ask(
     storage: Option<&Storage>,
     cfg: &crate::config::AskCfg,
 ) -> String {
-    ask_in(question, &Conversation::default(), snap, findings, storage, cfg).0
+    match ask_in(question, &Conversation::default(), snap, findings, storage, cfg) {
+        Ok((answer, _)) => answer,
+        Err(e) => e,
+    }
 }
 
-/// [`ask`] within a thread. Returns the answer and where it came from (the destination, or
-/// "offline (…)" when answered by rules).
+/// How to set up a model, for messages (TUI, CLI and MCP all read it).
+pub const SETUP_HELP: &str = "Ask answers with a language model, in the cloud or on your own network:\n\
+- **Claude:** set `ANTHROPIC_API_KEY` in fat's environment.\n\
+- **Your own server** (Ollama, LM Studio, vLLM, llama.cpp…): in the TUI press `,` and open **Ask**: set Provider, \
+Server URL and Model (`m` lists the server's models, `t` tests it). Or set `FAT_ASK_PROVIDER`, `FAT_ASK_URL` and \
+`FAT_ASK_MODEL`, or `[ask]` in fat's config file.";
+
+/// [`ask`] within a thread. Ok: the model's answer and where it came from. Err: why there is
+/// no answer and what to do (nothing was answered; the caller should not keep it as one).
 pub fn ask_in(
     question: &str,
     conv: &Conversation,
@@ -80,25 +91,31 @@ pub fn ask_in(
     findings: &[Finding],
     storage: Option<&Storage>,
     cfg: &crate::config::AskCfg,
-) -> (String, String) {
-    let offline = || offline_answer(question, snap, findings, storage);
+) -> Result<(String, String), String> {
     if !cfg.enabled {
-        return (offline(), "offline ([ask] enabled = false)".into());
+        return Err("**Ask is turned off** (`[ask] enabled = false`). Turn it on in the TUI with `,` → **Ask** → \
+Enabled, or in fat's config file. Nothing was sent."
+            .into());
     }
-    match crate::llm::resolve(cfg) {
-        Ok(ep) if ep.usable() => {
-            let body = request_json_in(question, conv, snap, findings, storage, &ep);
-            let headers: &[(&str, &str)] = match ep.provider {
-                crate::llm::Provider::Anthropic => &[("anthropic-version", API_VERSION), ("anthropic-beta", API_BETA)],
-                _ => &[],
-            };
-            match ep.send(&body, headers) {
-                Ok(answer) => (answer, ep.describe()),
-                Err(e) => (format!("{e}\n\nOffline answer instead:\n{}", offline()), format!("offline ({e})")),
-            }
+    let ep = match crate::llm::resolve(cfg) {
+        Ok(ep) => ep,
+        Err(e) => {
+            return Err(format!(
+                "**Ask can't use its settings:** {e}\n\nFix them with `,` → **Ask**. Nothing was sent."
+            ));
         }
-        Ok(ep) => (offline(), format!("offline ({} is not set)", ep.key_env)),
-        Err(e) => (format!("{e}\n\nOffline answer instead:\n{}", offline()), format!("offline ({e})")),
+    };
+    if !ep.usable() {
+        return Err(format!("**No model is set up for Ask.**\n\n{SETUP_HELP}\n\nNothing was sent."));
+    }
+    let body = request_json_in(question, conv, snap, findings, storage, &ep);
+    let headers: &[(&str, &str)] = match ep.provider {
+        crate::llm::Provider::Anthropic => &[("anthropic-version", API_VERSION), ("anthropic-beta", API_BETA)],
+        _ => &[],
+    };
+    match ep.send(&body, headers) {
+        Ok(answer) => Ok((answer, ep.describe())),
+        Err(e) => Err(format!("**No answer:** {e}\n\nCheck the model in the TUI with `,` → **Ask** → `t`.")),
     }
 }
 
@@ -210,15 +227,15 @@ pub fn dry_run(
 ) -> (String, String) {
     let ep = match crate::llm::resolve(cfg) {
         Ok(ep) => ep,
-        Err(e) => return (String::new(), format!("dry run: {e}; `fat ask` answers offline and sends nothing")),
+        Err(e) => return (String::new(), format!("dry run: {e}; `fat ask` can't send anything until that is fixed")),
     };
     let to = format!("{} ({})", ep.url, ep.describe());
     let note = match (cfg.enabled, ep.usable()) {
-        (false, _) => format!(
-            "dry run: [ask] enabled = false, so `fat ask` answers offline and sends nothing; this is what it would send to {to}"
-        ),
+        (false, _) => {
+            format!("dry run: [ask] enabled = false, so `fat ask` sends nothing; this is what it would send to {to}")
+        }
         (true, false) => format!(
-            "dry run: {} is not set, so `fat ask` answers offline and sends nothing; this is what it would send to {to}",
+            "dry run: {} is not set, so `fat ask` has no model and sends nothing; this is what it would send to {to}",
             ep.key_env
         ),
         (true, true) => format!("dry run: this body would be POSTed to {to}; nothing was sent"),
@@ -254,7 +271,7 @@ pub(crate) fn parse_response(v: &Value) -> Result<String, String> {
         if !why.is_empty() {
             out.push_str(&format!(" ({why})"));
         }
-        out.push_str(" Try rephrasing, or unset ANTHROPIC_API_KEY for the offline answer.");
+        out.push_str(" Try rephrasing the question.");
         return Ok(out);
     }
     let text: Vec<&str> = v
@@ -1094,38 +1111,7 @@ fn storage_json(st: &Storage, scale: usize) -> Value {
     })
 }
 
-/// The offline answer's storage part: what grew, who wrote, what is held by deleted files.
-fn storage_section(out: &mut Vec<String>, st: &Storage) {
-    let g = &st.growth;
-    let mins = (st.window_ms / 60_000).max(1);
-    let under = st.under.as_deref().unwrap_or("/");
-    let growers: Vec<_> = g.growers.iter().filter(|x| x.delta != 0).take(8).collect();
-    if growers.is_empty() {
-        out.push(format!("No path under {under} measurably changed size in the last {mins} min."));
-    } else {
-        out.push(format!("Changed under {under} in the last {mins} min:"));
-        for x in growers {
-            let who = x.writers.first().map(|(pid, name, _)| format!("  ({name}, pid {pid})")).unwrap_or_default();
-            let sign = if x.delta >= 0 { "+" } else { "-" };
-            let other = if x.other { "other under " } else { "" };
-            out.push(format!("  {sign}{:<9} {other}{}{who}", human(x.delta.unsigned_abs()), x.path));
-        }
-    }
-    if !g.writers.is_empty() {
-        out.push("Wrote the most in that window:".to_string());
-        for (pid, name, b) in g.writers.iter().take(5) {
-            out.push(format!("  {:<9} pid {pid:<7} {name}", human(*b)));
-        }
-    }
-    for (pid, name, path, b) in g.deleted_open.iter().take(3) {
-        out.push(format!("  {} held by deleted {path} (pid {pid} {name})", human(*b)));
-    }
-    for n in g.notes.iter().take(3) {
-        out.push(format!("  note: {n}"));
-    }
-}
-
-// ---------- offline answerer ----------
+// ---------- what a question is about ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Topic {
@@ -1165,233 +1151,6 @@ pub(crate) fn topics(question: &str) -> Vec<Topic> {
         t.push(Topic::Containers);
     }
     t
-}
-
-fn human(b: u64) -> String {
-    let f = b as f64;
-    match b {
-        0..=1023 => format!("{b}B"),
-        1024..=1_048_575 => format!("{:.1}K", f / 1024.0),
-        1_048_576..=1_073_741_823 => format!("{:.1}M", f / 1_048_576.0),
-        _ => format!("{:.2}G", f / 1_073_741_824.0),
-    }
-}
-
-fn proc_line(p: &Proc, metric: String) -> String {
-    format!("  {:>7}  {:<24} {}", p.pid, trunc(&p.name, 24), metric)
-}
-
-/// Rule-based answer from findings + top consumers.
-pub fn offline_answer(question: &str, snap: &Snapshot, findings: &[Finding], storage: Option<&Storage>) -> String {
-    let s = &snap.system;
-    let mut topics = topics(question);
-    let overview = topics.is_empty();
-    if overview {
-        topics = vec![Topic::Cpu, Topic::Memory];
-    }
-    let mut out = Vec::new();
-
-    let mut sorted: Vec<&Finding> = findings.iter().collect();
-    let rank = |f: &Finding| match f.severity.as_str() {
-        "crit" => 0,
-        "warn" => 1,
-        _ => 2,
-    };
-    sorted.sort_by_key(|f| rank(f));
-    if !sorted.is_empty() {
-        out.push("What stands out:".to_string());
-        for f in sorted.iter().take(6) {
-            out.push(format!("  [{}] {} — {}", f.severity, f.title, f.detail));
-            if let Some(a) = &f.action {
-                out.push(format!("      → fat {a}"));
-            }
-        }
-        out.push(String::new());
-    }
-
-    for t in &topics {
-        match t {
-            Topic::Cpu => {
-                let thermal = match s.temp_c {
-                    Some(t) if s.thermal.is_empty() || s.thermal == "unknown" => format!("{t:.0}°C"),
-                    Some(t) => format!("{} ({t:.0}°C)", s.thermal),
-                    None => or_unknown(&s.thermal).to_string(),
-                };
-                out.push(format!(
-                    "CPU {:.0}% across {} cores, load {:.2} {:.2} {:.2}, thermal {thermal}.",
-                    s.cpu, s.cores, s.load[0], s.load[1], s.load[2]
-                ));
-                if let Some(psi) = &s.psi {
-                    out.push(format!(
-                        "CPU pressure: tasks waited for a CPU {:.1}% of the last 10s{}.",
-                        psi.cpu_some,
-                        stall_hint(psi.cpu_some)
-                    ));
-                }
-                push_top(&mut out, "Top CPU:", top_by(snap, 5, |p| p.cpu as f64), |p| format!("{:.1}% cpu", p.cpu));
-            }
-            Topic::Power => {
-                let batt = match (s.battery_pct, s.on_battery) {
-                    (Some(pct), Some(true)) => format!("on battery at {pct:.0}%"),
-                    (Some(pct), _) => format!("battery {pct:.0}% (plugged in)"),
-                    _ => "battery unknown".to_string(),
-                };
-                let what = match s.power_source.as_str() {
-                    "rapl" => "Measured CPU package power (RAPL)",
-                    "estimate" => "Estimated power (CPU-time model)",
-                    _ => "Estimated process power",
-                };
-                out.push(format!("{what} {:.1} W, {batt}.", s.power_mw / 1000.0));
-                push_top(&mut out, "Top power:", top_by(snap, 5, |p| p.power_mw as f64), |p| {
-                    format!("{:.0} mW, {:.1}% cpu", p.power_mw, p.cpu)
-                });
-            }
-            Topic::Memory => {
-                out.push(format!(
-                    "Memory {}/{} used, swap {}/{}, pressure {}.",
-                    human(s.mem_used),
-                    human(s.mem_total),
-                    human(s.swap_used),
-                    human(s.swap_total),
-                    or_unknown(&s.mem_pressure)
-                ));
-                if let Some(psi) = &s.psi {
-                    out.push(format!(
-                        "Memory pressure: some tasks stalled {:.1}%, all tasks stalled {:.1}% of the last 10s{}.",
-                        psi.mem_some,
-                        psi.mem_full,
-                        stall_hint(psi.mem_some.max(psi.mem_full * 4.0))
-                    ));
-                }
-                push_top(&mut out, "Top memory:", top_by(snap, 5, |p| p.mem as f64), |p| {
-                    format!("{} rss", human(p.mem))
-                });
-            }
-            Topic::Ports => {
-                let listening: Vec<_> =
-                    snap.ports.iter().filter(|p| p.state == "LISTEN" || p.state.is_empty()).collect();
-                out.push(format!("{} listening sockets.", listening.len()));
-                let orphans: Vec<_> = listening.iter().filter(|p| p.orphan).collect();
-                if !orphans.is_empty() {
-                    out.push(format!("{} look orphaned (dev servers whose parent went away):", orphans.len()));
-                    for p in orphans.iter().take(8) {
-                        out.push(format!("  :{:<6} pid {:<7} {}  {}", p.port, p.pid, p.process, p.note));
-                    }
-                    out.push(format!("  → pause one with `fat pause {}`, or see `fat ports`", orphans[0].pid));
-                }
-                for p in listening.iter().filter(|p| !p.orphan).take(10) {
-                    out.push(format!("  :{:<6} pid {:<7} {}", p.port, p.pid, p.process));
-                }
-            }
-            Topic::Disk => {
-                out.push(format!("Disk read {}/s, write {}/s.", human(s.disk_read_bps), human(s.disk_write_bps)));
-                if let Some(psi) = &s.psi {
-                    out.push(format!(
-                        "IO pressure: some tasks waited on io {:.1}%, all {:.1}% of the last 10s{}.",
-                        psi.io_some,
-                        psi.io_full,
-                        stall_hint(psi.io_some)
-                    ));
-                }
-                push_top(
-                    &mut out,
-                    "Top disk:",
-                    top_by(snap, 5, |p| (p.disk_read_bps + p.disk_write_bps) as f64),
-                    |p| format!("r {}/s w {}/s", human(p.disk_read_bps), human(p.disk_write_bps)),
-                );
-                if let Some(st) = storage {
-                    storage_section(&mut out, st);
-                }
-            }
-            Topic::Network => {
-                out.push(format!("Network in {}/s, out {}/s.", human(s.net_rx_bps), human(s.net_tx_bps)));
-                push_top(&mut out, "Top network:", top_by(snap, 5, |p| (p.net_rx_bps + p.net_tx_bps) as f64), |p| {
-                    format!("in {}/s out {}/s", human(p.net_rx_bps), human(p.net_tx_bps))
-                });
-            }
-            Topic::Containers => container_section(&mut out, snap),
-        }
-        out.push(String::new());
-    }
-
-    if let Some(p) = top_by(snap, 1, |p| p.cpu as f64).first().filter(|p| p.cpu >= 50.0) {
-        out.push(format!(
-            "Suggestion: `fat why {}` to see what started {}; `fat pause {}` stops it reversibly (`fat resume {}`).",
-            p.pid, p.name, p.pid, p.pid
-        ));
-    }
-    out.push(KEY_HINT.to_string());
-    out.join("\n")
-}
-
-fn stall_hint(pct: f32) -> &'static str {
-    if pct >= 20.0 {
-        " — heavy contention"
-    } else if pct >= 5.0 {
-        " — noticeable contention"
-    } else {
-        ""
-    }
-}
-
-/// Containers and the host processes attributed to each (Linux cgroups).
-fn container_section(out: &mut Vec<String>, snap: &Snapshot) {
-    use std::collections::BTreeMap;
-    let mut by_ctr: BTreeMap<String, (f32, u64, usize)> = BTreeMap::new();
-    for p in &snap.procs {
-        if let Some(id) = &p.container {
-            let e = by_ctr.entry(crate::fleet::container_label(&snap.containers, id)).or_default();
-            e.0 += p.cpu;
-            e.1 += p.mem;
-            e.2 += 1;
-        }
-    }
-    if snap.containers.is_empty() && by_ctr.is_empty() {
-        out.push(
-            "No containers found (no reachable docker / podman / nerdctl, and no process in a container cgroup)."
-                .into(),
-        );
-        return;
-    }
-    if !snap.containers.is_empty() {
-        out.push(format!("{} running containers:", snap.containers.len()));
-        let mut cs: Vec<_> = snap.containers.iter().collect();
-        cs.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
-        for c in cs.iter().take(10) {
-            out.push(format!(
-                "  {:<24} {:>6.1}% cpu {:>8}  {} ({})",
-                trunc(&c.name, 24),
-                c.cpu,
-                human(c.mem),
-                trunc(&c.image, 40),
-                c.runtime
-            ));
-        }
-    }
-    if !by_ctr.is_empty() {
-        let mut v: Vec<_> = by_ctr.into_iter().collect();
-        v.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
-        out.push("Host processes by container:".into());
-        for (name, (cpu, mem, n)) in v.iter().take(10) {
-            out.push(format!("  {:<24} {:>6.1}% cpu {:>8}  {n} procs", trunc(name, 24), cpu, human(*mem)));
-        }
-        out.push(format!("  → `fat snapshot --json` lists them; in the TUI type /{} to filter", v[0].0));
-    }
-}
-
-fn or_unknown(s: &str) -> &str {
-    if s.is_empty() { "unknown" } else { s }
-}
-
-fn push_top(out: &mut Vec<String>, title: &str, procs: Vec<&Proc>, metric: impl Fn(&Proc) -> String) {
-    if procs.is_empty() {
-        out.push(format!("{title} (no data)"));
-        return;
-    }
-    out.push(title.to_string());
-    for p in procs {
-        out.push(proc_line(p, metric(p)));
-    }
 }
 
 #[cfg(test)]
@@ -1533,22 +1292,6 @@ mod tests {
         assert_eq!(cgroup_label("/init.scope"), "init.scope");
         assert_eq!(cgroup_label("/"), "");
         assert_eq!(cgroup_label("/a.slice/b.slice"), "b.slice");
-    }
-
-    #[test]
-    fn offline_linux_answers_use_psi_and_containers() {
-        let s = linux_snap();
-        let a = offline_answer("why is the cpu so slow", &s, &[], None);
-        assert!(a.contains("CPU pressure") && a.contains("23.0%") && a.contains("heavy contention"), "{a}");
-        assert!(a.contains("81°C"), "{a}");
-        let a = offline_answer("battery power?", &s, &[], None);
-        assert!(a.contains("RAPL") && a.contains("61.0 W"), "{a}");
-        let a = offline_answer("which docker container is busy", &s, &[], None);
-        assert!(a.contains("api-1") && a.contains("Host processes by container"), "{a}");
-        assert!(topics("is a pod hogging io").contains(&Topic::Containers));
-        // macOS answers keep their wording
-        let m = offline_answer("battery power?", &snap(), &[], None);
-        assert!(m.contains("Estimated process power") && !m.contains("pressure:"));
     }
 
     #[test]
@@ -1714,27 +1457,24 @@ mod tests {
         assert_eq!(topics("who is using port 5173"), vec![Topic::Ports]);
         assert!(topics("RAM usage").contains(&Topic::Memory));
         assert!(topics("what is going on").is_empty());
+        assert!(topics("is a pod hogging io").contains(&Topic::Containers));
     }
 
     #[test]
-    fn offline_answers() {
-        let s = snap();
-        let a = offline_answer("why is it slow", &s, &findings(), None);
-        assert!(a.contains("node is burning"));
-        assert!(a.contains("fat pause 500"));
-        assert!(a.contains("Top CPU"));
-        assert!(a.trim_end().ends_with(KEY_HINT));
-        let p = offline_answer("any orphan ports?", &s, &[], None);
-        assert!(p.contains("5173") && p.contains("orphaned"));
-        let o = offline_answer("what's up", &s, &[], None);
-        assert!(o.contains("Top CPU") && o.contains("Top memory"));
-    }
-
-    #[test]
-    fn ask_without_key_is_offline() {
-        let cfg = crate::config::AskCfg { enabled: false, ..Default::default() };
-        let a = ask("battery?", &snap(), &[], None, &cfg);
-        assert!(a.contains(KEY_HINT));
+    fn without_a_model_ask_explains_and_sends_nothing() {
+        let conv = Conversation::default();
+        let off = crate::config::AskCfg { enabled: false, ..Default::default() };
+        let e = ask_in("battery?", &conv, &snap(), &[], None, &off).unwrap_err();
+        assert!(e.contains("Ask is turned off") && e.contains("Nothing was sent"), "{e}");
+        // The default (Claude) with no key in this environment's variable name.
+        let none = crate::config::AskCfg { key_env: "FAT_TEST_NO_SUCH_KEY".into(), ..Default::default() };
+        let e = ask_in("battery?", &conv, &snap(), &[], None, &none).unwrap_err();
+        assert!(
+            e.contains("No model is set up") && e.contains("ANTHROPIC_API_KEY") && e.contains("FAT_ASK_URL"),
+            "{e}"
+        );
+        assert!(!e.contains("Top CPU") && !e.contains("node"), "no system details stand in for an answer: {e}");
+        assert_eq!(ask("battery?", &snap(), &[], None, &none), e);
     }
 
     #[test]
@@ -1766,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_goes_into_the_digest_and_the_offline_answer() {
+    fn storage_goes_into_the_digest() {
         use crate::fs::{Evidence, Grower};
         let st = Storage {
             window_ms: 600_000,
@@ -1807,9 +1547,6 @@ mod tests {
         assert_eq!(ctx["storage"]["writers"][0]["written_mb"], 310.0);
         assert_eq!(ctx["top_disk"][0]["disk_w_kbps"], 512);
         assert!(!build_context(&s, &[], None).contains("\"storage\""));
-        let a = offline_answer("what writes under /var", &s, &[], Some(&st));
-        assert!(a.contains("/var/lib/prometheus/wal") && a.contains("prometheus, pid 1810"), "{a}");
-        assert!(a.contains("note: fanotify needs root"), "{a}");
     }
 
     #[test]
@@ -1962,7 +1699,7 @@ mod tests {
         let req = h.join().unwrap();
         assert!(req.starts_with("POST /api/chat ") && req.contains("\"num_ctx\":"), "{req}");
 
-        // Unreachable server: the error, then the offline answer.
+        // Unreachable server: the error and what to check, nothing else.
         let cfg = crate::config::AskCfg {
             provider: "openai".into(),
             url: "http://127.0.0.1:9".into(),
@@ -1971,13 +1708,12 @@ mod tests {
             ..Default::default()
         };
         let a = ask("why slow", &snap(), &[], None, &cfg);
-        assert!(
-            a.contains("Could not reach openai · m · http://127.0.0.1:9") && a.contains("Offline answer instead"),
-            "{a}"
-        );
-        // Misconfigured: explained, offline answer.
+        assert!(a.starts_with("**No answer:** Could not reach openai · m · http://127.0.0.1:9"), "{a}");
+        assert!(!a.contains("Top CPU"), "{a}");
+        // Misconfigured: explained.
         let cfg = crate::config::AskCfg { provider: "ollama".into(), ..Default::default() };
-        assert!(ask("why slow", &snap(), &[], None, &cfg).starts_with("[ask] provider = \"ollama\" needs url"));
+        let a = ask("why slow", &snap(), &[], None, &cfg);
+        assert!(a.contains("Ask can't use its settings") && a.contains("needs url"), "{a}");
     }
 
     #[test]

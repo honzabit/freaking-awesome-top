@@ -1456,9 +1456,13 @@ fn tool_ask(state: &mut State, args: &Value) -> Result<Value> {
     let findings = crate::blame::diagnose(snap, state.history.as_ref());
     let storage =
         crate::ask::wants_storage(&q).then(|| crate::ask::gather_storage(&q, state.config.history_path.as_deref()));
-    let answer = crate::ask::ask(&q, snap, &findings, storage.as_ref(), &state.config.ask);
+    let conv = crate::ask::Conversation::default();
+    let (answered, answer) = match crate::ask::ask_in(&q, &conv, snap, &findings, storage.as_ref(), &state.config.ask) {
+        Ok((a, _)) => (true, a),
+        Err(why) => (false, why),
+    };
     let via = crate::llm::destination(&state.config.ask);
-    Ok(json!({ "question": q, "answer": answer, "via": via, "findings": findings }))
+    Ok(json!({ "question": q, "answered": answered, "answer": answer, "via": via, "findings": findings }))
 }
 
 // ---------------------------------------------------------------------------

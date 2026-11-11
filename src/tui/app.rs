@@ -1142,8 +1142,10 @@ pub struct App {
     pub log_kind: Option<ActionKind>,
     /// Action log text filter (`/`): name, pid, who, message.
     pub log_filter: String,
-    /// Where the current question goes ("ollama · qwen3 · http://…", "offline (…)").
+    /// Where the current question goes ("ollama · qwen3 · http://…", "no model set up (…)").
     pub ask_dest: String,
+    /// A model is set up, so a question can be answered.
+    pub ask_ready: bool,
     ask_seq: u64,
     pub modal: Modal,
     pub status: Option<Status>,
@@ -1224,6 +1226,7 @@ impl App {
             log_kind: None,
             log_filter: String::new(),
             ask_dest: String::new(),
+            ask_ready: false,
             ask_seq: 0,
             modal: Modal::None,
             status: None,

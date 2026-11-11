@@ -2014,6 +2014,12 @@ fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::styled(format!("→ {}", app.ask_dest), dim()));
         }
     }
+    if lines.is_empty() && !app.ask_ready && !app.ask_dest.is_empty() {
+        lines.extend(super::markdown::render(
+            &format!("**No model is set up yet.**\n\n{}\n\nNow: {}", crate::ask::SETUP_HELP, app.ask_dest),
+            inner_w,
+        ));
+    }
     if lines.is_empty() {
         lines.push(Line::styled("Ask about this machine in plain language, for example:", dim()));
         for ex in ["why is this machine slow?", "what writes all the time under /var?", "what is using port 3000?"] {

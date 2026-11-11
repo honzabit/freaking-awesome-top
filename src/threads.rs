@@ -30,7 +30,8 @@ pub struct Turn {
     pub ts: Ts,
     pub question: String,
     pub answer: String,
-    /// Where it was answered: "anthropic · … · https://…", "ollama · … ", "offline (…)".
+    /// Where it was answered: "anthropic · … · https://…", "ollama · … " (older versions also
+    /// kept rule-based "offline (…)" answers).
     pub via: String,
 }
 
@@ -214,6 +215,8 @@ pub struct Asked {
     pub turns: Vec<Turn>,
     pub threads: Vec<Thread>,
     pub error: Option<String>,
+    /// A model answered (otherwise `answer` says why not, and nothing was saved).
+    pub answered: bool,
 }
 
 /// Past threads sent along with a question, at most; how far back; how much of each answer.
@@ -258,9 +261,19 @@ pub fn ask_and_save(
             conv.memory = st.memory(&host, thread, since, MEMORY_THREADS, MEMORY_ANSWER_CHARS).unwrap_or_default();
         }
     }
-    let (answer, via) = crate::ask::ask_in(question, &conv, snap, findings, storage, cfg);
-    out.answer = answer;
-    out.via = via;
+    match crate::ask::ask_in(question, &conv, snap, findings, storage, cfg) {
+        Ok((answer, via)) => {
+            out.answer = answer;
+            out.via = via;
+            out.answered = true;
+        }
+        Err(why) => {
+            // Not an answer: shown, never kept in a thread.
+            out.answer = why;
+            out.via = "not answered".into();
+            return out;
+        }
+    }
     if let Some(st) = &store {
         match st.add_turn(thread, &host, now, question, &out.answer, &out.via) {
             Ok(id) => {
@@ -329,6 +342,16 @@ mod tests {
         assert!(s.memory("local", Some(cur), 2_000, 5, 100).unwrap().is_empty(), "too old");
         assert_eq!(s.prune(2_000).unwrap(), 1);
         assert_eq!(s.threads(10).unwrap().len(), 3);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn unanswered_questions_are_not_kept() {
+        let (_, p) = store("unanswered");
+        let cfg = crate::config::AskCfg { enabled: false, ..Default::default() };
+        let r = ask_and_save(Some(&p), None, "why slow?", &Default::default(), &[], None, &cfg);
+        assert!(!r.answered && r.thread.is_none() && r.answer.contains("turned off"), "{r:?}");
+        assert!(Store::open(&p).unwrap().threads(10).unwrap().is_empty());
         let _ = std::fs::remove_file(&p);
     }
 }
