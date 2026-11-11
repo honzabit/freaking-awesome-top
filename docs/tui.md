@@ -215,7 +215,7 @@ A health table of every host, in any profile. See [Fleets](fleet.md).
 `,` opens the Settings screen, where every setting can be read and edited. It sits with the Log screen at the right
 end of the tab bar; neither has a number key, and `Esc` returns to the view you came from.
 
-- **Groups** (on the left, `←` `→`): Ask, Recording, Server, Fleet, Hosts, Agents.
+- **Groups** (on the left, `←` `→`): Ask, Recording, Server, Fleet, Hosts, Agents, Updates.
 - **Source:** every setting shows its value and where that value comes from: the default, the config file, or an
   environment variable. An environment variable wins and can't be changed there.
 
@@ -245,6 +245,8 @@ end of the tab bar; neither has a number key, and `Esc` returns to the view you 
 - **Agents:** which side-effect tools agents may use over MCP (`[mcp] allow_actions`), as a checklist. Allowing
   anything new asks for confirmation first. Kill still needs a preview and a one-time token per process. See
   [For agents: MCP](agents.md).
+- **Updates:** the daily version check, automatic updates, and whether `fat record` restarts itself into a new
+  binary. See [Updates](updates.md).
 
 ### Editing
 

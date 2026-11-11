@@ -3,6 +3,9 @@
 # SHA256SUMS, and opens a DRAFT GitHub release. Nothing is published until a maintainer reviews
 # the draft and publishes it.
 #
+# SHA256SUMS is also signed (SHA256SUMS.sig, Ed25519) with the key in the FAT_RELEASE_SIGNING_KEY
+# secret; fat update checks it against the public key built into fat (keys/release-signing.hex).
+#
 # Verify a download:
 #   sha256sum -c SHA256SUMS --ignore-missing
 #   gh attestation verify fat-<version>-<target>.tar.gz --repo <owner>/<repo>
@@ -44,6 +47,11 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          # fat update verifies SHA256SUMS.sig with the key built into the previous release.
+          grep -Eq '^[0-9a-f]{64}$' keys/release-signing.hex || {
+            echo "::error::keys/release-signing.hex is not set up (see RELEASING.md)"
+            exit 1
+          }
 
   build:
     name: ${{ matrix.target }}
@@ -114,16 +122,42 @@ jobs:
         with:
           pattern: fat-*
           merge-multiple: true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          path: src
       - run: sha256sum fat-*.tar.gz | tee SHA256SUMS
+      - name: sign SHA256SUMS
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.FAT_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::the FAT_RELEASE_SIGNING_KEY secret is not set (see RELEASING.md)"
+            exit 1
+          fi
+          umask 077
+          key="$RUNNER_TEMP/release-signing.pem"
+          printf '%s\n' "$SIGNING_KEY" > "$key"
+          openssl pkeyutl -sign -inkey "$key" -rawin -in SHA256SUMS -out SHA256SUMS.sig
+          rm -f "$key"
+          # The signature must verify with the public key built into this release, or the
+          # next `fat update` would refuse it.
+          python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex("302a300506032b6570032100" + open(sys.argv[1]).read().strip()))' \
+            src/keys/release-signing.hex > "$RUNNER_TEMP/pub.der"
+          openssl pkeyutl -verify -pubin -keyform DER -inkey "$RUNNER_TEMP/pub.der" -rawin \
+            -in SHA256SUMS -sigfile SHA256SUMS.sig
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             fat-*.tar.gz
             SHA256SUMS
+            SHA256SUMS.sig
       - name: create draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$TAG" fat-*.tar.gz SHA256SUMS \
+          gh release create "$TAG" fat-*.tar.gz SHA256SUMS SHA256SUMS.sig \
             --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
             --title "fat $VERSION" --generate-notes

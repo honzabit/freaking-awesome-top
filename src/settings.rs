@@ -89,7 +89,7 @@ pub fn ask_relevant(key: &str, provider: &str) -> bool {
 }
 
 /// Sidebar groups, in order.
-pub const GROUPS: &[&str] = &["Ask", "Recording", "Server", "Fleet", "Hosts", "Agents"];
+pub const GROUPS: &[&str] = &["Ask", "Recording", "Server", "Fleet", "Hosts", "Agents", "Updates"];
 
 const PROVIDERS: &[&str] = &["anthropic", "openai", "ollama"];
 const DETAILS: &[&str] = &["full", "minimal"];
@@ -470,6 +470,43 @@ pub fn fields(cfg: &Config, file_text: &str, env: &dyn Fn(&str) -> Option<String
         "tools agents (MCP) may use that change this machine; nothing = read-only. Kill always needs a preview first.",
         Kind::Multi(crate::mcp::ACTION_TOOLS),
         allowed.join(", "),
+        None,
+        false,
+        false,
+    );
+    let g = "Updates";
+    push(
+        g,
+        "update",
+        "check",
+        "Check for new releases",
+        "once a day, in the background: one request to GitHub, nothing else sent. Off under [ask] local_only.",
+        Kind::Bool,
+        cfg.update.check.to_string(),
+        Some("FAT_NO_UPDATE_CHECK"),
+        false,
+        false,
+    );
+    push(
+        g,
+        "update",
+        "auto",
+        "Install updates automatically",
+        "only releases signed with fat's release key; the previous binary is kept (fat update --rollback)",
+        Kind::Bool,
+        cfg.update.auto.to_string(),
+        None,
+        false,
+        false,
+    );
+    push(
+        g,
+        "update",
+        "restart_recorder",
+        "Recorder restarts into a new binary",
+        "fat record notices its binary was replaced and restarts itself between samples",
+        Kind::Bool,
+        cfg.update.restart_recorder.to_string(),
         None,
         false,
         false,

@@ -57,6 +57,26 @@ pub struct Config {
     pub server: crate::server::ServerCfg,
     /// `[fleet]`: inventory sources and fan-out limits.
     pub fleet: crate::server::FleetCfg,
+    /// `[update]`: version check and self-update.
+    pub update: UpdateCfg,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UpdateCfg {
+    /// Check once a day whether a newer release exists (TUI, recorder). Off with
+    /// FAT_NO_UPDATE_CHECK=1 or `[ask] local_only`.
+    pub check: bool,
+    /// Install newer releases by itself (verified against fat's release key).
+    pub auto: bool,
+    /// `fat record` restarts itself into a newly installed binary between samples.
+    pub restart_recorder: bool,
+}
+
+impl Default for UpdateCfg {
+    fn default() -> Self {
+        Self { check: true, auto: false, restart_recorder: false }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -141,6 +161,7 @@ impl Default for Config {
             ask: AskCfg::default(),
             server: Default::default(),
             fleet: Default::default(),
+            update: Default::default(),
         }
     }
 }

@@ -55,6 +55,9 @@ tar -xzf fat-<version>-<target>.tar.gz && install -m 755 fat-<version>-<target>/
 On macOS use `shasum -a 256 -c SHA256SUMS --ignore-missing` for the first step. The attestation proves the archive
 was built by this repository's release workflow from that tag.
 
+Later, `fat update` installs new releases after checking their signature; fat also tells you once a day
+when there is one. Details: [docs/updates.md](docs/updates.md).
+
 **From source** (Rust 1.89+ and a C compiler; SQLite is bundled):
 
 ```bash
@@ -217,6 +220,7 @@ Details: [docs/agents.md](docs/agents.md).
 | Fleets over ssh | [docs/fleet.md](docs/fleet.md) |
 | Ask, threads, keeping it in your network | [docs/ask.md](docs/ask.md) |
 | Agents and MCP | [docs/agents.md](docs/agents.md) |
+| Updates: version check, `fat update`, auto-update | [docs/updates.md](docs/updates.md) |
 | Configuration reference | [docs/configuration.md](docs/configuration.md) |
 | Everything fat does | [docs/features.md](docs/features.md) |
 | Design notes, performance, limitations | [docs/design.md](docs/design.md) |

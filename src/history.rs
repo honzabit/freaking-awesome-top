@@ -2951,6 +2951,8 @@ pub fn record_with(cfg: &crate::config::Config, opts: &crate::server::export::Re
     // FAT_RECORD_PROFILE=1: print the average wall time of each phase every 60 samples
     // (sizing the daemon on a new kind of host without a profiler).
     let mut prof = std::env::var_os("FAT_RECORD_PROFILE").map(|_| PhaseProfile::default());
+    let mut updates = RecorderUpdates::new(cfg);
+    let mut restart = false;
     let report = |what: &str, e: &anyhow::Error, errors: &mut u64| {
         *errors += 1;
         // Don't flood the terminal/journal if the disk is full or the DB is locked.
@@ -3030,14 +3032,104 @@ pub fn record_with(cfg: &crate::config::Config, opts: &crate::server::export::Re
             }
             last_prune = Instant::now();
         }
+        if updates.tick() {
+            restart = true;
+            break;
+        }
         // Sleep in short slices so Ctrl-C is handled promptly.
         while !STOP.load(Ordering::SeqCst) && started.elapsed() < interval {
             let left = interval.saturating_sub(started.elapsed());
             std::thread::sleep(left.min(Duration::from_millis(100)));
         }
     }
+    if restart && let Some(exe) = updates.exe.take() {
+        println!("fat record: restarting into the newly installed {} after {recorded} samples", exe.display());
+        drop(hist);
+        use std::os::unix::process::CommandExt;
+        // Same pid, arguments and environment; the writer lock and the metrics socket are
+        // close-on-exec, so the new binary takes them over cleanly.
+        let e = std::process::Command::new(&exe).args(std::env::args_os().skip(1)).exec();
+        anyhow::bail!("fat record: restarting into {} failed: {e}", exe.display());
+    }
     println!("fat record: stopped after {recorded} samples ({errors} errors)");
     Ok(())
+}
+
+/// The recorder's side of updates: the daily check (and, with `[update] auto`, the install) in a
+/// background thread, and noticing that its own binary was replaced.
+struct RecorderUpdates {
+    cfg: crate::config::Config,
+    /// The binary this recorder runs, and its identity at start.
+    exe: Option<PathBuf>,
+    id: Option<(u64, u64, i64)>,
+    last_look: Instant,
+    job: Option<std::thread::JoinHandle<()>>,
+    told: bool,
+}
+
+impl RecorderUpdates {
+    const LOOK_EVERY: Duration = Duration::from_secs(60);
+
+    fn new(cfg: &crate::config::Config) -> Self {
+        let exe = crate::update::current_exe().ok();
+        let id = exe.as_deref().and_then(crate::update::file_id);
+        let mut u = Self { cfg: cfg.clone(), exe, id, last_look: Instant::now(), job: None, told: false };
+        u.start_check();
+        u
+    }
+
+    fn start_check(&mut self) {
+        if self.job.as_ref().is_some_and(|j| !j.is_finished()) {
+            return;
+        }
+        let cfg = self.cfg.clone();
+        self.job = std::thread::Builder::new()
+            .name("fat-update".into())
+            .spawn(move || {
+                if let Some(s) = crate::update::background(&cfg) {
+                    if let Some(v) = s.installed_newer() {
+                        println!("fat record: installed fat {v}");
+                    } else if let Some(v) = s.available() {
+                        println!("fat record: fat {v} is available (`fat update` installs it)");
+                    }
+                    if !s.error.is_empty() {
+                        eprintln!("fat record: update: {}", s.error);
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// Once a minute: start the daily check when due; true when the recorder should restart
+    /// into a replaced binary.
+    fn tick(&mut self) -> bool {
+        if self.last_look.elapsed() < Self::LOOK_EVERY {
+            return false;
+        }
+        self.last_look = Instant::now();
+        if crate::update::load_state().due(crate::model::now_ms()) {
+            self.start_check();
+        }
+        let Some(exe) = self.exe.as_deref() else { return false };
+        let now = crate::update::file_id(exe);
+        if now.is_none() || now == self.id {
+            return false;
+        }
+        // Replaced (by fat update, a package manager or by hand). Only restart into something
+        // that runs, and never mid-install: the replacement is an atomic rename.
+        let Some(said) = crate::update::runs(exe) else { return false };
+        if self.cfg.update.restart_recorder {
+            println!("fat record: {} is now {said}", exe.display());
+            return true;
+        }
+        if !std::mem::replace(&mut self.told, true) {
+            println!(
+                "fat record: {} is now {said}; restart the recorder to use it (or set [update] restart_recorder = true)",
+                exe.display()
+            );
+        }
+        false
+    }
 }
 
 /// Average wall time per recorder phase (FAT_RECORD_PROFILE=1).

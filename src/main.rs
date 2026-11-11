@@ -19,6 +19,7 @@ mod settings;
 mod sys;
 mod threads;
 mod tui;
+mod update;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -183,6 +184,15 @@ enum Cmd {
     Fs(FsArgs),
     /// Serve the MCP protocol on stdio (for agents).
     Mcp,
+    /// Update fat to the latest release (signature-checked), check for one, or roll back.
+    Update {
+        /// Only check whether a newer release exists.
+        #[arg(long, conflicts_with = "rollback")]
+        check: bool,
+        /// Go back to the binary the last update replaced.
+        #[arg(long)]
+        rollback: bool,
+    },
     // === server mode (contract: src/server/mod.rs). Each agent adds its variants below its
     // own marker only: services | kernel | doctor-incident | recorder-export | fleet. ===
     // --- services ---
@@ -244,7 +254,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
         &["pause", "resume", "renice", "kill", "undo", "log"],
     ),
     ("Flight recorder", &["record", "history"]),
-    ("Advanced", &["run", "mcp"]),
+    ("Advanced", &["run", "mcp", "update"]),
     ("Server", &["services", "kernel", "events", "what-happened", "fleet"]),
 ];
 
@@ -887,6 +897,46 @@ fn run_fs(a: FsArgs, cfg: &config::Config) -> Result<()> {
     Ok(())
 }
 
+/// `fat update [--check | --rollback]`.
+fn run_update(check: bool, rollback: bool) -> Result<()> {
+    let exe = update::current_exe()?;
+    if rollback {
+        let v = update::rollback(&exe)?;
+        println!(
+            "restored {v} at {} (the replaced binary is now {})",
+            exe.display(),
+            update::prev_path(&exe).display()
+        );
+        return Ok(());
+    }
+    let s = update::check_now(std::time::Duration::from_secs(15));
+    if !s.error.is_empty() {
+        eprintln!("fat update: can't tell which release is the latest: {}", s.error);
+        std::process::exit(1);
+    }
+    let Some(v) = s.available().map(str::to_string) else {
+        println!("fat {} is the latest release", update::VERSION);
+        return Ok(());
+    };
+    if check {
+        println!("fat {v} is available (this is {}); `fat update` installs it", update::VERSION);
+        return Ok(());
+    }
+    println!("updating fat {} → {v} at {}", update::VERSION, exe.display());
+    match update::install(&v, &exe) {
+        Ok(i) => {
+            println!("installed fat {} (signature and checksum verified)", i.version);
+            println!("the previous binary is {}; `fat update --rollback` goes back", i.previous.display());
+            println!("a running `fat record` keeps the old binary until it restarts");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("fat update: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // Behave like a normal Unix tool when piped into `head` etc.: die quietly on EPIPE
     // instead of panicking in println!.
@@ -999,7 +1049,8 @@ fn main() -> Result<()> {
                 s.containers = fleet::containers();
             }
             let h = history::History::open_read_only(cfg.history_path.as_deref()).ok();
-            let f = blame::diagnose_with_fs(&s, h.as_ref(), &fs_facts(h.as_ref()));
+            let mut f = blame::diagnose_with_fs(&s, h.as_ref(), &fs_facts(h.as_ref()));
+            f.extend(update::finding(&cfg));
             if json {
                 print_json(&f)?;
             } else if f.is_empty() {
@@ -1152,6 +1203,7 @@ fn main() -> Result<()> {
         // [fleet] inventory, parallel read-only polls, findings across hosts.
         Some(Cmd::Fleet(a)) => fleet::cli::run(a, &cfg)?,
         Some(Cmd::Mcp) => mcp::serve()?,
+        Some(Cmd::Update { check, rollback }) => run_update(check, rollback)?,
         // === server mode dispatch: one arm per variant, each under its owner's marker. ===
         // --- services ---
         Some(Cmd::Services { failed, kind, json }) => {

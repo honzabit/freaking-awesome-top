@@ -65,4 +65,7 @@ fat fleet doctor | events --since 2h | hosts | containers
 fat fleet --host db-01 what-happened --at 03:12           # one host's incident, read-only
 fat fleet exec-readonly kernel --json                     # one allowlisted read-only fat command everywhere
 fat mcp                     # MCP server on stdio
+fat update [--check | --rollback]                         # install the latest release (signature-checked)
 ```
+
+More on updates in [Updates](updates.md).

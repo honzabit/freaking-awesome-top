@@ -76,6 +76,8 @@ enum Msg {
     SettingsModels(Result<Vec<String>, String>),
     /// The ways to connect ask found on this machine.
     AskOptions(Vec<crate::llm::AskOption>),
+    /// The update check's result.
+    Update(crate::update::State),
     /// None = no recorded history for this window (fall back to the in-memory ring).
     Timeline(Option<(Vec<Point>, Vec<Ts>)>),
     Past(Ts, Option<Box<Snapshot>>),
@@ -1383,6 +1385,7 @@ fn apply_msg(app: &mut App, msg: Msg) {
                 ui.note = Some((text, err));
             }
         }
+        Msg::Update(s) => app.update_note = crate::update::header_note(&s),
         Msg::AskOptions(opts) => {
             app.settings.ask_options = opts;
             app.settings.ask_detecting = false;
@@ -1489,6 +1492,15 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
         KernelLogCache { read: Box::new(|since| crate::server::kernel::read_kmsg_since(Some(since))), cached: None }
     });
     let hist_tx = spawn_history(hist, tx.clone(), klog);
+    // Update check (daily, cached; with [update] auto also the install): never delays the UI.
+    {
+        let (cfg, tx) = (cfg.clone(), tx.clone());
+        let _ = thread::Builder::new().name("fat-update".into()).spawn(move || {
+            if let Ok(Some(s)) = guarded(|| crate::update::background(&cfg)) {
+                let _ = tx.send(Msg::Update(s));
+            }
+        });
+    }
     let inventory: Inventory = Arc::default();
     spawn_inventory(cfg.clone(), inventory.clone(), tx.clone());
     let transport: Arc<dyn Transport> = Arc::new(fanout::SshTransport { cfg: cfg.fleet.clone() });

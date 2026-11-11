@@ -39,6 +39,11 @@ provider = "anthropic"     # "anthropic" | "openai" (OpenAI-compatible server) |
 [mcp]
 allow_actions = []         # side-effect tools agents may use: "pause", "resume", "renice", "kill", "undo", or "all"
 
+[update]
+check            = true    # once a day: is there a newer release? (FAT_NO_UPDATE_CHECK=1 turns it off)
+auto             = false   # install newer releases by itself (signature-checked)
+restart_recorder = false   # fat record restarts itself into a replaced binary
+
 [[hosts]]
 name     = "web-01"
 ssh      = "admin@web-01.example.com"   # defaults to name; passed to ssh verbatim
@@ -60,3 +65,4 @@ tags     = ["prod"]
 | `[[hosts]]` | hosts for the fleet commands and the Fleet tab | [Fleets](fleet.md) |
 | `[fleet]` | fleet inventory and polling | [Fleets](fleet.md) |
 | `[server]` | the server profile and system-wide recorder | [Servers](server.md) |
+| `[update]` | the daily version check, automatic updates, recorder restarts | [Updates](updates.md) |

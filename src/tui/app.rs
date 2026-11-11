@@ -1212,6 +1212,8 @@ pub struct App {
     pub now: Ts,
     pub config_path: String,
     pub history_ok: bool,
+    /// "⬆ fat 0.2.0 · fat update" when a newer release is known.
+    pub update_note: Option<String>,
     pub configured_hosts: usize,
     pub interval_ms: u64,
     pub collector_error: Option<String>,
@@ -1292,6 +1294,7 @@ impl App {
             now: crate::model::now_ms(),
             config_path: String::new(),
             history_ok: false,
+            update_note: None,
             configured_hosts: 0,
             interval_ms,
             collector_error: None,

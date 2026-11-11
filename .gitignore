@@ -1,2 +1,4 @@
 target/
 dist/
+# release signing key: never commit it
+*.pem

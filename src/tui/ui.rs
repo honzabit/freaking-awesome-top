@@ -114,6 +114,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     } else {
         l1.push(Span::styled(" sampling…", dim()));
     }
+    if let Some(note) = &app.update_note {
+        let used: usize = l1.iter().map(|s| s.width()).sum();
+        if used + badge_w + note.chars().count() + 3 < w {
+            l1.push(Span::styled(format!("  {note}"), Style::default().fg(Color::Yellow)));
+        }
+    }
     let used: usize = l1.iter().map(|s| s.width()).sum();
     if used + badge_w < w {
         l1.push(Span::raw(" ".repeat(w - used - badge_w)));
@@ -2719,6 +2725,18 @@ mod tests {
             s.push('\n');
         }
         s
+    }
+
+    #[test]
+    fn header_shows_a_newer_release_when_it_fits() {
+        let mut a = full_app();
+        a.update_note = Some("⬆ fat 0.2.0 · fat update".into());
+        let wide = render(&mut a, 160, 40);
+        assert!(wide.lines().next().unwrap().contains("⬆ fat 0.2.0 · fat update"), "{wide}");
+        assert!(wide.lines().next().unwrap().contains("LIVE"));
+        let narrow = render(&mut a, 60, 40);
+        assert!(!narrow.contains("fat 0.2.0"), "dropped before the live badge: {narrow}");
+        assert!(narrow.lines().next().unwrap().contains("LIVE"));
     }
 
     fn full_app() -> App {
