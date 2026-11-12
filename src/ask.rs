@@ -394,14 +394,10 @@ fn known_secret(w: &str) -> bool {
     }
     // JWT: three base64url parts, the first two starting with '{"' encoded.
     let parts: Vec<&str> = w.split('.').collect();
-    if parts.len() == 3
+    parts.len() == 3
         && parts[0].starts_with("eyJ")
         && parts[1].starts_with("eyJ")
         && parts.iter().all(|p| !p.is_empty())
-    {
-        return true;
-    }
-    false
 }
 
 /// A long opaque blob (hex or base64): probably a token, a key or a hash of one.
