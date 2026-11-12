@@ -1,6 +1,6 @@
 [package]
 name = "fat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # rusqlite 0.41 (bundled SQLite 3.54)
 rust-version = "1.89"
