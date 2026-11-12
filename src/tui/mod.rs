@@ -285,6 +285,87 @@ fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
     }
 }
 
+// ------------------------------------------------------------------ shell (`!`)
+
+/// Hand the terminal to an interactive shell and take it back when it exits. Everything
+/// else keeps running meanwhile (sampling, history, fleet polls); only drawing pauses.
+///
+/// The shell gets its own process group and the terminal's foreground, as a shell does for
+/// a job: Ctrl-C, Ctrl-Z and Ctrl-\ go to it and its children, never to fat.
+fn run_shell(term: &mut Terminal<CrosstermBackend<Stdout>>, env: &[(String, String)]) -> anyhow::Result<Option<i32>> {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let shell = std::env::var("SHELL").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "/bin/sh".into());
+    restore_terminal();
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            let _ = writeln!(out, "\x1b[1;31mfat: this shell runs as root\x1b[0m");
+        }
+        let _ = writeln!(out, "\x1b[2mfat is still running and sampling · type exit to return\x1b[0m");
+        let _ = out.flush();
+    }
+    let mut cmd = std::process::Command::new(&shell);
+    cmd.envs(env.iter().map(|(k, v)| (k, v)));
+    // SAFETY: setpgid is async-signal-safe; between fork and exec it only moves the child
+    // into a process group of its own.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    let result = match cmd.spawn() {
+        Ok(mut child) => {
+            let pid = child.id() as libc::pid_t;
+            // Also from here, so the terminal can be handed over before the child has run.
+            // SAFETY: plain syscalls on our own child and the controlling terminal (fd 0).
+            unsafe {
+                libc::setpgid(pid, pid);
+            }
+            foreground(pid);
+            let status = child.wait();
+            // SAFETY: getpgrp cannot fail.
+            foreground(unsafe { libc::getpgrp() });
+            status.map(|s| s.code().or_else(|| s.signal().map(|n| 128 + n))).map_err(anyhow::Error::from)
+        }
+        Err(e) => Err(anyhow::anyhow!("cannot start {shell}: {e}")),
+    };
+    enable_raw_mode()?;
+    TERM_ACTIVE.store(true, Ordering::SeqCst);
+    execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        crossterm::cursor::Hide,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+    )?;
+    // Make the next draw repaint every cell: an empty frame first, so ratatui's diff starts
+    // from blank. (Terminal::clear would ask the terminal where its cursor is, and stall on
+    // one that does not answer.)
+    term.draw(|_| {})?;
+    result
+}
+
+/// Make `pgrp` the terminal's foreground process group. Called by a background group
+/// (handing it back), tcsetpgrp would stop us with SIGTTOU, so that is ignored meanwhile.
+fn foreground(pgrp: libc::pid_t) {
+    // SAFETY: signal swaps a disposition and returns the previous one, restored right after;
+    // tcsetpgrp acts on fd 0, our controlling terminal; failures leave things as they were.
+    unsafe {
+        let prev = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::tcsetpgrp(0, pgrp);
+        libc::signal(libc::SIGTTOU, prev);
+    }
+}
+
+fn shell_status(code: Option<i32>) -> String {
+    match code {
+        Some(0) | None => "back from the shell".into(),
+        Some(c) => format!("back from the shell (exit {c})"),
+    }
+}
+
 // ------------------------------------------------------------------ background threads
 
 fn spawn_sampler(cfg: Config, profile: crate::server::Profile, tx: Sender<Msg>, fs: Arc<FsShared>) {
@@ -1451,6 +1532,15 @@ fn event_loop(
                         for cmd in app.on_key(k) {
                             ctx.exec(app, cmd);
                         }
+                        if let Some(env) = app.shell.take() {
+                            let (msg, err) = match run_shell(term, &env) {
+                                Ok(code) => (shell_status(code), false),
+                                Err(e) => (format!("shell: {e}"), true),
+                            };
+                            app.now = now_ms();
+                            app.set_status(msg, err);
+                            break;
+                        }
                     }
                     Event::Resize(..) => {}
                     _ => {}
@@ -1486,6 +1576,10 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
     let mut app = App::new(cfg.interval_ms);
     app.config_path = config_path;
     app.history_ok = hist.is_some();
+    app.shell_enabled = cfg.tui.shell;
+    if std::env::var_os("FAT_SHELL").is_some() {
+        app.set_status("this fat runs in a shell opened from another fat: exit both to get back to it", false);
+    }
     app.configured_hosts = cfg.hosts.len();
     app.set_profile(profile, cfg.server.clone(), cfg.fleet.tui_refresh_s);
     let klog = (profile == crate::server::Profile::Server && cfg.server.kmsg && cfg!(target_os = "linux")).then(|| {

@@ -1226,6 +1226,10 @@ pub struct App {
     pub history_ok: bool,
     /// "⬆ fat 0.2.0 · fat update" when a newer release is known.
     pub update_note: Option<String>,
+    /// `!` opens a shell (`[tui] shell`).
+    pub shell_enabled: bool,
+    /// A shell was asked for, with these variables; the event loop runs it (it needs the terminal).
+    pub shell: Option<Vec<(String, String)>>,
     pub configured_hosts: usize,
     pub interval_ms: u64,
     pub collector_error: Option<String>,
@@ -1307,6 +1311,8 @@ impl App {
             config_path: String::new(),
             history_ok: false,
             update_note: None,
+            shell_enabled: true,
+            shell: None,
             configured_hosts: 0,
             interval_ms,
             collector_error: None,
@@ -1876,6 +1882,54 @@ impl App {
         self.sel = step(self.sel, delta, self.rows.len());
         self.sel_pid = self.row_pid(self.sel);
         self.follow = self.sel != 0;
+    }
+
+    /// What the shell opened with `!` gets about the selection: `FAT_SHELL=1`, and when
+    /// something is selected `FAT_PID` (and `FAT_PROCESS`), `FAT_PORT` and `FAT_PEER` (Ports),
+    /// `FAT_PATH` (Fs).
+    pub fn shell_env(&self) -> Vec<(String, String)> {
+        let mut v = vec![("FAT_SHELL".to_string(), "1".to_string())];
+        let mut put = |k: &str, val: String| {
+            if !val.is_empty() && val != "0" {
+                v.push((k.to_string(), val));
+            }
+        };
+        match self.tab {
+            Tab::Procs => {
+                if let Some(p) = self.selected_proc() {
+                    put("FAT_PID", p.pid.to_string());
+                    put("FAT_PROCESS", p.name.clone());
+                }
+            }
+            Tab::Ports => {
+                if let Some((pid, name)) = self.selected_port_owner() {
+                    put("FAT_PID", pid.to_string());
+                    put("FAT_PROCESS", name);
+                }
+                let s = self.view();
+                match (s, self.port_rows.get(self.port_sel)) {
+                    (Some(s), Some(PortRow::Listen(i))) => {
+                        if let Some(p) = s.ports.get(*i) {
+                            put("FAT_PORT", p.port.to_string());
+                        }
+                    }
+                    (Some(s), Some(PortRow::Group(i))) => {
+                        if let Some(g) = s.conns.groups.get(*i) {
+                            put("FAT_PORT", if g.inbound { g.local_port } else { g.remote_port }.to_string());
+                            put("FAT_PEER", g.remote.trim_start_matches('[').trim_end_matches(']').to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Tab::Fs => {
+                if let Some(e) = self.fs.selected_entry() {
+                    put("FAT_PATH", e.path.clone());
+                }
+            }
+            _ => {}
+        }
+        v
     }
 
     /// The selected listener, when the selected row is one.
@@ -2564,6 +2618,14 @@ impl App {
                 return Vec::new();
             }
             KeyCode::Char('?') => return self.ask_new(),
+            KeyCode::Char('!') => {
+                if self.shell_enabled {
+                    self.shell = Some(self.shell_env());
+                } else {
+                    self.set_status("the shell is turned off ([tui] shell = false)", true);
+                }
+                return Vec::new();
+            }
             KeyCode::Char(',') => return self.switch_tab(Tab::Settings),
             KeyCode::Char('L') => {
                 self.go_live();
@@ -4999,5 +5061,75 @@ pub(crate) mod tests {
         for q in ["10.0.0", "AS1", "other"] {
             assert!(!peer_matches(&g, q), "{q}");
         }
+    }
+
+    #[test]
+    fn bang_asks_for_a_shell_with_the_selection() {
+        use crate::model::{ConnGroup, Conns};
+        let get = |env: &[(String, String)], k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        let mut a = app();
+        let mut s = snap(2_000_000);
+        s.conns = Conns {
+            groups: vec![
+                ConnGroup {
+                    state: "TIME_WAIT".into(),
+                    inbound: true,
+                    local_port: 443,
+                    remote: "203.0.113.5".into(),
+                    count: 3,
+                    ..Default::default()
+                },
+                ConnGroup {
+                    state: "ESTABLISHED".into(),
+                    pid: 20,
+                    process: "app".into(),
+                    remote: "[2001:db8::9]".into(),
+                    remote_port: 5432,
+                    count: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        a.on_snapshot(s);
+        a.ensure_rows();
+
+        // Procs: the selected process.
+        a.on_key(code(KeyCode::Char('!')));
+        let env = a.shell.take().expect("a shell is asked for");
+        assert_eq!(get(&env, "FAT_SHELL").as_deref(), Some("1"));
+        let p = a.selected_proc().unwrap();
+        assert_eq!(get(&env, "FAT_PID"), Some(p.pid.to_string()));
+        assert_eq!(get(&env, "FAT_PROCESS"), Some(p.name.clone()));
+
+        // Ports: the owner, the port and the peer (brackets dropped); no pid for TIME_WAIT.
+        a.switch_tab(Tab::Ports);
+        a.ensure_rows();
+        let at = |a: &mut App, i: usize| {
+            a.port_sel = a.port_rows.iter().position(|r| *r == PortRow::Group(i)).unwrap();
+            a.on_key(code(KeyCode::Char('!')));
+            a.shell.take().unwrap()
+        };
+        let env = at(&mut a, 1);
+        assert_eq!(get(&env, "FAT_PID").as_deref(), Some("20"));
+        assert_eq!(get(&env, "FAT_PORT").as_deref(), Some("5432"));
+        assert_eq!(get(&env, "FAT_PEER").as_deref(), Some("2001:db8::9"));
+        let env = at(&mut a, 0);
+        assert_eq!(get(&env, "FAT_PID"), None, "nobody owns a TIME_WAIT socket");
+        assert_eq!(get(&env, "FAT_PORT").as_deref(), Some("443"), "inbound: our port");
+
+        // While typing a filter, ! is just a character.
+        a.switch_tab(Tab::Procs);
+        a.on_key(code(KeyCode::Char('/')));
+        a.on_key(code(KeyCode::Char('!')));
+        assert!(a.shell.is_none());
+        a.on_key(code(KeyCode::Esc));
+
+        // Turned off: a message instead.
+        a.modal = Modal::None;
+        a.shell_enabled = false;
+        a.on_key(code(KeyCode::Char('!')));
+        assert!(a.shell.is_none());
+        assert!(a.status.as_ref().is_some_and(|s| s.error && s.text.contains("[tui] shell")));
     }
 }

@@ -89,7 +89,8 @@ pub fn ask_relevant(key: &str, provider: &str) -> bool {
 }
 
 /// Sidebar groups, in order.
-pub const GROUPS: &[&str] = &["Ask", "Recording", "Server", "Fleet", "Hosts", "Agents", "Peers", "Updates"];
+pub const GROUPS: &[&str] =
+    &["Ask", "Recording", "Server", "Fleet", "Hosts", "Agents", "Peers", "Updates", "Interface"];
 
 const PROVIDERS: &[&str] = &["anthropic", "openai", "ollama"];
 const DETAILS: &[&str] = &["full", "minimal"];
@@ -544,6 +545,18 @@ pub fn fields(cfg: &Config, file_text: &str, env: &dyn Fn(&str) -> Option<String
         "fat record notices its binary was replaced and restarts itself between samples",
         Kind::Bool,
         cfg.update.restart_recorder.to_string(),
+        None,
+        false,
+        false,
+    );
+    push(
+        "Interface",
+        "tui",
+        "shell",
+        "! opens a shell",
+        "a shell in this terminal while fat keeps running; exit returns to fat",
+        Kind::Bool,
+        cfg.tui.shell.to_string(),
         None,
         false,
         false,

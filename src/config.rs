@@ -61,6 +61,21 @@ pub struct Config {
     pub update: UpdateCfg,
     /// `[peers]`: names and networks for connection peers.
     pub peers: PeersCfg,
+    /// `[tui]`: the interactive view.
+    pub tui: TuiCfg,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TuiCfg {
+    /// `!` opens a shell while fat keeps running.
+    pub shell: bool,
+}
+
+impl Default for TuiCfg {
+    fn default() -> Self {
+        Self { shell: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -184,6 +199,7 @@ impl Default for Config {
             fleet: Default::default(),
             update: Default::default(),
             peers: Default::default(),
+            tui: Default::default(),
         }
     }
 }

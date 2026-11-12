@@ -44,6 +44,9 @@ names  = true   # reverse-DNS names for connection peers (FAT_NO_PEER_NAMES=1 tu
 asn    = true   # network (AS) of public peers, from a local iptoasn.com table refreshed weekly
 asn_db = ""     # use this ip2asn-combined.tsv(.gz) instead of downloading (FAT_ASN_DB)
 
+[tui]
+shell = true    # ! opens a shell while fat keeps running
+
 [update]
 check            = true    # once a day: is there a newer release? (FAT_NO_UPDATE_CHECK=1 turns it off)
 auto             = false   # install newer releases by itself (signature-checked)
@@ -71,4 +74,5 @@ tags     = ["prod"]
 | `[fleet]` | fleet inventory and polling | [Fleets](fleet.md) |
 | `[server]` | the server profile and system-wide recorder | [Servers](server.md) |
 | `[peers]` | names and networks (AS) for connection peers in Ports. The table download stops under `[ask] local_only`; machines without internet can be given a copy with `asn_db`, and `FAT_ASN_URL` points at a mirror | [TUI: Ports](tui.md) |
+| `[tui]` | whether `!` opens a shell | [TUI: Shell](tui.md#shell-) |
 | `[update]` | the daily version check, automatic updates, recorder restarts | [Updates](updates.md) |

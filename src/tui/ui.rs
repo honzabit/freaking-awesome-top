@@ -2512,6 +2512,7 @@ const HELP: &[(&str, &str)] = &[
     ("Ports: ←→ f", "view by state (All, Listen, Established, Time-wait, Close-wait, Other, Orphans) · filter dialog"),
     ("?", "ask in plain language: a new thread in the Ask tab"),
     (",", "settings screen: every setting by group (←→), with its source; Esc back"),
+    ("!", "a shell while fat keeps running; exit returns. $FAT_PID, $FAT_PORT, $FAT_PEER, $FAT_PATH: the selection"),
     ("Ask: ⏎ n ↑↓ d", "follow up in this thread · new thread · open another · delete (Esc leaves the input)"),
     ("h", "this help"),
     ("q / Ctrl-C", "quit"),

@@ -38,8 +38,29 @@ The key numbers in the sections below (Ports `2`, Timeline `4`) are the desktop 
 | `?` | ask in plain language: opens the Ask tab on a new thread |
 | `a` | the Log screen (see below) |
 | `,` | the Settings screen (see [Settings](#settings-)) |
+| `!` | a shell, while fat keeps running (see below) |
 | `h` | help |
 | `q` / `Ctrl-C` | quit |
+
+### Shell (`!`)
+
+`!` opens your shell (`$SHELL`, or `/bin/sh`) in this terminal, in the directory fat was started from. Type `exit`
+to come back to fat, on the same view with the same selection.
+
+- **fat keeps running meanwhile.** Sampling, the history, fleet polls and the peer lookups go on, so there is no
+  gap in the data. Only drawing pauses.
+- **`Ctrl-C`, `Ctrl-Z` and `Ctrl-\` reach the shell and what you run in it, never fat.** The shell gets the
+  terminal the way a job does in a shell.
+- **The selection comes along as variables:**
+  - `FAT_SHELL=1` always;
+  - `FAT_PID` and `FAT_PROCESS`: the selected process, or the owner of the selected row in Ports;
+  - `FAT_PORT` and `FAT_PEER`: from the selected row in Ports;
+  - `FAT_PATH`: from the selected entry in Fs.
+
+  So `lsof -p $FAT_PID` or `ss -tn dst $FAT_PEER` is one line.
+- **When fat runs as root, so does the shell,** and fat prints that in red as the shell opens.
+- **To turn it off,** for example on shared machines, set `[tui] shell = false` (Settings → Interface). `!` then
+  only says it is off.
 
 ### Log screen (`a`)
 
@@ -225,7 +246,7 @@ A health table of every host, in any profile. See [Fleets](fleet.md).
 `,` opens the Settings screen, where every setting can be read and edited. It sits with the Log screen at the right
 end of the tab bar; neither has a number key, and `Esc` returns to the view you came from.
 
-- **Groups** (on the left, `←` `→`): Ask, Recording, Server, Fleet, Hosts, Agents, Peers, Updates.
+- **Groups** (on the left, `←` `→`): Ask, Recording, Server, Fleet, Hosts, Agents, Peers, Updates, Interface.
 - **Source:** every setting shows its value and where that value comes from: the default, the config file, or an
   environment variable. An environment variable wins and can't be changed there.
 
@@ -258,6 +279,7 @@ end of the tab bar; neither has a number key, and `Esc` returns to the view you 
 - **Peers:** names and networks for connection peers in Ports, and the AS table to use instead of downloading one.
 - **Updates:** the daily version check, automatic updates, and whether `fat record` restarts itself into a new
   binary. See [Updates](updates.md).
+- **Interface:** whether `!` opens a shell.
 
 ### Editing
 
