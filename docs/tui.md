@@ -56,10 +56,20 @@ The action log: everything fat did and who asked (you in the TUI, the CLI, or an
 
 Connections grouped by state, each view with a live count.
 
+Each connection group's note shows who the peer is:
+- **Its name**, from reverse DNS through the system resolver, so `/etc/hosts` and internal DNS apply. A name followed
+  by a yellow `?` does not resolve back to the address. Whoever owns an address chooses its reverse name, so an
+  unconfirmed name proves nothing.
+- **Its network** (`AS15169 GOOGLE`), for public addresses only, looked up offline in a local copy of the
+  [iptoasn.com](https://iptoasn.com) table. fat downloads the table on first use and refreshes it weekly; no peer
+  address leaves the machine for it.
+
+Nothing is looked up, loaded or downloaded until you first open Ports; names arrive a sample or two after that. Both lookups can be turned off; see [Configuration](configuration.md).
+
 | Key | Action |
 | --- | --- |
 | `←` `→` | switch view: All · Listen · Established · Time-wait · Close-wait · Other · Orphans |
-| `f` | open the filter: protocol, address scope, process, port or range, peer address (`Esc` clears it) |
+| `f` | open the filter: protocol, address scope, process, port or range, peer (part of its address, name or network: `10.0.`, `cdn`, `AS15169`) (`Esc` clears it) |
 | `k` | kills the tree |
 
 ### Timeline (`4`)
@@ -215,7 +225,7 @@ A health table of every host, in any profile. See [Fleets](fleet.md).
 `,` opens the Settings screen, where every setting can be read and edited. It sits with the Log screen at the right
 end of the tab bar; neither has a number key, and `Esc` returns to the view you came from.
 
-- **Groups** (on the left, `←` `→`): Ask, Recording, Server, Fleet, Hosts, Agents, Updates.
+- **Groups** (on the left, `←` `→`): Ask, Recording, Server, Fleet, Hosts, Agents, Peers, Updates.
 - **Source:** every setting shows its value and where that value comes from: the default, the config file, or an
   environment variable. An environment variable wins and can't be changed there.
 
@@ -245,6 +255,7 @@ end of the tab bar; neither has a number key, and `Esc` returns to the view you 
 - **Agents:** which side-effect tools agents may use over MCP (`[mcp] allow_actions`), as a checklist. Allowing
   anything new asks for confirmation first. Kill still needs a preview and a one-time token per process. See
   [For agents: MCP](agents.md).
+- **Peers:** names and networks for connection peers in Ports, and the AS table to use instead of downloading one.
 - **Updates:** the daily version check, automatic updates, and whether `fat record` restarts itself into a new
   binary. See [Updates](updates.md).
 

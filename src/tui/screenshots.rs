@@ -216,7 +216,14 @@ fn demo_snap(ts: i64, wobble: f32) -> Snapshot {
             remote: remote.into(),
             remote_port: rport,
             count,
+            ..Default::default()
         }
+    };
+    let named = |mut g: ConnGroup, name: &str, verified: bool, net: Option<(u32, &str)>| {
+        g.peer_name = name.into();
+        g.peer_name_verified = verified;
+        g.peer_net = net.map(|(asn, n)| crate::model::PeerNet { asn, name: n.into(), country: String::new() });
+        g
     };
     s.conns = Conns {
         states: vec![
@@ -227,12 +234,22 @@ fn demo_snap(ts: i64, wobble: f32) -> Snapshot {
             ("SYN_SENT".into(), 2),
         ],
         groups: vec![
-            g("ESTABLISHED", 903, "nginx", true, 443, "203.0.113.40", 0, 412),
+            named(
+                g("ESTABLISHED", 903, "nginx", true, 443, "203.0.113.40", 0, 412),
+                "lb-2.example.net",
+                true,
+                Some((64500, "EXAMPLE-CDN")),
+            ),
             g("ESTABLISHED", 1200, "node", false, 0, "127.0.0.1", 5432, 80),
-            g("TIME_WAIT", 0, "", true, 443, "198.51.100.7", 0, 214),
+            named(g("TIME_WAIT", 0, "", true, 443, "198.51.100.7", 0, 214), "", false, Some((64511, "EXAMPLE-ISP"))),
             g("ESTABLISHED", 1310, "python3", false, 0, "127.0.0.1", 6379, 32),
-            g("CLOSE_WAIT", 1310, "python3", false, 0, "192.0.2.15", 443, 18),
-            g("SYN_SENT", 2101, "backup", false, 0, "10.0.9.2", 873, 2),
+            named(
+                g("CLOSE_WAIT", 1310, "python3", false, 0, "192.0.2.15", 443, 18),
+                "api.partner.example",
+                false,
+                Some((64496, "EXAMPLE-HOSTING")),
+            ),
+            named(g("SYN_SENT", 2101, "backup", false, 0, "10.0.9.2", 873, 2), "backup-01.internal", true, None),
         ],
         ..Default::default()
     };

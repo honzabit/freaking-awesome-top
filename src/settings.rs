@@ -89,7 +89,7 @@ pub fn ask_relevant(key: &str, provider: &str) -> bool {
 }
 
 /// Sidebar groups, in order.
-pub const GROUPS: &[&str] = &["Ask", "Recording", "Server", "Fleet", "Hosts", "Agents", "Updates"];
+pub const GROUPS: &[&str] = &["Ask", "Recording", "Server", "Fleet", "Hosts", "Agents", "Peers", "Updates"];
 
 const PROVIDERS: &[&str] = &["anthropic", "openai", "ollama"];
 const DETAILS: &[&str] = &["full", "minimal"];
@@ -471,6 +471,43 @@ pub fn fields(cfg: &Config, file_text: &str, env: &dyn Fn(&str) -> Option<String
         Kind::Multi(crate::mcp::ACTION_TOOLS),
         allowed.join(", "),
         None,
+        false,
+        false,
+    );
+    let g = "Peers";
+    push(
+        g,
+        "peers",
+        "names",
+        "Names for connection peers",
+        "reverse DNS through the system resolver, checked forward; unconfirmed names get a ?",
+        Kind::Bool,
+        cfg.peers.names.to_string(),
+        Some("FAT_NO_PEER_NAMES"),
+        false,
+        false,
+    );
+    push(
+        g,
+        "peers",
+        "asn",
+        "Network (AS) of public peers",
+        "looked up offline in the iptoasn.com table, downloaded weekly (not under [ask] local_only)",
+        Kind::Bool,
+        cfg.peers.asn.to_string(),
+        None,
+        false,
+        false,
+    );
+    push(
+        g,
+        "peers",
+        "asn_db",
+        "AS table file",
+        "use this ip2asn-combined.tsv(.gz) instead of downloading one; empty = download",
+        Kind::Text,
+        cfg.peers.asn_db.clone(),
+        Some("FAT_ASN_DB"),
         false,
         false,
     );

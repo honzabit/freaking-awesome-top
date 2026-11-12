@@ -14,6 +14,7 @@ mod llm;
 mod llm_cli;
 mod mcp;
 mod model;
+mod peers;
 mod server;
 mod settings;
 mod sys;
@@ -1051,6 +1052,7 @@ fn main() -> Result<()> {
             let h = history::History::open_read_only(cfg.history_path.as_deref()).ok();
             let mut f = blame::diagnose_with_fs(&s, h.as_ref(), &fs_facts(h.as_ref()));
             f.extend(update::finding(&cfg));
+            f.extend(peers::finding(&cfg));
             if json {
                 print_json(&f)?;
             } else if f.is_empty() {

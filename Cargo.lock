@@ -626,6 +626,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "ed25519-dalek",
+ "flate2",
  "libc",
  "ratatui",
  "rusqlite",

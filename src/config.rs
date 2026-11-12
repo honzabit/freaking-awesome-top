@@ -59,6 +59,27 @@ pub struct Config {
     pub fleet: crate::server::FleetCfg,
     /// `[update]`: version check and self-update.
     pub update: UpdateCfg,
+    /// `[peers]`: names and networks for connection peers.
+    pub peers: PeersCfg,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PeersCfg {
+    /// Reverse-DNS names for connection peers, checked forward, through the system resolver.
+    /// Off with FAT_NO_PEER_NAMES=1.
+    pub names: bool,
+    /// The network (AS) a public peer belongs to, from a local copy of the iptoasn.com table
+    /// (downloaded weekly unless `[ask] local_only`).
+    pub asn: bool,
+    /// Use this table instead of downloading one (FAT_ASN_DB).
+    pub asn_db: String,
+}
+
+impl Default for PeersCfg {
+    fn default() -> Self {
+        Self { names: true, asn: true, asn_db: String::new() }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -162,6 +183,7 @@ impl Default for Config {
             server: Default::default(),
             fleet: Default::default(),
             update: Default::default(),
+            peers: Default::default(),
         }
     }
 }

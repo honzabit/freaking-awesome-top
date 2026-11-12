@@ -29,3 +29,5 @@ ureq = { version = "2", features = ["json"] }
 # fat update: verify the release's signed SHA256SUMS (Ed25519) and each archive's SHA-256.
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 sha2 = "0.10"
+# [peers] asn: the iptoasn.com table is a .tsv.gz (flate2 is already in the tree via ureq).
+flate2 = "1"

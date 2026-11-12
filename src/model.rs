@@ -231,6 +231,27 @@ pub struct ConnGroup {
     pub remote: String,
     pub remote_port: u16,
     pub count: u32,
+    /// The peer's reverse-DNS name, when it has one (and fat has looked it up).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub peer_name: String,
+    /// The name resolves back to the peer's address. A name that does not was chosen by
+    /// whoever owns the address, and proves nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub peer_name_verified: bool,
+    /// The network a public peer belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_net: Option<PeerNet>,
+}
+
+/// An autonomous system: who routes an address.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PeerNet {
+    pub asn: u32,
+    /// As registered ("CLOUDFLARENET", "AMAZON-02").
+    pub name: String,
+    /// Registration country (ISO code), not where the host is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub country: String,
 }
 
 impl Snapshot {

@@ -92,7 +92,16 @@ pub fn ports(procs: &[Proc]) -> Vec<Port> {
 pub fn connections(procs: &[Proc]) -> crate::model::Conns {
     let scan = cached_raw();
     let names: HashMap<u32, &str> = procs.iter().map(|p| (p.pid, p.name.as_str())).collect();
-    group_conns(&scan.socks, &scan.conns, &names, scan.notes.clone())
+    let mut c = group_conns(&scan.socks, &scan.conns, &names, scan.notes.clone());
+    for g in &mut c.groups {
+        if let Some(ip) = crate::peers::parse_shown(&g.remote) {
+            let w = crate::peers::who(ip);
+            g.peer_name = w.name;
+            g.peer_name_verified = w.verified;
+            g.peer_net = w.net;
+        }
+    }
+    c
 }
 
 /// Count and group. Inbound = to a port something listens on here; those are grouped by
@@ -147,7 +156,18 @@ fn group_conns(
                     .or_else(|| conns.iter().find(|c| c.pid == pid).map(|c| c.command.clone()))
                     .unwrap_or_default()
             };
-            ConnGroup { state: state.into(), pid, process, inbound, local, local_port, remote, remote_port, count }
+            ConnGroup {
+                state: state.into(),
+                pid,
+                process,
+                inbound,
+                local,
+                local_port,
+                remote,
+                remote_port,
+                count,
+                ..Default::default()
+            }
         })
         .collect();
     groups.sort_by(|a, b| {

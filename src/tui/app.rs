@@ -382,7 +382,7 @@ impl PortFilter {
             && (self.scope == PortScope::Any || PortScope::of(&g.remote) == self.scope)
             && self.process_ok(&g.process)
             && self.port_ok(&[g.local_port, g.remote_port])
-            && (self.remote.trim().is_empty() || g.remote.contains(self.remote.trim()))
+            && (self.remote.trim().is_empty() || peer_matches(g, self.remote.trim()))
     }
 
     /// "tcp · public · port 443" for titles.
@@ -415,7 +415,19 @@ pub struct PortFilterForm {
 }
 
 impl PortFilterForm {
-    pub const LABELS: [&'static str; 5] = ["Protocol", "Address scope", "Process", "Port", "Peer address"];
+    pub const LABELS: [&'static str; 5] = ["Protocol", "Address scope", "Process", "Port", "Peer"];
+}
+
+/// The peer filter: part of the address, of its name, or of its network ("AS15169", "google").
+fn peer_matches(g: &crate::model::ConnGroup, q: &str) -> bool {
+    if g.remote.contains(q) {
+        return true;
+    }
+    let q = q.to_lowercase();
+    g.peer_name.contains(&q)
+        || g.peer_net
+            .as_ref()
+            .is_some_and(|n| format!("as{}", n.asn).starts_with(&q) || n.name.to_lowercase().contains(&q))
 }
 
 /// One row of the Ports table.
@@ -2463,6 +2475,9 @@ impl App {
     pub fn switch_tab(&mut self, t: Tab) -> Vec<Command> {
         if self.tab != t {
             self.why = None;
+        }
+        if t == Tab::Ports {
+            crate::peers::activate();
         }
         if Tab::SCREENS.contains(&t) {
             if !Tab::SCREENS.contains(&self.tab) {
@@ -4791,6 +4806,7 @@ pub(crate) mod tests {
             remote: remote.into(),
             remote_port: rport,
             count,
+            ..Default::default()
         };
         s.conns = Conns {
             states: vec![
@@ -4967,5 +4983,21 @@ pub(crate) mod tests {
         a.settings.sel = a.settings.rows().iter().position(|r| *r == SRow::AskAdvanced).unwrap();
         a.on_key(code(KeyCode::Enter));
         assert!(!a.settings.ask_advanced, "Enter folds Advanced");
+    }
+
+    #[test]
+    fn peer_filter_matches_name_and_network() {
+        let g = crate::model::ConnGroup {
+            remote: "203.0.113.5".into(),
+            peer_name: "edge-3.cdn.example".into(),
+            peer_net: Some(crate::model::PeerNet { asn: 64500, name: "Example-CDN".into(), country: String::new() }),
+            ..Default::default()
+        };
+        for q in ["203.0.113", "cdn.example", "AS64500", "as645", "example-cdn", "Example"] {
+            assert!(peer_matches(&g, q), "{q}");
+        }
+        for q in ["10.0.0", "AS1", "other"] {
+            assert!(!peer_matches(&g, q), "{q}");
+        }
     }
 }

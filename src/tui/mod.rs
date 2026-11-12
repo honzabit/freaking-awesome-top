@@ -1492,6 +1492,8 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
         KernelLogCache { read: Box::new(|since| crate::server::kernel::read_kmsg_since(Some(since))), cached: None }
     });
     let hist_tx = spawn_history(hist, tx.clone(), klog);
+    // Peer names and networks for the Ports view (background; answers arrive with later samples).
+    crate::peers::init(&cfg);
     // Update check (daily, cached; with [update] auto also the install): never delays the UI.
     {
         let (cfg, tx) = (cfg.clone(), tx.clone());

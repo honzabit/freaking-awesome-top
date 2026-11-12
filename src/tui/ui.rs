@@ -711,7 +711,18 @@ fn draw_ports(f: &mut Frame, app: &mut App, area: Rect) {
                     (0, _) => ("-".to_string(), Span::styled("(owner hidden)", dim())),
                     (p, _) => (p.to_string(), Span::styled(g.process.clone(), Style::default().bold())),
                 };
-                let note = if g.inbound { format!("in → :{}", g.local_port) } else { "out".to_string() };
+                let dir = if g.inbound { format!("in → :{}", g.local_port) } else { "out".to_string() };
+                let mut note = vec![Span::styled(dir, dim())];
+                if !g.peer_name.is_empty() {
+                    note.push(Span::raw(format!("  {}", g.peer_name)));
+                    if !g.peer_name_verified {
+                        // The address's owner picks its PTR name: unconfirmed names prove nothing.
+                        note.push(Span::styled("?", Style::default().fg(Color::Yellow)));
+                    }
+                }
+                if let Some(n) = &g.peer_net {
+                    note.push(Span::styled(format!("  AS{} {}", n.asn, n.name), dim()));
+                }
                 Row::new(vec![
                     Cell::from(Span::styled(g.state.to_lowercase().replace('_', "-"), state_style(&g.state))),
                     Cell::from(local),
@@ -722,7 +733,7 @@ fn draw_ports(f: &mut Frame, app: &mut App, area: Rect) {
                     ),
                     num(pid, Style::default()),
                     Cell::from(process),
-                    Cell::from(Span::styled(note, dim())),
+                    Cell::from(Line::from(note)),
                 ])
             }
         };
@@ -780,7 +791,7 @@ fn draw_port_filter(f: &mut Frame, app: &App, form: &crate::tui::app::PortFilter
         "loopback · private · public (⏎ / ←→)",
         "part of the name",
         "8080 or 8000-8100",
-        "part of the address",
+        "address, name or AS",
     ];
     let mut lines = Vec::new();
     for (i, label) in crate::tui::app::PortFilterForm::LABELS.iter().enumerate() {
@@ -3456,6 +3467,8 @@ mod tests {
                         remote: "10.0.3.7".into(),
                         remote_port: 5432,
                         count: 412,
+                        peer_name: "db-1.internal".into(),
+                        peer_name_verified: true,
                         ..Default::default()
                     },
                     ConnGroup {
@@ -3465,6 +3478,12 @@ mod tests {
                         local_port: 443,
                         remote: "203.0.113.5".into(),
                         count: 210,
+                        peer_name: "claims.example".into(),
+                        peer_net: Some(crate::model::PeerNet {
+                            asn: 64500,
+                            name: "EXAMPLE-NET".into(),
+                            country: "NL".into(),
+                        }),
                         ..Default::default()
                     },
                 ],
@@ -3480,6 +3499,10 @@ mod tests {
                     "{out}"
                 );
                 assert!(out.contains("10.0.3.7:5432") && out.contains("×412") && out.contains("(kernel)"), "{out}");
+            }
+            if h >= 24 && w >= 140 {
+                assert!(out.contains("out  db-1.internal "), "verified names carry no mark: {out}");
+                assert!(out.contains("claims.example?  AS64500 EXAMPLE-NET"), "unconfirmed names are marked: {out}");
             }
             a.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
             let out = render(&mut a, w, h);
