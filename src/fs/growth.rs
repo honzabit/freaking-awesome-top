@@ -69,6 +69,53 @@ const KEEP_MS: i64 = 70 * 60 * 1000;
 const MTIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// `p` is `prefix` or below it (component-wise).
+/// Where a report must scan modification times because live events were lost there.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only FSEvents reports losses by directory
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Rescan {
+    None,
+    /// The whole report root.
+    Root,
+    /// These directories inside it.
+    Dirs(Vec<String>),
+}
+
+/// Directories scanned at most before the whole root is scanned instead.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only FSEvents reports losses by directory
+const RESCAN_DIRS: usize = 8;
+
+/// From losses (directory, last event id; "/" = anywhere), those after `after_id` that touch
+/// `root`: a loss at or above it means the whole root, losses below it name the directories.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only FSEvents reports losses by directory
+pub(crate) fn rescan_targets(losses: &[(String, u64)], after_id: u64, root: &str) -> Rescan {
+    let mut dirs: Vec<&str> = Vec::new();
+    for (d, id) in losses {
+        if *id <= after_id {
+            continue;
+        }
+        if under_prefix(root, d) {
+            return Rescan::Root;
+        }
+        if under_prefix(d, root) {
+            dirs.push(d);
+        }
+    }
+    dirs.sort_unstable();
+    dirs.dedup();
+    // Keep only the outermost: /a covers /a/b.
+    let mut out: Vec<String> = Vec::new();
+    for d in dirs {
+        if !out.iter().any(|o| under_prefix(d, o)) {
+            out.push(d.to_string());
+        }
+    }
+    match out.len() {
+        0 => Rescan::None,
+        n if n > RESCAN_DIRS => Rescan::Root,
+        _ => Rescan::Dirs(out),
+    }
+}
+
 pub(crate) fn under_prefix(p: &str, prefix: &str) -> bool {
     if prefix == "/" || prefix.is_empty() {
         return p.starts_with('/');
@@ -352,11 +399,11 @@ impl Tracker {
 
         // 1. Live/retroactive events.
         #[cfg(target_os = "macos")]
-        let (live, exact_cover) = self.fsevents_obs(from, now, &root, &may_stat, &mut notes);
+        let (live, exact_cover, rescan) = self.fsevents_obs(from, now, &root, &may_stat, &mut notes);
         #[cfg(target_os = "linux")]
-        let (live, exact_cover) = self.watch_obs(from, now, &root, scanner, &mut notes);
+        let ((live, exact_cover), rescan) = (self.watch_obs(from, now, &root, scanner, &mut notes), Rescan::None);
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let (live, exact_cover): (Vec<Obs>, bool) = (vec![], false);
+        let (live, exact_cover, rescan): (Vec<Obs>, bool, Rescan) = (vec![], false, Rescan::None);
         obs.extend(live);
 
         // 2. Open files of writers.
@@ -372,9 +419,12 @@ impl Tracker {
             obs.extend(scan_diff(h, scanner, &root, from, now, window_ms, &mut notes));
         }
 
-        // 4. Mtime fallback.
-        if !exact_cover {
-            obs.extend(self.mtime_obs(from, &root, scanner, &may_stat, &mut notes));
+        // 4. Mtime fallback: when events don't cover the window, or were lost somewhere in it.
+        match rescan {
+            _ if !exact_cover => obs.extend(self.mtime_obs(from, &root, scanner, &may_stat, &mut notes)),
+            Rescan::Root => obs.extend(self.mtime_obs(from, &root, scanner, &may_stat, &mut notes)),
+            Rescan::Dirs(dirs) => obs.extend(self.mtime_scan(dirs, from, &may_stat, &mut notes)),
+            Rescan::None => {}
         }
 
         // Scanner listings as baselines for files whose delta is unknown.
@@ -612,7 +662,7 @@ impl Tracker {
         root: &str,
         may_stat: &dyn Fn(&str, &str) -> bool,
         notes: &mut Vec<String>,
-    ) -> (Vec<Obs>, bool) {
+    ) -> (Vec<Obs>, bool, Rescan) {
         self.mac.clock.anchor_now();
         // Window older than the live journal: restart it further back (it keeps tailing).
         if self.mac.journal.is_none() || from < self.mac.journal_from_ms - 30_000 {
@@ -623,18 +673,15 @@ impl Tracker {
         loop {
             tries += 1;
             let Some(j) = self.mac.journal.as_ref() else {
-                return (vec![], false);
+                return (vec![], false, Rescan::None);
             };
             let done =
                 j.wait_history(HISTORY_WAIT.saturating_sub(t0.elapsed()).max(std::time::Duration::from_millis(500)));
             let since_id = j.since_id;
-            let (err, dropped) = {
-                let st = j.state.lock().unwrap();
-                (st.error.clone(), st.dropped)
-            };
+            let err = j.state.lock().unwrap().error.clone();
             if let Some(e) = err {
                 notes.push(format!("FSEvents unavailable: {e}"));
-                return (vec![], false);
+                return (vec![], false, Rescan::None);
             }
             // Window start as an event id: fat's clock, else fit file ctimes of a sample of
             // the whole journal (then remember the fit as an anchor).
@@ -691,10 +738,21 @@ impl Tracker {
                     t0.elapsed()
                 ));
             }
-            if dropped > 0 {
-                notes.push(format!(
-                    "FSEvents coalesced {dropped} event batches (heavy churn): some paths may be missing"
-                ));
+            // Events FSEvents lost inside the window (heavy churn): scan modification times there.
+            let rescan = {
+                let st = j.state.lock().unwrap();
+                let lost: Vec<(String, u64)> = st.losses.iter().map(|(d, (id, _))| (d.clone(), *id)).collect();
+                rescan_targets(&lost, b, root)
+            };
+            match &rescan {
+                Rescan::None => {}
+                Rescan::Root => {
+                    notes.push("FSEvents lost events here (heavy churn): modification times are scanned as well".into())
+                }
+                Rescan::Dirs(d) => notes.push(format!(
+                    "FSEvents lost events under {} (heavy churn): modification times scanned there",
+                    d.join(", ")
+                )),
             }
             // Drop entries too old to matter for any window we serve.
             let keep = self.mac.clock.id_at(now - KEEP_MS);
@@ -713,7 +771,7 @@ impl Tracker {
                 notes.push("no Full Disk Access: changes inside TCC-protected folders (Documents, Desktop, Downloads, Mail, app containers...) are counted, not sized".into());
             }
             let o = self.events_to_obs(in_window, from, Evidence::Fsevents, may_stat, false, None);
-            return (o, done);
+            return (o, done, rescan);
         }
     }
 
@@ -806,6 +864,17 @@ impl Tracker {
                 }
             }
         }
+        self.mtime_scan(roots, from, may_stat, notes)
+    }
+
+    /// Files under `roots` modified since `from` (time-bounded walk).
+    fn mtime_scan(
+        &mut self,
+        roots: Vec<String>,
+        from: Ts,
+        may_stat: &dyn Fn(&str, &str) -> bool,
+        notes: &mut Vec<String>,
+    ) -> Vec<Obs> {
         let home = self.home.clone();
         let excl = self.exclude.clone();
         let skip = |p: &str| !may_stat(p, &home) || paths::is_pseudo_path(p) || excl.iter().any(|e| under_prefix(p, e));
@@ -1082,6 +1151,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lost_events_pick_what_to_rescan() {
+        let l = |v: &[(&str, u64)]| v.iter().map(|(d, i)| (d.to_string(), *i)).collect::<Vec<_>>();
+        let root = "/Users/me/proj";
+        assert_eq!(rescan_targets(&l(&[]), 10, root), Rescan::None);
+        // Before the window, or somewhere else: nothing to do.
+        assert_eq!(rescan_targets(&l(&[("/", 5), ("/Users/me/proj/a", 9)]), 10, root), Rescan::None);
+        assert_eq!(rescan_targets(&l(&[("/Users/other", 50), ("/Users/me/project", 50)]), 10, root), Rescan::None);
+        // At or above the root: all of it.
+        assert_eq!(rescan_targets(&l(&[("/", 11)]), 10, root), Rescan::Root);
+        assert_eq!(rescan_targets(&l(&[("/Users/me", 11)]), 10, root), Rescan::Root);
+        assert_eq!(rescan_targets(&l(&[("/Users/me/proj", 11)]), 10, root), Rescan::Root);
+        // Below it: those directories, outermost only.
+        assert_eq!(
+            rescan_targets(
+                &l(&[("/Users/me/proj/b/c", 11), ("/Users/me/proj/a", 12), ("/Users/me/proj/b", 13)]),
+                10,
+                root
+            ),
+            Rescan::Dirs(vec!["/Users/me/proj/a".into(), "/Users/me/proj/b".into()])
+        );
+        // Too many separate places: the whole root.
+        let many: Vec<(String, u64)> = (0..=RESCAN_DIRS).map(|i| (format!("/Users/me/proj/d{i}"), 11)).collect();
+        assert_eq!(rescan_targets(&many, 10, root), Rescan::Root);
+    }
+
     /// End to end: a file written by a child process in a scratch dir shows up as a grower of
     /// a report limited to that dir. macOS: FSEvents replay; Linux: watch (inotify/fanotify).
     #[test]
@@ -1102,8 +1197,15 @@ mod tests {
             .status()
             .unwrap();
         assert!(st.success());
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        let g = t.report(5 * 60_000, Some(&ds), None, None);
+        // Events arrive with some latency, more on a busy machine: ask again until a deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let g = loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let g = t.report(5 * 60_000, Some(&ds), None, None);
+            if g.growers.iter().any(|x| x.path == fp) || std::time::Instant::now() >= deadline {
+                break g;
+            }
+        };
         eprintln!("growers={:?}\nnotes={:?}\nlive_paths={}", g.growers, g.notes, t.live_paths());
         let hit =
             g.growers.iter().find(|x| x.path == fp).unwrap_or_else(|| panic!("{fp} not reported: {:?}", g.growers));

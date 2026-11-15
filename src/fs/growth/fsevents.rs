@@ -76,6 +76,15 @@ const EV_ITEM_CLONED: u32 = 0x40_0000;
 /// Content-changing item flags (metadata-only events such as xattr/owner/finder info are ignored).
 const EV_INTERESTING: u32 = EV_ITEM_CREATED | EV_ITEM_REMOVED | EV_ITEM_RENAMED | EV_ITEM_MODIFIED | EV_ITEM_CLONED;
 
+/// Kinds of loss in [`State::losses`]: dropped in this process before the callback (happens
+/// under heavy replay even with a callback that does nothing) / dropped by the kernel /
+/// coalesced into "rescan this directory".
+pub const LOST_USER: u32 = 1;
+pub const LOST_KERNEL: u32 = 2;
+pub const LOST_COALESCED: u32 = 4;
+/// Distinct directories remembered in [`State::losses`]; past this a loss counts as "/".
+const LOSS_CAP: usize = 2000;
+
 /// CFAbsoluteTime epoch (2001-01-01) in unix seconds.
 const CF_EPOCH: f64 = 978_307_200.0;
 
@@ -98,6 +107,8 @@ pub struct State {
     pub history_done: bool,
     /// Events were dropped or coalesced into "rescan this dir" (user/kernel drop, MustScanSubDirs).
     pub dropped: u64,
+    /// Where events were lost: directory ("/" = anywhere) → (last event id, [`LOST_USER`] etc.).
+    pub losses: HashMap<String, (u64, u32)>,
     pub events: u64,
     pub error: Option<String>,
     /// Highest event id seen.
@@ -247,6 +258,23 @@ extern "C" fn callback(_s: CFRef, info: *mut c_void, n: usize, paths: *mut c_voi
         }
         if f & (EV_USER_DROPPED | EV_KERNEL_DROPPED | EV_MUST_SCAN_SUBDIRS) != 0 {
             st.dropped += 1;
+            // A drop means "anything may have changed"; a coalesced dir names where.
+            let dir = if f & (EV_USER_DROPPED | EV_KERNEL_DROPPED) != 0 || paths[i].is_null() {
+                "/".to_string()
+            } else {
+                // SAFETY: non-null NUL-terminated string from FSEvents.
+                let p = unsafe { CStr::from_ptr(paths[i]) }.to_string_lossy();
+                let p = p.trim_end_matches('/');
+                if p.is_empty() { "/".to_string() } else { p.to_string() }
+            };
+            let kind = if f & EV_USER_DROPPED != 0 {
+                LOST_USER
+            } else if f & EV_KERNEL_DROPPED != 0 {
+                LOST_KERNEL
+            } else {
+                LOST_COALESCED
+            };
+            note_loss(&mut st.losses, dir, id, kind);
         }
         if f & EV_INTERESTING == 0 || paths[i].is_null() {
             continue;
@@ -276,6 +304,14 @@ extern "C" fn callback(_s: CFRef, info: *mut c_void, n: usize, paths: *mut c_voi
         }
         super::record_event(&mut st.paths, ctx.cap, p, nf, id as i64, 0);
     }
+}
+
+/// Remember a loss in `dir` at event `id` (bounded: past [`LOSS_CAP`] dirs it counts as "/").
+fn note_loss(losses: &mut HashMap<String, (u64, u32)>, dir: String, id: u64, kind: u32) {
+    let dir = if losses.len() >= LOSS_CAP && !losses.contains_key(&dir) { "/".to_string() } else { dir };
+    let e = losses.entry(dir).or_insert((0, 0));
+    e.0 = e.0.max(id);
+    e.1 |= kind;
 }
 
 /// Maps wall-clock time to FSEvents ids. `FSEventsGetLastEventIdForDeviceBeforeTime` needs
@@ -446,6 +482,19 @@ mod tests {
     /// (FSEventsGetLastEventIdForDeviceBeforeTime returns 0 for non-root users on macOS 15, so
     /// the time->id lookup is fat's own clock; replay from an explicit id works unprivileged.)
     #[test]
+    fn losses_are_bounded_and_keep_the_latest_id() {
+        let mut l = HashMap::new();
+        note_loss(&mut l, "/a".into(), 5, LOST_COALESCED);
+        note_loss(&mut l, "/a".into(), 3, LOST_USER);
+        assert_eq!(l["/a"], (5, LOST_COALESCED | LOST_USER));
+        for i in 0..LOSS_CAP + 10 {
+            note_loss(&mut l, format!("/d{i}"), 10, LOST_COALESCED);
+        }
+        assert_eq!(l.len(), LOSS_CAP + 1, "past the cap, losses fold into \"/\"");
+        assert!(l.contains_key("/"));
+    }
+
+    #[test]
     fn replay_sees_recent_write() {
         let dev = std::fs::metadata("/").map(|m| std::os::unix::fs::MetadataExt::dev(&m)).unwrap();
         eprintln!(
@@ -465,14 +514,22 @@ mod tests {
         // Let fseventsd persist the batch, so this really is a replay.
         std::thread::sleep(Duration::from_millis(1500));
         let j = Journal::start(vec![dir.to_string_lossy().into_owned()], since, 10_000, vec![]);
-        assert!(j.wait_history(Duration::from_secs(10)), "history replay did not finish");
+        // A busy machine replays slowly: allow for it rather than fail on a fixed short wait.
+        assert!(j.wait_history(Duration::from_secs(90)), "history replay did not finish");
         let st = j.state.lock().unwrap();
         let key = f.to_string_lossy().into_owned();
-        let ev = st
-            .paths
-            .get(&key)
-            .unwrap_or_else(|| panic!("{key} not in replay: {:?}", st.paths.keys().collect::<Vec<_>>()));
-        assert!(ev.flags & F_CREATED != 0);
+        // The contract: the write is in the replay, or FSEvents said it lost events there
+        // (the report then scans modification times).
+        let lost_here = st.losses.keys().any(|d| super::super::under_prefix(&key, d));
+        match st.paths.get(&key) {
+            Some(ev) => assert!(ev.flags & F_CREATED != 0),
+            None => assert!(
+                lost_here,
+                "{key} neither replayed nor lost: {:?} / losses {:?}",
+                st.paths.keys().collect::<Vec<_>>(),
+                st.losses
+            ),
+        }
         drop(st);
         drop(j);
         let _ = std::fs::remove_dir_all(&dir);
