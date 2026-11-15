@@ -18,8 +18,9 @@ In the background, the TUI and `fat record` check at most once a day:
 - **Never in the way:** the check runs in a background thread with a short timeout, and the answer is cached
   (`~/.local/share/fat/update.json` on Linux, `~/Library/Application Support/fat/update.json` on macOS).
   Being offline is silent.
-- **Where it shows:** a yellow `⬆ fat 0.2.0 · fat update` in the TUI header, an `info` finding in
-  `fat doctor`, and a line in the `fat record` log. Never in `--json` output or MCP replies.
+- **Where it shows:** `⬆ fat 0.2.0 · U` in the TUI header (with a one-time line in the footer), an `info`
+  finding in `fat doctor`, and a line in the `fat record` log. Never in `--json` output or MCP replies. A
+  TUI left running checks again every hour (still at most one request a day).
 
 Turn it off with any of:
 
@@ -63,9 +64,25 @@ auto = true
 
 With `auto`, the daily check also installs a newer release, in the same way as `fat update`:
 
-- in the TUI, at start, in the background. The running TUI keeps its version; the header then says
-  `fat 0.2.0 installed · restart fat`.
+- in the TUI, in the background. The running TUI keeps its version until you restart it; the header
+  then says `⬆ fat 0.2.0 installed · U`.
 - in `fat record`. On a server this is what keeps fat current.
+
+## In the TUI (`U`)
+
+fat never interrupts you with an update: it shows a badge in the header and says so once in the footer.
+Press `U` when it suits you:
+
+- **Already installed** (by `[update] auto`, by `fat update` in another terminal or in the `!` shell, or by
+  anything else that replaced the binary, which fat notices within 30 seconds): the dialog shows the
+  release notes, and `⏎` restarts fat into the new version.
+- **Not installed yet:** `⏎` installs it, with the same checks as `fat update`, and then restarts.
+  Binaries a package manager owns are left to it; the dialog says which.
+- **Nothing newer:** `U` says which version is the latest.
+
+The restart keeps your place: tab, sort, filter, selection, the Ports view, the Fs directory and a rewind
+position come back, and the history is on disk anyway. fat restarts in the same terminal, with the same
+arguments.
 
 ## The recorder after an update
 

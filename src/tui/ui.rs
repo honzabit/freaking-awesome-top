@@ -116,10 +116,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     } else {
         l1.push(Span::styled(" sampling…", dim()));
     }
-    if let Some(note) = &app.update_note {
+    if let Some(note) = app.update_badge() {
         let used: usize = l1.iter().map(|s| s.width()).sum();
         if used + badge_w + note.chars().count() + 3 < w {
-            l1.push(Span::styled(format!("  {note}"), Style::default().fg(th::warn())));
+            l1.push(Span::raw("  "));
+            l1.push(Span::styled(note, Style::default().fg(th::accent()).bold()));
         }
     }
     let used: usize = l1.iter().map(|s| s.width()).sum();
@@ -2421,6 +2422,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
     match &app.modal {
         Modal::None | Modal::Filter => {}
         Modal::Help => draw_help(f, area),
+        Modal::Update => draw_update(f, app, area),
         Modal::PortFilter(form) => draw_port_filter(f, app, form, area),
 
         Modal::Confirm { prompt, .. } => {
@@ -2514,6 +2516,7 @@ const HELP: &[(&str, &str)] = &[
     ("?", "ask in plain language: a new thread in the Ask tab"),
     (",", "settings screen: every setting by group (←→), with its source; Esc back"),
     ("!", "a shell while fat keeps running; exit returns. $FAT_PID, $FAT_PORT, $FAT_PEER, $FAT_PATH: the selection"),
+    ("U", "update: what's new in a newer fat, and restart into it (your view comes back)"),
     ("Ask: ⏎ n ↑↓ d", "follow up in this thread · new thread · open another · delete (Esc leaves the input)"),
     ("h", "this help"),
     ("q / Ctrl-C", "quit"),
@@ -2546,6 +2549,90 @@ fn help_lines(inner: usize) -> Vec<Line<'static>> {
         }
     }
     out
+}
+
+/// `U`: what's new and what ⏎ does.
+fn draw_update(f: &mut Frame, app: &App, area: Rect) {
+    use crate::tui::app::Offer;
+    let u = &app.update;
+    let width = 84.min(area.width.saturating_sub(2));
+    let inner = width.saturating_sub(4);
+    let running = crate::update::VERSION;
+    let (head, act) = match app.offer() {
+        Offer::Restart(v) => (
+            format!("fat {v} is installed. You're running {running}."),
+            Some((
+                "⏎ restart into it",
+                "Your tab, selection, sort and filter come back, and history is kept.".to_string(),
+            )),
+        ),
+        Offer::Install(v) => (
+            format!("fat {v} is out. You're running {running}."),
+            match &u.blocked {
+                Some(why) => Some(("", format!("fat won't replace this binary: {why}."))),
+                None => Some((
+                    "⏎ install and restart",
+                    "Signature and checksum are verified first; `fat update --rollback` goes back.".to_string(),
+                )),
+            },
+        ),
+        Offer::None => (format!("fat {running} is the latest release."), None),
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::styled(head, Style::default().bold()));
+    lines.push(Line::raw(""));
+    // Release notes, cut to what fits.
+    let room = area.height.saturating_sub(12).max(3) as usize;
+    match &u.notes {
+        None => lines.push(Line::styled("release notes: loading…", dim())),
+        Some(Err(e)) => lines.push(Line::styled(e.clone(), dim())),
+        Some(Ok(t)) if t.trim().is_empty() => lines.push(Line::styled(crate::update::release_url(&u.notes_for), dim())),
+        Some(Ok(t)) => {
+            let md = crate::tui::markdown::render(t, inner);
+            let n = md.len();
+            lines.extend(md.into_iter().take(room));
+            if n > room {
+                lines.push(Line::styled(format!("… {}", crate::update::release_url(&u.notes_for)), dim()));
+            }
+        }
+    }
+    lines.push(Line::raw(""));
+    if let Some(e) = &u.error {
+        lines.push(Line::styled(format!("✗ {e}"), Style::default().fg(th::crit())));
+    }
+    let keys = if u.busy {
+        lines.push(Line::styled("installing… (signature, checksum, then a test run)", Style::default().fg(th::key())));
+        vec![Span::styled(" Esc ", th::badge(th::muted())), Span::styled(" hide (it carries on)", dim())]
+    } else {
+        let mut k = Vec::new();
+        if let Some((label, hint)) = &act {
+            if !label.is_empty() {
+                k.push(Span::styled(format!(" {label} "), th::badge(th::accent()).bold()));
+                k.push(Span::raw("  "));
+            }
+            lines.push(Line::styled(hint.clone(), dim()));
+        }
+        k.push(Span::styled(" Esc ", th::badge(th::muted())));
+        k.push(Span::styled(" later", dim()));
+        k
+    };
+    lines.push(Line::raw(""));
+    lines.push(Line::from(keys));
+    // Rows once wrapped (border and padding take 4 columns).
+    let rows: usize = lines.iter().map(|l| l.width().max(1).div_ceil(inner.max(1) as usize)).sum();
+    let h = (rows as u16 + 2).min(area.height);
+    let r = centered(width, h, area);
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th::accent()))
+                .title(Line::styled(" Update fat ", Style::default().bold()))
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        ),
+        r,
+    );
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
@@ -2743,13 +2830,36 @@ mod tests {
     #[test]
     fn header_shows_a_newer_release_when_it_fits() {
         let mut a = full_app();
-        a.update_note = Some("⬆ fat 0.2.0 · fat update".into());
+        a.update_state = Some(crate::update::State { latest: "99.0.0".into(), ..Default::default() });
         let wide = render(&mut a, 160, 40);
-        assert!(wide.lines().next().unwrap().contains("⬆ fat 0.2.0 · fat update"), "{wide}");
+        assert!(wide.lines().next().unwrap().contains("⬆ fat 99.0.0 · U"), "{wide}");
         assert!(wide.lines().next().unwrap().contains("LIVE"));
         let narrow = render(&mut a, 60, 40);
-        assert!(!narrow.contains("fat 0.2.0"), "dropped before the live badge: {narrow}");
+        assert!(!narrow.contains("fat 99.0.0"), "dropped before the live badge: {narrow}");
         assert!(narrow.lines().next().unwrap().contains("LIVE"));
+    }
+
+    #[test]
+    fn update_dialog_offers_the_restart_with_notes() {
+        let mut a = full_app();
+        a.set_update(None, Some("99.0.0".into()));
+        a.update.notes_for = "99.0.0".into();
+        a.update.notes = Some(Ok("## What's new\n\n- **themes**: light and mono".into()));
+        a.modal = crate::tui::app::Modal::Update;
+        let out = render(&mut a, 120, 40);
+        assert!(out.contains("Update fat") && out.contains("fat 99.0.0 is installed"), "{out}");
+        assert!(out.contains("themes: light and mono") && out.contains("restart into it"), "{out}");
+        assert!(out.lines().next().unwrap().contains("⬆ fat 99.0.0 installed · U"), "{out}");
+
+        // Not installed, and a binary fat must not replace: say why instead of offering ⏎.
+        let mut a = full_app();
+        a.update_state = Some(crate::update::State { latest: "99.0.0".into(), ..Default::default() });
+        a.update.blocked = Some("Homebrew installed it: use brew upgrade".into());
+        a.update.notes = Some(Err("release notes: HTTP 403".into()));
+        a.modal = crate::tui::app::Modal::Update;
+        let out = render(&mut a, 120, 40);
+        assert!(out.contains("fat 99.0.0 is out") && out.contains("brew upgrade"), "{out}");
+        assert!(!out.contains("install and restart") && out.contains("HTTP 403"), "{out}");
     }
 
     fn full_app() -> App {

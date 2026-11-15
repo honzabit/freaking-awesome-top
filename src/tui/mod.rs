@@ -79,6 +79,12 @@ enum Msg {
     AskOptions(Vec<crate::llm::AskOption>),
     /// The update check's result.
     Update(crate::update::State),
+    /// The binary on disk was replaced by this newer version.
+    Replaced(String),
+    /// Release notes of a version (or why there are none).
+    UpdateNotes(String, Result<String, String>),
+    /// An install from the update dialog finished (the version, or what went wrong).
+    UpdateInstalled(Result<String, String>),
     /// None = no recorded history for this window (fall back to the in-memory ring).
     Timeline(Option<(Vec<Point>, Vec<Ts>)>),
     Past(Ts, Option<Box<Snapshot>>),
@@ -1035,6 +1041,56 @@ fn settings_ui(cfg: &Config, path: Option<&std::path::Path>) -> app::SettingsUi 
 
 impl Ctx {
     /// After a settings write: apply what can apply live, rebuild the screen, say what happened.
+    /// `U`: the update dialog, or a line saying there is nothing to update.
+    fn open_update(&mut self, app: &mut App) {
+        use crate::update;
+        let env = |k: &str| std::env::var(k).ok();
+        let off = update::check_off_reason(&self.cfg, &env);
+        let v = match app.offer() {
+            app::Offer::None => {
+                let err = app.update_state.as_ref().map(|s| s.error.clone()).filter(|e| !e.is_empty());
+                let msg = match (off, err, &app.update_state) {
+                    (Some(why), _, _) => format!("update checks are off ({why}); `fat update` checks by hand"),
+                    (None, Some(e), _) => format!("can't tell which release is the latest: {e}"),
+                    (None, None, None) => "checking for a newer fat…".to_string(),
+                    (None, None, Some(_)) => format!("fat {} is the latest release", update::VERSION),
+                };
+                app.set_status(msg, false);
+                return;
+            }
+            app::Offer::Restart(v) => {
+                app.update.blocked = None;
+                v
+            }
+            app::Offer::Install(v) => {
+                app.update.blocked = match update::current_exe() {
+                    Err(e) => Some(format!("{e:#}")),
+                    Ok(exe) => update::managed_by(&exe).map(str::to_string).or_else(|| {
+                        update::target().is_none().then(|| "there are no fat releases for this platform".into())
+                    }),
+                };
+                v
+            }
+        };
+        app.update.error = None;
+        app.modal = app::Modal::Update;
+        if app.update.notes_for != v {
+            app.update.notes_for = v.clone();
+            app.update.notes = None;
+            if off.is_some() {
+                app.update.notes = Some(Err(format!("release notes: {}", update::release_url(&v))));
+            } else {
+                let tx = self.tx.clone();
+                let _ = thread::Builder::new().name("fat-notes".into()).spawn(move || {
+                    let r = guarded(|| update::notes(&v, Duration::from_secs(10)))
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!(e)))
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Msg::UpdateNotes(v, r));
+                });
+            }
+        }
+    }
+
     fn after_settings_write(
         &mut self,
         app: &mut App,
@@ -1136,6 +1192,21 @@ impl Ctx {
             Command::FsLargest(p) => self.fs_send(app, FsReq::Largest(p)),
             Command::FsAt { ts, path } => self.fs_send(app, FsReq::At { ts, path }),
             Command::Quit => app.quit = true,
+            Command::Restart => {
+                app.restart = true;
+                app.quit = true;
+            }
+            Command::OpenUpdate => self.open_update(app),
+            Command::InstallUpdate(v) => {
+                let tx = self.tx.clone();
+                let _ = thread::Builder::new().name("fat-install".into()).spawn(move || {
+                    let r = guarded(|| crate::update::current_exe().and_then(|exe| crate::update::install(&v, &exe)))
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!(e)))
+                        .map(|i| i.version)
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Msg::UpdateInstalled(r));
+                });
+            }
             Command::LoadEvents { from, to } => match &self.hist {
                 Some(h) if app.history_ok => {
                     let _ = h.send(HistReq::Events { from, to });
@@ -1475,7 +1546,27 @@ fn apply_msg(app: &mut App, msg: Msg) {
                 ui.note = Some((text, err));
             }
         }
-        Msg::Update(s) => app.update_note = crate::update::header_note(&s),
+        Msg::Update(s) => app.set_update(Some(s), None),
+        Msg::Replaced(v) => app.set_update(None, Some(v)),
+        Msg::UpdateNotes(v, r) => {
+            if app.update.notes_for == v {
+                app.update.notes = Some(r);
+            }
+        }
+        Msg::UpdateInstalled(r) => {
+            app.update.busy = false;
+            match r {
+                Ok(v) => {
+                    app.set_update(None, Some(v));
+                    // Still waiting in the dialog: go on into the new version.
+                    if app.modal == app::Modal::Update {
+                        app.restart = true;
+                        app.quit = true;
+                    }
+                }
+                Err(e) => app.update.error = Some(e),
+            }
+        }
         Msg::AskOptions(opts) => {
             app.settings.ask_options = opts;
             app.settings.ask_detecting = false;
@@ -1568,6 +1659,88 @@ fn event_loop(
     Ok(())
 }
 
+/// Update check (when due, at most daily; with `[update] auto` also the install), repeated
+/// hourly for a fat left running, and a cheap look every 30 s at whether the binary on disk was
+/// replaced by a newer fat (`fat update` in another terminal, a package manager). Never delays the UI.
+fn spawn_update_watch(cfg: Config, tx: Sender<Msg>) {
+    let _ = thread::Builder::new().name("fat-update".into()).spawn(move || {
+        let exe = crate::update::current_exe().ok();
+        let mut seen = exe.as_deref().and_then(crate::update::file_id);
+        let mut last_check: Option<std::time::Instant> = None;
+        loop {
+            if last_check.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600)) {
+                last_check = Some(std::time::Instant::now());
+                if let Ok(Some(s)) = guarded(|| crate::update::background(&cfg))
+                    && tx.send(Msg::Update(s)).is_err()
+                {
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_secs(30));
+            let Some(exe) = exe.as_deref() else { continue };
+            let id = crate::update::file_id(exe);
+            if id.is_some() && id != seen {
+                seen = id;
+                let v = crate::update::runs(exe).and_then(|s| s.strip_prefix("fat ").map(str::to_string));
+                if let Some(v) = v.filter(|v| crate::update::newer(v, crate::update::VERSION))
+                    && tx.send(Msg::Replaced(v)).is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Where the old fat leaves the view for the new one on a restart.
+fn resume_dir() -> std::path::PathBuf {
+    dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("fat")
+}
+
+/// Restart into the binary on disk, same arguments, the view saved for it. Only returns on
+/// failure (the terminal is still set up then; the caller restores it).
+fn restart(app: &App) -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = match crate::update::current_exe() {
+        Ok(e) => e,
+        Err(e) => return e,
+    };
+    let dir = resume_dir();
+    let path = dir.join(format!("resume-{}.json", std::process::id()));
+    let saved = serde_json::to_string(&app.resume_state()).map_err(anyhow::Error::from).and_then(|text| {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::create_dir_all(&dir)?;
+        let _ = std::fs::remove_file(&path);
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+        f.write_all(text.as_bytes())?;
+        Ok(())
+    });
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(std::env::args_os().skip(1));
+    if saved.is_ok() {
+        cmd.env("FAT_RESUME", &path);
+    }
+    // Keep the alternate screen: the new fat draws over this one without a flash.
+    let _ = disable_raw_mode();
+    let err = cmd.exec();
+    let _ = std::fs::remove_file(&path);
+    anyhow::anyhow!("restarting into {}: {err}; run fat again", exe.display())
+}
+
+/// The view a restarting fat left (`FAT_RESUME`), read once and removed.
+fn take_resume() -> Option<app::Resume> {
+    let p = std::path::PathBuf::from(std::env::var_os("FAT_RESUME")?);
+    // Only our own file: the variable is inherited by anything fat starts.
+    let name = p.file_name()?.to_str()?;
+    if p.parent()? != resume_dir() || !name.starts_with("resume-") || !name.ends_with(".json") {
+        return None;
+    }
+    let text = std::fs::read_to_string(&p).ok()?;
+    let _ = std::fs::remove_file(&p);
+    serde_json::from_str(&text).ok()
+}
+
 /// Make `[theme]` (with FAT_THEME / NO_COLOR) the current theme; the first problem with it, if any.
 fn apply_theme(cfg: &crate::config::ThemeCfg) -> Option<String> {
     let env = |k: &str| std::env::var(k).ok();
@@ -1608,15 +1781,7 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
     let hist_tx = spawn_history(hist, tx.clone(), klog);
     // Peer names and networks for the Ports view (background; answers arrive with later samples).
     crate::peers::init(&cfg);
-    // Update check (daily, cached; with [update] auto also the install): never delays the UI.
-    {
-        let (cfg, tx) = (cfg.clone(), tx.clone());
-        let _ = thread::Builder::new().name("fat-update".into()).spawn(move || {
-            if let Ok(Some(s)) = guarded(|| crate::update::background(&cfg)) {
-                let _ = tx.send(Msg::Update(s));
-            }
-        });
-    }
+    spawn_update_watch(cfg.clone(), tx.clone());
     let inventory: Inventory = Arc::default();
     spawn_inventory(cfg.clone(), inventory.clone(), tx.clone());
     let transport: Arc<dyn Transport> = Arc::new(fanout::SshTransport { cfg: cfg.fleet.clone() });
@@ -1636,10 +1801,23 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
     // Nothing else runs before the first frame: the journal is read when the action log (`a`)
     // opens or an action runs, samples arrive from the sampler thread.
 
+    if let Some(r) = take_resume() {
+        for cmd in app.resume(&r) {
+            ctx.exec(&mut app, cmd);
+        }
+        app.set_status(format!("now running fat {}", crate::update::VERSION), false);
+    }
+
     QUIT_SIGNAL.store(0, Ordering::SeqCst);
     let old_signals = install_quit_signals();
     spawn_quit_watchdog();
-    let res = setup_terminal().and_then(|mut term| event_loop(&mut term, &mut app, &mut ctx, rx));
+    let mut res = setup_terminal().and_then(|mut term| event_loop(&mut term, &mut app, &mut ctx, rx));
+    if res.is_ok() && app.restart {
+        restore_signals(old_signals);
+        res = Err(restart(&app));
+        restore_terminal();
+        return res;
+    }
     restore_terminal();
     restore_signals(old_signals);
     if let Ok(mut v) = BG_PANICS.lock() {

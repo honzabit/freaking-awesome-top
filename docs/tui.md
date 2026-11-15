@@ -39,6 +39,7 @@ The key numbers in the sections below (Ports `2`, Timeline `4`) are the desktop 
 | `a` | the Log screen (see below) |
 | `,` | the Settings screen (see [Settings](#settings-)) |
 | `!` | a shell, while fat keeps running (see below) |
+| `U` | update: what's new, and restart into a newer fat (see [Updates](updates.md#in-the-tui-u)) |
 | `h` | help |
 | `q` / `Ctrl-C` | quit |
 

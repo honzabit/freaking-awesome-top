@@ -190,12 +190,33 @@ pub fn background(cfg: &crate::config::Config) -> Option<State> {
     Some(s)
 }
 
-/// What the TUI header shows: "⬆ 0.2.0" (available) or "0.2.0 installed: restart" (auto-updated).
-pub fn header_note(s: &State) -> Option<String> {
-    if let Some(v) = s.installed_newer() {
-        return Some(format!("fat {v} installed · restart fat"));
+/// Where a release's page is.
+pub fn release_url(version: &str) -> String {
+    format!("{REPO}/releases/tag/v{version}")
+}
+
+/// The release notes of `version` (Markdown), from the GitHub API. Not available through a
+/// `FAT_UPDATE_URL` mirror (it has only the files).
+pub fn notes(version: &str, timeout: Duration) -> Result<String> {
+    if base() != REPO {
+        bail!("release notes: {}", release_url(version));
     }
-    s.available().map(|v| format!("⬆ fat {v} · fat update"))
+    let path = REPO.strip_prefix("https://github.com/").context("not a GitHub repository")?;
+    let url = format!("https://api.github.com/repos/{path}/releases/tags/v{version}");
+    let resp = match agent(timeout, 3).get(&url).set("Accept", "application/vnd.github+json").call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) => bail!("release notes: HTTP {code}"),
+        Err(e) => bail!("release notes: {}", short_err(&e)),
+    };
+    let mut text = String::new();
+    resp.into_reader().take(1 << 20).read_to_string(&mut text)?;
+    notes_from_json(&text)
+}
+
+fn notes_from_json(text: &str) -> Result<String> {
+    let v: serde_json::Value = serde_json::from_str(text).context("release notes: unexpected answer")?;
+    let body = v.get("body").and_then(|b| b.as_str()).unwrap_or("").replace("\r\n", "\n");
+    Ok(body.trim().to_string())
 }
 
 /// This platform's release archive suffix.
@@ -442,7 +463,7 @@ pub fn finding(cfg: &crate::config::Config) -> Option<crate::model::Finding> {
     let s = load_state();
     let v = s.available()?;
     let (title, action) = match s.installed_newer() {
-        Some(i) => (format!("fat {i} is installed; restart fat to use it"), None),
+        Some(i) => (format!("fat {i} is installed; restart fat to use it (U in fat restarts it in place)"), None),
         None => (format!("fat {v} is available (this is {VERSION})"), Some("fat update".to_string())),
     };
     Some(crate::model::Finding {
@@ -457,6 +478,14 @@ pub fn finding(cfg: &crate::config::Config) -> Option<crate::model::Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_notes_come_from_the_body() {
+        let j = r###"{"tag_name":"v0.2.1","body":"## What's new\r\n\r\n- peers\r\n"}"###;
+        assert_eq!(notes_from_json(j).unwrap(), "## What's new\n\n- peers");
+        assert_eq!(notes_from_json(r#"{"body":null}"#).unwrap(), "");
+        assert!(notes_from_json("<html>").is_err());
+    }
 
     #[test]
     fn versions() {

@@ -104,6 +104,8 @@ pub enum SortKey {
 }
 
 impl SortKey {
+    pub const ALL: [SortKey; 7] =
+        [SortKey::Cpu, SortKey::Mem, SortKey::Power, SortKey::Net, SortKey::Disk, SortKey::Pid, SortKey::Name];
     pub fn label(self) -> &'static str {
         match self {
             SortKey::Cpu => "cpu",
@@ -218,6 +220,12 @@ pub enum Command {
     /// Fetch one host's snapshot (read-only) for the drill-in view.
     FleetDrill(String),
     Quit,
+    /// Open the update dialog (`U`): fetch notes, work out whether fat can install itself.
+    OpenUpdate,
+    /// Download, verify and install this release, then restart into it.
+    InstallUpdate(String),
+    /// Restart into the binary on disk, keeping the view ([`Resume`]).
+    Restart,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -236,6 +244,8 @@ pub enum Modal {
         start: u64,
     },
     Help,
+    /// The update dialog (`U`); its contents are [`App::update`].
+    Update,
     /// The Ports filter dialog (`f` in Ports).
     PortFilter(PortFilterForm),
 }
@@ -1131,6 +1141,48 @@ impl FsView {
     }
 }
 
+/// What the update dialog shows besides the versions.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UpdateUi {
+    /// Release notes of the version offered: None loading, Err why not.
+    pub notes: Option<Result<String, String>>,
+    /// The version `notes` belong to.
+    pub notes_for: String,
+    /// Installing now.
+    pub busy: bool,
+    pub error: Option<String>,
+    /// Why fat won't replace this binary itself (package manager, dev build, no release).
+    pub blocked: Option<String>,
+}
+
+/// What the update dialog offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Offer {
+    /// A newer fat is on disk: restart into it.
+    Restart(String),
+    /// A newer release exists: install it, then restart.
+    Install(String),
+    /// Nothing newer is known.
+    None,
+}
+
+/// The view, carried across a restart (`U`): written by the old fat, read by the new one.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Resume {
+    pub tab: String,
+    pub sort: String,
+    pub sort_desc: bool,
+    pub tree: bool,
+    pub filter: String,
+    /// The current tab's own filter (Fs, Services, Events, Fleet, Log).
+    pub tab_filter: String,
+    pub sel_pid: Option<u32>,
+    pub port_view: String,
+    pub fs_path: String,
+    pub cursor: Option<Ts>,
+}
+
 pub struct App {
     pub tab: Tab,
     pub live: Option<Snapshot>,
@@ -1224,8 +1276,13 @@ pub struct App {
     pub now: Ts,
     pub config_path: String,
     pub history_ok: bool,
-    /// "⬆ fat 0.2.0 · fat update" when a newer release is known.
-    pub update_note: Option<String>,
+    /// The last update check (None: checks are off or haven't answered).
+    pub update_state: Option<crate::update::State>,
+    /// A newer fat replaced the binary on disk (by `fat update`, a package manager…): its version.
+    pub replaced_by: Option<String>,
+    pub update: UpdateUi,
+    /// Restart into the binary on disk when the loop ends (set with `quit`).
+    pub restart: bool,
     /// `!` opens a shell (`[tui] shell`).
     pub shell_enabled: bool,
     /// A shell was asked for, with these variables; the event loop runs it (it needs the terminal).
@@ -1310,7 +1367,10 @@ impl App {
             now: crate::model::now_ms(),
             config_path: String::new(),
             history_ok: false,
-            update_note: None,
+            update_state: None,
+            replaced_by: None,
+            update: UpdateUi::default(),
+            restart: false,
             shell_enabled: true,
             shell: None,
             configured_hosts: 0,
@@ -2083,6 +2143,7 @@ impl App {
         match modal {
             Modal::None => Vec::new(),
             Modal::Help => Vec::new(), // any key closes
+            Modal::Update => self.on_update_key(k),
             Modal::PortFilter(form) => self.on_port_filter_key(form, k),
 
             Modal::Filter => {
@@ -2589,6 +2650,115 @@ impl App {
         }
     }
 
+    /// What `U` offers now.
+    pub fn offer(&self) -> Offer {
+        let installed = self.update_state.as_ref().and_then(|s| s.installed_newer()).map(str::to_string);
+        if let Some(v) = self.replaced_by.clone().or(installed) {
+            return Offer::Restart(v);
+        }
+        match self.update_state.as_ref().and_then(|s| s.available()) {
+            Some(v) => Offer::Install(v.to_string()),
+            None => Offer::None,
+        }
+    }
+
+    /// The header badge: "⬆ fat 0.2.1 installed · U" / "⬆ fat 0.2.1 · U".
+    pub fn update_badge(&self) -> Option<String> {
+        match self.offer() {
+            Offer::Restart(v) => Some(format!("⬆ fat {v} installed · U")),
+            Offer::Install(v) => Some(format!("⬆ fat {v} · U")),
+            Offer::None => None,
+        }
+    }
+
+    /// A new update state or replaced binary arrived: say so once, without interrupting.
+    pub fn set_update(&mut self, state: Option<crate::update::State>, replaced_by: Option<String>) {
+        let before = self.offer();
+        if state.is_some() {
+            self.update_state = state;
+        }
+        if replaced_by.is_some() {
+            self.replaced_by = replaced_by;
+        }
+        let after = self.offer();
+        if after != before {
+            match &after {
+                Offer::Restart(v) => self.set_status(format!("fat {v} is installed · U restarts into it"), false),
+                Offer::Install(v) => self.set_status(format!("fat {v} is out · U to see what's new"), false),
+                Offer::None => {}
+            }
+        }
+    }
+
+    fn on_update_key(&mut self, k: KeyEvent) -> Vec<Command> {
+        match k.code {
+            KeyCode::Enter => match self.offer() {
+                Offer::Restart(_) => return vec![Command::Restart],
+                Offer::Install(v) if self.update.blocked.is_none() && !self.update.busy => {
+                    self.update.busy = true;
+                    self.update.error = None;
+                    self.modal = Modal::Update;
+                    return vec![Command::InstallUpdate(v)];
+                }
+                _ => self.modal = Modal::Update,
+            },
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('U') => {}
+            _ => self.modal = Modal::Update,
+        }
+        Vec::new()
+    }
+
+    /// The view to carry across a restart.
+    pub fn resume_state(&self) -> Resume {
+        let tab_filter = match self.tab {
+            Tab::Procs | Tab::Ports | Tab::Timeline | Tab::Doctor | Tab::Ask | Tab::Settings => String::new(),
+            _ => self.active_filter().to_string(),
+        };
+        Resume {
+            tab: self.tab.title().to_string(),
+            sort: self.sort.label().to_string(),
+            sort_desc: self.sort_desc,
+            tree: self.tree,
+            filter: self.filter.clone(),
+            tab_filter,
+            sel_pid: self.sel_pid,
+            port_view: format!("{:?}", self.port_view),
+            fs_path: if self.fs.opened { self.fs.path.clone() } else { String::new() },
+            cursor: self.cursor,
+        }
+    }
+
+    /// Put back a view saved by [`App::resume_state`]; returns the commands its tab needs.
+    pub fn resume(&mut self, r: &Resume) -> Vec<Command> {
+        if let Some(k) = SortKey::ALL.iter().find(|k| k.label() == r.sort) {
+            self.sort = *k;
+        }
+        self.sort_desc = r.sort_desc;
+        self.tree = r.tree;
+        self.set_filter(r.filter.clone());
+        if let Some(pid) = r.sel_pid {
+            self.sel_pid = Some(pid);
+            self.follow = true;
+        }
+        if let Some(v) = PortView::ALL.iter().find(|v| format!("{v:?}") == r.port_view) {
+            self.port_view = *v;
+        }
+        if !r.fs_path.is_empty() {
+            self.fs.path = r.fs_path.clone();
+        }
+        let mut cmds = Vec::new();
+        if let Some(t) = self.tabs().into_iter().find(|t| t.title() == r.tab) {
+            cmds.extend(self.switch_tab(t));
+            if !r.tab_filter.is_empty() {
+                self.set_active_filter(r.tab_filter.clone());
+            }
+        }
+        if let Some(ts) = r.cursor {
+            cmds.extend(self.jump_to(ts));
+        }
+        cmds
+    }
+
     fn on_global_key(&mut self, k: KeyEvent) -> Vec<Command> {
         // The fleet drill-in uses `u` for its Units view (global `u` is undo).
         if self.tab == Tab::Fleet && self.fleet.drill.is_some() && k.code == KeyCode::Char('u') {
@@ -2632,6 +2802,7 @@ impl App {
                 return Vec::new();
             }
             KeyCode::Char('u') => return vec![Command::Undo],
+            KeyCode::Char('U') => return vec![Command::OpenUpdate],
             KeyCode::Esc if Tab::SCREENS.contains(&self.tab) => {
                 if self.tab == Tab::Log && (!self.log_filter.is_empty() || self.log_kind.is_some()) {
                     self.log_filter.clear();
@@ -5061,6 +5232,79 @@ pub(crate) mod tests {
         for q in ["10.0.0", "AS1", "other"] {
             assert!(!peer_matches(&g, q), "{q}");
         }
+    }
+
+    #[test]
+    fn updates_are_offered_quietly_and_u_opens_the_dialog() {
+        use crate::update::State;
+        let mut a = app();
+        assert_eq!(a.offer(), Offer::None);
+        assert_eq!(a.on_key(key('U')), vec![Command::OpenUpdate], "U asks; the context decides what to show");
+
+        // A newer release: a one-time line and a badge, no dialog.
+        a.set_update(Some(State { latest: "99.0.0".into(), ..Default::default() }), None);
+        assert_eq!(a.offer(), Offer::Install("99.0.0".into()));
+        assert_eq!(a.modal, Modal::None, "never pops up by itself");
+        assert!(a.status.as_ref().unwrap().text.contains("fat 99.0.0 is out · U"));
+        a.status = None;
+        a.set_update(Some(State { latest: "99.0.0".into(), ..Default::default() }), None);
+        assert!(a.status.is_none(), "said once, not on every daily check");
+        assert_eq!(a.update_badge().unwrap(), "⬆ fat 99.0.0 · U");
+
+        // In the dialog, ⏎ installs (and stays open while it runs); Esc closes.
+        a.modal = Modal::Update;
+        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::InstallUpdate("99.0.0".into())]);
+        assert!(a.update.busy && a.modal == Modal::Update);
+        assert!(a.on_key(code(KeyCode::Enter)).is_empty(), "no second install while one runs");
+        a.on_key(code(KeyCode::Esc));
+        assert_eq!(a.modal, Modal::None);
+
+        // A binary fat must not replace: ⏎ does nothing.
+        a.update.busy = false;
+        a.update.blocked = Some("Homebrew installed it".into());
+        a.modal = Modal::Update;
+        assert!(a.on_key(code(KeyCode::Enter)).is_empty());
+
+        // Once it is on disk (by auto-update, `fat update`, or the dialog), ⏎ restarts.
+        a.set_update(None, Some("99.0.0".into()));
+        assert_eq!(a.offer(), Offer::Restart("99.0.0".into()));
+        assert!(a.status.as_ref().unwrap().text.contains("installed · U restarts into it"));
+        a.modal = Modal::Update;
+        assert_eq!(a.on_key(code(KeyCode::Enter)), vec![Command::Restart]);
+    }
+
+    #[test]
+    fn the_view_survives_a_restart() {
+        let mut a = app();
+        a.on_snapshot(snap(2_000_000));
+        a.sort = SortKey::Mem;
+        a.sort_desc = false;
+        a.tree = true;
+        a.set_filter("post".into());
+        a.sel_pid = Some(200);
+        a.port_view = PortView::ALL[2];
+        a.switch_tab(Tab::Ports);
+        let r = a.resume_state();
+        let json = serde_json::to_string(&r).unwrap();
+
+        let mut b = app();
+        b.on_snapshot(snap(2_000_000));
+        let cmds = b.resume(&serde_json::from_str(&json).unwrap());
+        assert_eq!(b.tab, Tab::Ports);
+        assert_eq!((b.sort, b.sort_desc, b.tree, b.filter.as_str()), (SortKey::Mem, false, true, "post"));
+        assert_eq!((b.sel_pid, b.port_view), (Some(200), PortView::ALL[2]));
+        assert!(cmds.is_empty(), "{cmds:?}");
+
+        // Rewound: the new fat goes back to the same moment.
+        let mut a = app();
+        a.on_snapshot(snap(2_000_000));
+        a.cursor = Some(1_500_000);
+        let mut b = app();
+        assert_eq!(b.resume(&a.resume_state()), vec![Command::LoadAt(1_500_000)]);
+        // Unknown names (an older or newer fat wrote them) are skipped, not fatal.
+        let mut c = app();
+        c.resume(&Resume { tab: "Nope".into(), sort: "nope".into(), ..Default::default() });
+        assert_eq!(c.tab, Tab::Procs);
     }
 
     #[test]
