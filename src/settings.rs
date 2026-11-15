@@ -561,6 +561,18 @@ pub fn fields(cfg: &Config, file_text: &str, env: &dyn Fn(&str) -> Option<String
         false,
         false,
     );
+    push(
+        "Interface",
+        "theme",
+        "name",
+        "Theme",
+        "auto: mono when NO_COLOR is set, else dark. Recolor single roles in [theme] (see docs)",
+        Kind::Choice(crate::tui::theme::NAMES),
+        if cfg.theme.name.is_empty() { "auto".into() } else { cfg.theme.name.clone() },
+        Some("FAT_THEME"),
+        false,
+        true,
+    );
     for f in out.iter_mut().filter(|f| f.section == "ask") {
         f.sub = ask_sub(&f.key);
     }

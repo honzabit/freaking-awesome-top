@@ -24,6 +24,7 @@ pub mod markdown;
 mod screenshots;
 pub mod server;
 mod server_ui;
+pub mod theme;
 pub mod ui;
 pub mod widgets;
 
@@ -301,7 +302,9 @@ fn run_shell(term: &mut Terminal<CrosstermBackend<Stdout>>, env: &[(String, Stri
         let mut out = std::io::stdout();
         // SAFETY: geteuid has no preconditions and cannot fail.
         if unsafe { libc::geteuid() } == 0 {
-            let _ = writeln!(out, "\x1b[1;31mfat: this shell runs as root\x1b[0m");
+            // Mono: bold only; otherwise bold in the theme's crit color.
+            let red = if theme::get().mono { "" } else { ";31" };
+            let _ = writeln!(out, "\x1b[1{red}mfat: this shell runs as root\x1b[0m");
         }
         let _ = writeln!(out, "\x1b[2mfat is still running and sampling · type exit to return\x1b[0m");
         let _ = out.flush();
@@ -1046,6 +1049,12 @@ impl Ctx {
                     && let Err(e) = crate::llm::resolve(&cfg.ask)
                 {
                     msg = format!("saved; but ask can't use it yet: {e}");
+                } else if section == "theme" {
+                    self.cfg.theme = cfg.theme.clone();
+                    msg = match apply_theme(&cfg.theme) {
+                        Some(p) => format!("saved; but {p}"),
+                        None => format!("theme: {} (saved to {})", theme::get().name, path.display()),
+                    };
                 } else if section != "ask" {
                     msg.push_str(" (takes effect the next time fat starts)");
                 }
@@ -1559,6 +1568,14 @@ fn event_loop(
     Ok(())
 }
 
+/// Make `[theme]` (with FAT_THEME / NO_COLOR) the current theme; the first problem with it, if any.
+fn apply_theme(cfg: &crate::config::ThemeCfg) -> Option<String> {
+    let env = |k: &str| std::env::var(k).ok();
+    let (t, problems) = theme::Theme::from_cfg(cfg, &env);
+    theme::set(t);
+    problems.into_iter().next()
+}
+
 pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
     let _ = UI_THREAD.set(thread::current().id());
     install_panic_hook();
@@ -1577,6 +1594,9 @@ pub fn run(cfg: crate::config::Config) -> anyhow::Result<()> {
     app.config_path = config_path;
     app.history_ok = hist.is_some();
     app.shell_enabled = cfg.tui.shell;
+    if let Some(p) = apply_theme(&cfg.theme) {
+        app.set_status(&p, true);
+    }
     if std::env::var_os("FAT_SHELL").is_some() {
         app.set_status("this fat runs in a shell opened from another fat: exit both to get back to it", false);
     }

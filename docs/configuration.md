@@ -47,6 +47,10 @@ asn_db = ""     # use this ip2asn-combined.tsv(.gz) instead of downloading (FAT_
 [tui]
 shell = true    # ! opens a shell while fat keeps running
 
+[theme]
+name = "auto"   # auto (mono when NO_COLOR is set, else dark), dark, light or mono; FAT_THEME overrides
+# warn = "#d08700"   # recolor one role: a name (red, light-blue…), 0-255, or #rrggbb
+
 [update]
 check            = true    # once a day: is there a newer release? (FAT_NO_UPDATE_CHECK=1 turns it off)
 auto             = false   # install newer releases by itself (signature-checked)
@@ -75,4 +79,5 @@ tags     = ["prod"]
 | `[server]` | the server profile and system-wide recorder | [Servers](server.md) |
 | `[peers]` | names and networks (AS) for connection peers in Ports. The table download stops under `[ask] local_only`; machines without internet can be given a copy with `asn_db`, and `FAT_ASN_URL` points at a mirror | [TUI: Ports](tui.md) |
 | `[tui]` | whether `!` opens a shell | [TUI: Shell](tui.md#shell-) |
+| `[theme]` | the colors of the interactive view | [TUI: Themes](tui.md#themes) |
 | `[update]` | the daily version check, automatic updates, recorder restarts | [Updates](updates.md) |

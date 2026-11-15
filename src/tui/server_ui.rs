@@ -8,7 +8,8 @@ use crate::tui::app::{App, Tab};
 use crate::tui::server::{
     DrillView, EVENT_WINDOW_NAMES, HostDrill, Panel, mem_limit_ratio, unit_is_problem, unit_kind_label, unit_rank,
 };
-use crate::tui::ui::{ACCENT, SEL_BG, centered, num, psi_spans, scroll_into_view};
+use crate::tui::theme as th;
+use crate::tui::ui::{centered, num, psi_spans, scroll_into_view};
 use crate::tui::widgets::*;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -32,11 +33,11 @@ fn sev_tag(s: Severity) -> &'static str {
 fn limit_color(ratio: f64, warn: f32) -> Color {
     let warn = warn as f64;
     if ratio >= warn {
-        Color::Red
+        th::crit()
     } else if ratio >= warn * 0.8 {
-        Color::Yellow
+        th::warn()
     } else {
-        Color::Green
+        th::good()
     }
 }
 
@@ -73,9 +74,9 @@ pub fn header_lines(app: &App, s: &Snapshot, w: usize, n: usize) -> Vec<Line<'st
     if let Some(k) = k {
         let part = |label: &str, v: f32, warn: f32| {
             let st = if v >= warn {
-                Style::default().fg(Color::Red).bold()
+                Style::default().fg(th::crit()).bold()
             } else if v >= warn / 2.0 {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(th::warn())
             } else {
                 dim()
             };
@@ -88,17 +89,17 @@ pub fn header_lines(app: &App, s: &Snapshot, w: usize, n: usize) -> Vec<Line<'st
             tail.extend(part("irq", k.irq_pct + k.softirq_pct, 10.0));
         }
         tail.push(Span::styled(format!("  R{}", k.procs_running), dim()));
-        let d_style = if k.procs_blocked > 0 { Style::default().fg(Color::Yellow).bold() } else { dim() };
+        let d_style = if k.procs_blocked > 0 { Style::default().fg(th::warn()).bold() } else { dim() };
         tail.push(Span::styled(format!(" D{}", k.procs_blocked), d_style));
         if !k.d_state.is_empty() {
-            tail.push(Span::styled(format!(" ({} stuck)", k.d_state.len()), Style::default().fg(Color::Red)));
+            tail.push(Span::styled(format!(" ({} stuck)", k.d_state.len()), Style::default().fg(th::crit())));
         }
     }
     let tail_w: usize = tail.iter().map(|s| s.width()).sum();
     let cores_w = if sys.per_core.len() + 12 + tail_w < w / 2 { sys.per_core.len() } else { 0 };
     let spark_w = w.saturating_sub(10 + cores_w + 2 + tail_w);
     let mut l2 = vec![
-        Span::styled("CPU ", Style::default().fg(ACCENT).bold()),
+        Span::styled("CPU ", Style::default().fg(th::accent()).bold()),
         Span::styled(format!("{:>4.0}% ", sys.cpu), Style::default().fg(pct_color(sys.cpu)).bold()),
         Span::styled(
             sparkline(app.ring_points.iter().map(|p| p.cpu), spark_w),
@@ -131,7 +132,7 @@ pub fn header_lines(app: &App, s: &Snapshot, w: usize, n: usize) -> Vec<Line<'st
         .or(sys.psi);
     let bw = (w / 6).clamp(8, 30);
     let mut l3 = vec![
-        Span::styled("MEM ", Style::default().fg(ACCENT).bold()),
+        Span::styled("MEM ", Style::default().fg(th::accent()).bold()),
         Span::styled(bar(ratio, bw), Style::default().fg(pct_color((ratio * 100.0) as f32))),
         Span::raw(format!(" {}/{}", fmt_bytes(sys.mem_used), fmt_bytes(sys.mem_total))),
     ];
@@ -142,12 +143,12 @@ pub fn header_lines(app: &App, s: &Snapshot, w: usize, n: usize) -> Vec<Line<'st
         l3.extend(psi_spans(p));
     }
     if sys.swap_total > 0 || sys.swap_used > 0 {
-        l3.push(Span::styled("  SWP ", Style::default().fg(ACCENT)));
+        l3.push(Span::styled("  SWP ", Style::default().fg(th::accent())));
         l3.push(Span::raw(format!("{}/{}", fmt_bytes(sys.swap_used), fmt_bytes(sys.swap_total))));
         if let Some(k) = k.filter(|k| k.swap_in_ps + k.swap_out_ps >= 1.0) {
             l3.push(Span::styled(
                 format!(" in {:.0}/s out {:.0}/s", k.swap_in_ps, k.swap_out_ps),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(th::warn()),
             ));
         }
     }
@@ -158,7 +159,7 @@ pub fn header_lines(app: &App, s: &Snapshot, w: usize, n: usize) -> Vec<Line<'st
 
     // --- incidents in numbers
     let mut l4: Vec<Span> = Vec::new();
-    let label = |t: &str| Span::styled(format!("{t} "), Style::default().fg(ACCENT).bold());
+    let label = |t: &str| Span::styled(format!("{t} "), Style::default().fg(th::accent()).bold());
     let ring_ooms = app
         .event_ring
         .iter()
@@ -171,7 +172,7 @@ pub fn header_lines(app: &App, s: &Snapshot, w: usize, n: usize) -> Vec<Line<'st
     l4.push(label(oom_label));
     l4.push(Span::styled(
         oom.to_string(),
-        if oom > 0 { Style::default().fg(Color::Red).bold() } else { Style::default().fg(Color::Green) },
+        if oom > 0 { Style::default().fg(th::crit()).bold() } else { Style::default().fg(th::good()) },
     ));
     let failed = s.units.iter().filter(|u| u.is_failed()).count();
     let flapping = s.units.iter().filter(|u| u.flapping && !u.is_failed()).count();
@@ -179,10 +180,10 @@ pub fn header_lines(app: &App, s: &Snapshot, w: usize, n: usize) -> Vec<Line<'st
     l4.push(label("FAILED"));
     l4.push(Span::styled(
         failed.to_string(),
-        if failed > 0 { Style::default().fg(Color::Red).bold() } else { Style::default().fg(Color::Green) },
+        if failed > 0 { Style::default().fg(th::crit()).bold() } else { Style::default().fg(th::good()) },
     ));
     if flapping > 0 {
-        l4.push(Span::styled(format!(" ⟳{flapping}"), Style::default().fg(Color::Yellow).bold()));
+        l4.push(Span::styled(format!(" ⟳{flapping}"), Style::default().fg(th::warn()).bold()));
     }
     if let Some(k) = k {
         for (name, r) in [
@@ -201,9 +202,9 @@ pub fn header_lines(app: &App, s: &Snapshot, w: usize, n: usize) -> Vec<Line<'st
         }
         if let Some((d, a)) = worst_await(k) {
             let st = if a >= cfg.disk_await_warn_ms {
-                Style::default().fg(Color::Red).bold()
+                Style::default().fg(th::crit()).bold()
             } else if a >= cfg.disk_await_warn_ms / 2.0 {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(th::warn())
             } else {
                 Style::default()
             };
@@ -212,13 +213,13 @@ pub fn header_lines(app: &App, s: &Snapshot, w: usize, n: usize) -> Vec<Line<'st
             l4.push(Span::styled(format!("{d} {a:.0}ms"), st));
         }
         if !k.mdraid.iter().all(|m| !m.degraded) {
-            l4.push(Span::styled("  RAID degraded", Style::default().fg(Color::Red).bold()));
+            l4.push(Span::styled("  RAID degraded", Style::default().fg(th::crit()).bold()));
         }
         if !k.ro_remounts.is_empty() {
-            l4.push(Span::styled(format!("  RO {}", k.ro_remounts.join(",")), Style::default().fg(Color::Red).bold()));
+            l4.push(Span::styled(format!("  RO {}", k.ro_remounts.join(",")), Style::default().fg(th::crit()).bold()));
         }
         if k.ntp_synced == Some(false) {
-            l4.push(Span::styled("  clock unsynced", Style::default().fg(Color::Yellow)));
+            l4.push(Span::styled("  clock unsynced", Style::default().fg(th::warn())));
         }
     }
     let used: usize = l4.iter().map(|s| s.width()).sum();
@@ -239,9 +240,9 @@ pub fn tab_badge(app: &App, t: Tab) -> Option<Span<'static>> {
             let failed = app.units().iter().filter(|u| u.is_failed()).count();
             let flap = app.units().iter().filter(|u| u.flapping && !u.is_failed()).count();
             if failed > 0 {
-                Some(Span::styled(format!(" ✗{failed}"), Style::default().fg(Color::Red).bold()))
+                Some(Span::styled(format!(" ✗{failed}"), Style::default().fg(th::crit()).bold()))
             } else if flap > 0 {
-                Some(Span::styled(format!(" ⟳{flap}"), Style::default().fg(Color::Yellow).bold()))
+                Some(Span::styled(format!(" ⟳{flap}"), Style::default().fg(th::warn()).bold()))
             } else {
                 None
             }
@@ -258,9 +259,9 @@ pub fn tab_badge(app: &App, t: Tab) -> Option<Span<'static>> {
                 }
             }
             if c > 0 {
-                Some(Span::styled(format!(" {c}"), Style::default().fg(Color::Red).bold()))
+                Some(Span::styled(format!(" {c}"), Style::default().fg(th::crit()).bold()))
             } else if wn > 0 {
-                Some(Span::styled(format!(" {wn}"), Style::default().fg(Color::Yellow)))
+                Some(Span::styled(format!(" {wn}"), Style::default().fg(th::warn())))
             } else {
                 None
             }
@@ -268,7 +269,7 @@ pub fn tab_badge(app: &App, t: Tab) -> Option<Span<'static>> {
         Tab::Fleet if app.fleet.active() => {
             let (_, bad, crit, _) = app.fleet.tally();
             if bad + crit > 0 {
-                Some(Span::styled(format!(" ⚠{}", bad + crit), Style::default().fg(Color::Red).bold()))
+                Some(Span::styled(format!(" ⚠{}", bad + crit), Style::default().fg(th::crit()).bold()))
             } else {
                 None
             }
@@ -347,17 +348,17 @@ fn ucol_title(c: UCol, app: &App) -> Cell<'static> {
     };
     let sorted = key == Some(app.svc.sort);
     let text = if sorted { format!("{t}{}", if app.svc.natural { "▼" } else { "▲" }) } else { t.to_string() };
-    let st = if sorted { Style::default().fg(ACCENT).bold() } else { Style::default().bold() };
+    let st = if sorted { Style::default().fg(th::accent()).bold() } else { Style::default().bold() };
     let line = Line::styled(text, st);
     Cell::from(if right { line.alignment(ratatui::layout::Alignment::Right) } else { line })
 }
 
 fn state_style(u: &Unit) -> Style {
     match unit_rank(u) {
-        0 => Style::default().fg(Color::Red).bold(),
-        1 | 2 => Style::default().fg(Color::Yellow).bold(),
+        0 => Style::default().fg(th::crit()).bold(),
+        1 | 2 => Style::default().fg(th::warn()).bold(),
         3 => dim(),
-        4 => Style::default().fg(Color::Green),
+        4 => Style::default().fg(th::good()),
         _ => dim(),
     }
 }
@@ -367,11 +368,11 @@ fn unit_cell<'a>(c: UCol, u: &'a Unit, app: &App, first_of_kind: bool) -> Cell<'
     match c {
         UCol::Mark => {
             let (m, st) = if u.is_failed() {
-                ("✗", Style::default().fg(Color::Red).bold())
+                ("✗", Style::default().fg(th::crit()).bold())
             } else if u.flapping {
-                ("⟳", Style::default().fg(Color::Yellow).bold())
+                ("⟳", Style::default().fg(th::warn()).bold())
             } else if unit_is_problem(u, warn) {
-                ("!", Style::default().fg(Color::Yellow))
+                ("!", Style::default().fg(th::warn()))
             } else {
                 (" ", Style::default())
             };
@@ -382,11 +383,11 @@ fn unit_cell<'a>(c: UCol, u: &'a Unit, app: &App, first_of_kind: bool) -> Cell<'
                 (UnitKind::Container, Some(c)) if !c.name.is_empty() => c.name.as_str(),
                 _ => u.name.as_str(),
             };
-            let st = if u.is_failed() { Style::default().fg(Color::Red).bold() } else { Style::default().bold() };
+            let st = if u.is_failed() { Style::default().fg(th::crit()).bold() } else { Style::default().bold() };
             Cell::from(Span::styled(name, st))
         }
         UCol::Kind => {
-            let st = if app.svc.group && first_of_kind { Style::default().fg(ACCENT).bold() } else { dim() };
+            let st = if app.svc.group && first_of_kind { Style::default().fg(th::accent()).bold() } else { dim() };
             let txt = if app.svc.group && !first_of_kind { "" } else { unit_kind_label(u) };
             Cell::from(Span::styled(txt, st))
         }
@@ -419,9 +420,9 @@ fn unit_cell<'a>(c: UCol, u: &'a Unit, app: &App, first_of_kind: bool) -> Cell<'
         }
         UCol::Restarts => {
             let st = if u.flapping {
-                Style::default().fg(Color::Red).bold()
+                Style::default().fg(th::crit()).bold()
             } else if u.recent_restarts > 0 {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(th::warn())
             } else {
                 dim()
             };
@@ -436,7 +437,7 @@ fn unit_cell<'a>(c: UCol, u: &'a Unit, app: &App, first_of_kind: bool) -> Cell<'
             if u.cpu_throttled_pct > 0.0 {
                 num(
                     format!("{:.0}", u.cpu_throttled_pct),
-                    Style::default().fg(if u.cpu_throttled_pct >= 25.0 { Color::Red } else { Color::Yellow }),
+                    Style::default().fg(if u.cpu_throttled_pct >= 25.0 { th::crit() } else { th::warn() }),
                 )
             } else {
                 num("-".into(), dim())
@@ -480,10 +481,10 @@ pub fn draw_services(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(format!("{}/{} ", len, units.len()), dim()),
     ];
     if failed > 0 {
-        title.push(Span::styled(format!("✗ {failed} failed "), Style::default().fg(Color::Red).bold()));
+        title.push(Span::styled(format!("✗ {failed} failed "), Style::default().fg(th::crit()).bold()));
     }
     if flapping > 0 {
-        title.push(Span::styled(format!("⟳ {flapping} flapping "), Style::default().fg(Color::Yellow).bold()));
+        title.push(Span::styled(format!("⟳ {flapping} flapping "), Style::default().fg(th::warn()).bold()));
     }
     title.push(Span::raw(format!("· sort {}{} ", app.svc.sort.label(), if app.svc.natural { "▼" } else { "▲" })));
     if app.svc.group {
@@ -496,19 +497,19 @@ pub fn draw_services(f: &mut Frame, app: &mut App, area: Rect) {
         }
         kinds.sort();
         let s: Vec<String> = kinds.iter().map(|(k, n)| format!("{} {n}", k.as_str())).collect();
-        title.push(Span::styled(format!("· by kind: {} ", s.join(", ")), Style::default().fg(Color::Green)));
+        title.push(Span::styled(format!("· by kind: {} ", s.join(", ")), Style::default().fg(th::good())));
     }
     if app.svc.problems_only {
-        title.push(Span::styled("· problems only ", Style::default().fg(Color::Yellow)));
+        title.push(Span::styled("· problems only ", Style::default().fg(th::warn())));
     }
     if app.svc.hidden > 0 {
         title.push(Span::styled(format!("· {} inactive hidden (i) ", app.svc.hidden), dim()));
     }
     if !app.svc.filter.is_empty() {
-        title.push(Span::styled(format!("· /{} ", app.svc.filter), Style::default().fg(Color::Yellow)));
+        title.push(Span::styled(format!("· /{} ", app.svc.filter), Style::default().fg(th::key())));
     }
     if let Some(ts) = app.cursor {
-        title.push(Span::styled(format!("· ⏪ {} ", fmt_clock(ts)), Style::default().fg(Color::Magenta).bold()));
+        title.push(Span::styled(format!("· ⏪ {} ", fmt_clock(ts)), Style::default().fg(th::mark()).bold()));
     }
     let block = block.title(Line::from(title));
 
@@ -535,7 +536,7 @@ pub fn draw_services(f: &mut Frame, app: &mut App, area: Rect) {
         let first = i == 0 || app.svc.rows.get(i - 1).is_none_or(|&p| units[p].kind != u.kind);
         let mut row = Row::new(cols.iter().map(|&c| unit_cell(c, u, app, first)));
         if i == app.svc.sel {
-            row = row.style(Style::default().bg(SEL_BG));
+            row = row.style(Style::default().bg(th::selection()));
         }
         row
     });
@@ -563,27 +564,27 @@ pub fn draw_events(f: &mut Frame, app: &mut App, area: Rect) {
     let source = if app.ev.recorded.is_some() { "recorder + live" } else { "this session only" };
     let mut title = vec![
         Span::styled(" Events ", Style::default().bold()),
-        Span::styled(format!("last {} ", EVENT_WINDOW_NAMES[app.ev.window]), Style::default().fg(Color::Yellow)),
+        Span::styled(format!("last {} ", EVENT_WINDOW_NAMES[app.ev.window]), Style::default().fg(th::warn())),
     ];
     if c > 0 {
-        title.push(Span::styled(format!("{c} crit "), Style::default().fg(Color::Red).bold()));
+        title.push(Span::styled(format!("{c} crit "), Style::default().fg(th::crit()).bold()));
     }
     if w > 0 {
-        title.push(Span::styled(format!("{w} warn "), Style::default().fg(Color::Yellow)));
+        title.push(Span::styled(format!("{w} warn "), Style::default().fg(th::warn())));
     }
     title.push(Span::styled(format!("{i} info · {source} "), dim()));
     if app.ev.min_sev != Severity::Info {
-        title.push(Span::styled(format!("· {}+ only ", app.ev.min_sev.as_str()), Style::default().fg(Color::Yellow)));
+        title.push(Span::styled(format!("· {}+ only ", app.ev.min_sev.as_str()), Style::default().fg(th::warn())));
     }
     if !app.ev.filter.is_empty() {
-        title.push(Span::styled(format!("· /{} ", app.ev.filter), Style::default().fg(Color::Yellow)));
+        title.push(Span::styled(format!("· /{} ", app.ev.filter), Style::default().fg(th::key())));
     }
     let block = Block::default().borders(Borders::TOP).border_style(dim()).title(Line::from(title));
     if app.ev.merged.is_empty() {
         let mut t = Text::default();
         t.lines.push(Line::styled(
             format!("No events in the last {}.", EVENT_WINDOW_NAMES[app.ev.window]),
-            Style::default().fg(Color::Green).bold(),
+            Style::default().fg(th::good()).bold(),
         ));
         t.lines.push(Line::styled(
             "Events (OOM kills, failed or flapping units, disk latency, exhaustion, kernel warnings…) appear as they are detected.",
@@ -625,7 +626,7 @@ pub fn draw_events(f: &mut Frame, app: &mut App, area: Rect) {
         cells.push(Cell::from(what));
         let mut row = Row::new(cells);
         if i == app.ev.sel {
-            row = row.style(Style::default().bg(SEL_BG));
+            row = row.style(Style::default().bg(th::selection()));
         }
         row
     });
@@ -690,22 +691,22 @@ fn hcol(c: HCol) -> (&'static str, Constraint, Option<crate::tui::server::FleetS
 
 fn health_color(h: u8) -> Color {
     if h >= 80 {
-        Color::Green
+        th::good()
     } else if h >= 50 {
-        Color::Yellow
+        th::warn()
     } else {
-        Color::Red
+        th::crit()
     }
 }
 
 fn host_cell(c: HCol, h: &FleetHost) -> Cell<'_> {
     if !h.ok {
         return match c {
-            HCol::Name => Cell::from(Span::styled(h.name.as_str(), Style::default().fg(Color::Red).bold())),
-            HCol::Health => Cell::from(Span::styled("✗ down", Style::default().fg(Color::Red).bold())),
+            HCol::Name => Cell::from(Span::styled(h.name.as_str(), Style::default().fg(th::crit()).bold())),
+            HCol::Health => Cell::from(Span::styled("✗ down", Style::default().fg(th::crit()).bold())),
             HCol::Top => Cell::from(Span::styled(
                 h.error.clone().unwrap_or_else(|| "unreachable".into()),
-                Style::default().fg(Color::Red),
+                Style::default().fg(th::crit()),
             )),
             HCol::Lat => num(format!("{}ms", h.latency_ms), dim()),
             _ => Cell::from(""),
@@ -725,9 +726,9 @@ fn host_cell(c: HCol, h: &FleetHost) -> Cell<'_> {
         HCol::Load => {
             let per = if h.cores > 0 { h.load1 / h.cores as f64 } else { 0.0 };
             let st = if per >= 2.0 {
-                Style::default().fg(Color::Red)
+                Style::default().fg(th::crit())
             } else if per >= 1.0 {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(th::warn())
             } else {
                 dim()
             };
@@ -750,22 +751,22 @@ fn host_cell(c: HCol, h: &FleetHost) -> Cell<'_> {
             let f = h.findings;
             let mut v = Vec::new();
             if f.crit > 0 {
-                v.push(Span::styled(format!("{}c ", f.crit), Style::default().fg(Color::Red).bold()));
+                v.push(Span::styled(format!("{}c ", f.crit), Style::default().fg(th::crit()).bold()));
             }
             if f.warn > 0 {
-                v.push(Span::styled(format!("{}w", f.warn), Style::default().fg(Color::Yellow)));
+                v.push(Span::styled(format!("{}w", f.warn), Style::default().fg(th::warn())));
             }
             if v.is_empty() {
-                v.push(Span::styled("✓", Style::default().fg(Color::Green)));
+                v.push(Span::styled("✓", Style::default().fg(th::good())));
             }
             Cell::from(Line::from(v))
         }
         HCol::Units => num(
             h.units_failed.to_string(),
-            if h.units_failed > 0 { Style::default().fg(Color::Red).bold() } else { dim() },
+            if h.units_failed > 0 { Style::default().fg(th::crit()).bold() } else { dim() },
         ),
         HCol::Oom => {
-            num(h.oom_24h.to_string(), if h.oom_24h > 0 { Style::default().fg(Color::Red).bold() } else { dim() })
+            num(h.oom_24h.to_string(), if h.oom_24h > 0 { Style::default().fg(th::crit()).bold() } else { dim() })
         }
         HCol::Lat => num(format!("{}ms", h.latency_ms), dim()),
         HCol::Age => num(if h.age_ms > 0 { fmt_dur_short((h.age_ms / 1000) as u64) } else { "live".into() }, dim()),
@@ -808,22 +809,22 @@ pub fn draw_fleet(f: &mut Frame, app: &mut App, area: Rect) {
         let secs = (app.now - fl.poll_started).max(0) / 1000;
         title.push(Span::styled(
             format!("polling {}/{} {secs}s ", fl.answered, total),
-            Style::default().fg(ACCENT).bold(),
+            Style::default().fg(th::accent()).bold(),
         ));
     }
-    title.push(Span::styled(format!("✓{ok} "), Style::default().fg(Color::Green)));
+    title.push(Span::styled(format!("✓{ok} "), Style::default().fg(th::good())));
     if bad > 0 {
-        title.push(Span::styled(format!("✗{bad} down "), Style::default().fg(Color::Red).bold()));
+        title.push(Span::styled(format!("✗{bad} down "), Style::default().fg(th::crit()).bold()));
     }
     if crit > 0 {
-        title.push(Span::styled(format!("{crit} crit "), Style::default().fg(Color::Red)));
+        title.push(Span::styled(format!("{crit} crit "), Style::default().fg(th::crit())));
     }
     if warn > 0 {
-        title.push(Span::styled(format!("{warn} warn "), Style::default().fg(Color::Yellow)));
+        title.push(Span::styled(format!("{warn} warn "), Style::default().fg(th::warn())));
     }
     // Narrow: the findings live behind →; say so before the less important parts.
     if find_area.is_none() && !fl.findings.is_empty() {
-        title.push(Span::styled(format!("· {} findings → ", fl.findings.len()), Style::default().fg(ACCENT)));
+        title.push(Span::styled(format!("· {} findings → ", fl.findings.len()), Style::default().fg(th::accent())));
     }
     if !fl.polling && fl.last_done > 0 {
         title.push(Span::styled(
@@ -839,18 +840,18 @@ pub fn draw_fleet(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some((t, set)) = &fl.only {
         title.push(Span::styled(
             format!("· {} hosts with \"{}\" ", set.len(), clip(t, 40)),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(th::warn()),
         ));
     }
     if !fl.filter.is_empty() {
-        title.push(Span::styled(format!("· /{} ", fl.filter), Style::default().fg(Color::Yellow)));
+        title.push(Span::styled(format!("· /{} ", fl.filter), Style::default().fg(th::key())));
     }
     let block = Block::default().borders(Borders::TOP).border_style(dim()).title(Line::from(title));
 
     if fl.hosts.is_empty() {
         let mut t = Text::default();
         if let Some(e) = &fl.inventory_error {
-            t.lines.push(Line::styled(format!("inventory unreadable: {e}"), Style::default().fg(Color::Red)));
+            t.lines.push(Line::styled(format!("inventory unreadable: {e}"), Style::default().fg(th::crit())));
         } else if fl.polling {
             t.lines.push(Line::styled(format!("asking {total} host(s) for a read-only snapshot over ssh…"), dim()));
         } else {
@@ -863,15 +864,17 @@ pub fn draw_fleet(f: &mut Frame, app: &mut App, area: Rect) {
             let (t, _, key, right) = hcol(c);
             let sorted = key == Some(fl.sort);
             let text = if sorted { format!("{t}{}", if fl.natural { "▼" } else { "▲" }) } else { t.to_string() };
-            let line =
-                Line::styled(text, if sorted { Style::default().fg(ACCENT).bold() } else { Style::default().bold() });
+            let line = Line::styled(
+                text,
+                if sorted { Style::default().fg(th::accent()).bold() } else { Style::default().bold() },
+            );
             Cell::from(if right { line.alignment(ratatui::layout::Alignment::Right) } else { line })
         }));
         let rows = fl.rows.iter().enumerate().skip(fl.offset).take(body_h).map(|(i, &idx)| {
             let h = &fl.hosts[idx];
             let mut row = Row::new(cols.iter().map(|&c| host_cell(c, h)));
             if i == fl.sel && !fl.focus_findings {
-                row = row.style(Style::default().bg(SEL_BG));
+                row = row.style(Style::default().bg(th::selection()));
             }
             row
         });
@@ -895,7 +898,7 @@ fn draw_fleet_findings(f: &mut Frame, app: &App, area: Rect) {
     let focus = fl.focus_findings;
     let block = Block::default()
         .borders(Borders::TOP | Borders::LEFT)
-        .border_style(if focus { Style::default().fg(ACCENT) } else { dim() })
+        .border_style(if focus { Style::default().fg(th::accent()) } else { dim() })
         .title(Line::from(vec![
             Span::styled(" Fleet findings ", Style::default().bold()),
             Span::styled(if focus { "⏎ show those hosts · ← hosts " } else { "→ to browse " }, dim()),
@@ -910,7 +913,7 @@ fn draw_fleet_findings(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::with_capacity(visible * per);
     for (i, x) in fl.findings.iter().enumerate().skip(offset).take(visible) {
         let sel = focus && i == fl.finding_sel;
-        let bg = if sel { Style::default().bg(SEL_BG) } else { Style::default() };
+        let bg = if sel { Style::default().bg(th::selection()) } else { Style::default() };
         lines.push(
             Line::from(vec![
                 Span::styled(
@@ -940,7 +943,7 @@ fn draw_drill(f: &mut Frame, app: &App, area: Rect) {
     let Some(d) = app.fleet.drill.as_ref() else { return };
     let tab = |v: DrillView, label: &'static str| {
         if d.view == v {
-            Span::styled(format!(" {label} "), Style::default().fg(Color::Black).bg(ACCENT).bold())
+            Span::styled(format!(" {label} "), th::badge(th::accent()).bold())
         } else {
             Span::styled(format!(" {label} "), dim())
         }
@@ -953,7 +956,7 @@ fn draw_drill(f: &mut Frame, app: &App, area: Rect) {
         tab(DrillView::Procs, "p Procs"),
         Span::styled(" r refresh · Esc back ", dim()),
     ]);
-    let block = Block::default().borders(Borders::TOP).border_style(Style::default().fg(ACCENT)).title(title);
+    let block = Block::default().borders(Borders::TOP).border_style(Style::default().fg(th::accent())).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let Some(s) = d.snap.as_deref() else {
@@ -962,7 +965,7 @@ fn draw_drill(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Line::styled(
                 format!("could not fetch {}: {}", d.name, d.error.as_deref().unwrap_or("unknown error")),
-                Style::default().fg(Color::Red),
+                Style::default().fg(th::crit()),
             )
         };
         f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }), inner);
@@ -990,14 +993,14 @@ fn draw_drill_body(f: &mut Frame, app: &App, d: &HostDrill, s: &Snapshot, area: 
     let h = area.height.saturating_sub(1) as usize;
     let mut offset = 0;
     scroll_into_view(d.scroll, &mut offset, h, d.len());
-    let sel = Style::default().bg(SEL_BG);
+    let sel = Style::default().bg(th::selection());
     match d.view {
         DrillView::Doctor => {
             if d.findings.is_empty() {
                 f.render_widget(
                     Paragraph::new(Line::styled(
                         "✓ nothing unusual on this host",
-                        Style::default().fg(Color::Green).bold(),
+                        Style::default().fg(th::good()).bold(),
                     )),
                     area,
                 );
@@ -1086,14 +1089,14 @@ pub fn draw_panel(f: &mut Frame, p: &Panel, area: Rect) {
     );
     let mut t = Text::default();
     let head_style = match p.severity {
-        Severity::Crit => Style::default().fg(Color::Red).bold(),
-        Severity::Warn => Style::default().fg(Color::Yellow).bold(),
-        Severity::Info => Style::default().fg(ACCENT).bold(),
+        Severity::Crit => Style::default().fg(th::crit()).bold(),
+        Severity::Warn => Style::default().fg(th::warn()).bold(),
+        Severity::Info => Style::default().fg(th::accent()).bold(),
     };
     t.lines.push(Line::styled(p.headline.clone(), head_style));
     for (title, items) in &p.sections {
         t.lines.push(Line::raw(""));
-        t.lines.push(Line::styled(title.clone(), Style::default().fg(ACCENT).bold()));
+        t.lines.push(Line::styled(title.clone(), Style::default().fg(th::accent()).bold()));
         for it in items {
             let lead =
                 if title.starts_with("What you can do") || title.starts_with("Look closer") { "$ " } else { "• " };
@@ -1110,7 +1113,7 @@ pub fn draw_panel(f: &mut Frame, p: &Panel, area: Rect) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(th::accent()))
         .title(Line::styled(format!(" {} ", p.title), Style::default().bold()))
         .title_bottom(Line::styled(hint, dim()));
     f.render_widget(Clear, r);

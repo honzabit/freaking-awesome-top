@@ -62,6 +62,46 @@ to come back to fat, on the same view with the same selection.
 - **To turn it off,** for example on shared machines, set `[tui] shell = false` (Settings → Interface). `!` then
   only says it is off.
 
+### Themes
+
+fat comes with three themes. Pick one in Settings → Interface (it applies at once), with `[theme] name` in the
+config, or with `FAT_THEME` for one run.
+
+- **`dark`** (the default) uses the terminal's 16 basic colors, so your terminal's palette applies.
+- **`light`** uses fixed shades that stay readable on a light background.
+- **`mono`** uses no color: bold, underline, dim and reverse video carry the meaning instead. When the config
+  names no theme, setting `NO_COLOR` picks it.
+
+![Procs view in the light theme](img/procs-light.svg)
+
+![Procs view in the mono theme](img/procs-mono.svg)
+
+**To change single colors,** name the role in `[theme]`, on top of `dark` or `light`:
+
+```toml
+[theme]
+name = "light"
+warn = "#d08700"   # a name (red, light-blue, dark-gray…), a 256-color number, or #rrggbb
+crit = 160
+```
+
+| Role | Used for |
+| --- | --- |
+| `accent` | the tab bar, focus, headings |
+| `badge_text` | text on a colored badge |
+| `good` | fine, running, live |
+| `warn` | worth a look |
+| `crit` | act now |
+| `hot` | between warn and crit |
+| `info` | neutral facts: mounts, sources |
+| `mark` | off the normal path: paused, rewound, agent actions |
+| `key` | key hints and the active filter |
+| `dim` | secondary text |
+| `muted` | unknown or inactive |
+| `selection` | the background of the selected row |
+
+A role or color fat doesn't know is reported when fat starts, and that role keeps the theme's color.
+
 ### Log screen (`a`)
 
 The action log: everything fat did and who asked (you in the TUI, the CLI, or an agent over MCP).
@@ -279,7 +319,7 @@ end of the tab bar; neither has a number key, and `Esc` returns to the view you 
 - **Peers:** names and networks for connection peers in Ports, and the AS table to use instead of downloading one.
 - **Updates:** the daily version check, automatic updates, and whether `fat record` restarts itself into a new
   binary. See [Updates](updates.md).
-- **Interface:** whether `!` opens a shell.
+- **Interface:** whether `!` opens a shell, and the [theme](#themes).
 
 ### Editing
 

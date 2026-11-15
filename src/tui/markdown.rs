@@ -6,18 +6,16 @@
 //! rules, tables (kept as typed, pipes dimmed), and inline `**bold**`, `*italic*`, `` `code` ``
 //! and `[links](url)`. Anything else is shown as typed. A marker without a closing partner is
 //! literal text, so a lone `*` never italicizes the rest of a line.
-use ratatui::style::{Color, Modifier, Style};
+use crate::tui::theme as th;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-const CODE: Color = Color::Yellow;
-const HEADING: Color = Color::Cyan;
-
 fn dim() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(th::dim_color())
 }
 
 fn code_style() -> Style {
-    Style::default().fg(CODE)
+    Style::default().fg(th::key())
 }
 
 /// Render `text` as lines at most `width` cells wide.
@@ -57,7 +55,7 @@ pub fn render(text: &str, width: u16) -> Vec<Line<'static>> {
             continue;
         }
         if let Some((level, title)) = heading(trimmed) {
-            let style = Style::default().fg(HEADING).add_modifier(Modifier::BOLD);
+            let style = Style::default().fg(th::accent()).add_modifier(Modifier::BOLD);
             let style = if level == 1 { style.add_modifier(Modifier::UNDERLINED) } else { style };
             let spans = inline(title).into_iter().map(|s| Span::styled(s.content, style.patch(s.style))).collect();
             out.extend(wrap(spans, width, Vec::new(), Vec::new()));
@@ -82,7 +80,7 @@ pub fn render(text: &str, width: u16) -> Vec<Line<'static>> {
                 Marker::Bullet => (if level == 0 { "• " } else { "◦ " }).to_string(),
                 Marker::Number(n) => format!("{n} "),
             };
-            let first = vec![Span::raw(pad.clone()), Span::styled(bullet.clone(), Style::default().fg(HEADING))];
+            let first = vec![Span::raw(pad.clone()), Span::styled(bullet.clone(), Style::default().fg(th::accent()))];
             let hang = vec![Span::raw(format!("{pad}{}", " ".repeat(Span::raw(bullet.as_str()).width())))];
             out.extend(wrap(inline(rest), width, first, hang));
             continue;
@@ -370,7 +368,7 @@ mod tests {
         assert_eq!(text(&l), vec!["Disk is busy: run fat fs --growth or see docs (https://x.y)."]);
         assert!(styled(&l, "Disk").style.add_modifier.contains(Modifier::BOLD));
         assert!(styled(&l, "busy").style.add_modifier.contains(Modifier::ITALIC));
-        assert_eq!(styled(&l, "--growth").style.fg, Some(CODE));
+        assert_eq!(styled(&l, "--growth").style.fg, Some(th::key()));
         assert!(styled(&l, "docs").style.add_modifier.contains(Modifier::UNDERLINED));
     }
 

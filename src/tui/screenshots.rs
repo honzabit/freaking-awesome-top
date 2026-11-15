@@ -4,7 +4,8 @@
 //! ```text
 //! cargo test screenshots -- --ignored
 //! ```
-use super::app::{App, Tab};
+use super::app::{App, Modal, Tab};
+use super::theme::{self, Theme};
 use crate::model::{ConnGroup, Conns, Finding, Port, Proc, Proto, Snapshot};
 use crate::server::{Profile, ServerCfg, UnitKind};
 use ratatui::buffer::Buffer;
@@ -341,8 +342,8 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// A terminal window with the buffer in it.
-fn svg(buf: &Buffer, title: &str) -> String {
+/// A terminal window with the buffer in it (`light`: a light background, for the light theme).
+fn svg(buf: &Buffer, title: &str, light: bool) -> String {
     const CW: f32 = 8.6;
     const CH: f32 = 18.0;
     const PAD: f32 = 14.0;
@@ -350,14 +351,15 @@ fn svg(buf: &Buffer, title: &str) -> String {
     let (w, h) = (buf.area.width, buf.area.height);
     let width = w as f32 * CW + PAD * 2.0;
     let height = h as f32 * CH + PAD * 2.0 + BAR;
-    let (fg0, bg0) = ("#d7dae0", "#14171c");
+    let (fg0, bg0, chrome, title_fg) =
+        if light { ("#24292f", "#fbfbfa", "#e6e6e3", "#6a6f78") } else { ("#d7dae0", "#14171c", "#1f232b", "#8b919c") };
     let mut out = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="{t}">
 <style>text{{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace;font-size:14px;white-space:pre}}.b{{font-weight:700}}.i{{font-style:italic}}.u{{text-decoration:underline}}</style>
 <rect width="{width}" height="{height}" rx="10" fill="{bg0}"/>
-<rect width="{width}" height="{BAR}" rx="10" fill="#1f232b"/><rect y="20" width="{width}" height="10" fill="#1f232b"/>
+<rect width="{width}" height="{BAR}" rx="10" fill="{chrome}"/><rect y="20" width="{width}" height="10" fill="{chrome}"/>
 <circle cx="20" cy="15" r="6" fill="#ff5f57"/><circle cx="40" cy="15" r="6" fill="#febc2e"/><circle cx="60" cy="15" r="6" fill="#28c840"/>
-<text x="{cx}" y="20" fill="#8b919c" text-anchor="middle" style="font-size:13px">{t}</text>
+<text x="{cx}" y="20" fill="{title_fg}" text-anchor="middle" style="font-size:13px">{t}</text>
 "##,
         t = esc(title),
         cx = width / 2.0,
@@ -443,7 +445,7 @@ fn shot(a: &mut App, name: &str, title: &str, h: u16) -> String {
     let buf = term.backend().buffer().clone();
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/img").join(format!("{name}.svg"));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, svg(&buf, title)).unwrap();
+    std::fs::write(&path, svg(&buf, title, theme::get().name == "light")).unwrap();
     (0..h).map(|y| (0..W).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n").collect()
 }
 
@@ -470,6 +472,14 @@ fn screenshots() {
     a.switch_tab(Tab::Doctor);
     let out = shot(&mut a, "doctor", "fat · Doctor", 18);
     assert!(out.contains("OOM"), "{out}");
+
+    // The other themes, on the Procs tab.
+    a.switch_tab(Tab::Procs);
+    theme::set(Theme::light());
+    shot(&mut a, "procs-light", "fat · Procs · theme = \"light\"", 29);
+    theme::set(Theme::mono());
+    shot(&mut a, "procs-mono", "fat · Procs · theme = \"mono\" (or NO_COLOR)", 29);
+    theme::set(Theme::dark());
 
     // Ask: a thread with an answer.
     a.ask.threads = vec![crate::threads::Thread {
@@ -564,4 +574,62 @@ fn screenshots() {
     a.tab = Tab::Settings;
     let out = shot(&mut a, "settings", "fat · Settings", 34);
     assert!(out.contains("Connect ask to") && out.contains("Claude Code"), "{out}");
+}
+
+/// Every tab (and the help) drawn in `t`, as buffers.
+fn every_view(t: Theme) -> Vec<(String, Buffer)> {
+    theme::set(t);
+    let mut a = demo_app();
+    let mut out = Vec::new();
+    for tab in Tab::ALL {
+        for help in [false, true] {
+            a.switch_tab(tab);
+            a.ensure_rows();
+            a.ensure_server_rows();
+            a.modal = if help { Modal::Help } else { Modal::None };
+            let mut term = Terminal::new(TestBackend::new(W, 30)).unwrap();
+            term.draw(|f| super::ui::draw(f, &mut a)).unwrap();
+            out.push((format!("{tab:?}{}", if help { " + help" } else { "" }), term.backend().buffer().clone()));
+        }
+    }
+    theme::set(Theme::dark());
+    out
+}
+
+#[test]
+fn light_theme_leaves_no_basic_color_behind() {
+    // The light theme uses only 256-color shades; a basic color on screen was hardcoded.
+    for (view, buf) in every_view(Theme::light()) {
+        for (i, c) in buf.content.iter().enumerate() {
+            for col in [c.fg, c.bg] {
+                assert!(
+                    matches!(col, Color::Reset | Color::Indexed(16..) | Color::Rgb(..)),
+                    "{view}: {col:?} at ({}, {}) on {:?}",
+                    i as u16 % W,
+                    i as u16 / W,
+                    c.symbol()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mono_theme_draws_no_color_but_keeps_emphasis() {
+    let views = every_view(Theme::mono());
+    for (view, buf) in &views {
+        assert!(buf.content.iter().all(|c| c.fg == Color::Reset && c.bg == Color::Reset), "{view} has color");
+    }
+    let (_, procs) = views.iter().find(|(v, _)| v == "Procs").unwrap();
+    assert!(procs.content.iter().any(|c| c.modifier.contains(Modifier::REVERSED)), "the tab bar and selection");
+    assert!(procs.content.iter().any(|c| c.modifier.contains(Modifier::DIM)), "secondary text");
+}
+
+#[test]
+fn dark_is_the_default_and_overrides_reach_the_screen() {
+    assert_eq!(theme::get(), Theme::dark());
+    let custom = Theme { warn: Color::Rgb(1, 2, 3), accent: Color::Rgb(4, 5, 6), ..Theme::dark() };
+    let views = every_view(custom);
+    let used = |c: Color| views.iter().any(|(_, b)| b.content.iter().any(|x| x.fg == c || x.bg == c));
+    assert!(used(Color::Rgb(1, 2, 3)) && used(Color::Rgb(4, 5, 6)));
 }

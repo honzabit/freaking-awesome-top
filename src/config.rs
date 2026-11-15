@@ -63,6 +63,19 @@ pub struct Config {
     pub peers: PeersCfg,
     /// `[tui]`: the interactive view.
     pub tui: TuiCfg,
+    /// `[theme]`: colors of the interactive view.
+    pub theme: ThemeCfg,
+}
+
+/// `[theme]`: `name` picks a built-in theme, any other key recolors one role:
+/// `warn = "#d08700"`, `crit = 203`, `accent = "light-blue"`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ThemeCfg {
+    /// "auto" (mono when NO_COLOR is set, else dark), "dark", "light" or "mono". Env: FAT_THEME.
+    pub name: String,
+    #[serde(flatten)]
+    pub colors: std::collections::BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -200,6 +213,7 @@ impl Default for Config {
             update: Default::default(),
             peers: Default::default(),
             tui: Default::default(),
+            theme: Default::default(),
         }
     }
 }
@@ -282,6 +296,15 @@ mod tests {
         assert_eq!(c.fleet.groups["db"], vec!["db-*"]);
         assert_eq!(c.fleet.ssh_options, vec!["ServerAliveInterval=5"]);
         assert!(!c.fleet.control_master, "connection sharing is left to the ssh config by default");
+    }
+
+    #[test]
+    fn parse_theme_section() {
+        let c = Config::parse("[theme]\nname = \"light\"\nwarn = \"#d08700\"\ncrit = 203\n").unwrap();
+        assert_eq!(c.theme.name, "light");
+        assert_eq!(c.theme.colors["warn"].as_str(), Some("#d08700"));
+        assert_eq!(c.theme.colors["crit"].as_integer(), Some(203));
+        assert!(Config::parse("").unwrap().theme.colors.is_empty());
     }
 
     #[test]

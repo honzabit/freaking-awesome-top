@@ -2,6 +2,7 @@
 //! Everything here is pure and cheap so it can run per visible row each frame.
 
 use crate::model::Ts;
+use crate::tui::theme as th;
 use ratatui::style::{Color, Modifier, Style};
 
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -116,17 +117,17 @@ pub fn sparkline<I: DoubleEndedIterator<Item = f32> + ExactSizeIterator>(values:
 }
 
 pub fn dim() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(th::dim_color())
 }
 
 /// Color for a CPU percent (100 = one core).
 pub fn cpu_style(cpu: f32) -> Style {
     if cpu >= 100.0 {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        Style::default().fg(th::crit()).add_modifier(Modifier::BOLD)
     } else if cpu >= 50.0 {
-        Style::default().fg(Color::Red)
+        Style::default().fg(th::crit())
     } else if cpu >= 15.0 {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(th::warn())
     } else if cpu >= 0.5 {
         Style::default()
     } else {
@@ -137,20 +138,20 @@ pub fn cpu_style(cpu: f32) -> Style {
 /// Color for whole-machine percent 0..100.
 pub fn pct_color(p: f32) -> Color {
     if p >= 85.0 {
-        Color::Red
+        th::crit()
     } else if p >= 60.0 {
-        Color::Yellow
+        th::warn()
     } else {
-        Color::Green
+        th::good()
     }
 }
 
 pub fn mem_style(bytes: u64) -> Style {
     const G: u64 = 1 << 30;
     if bytes >= 4 * G {
-        Style::default().fg(Color::Red)
+        Style::default().fg(th::crit())
     } else if bytes >= G {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(th::warn())
     } else if bytes >= 100 << 20 {
         Style::default()
     } else {
@@ -160,9 +161,9 @@ pub fn mem_style(bytes: u64) -> Style {
 
 pub fn power_style(mw: f32) -> Style {
     if mw >= 5000.0 {
-        Style::default().fg(Color::Red)
+        Style::default().fg(th::crit())
     } else if mw >= 1000.0 {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(th::warn())
     } else if mw >= 100.0 {
         Style::default()
     } else {
@@ -172,9 +173,9 @@ pub fn power_style(mw: f32) -> Style {
 
 pub fn rate_style(bps: u64) -> Style {
     if bps >= 10 << 20 {
-        Style::default().fg(Color::Red)
+        Style::default().fg(th::crit())
     } else if bps >= 1 << 20 {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(th::warn())
     } else if bps > 0 {
         Style::default()
     } else {
@@ -184,28 +185,28 @@ pub fn rate_style(bps: u64) -> Style {
 
 pub fn pressure_color(level: &str) -> Color {
     match level {
-        "normal" => Color::Green,
-        "warn" => Color::Yellow,
-        "critical" => Color::Red,
-        _ => Color::Gray,
+        "normal" => th::good(),
+        "warn" => th::warn(),
+        "critical" => th::crit(),
+        _ => th::muted(),
     }
 }
 
 pub fn thermal_color(level: &str) -> Color {
     match level {
-        "nominal" => Color::Green,
-        "fair" => Color::Yellow,
-        "serious" => Color::LightRed,
-        "critical" => Color::Red,
-        _ => Color::Gray,
+        "nominal" => th::good(),
+        "fair" => th::warn(),
+        "serious" => th::hot(),
+        "critical" => th::crit(),
+        _ => th::muted(),
     }
 }
 
 pub fn severity_style(sev: &str) -> Style {
     match sev {
-        "crit" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        "warn" => Style::default().fg(Color::Yellow),
-        _ => Style::default().fg(Color::Cyan),
+        "crit" => Style::default().fg(th::crit()).add_modifier(Modifier::BOLD),
+        "warn" => Style::default().fg(th::warn()),
+        _ => Style::default().fg(th::accent()),
     }
 }
 
@@ -290,9 +291,9 @@ pub fn fmt_eta(secs: u64) -> String {
 /// Red under 2h, yellow under a day.
 pub fn eta_color(secs: u64) -> Color {
     if secs < 2 * 3600 {
-        Color::Red
+        th::crit()
     } else if secs < 86_400 {
-        Color::Yellow
+        th::warn()
     } else {
         Color::Reset
     }
@@ -367,13 +368,13 @@ pub fn group_deleted(v: &[(u32, String, String, u64)], min: u64) -> (Vec<Deleted
 /// Growth coloring: big positive deltas are hot, shrinking is green.
 pub fn delta_style(d: i64) -> Style {
     if d >= 1 << 30 {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        Style::default().fg(th::crit()).add_modifier(Modifier::BOLD)
     } else if d >= 100 << 20 {
-        Style::default().fg(Color::Red)
+        Style::default().fg(th::crit())
     } else if d >= 1 << 20 {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(th::warn())
     } else if d < 0 {
-        Style::default().fg(Color::Green)
+        Style::default().fg(th::good())
     } else if d > 0 {
         Style::default()
     } else {
@@ -384,11 +385,11 @@ pub fn delta_style(d: i64) -> Style {
 /// Volume fill (0..1) color: crit at 97%, warn at 90%.
 pub fn fill_color(ratio: f64) -> Color {
     if ratio >= 0.97 {
-        Color::Red
+        th::crit()
     } else if ratio >= 0.90 {
-        Color::Yellow
+        th::warn()
     } else {
-        Color::Green
+        th::good()
     }
 }
 

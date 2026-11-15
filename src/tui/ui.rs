@@ -5,6 +5,7 @@ use crate::fs::Volume;
 use crate::model::{Container, Proc};
 use crate::tui::app::{App, FsMode, GrowthRow, Modal, SortKey, Tab, ZOOM_NAMES, ZOOMS};
 use crate::tui::server_ui;
+use crate::tui::theme as th;
 use crate::tui::widgets::*;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
@@ -16,8 +17,6 @@ use ratatui::widgets::{
     Row, Table, Tabs, Wrap,
 };
 
-pub(super) const SEL_BG: Color = Color::Indexed(236);
-pub(super) const ACCENT: Color = Color::Cyan;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -68,6 +67,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_footer(f, app, footer);
     draw_modal(f, app, area);
+    if th::get().mono {
+        th::strip(f.buffer_mut());
+    }
 }
 
 // ------------------------------------------------------------------- header
@@ -81,20 +83,20 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let badge: Vec<Span> = match app.cursor {
         Some(ts) => vec![Span::styled(
             format!(" ⏪ REWIND {} ", fmt_clock(ts)),
-            Style::default().fg(Color::White).bg(Color::Magenta).add_modifier(Modifier::BOLD),
+            th::badge(th::mark()).add_modifier(Modifier::BOLD),
         )],
         None => {
-            let mut v = vec![Span::styled(" ● LIVE ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))];
+            let mut v = vec![Span::styled(" ● LIVE ", Style::default().fg(th::good()).add_modifier(Modifier::BOLD))];
             if app.history_ok {
-                v.push(Span::styled("rec ", Style::default().fg(Color::Red)));
+                v.push(Span::styled("rec ", Style::default().fg(th::crit())));
             }
             v
         }
     };
     let badge_w: usize = badge.iter().map(|s| s.width()).sum();
-    let mut l1 = vec![Span::styled(" fat ", Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))];
+    let mut l1 = vec![Span::styled(" fat ", th::badge(th::accent()).add_modifier(Modifier::BOLD))];
     if let Some(err) = &app.collector_error {
-        l1.push(Span::styled(format!(" collector unavailable: {err}"), Style::default().fg(Color::Red)));
+        l1.push(Span::styled(format!(" collector unavailable: {err}"), Style::default().fg(th::crit())));
     } else if let Some(s) = snap {
         let sys = &s.system;
         l1.push(Span::styled(
@@ -117,7 +119,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     if let Some(note) = &app.update_note {
         let used: usize = l1.iter().map(|s| s.width()).sum();
         if used + badge_w + note.chars().count() + 3 < w {
-            l1.push(Span::styled(format!("  {note}"), Style::default().fg(Color::Yellow)));
+            l1.push(Span::styled(format!("  {note}"), Style::default().fg(th::warn())));
         }
     }
     let used: usize = l1.iter().map(|s| s.width()).sum();
@@ -146,7 +148,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let cores_w = if sys.per_core.len() + 12 < w / 2 { sys.per_core.len() } else { 0 };
     let spark_w = w.saturating_sub(10 + cores_w + 2);
     let mut l2 = vec![
-        Span::styled("CPU ", Style::default().fg(ACCENT).bold()),
+        Span::styled("CPU ", Style::default().fg(th::accent()).bold()),
         Span::styled(format!("{:>4.0}% ", sys.cpu), Style::default().fg(pct_color(sys.cpu)).bold()),
         Span::styled(
             sparkline(app.ring_points.iter().map(|p| p.cpu), spark_w),
@@ -168,7 +170,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         let bw = if sys.psi.is_some() { (w / 6).clamp(8, 40) } else { (w / 4).clamp(8, 40) };
         let pc = pressure_color(&sys.mem_pressure);
         let mut l3 = vec![
-            Span::styled("MEM ", Style::default().fg(ACCENT).bold()),
+            Span::styled("MEM ", Style::default().fg(th::accent()).bold()),
             Span::styled(bar(ratio, bw), Style::default().fg(pc)),
             Span::raw(format!(" {}/{} ", fmt_bytes(sys.mem_used), fmt_bytes(sys.mem_total))),
             Span::styled(
@@ -180,25 +182,25 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             l3.extend(psi_spans(psi));
         }
         if sys.swap_total > 0 || sys.swap_used > 0 {
-            l3.push(Span::styled("  SWP ", Style::default().fg(ACCENT)));
+            l3.push(Span::styled("  SWP ", Style::default().fg(th::accent())));
             l3.push(Span::raw(format!("{}/{}", fmt_bytes(sys.swap_used), fmt_bytes(sys.swap_total))));
         }
         if !sys.gpus.is_empty() {
             let util = sys.gpus.iter().map(|g| g.util).fold(0.0f32, f32::max);
-            l3.push(Span::styled("  GPU ", Style::default().fg(ACCENT)));
+            l3.push(Span::styled("  GPU ", Style::default().fg(th::accent())));
             l3.push(Span::styled(format!("{util:.0}%"), Style::default().fg(pct_color(util))));
         }
         lines.push(Line::from(l3));
 
         // line 4: power, thermal, io, battery
-        let mut l4 = vec![Span::styled("PWR ", Style::default().fg(ACCENT).bold())];
+        let mut l4 = vec![Span::styled("PWR ", Style::default().fg(th::accent()).bold())];
         l4.extend(power_spans(sys.power_mw, &sys.power_source));
-        l4.push(Span::styled("  THERM ", Style::default().fg(ACCENT)));
+        l4.push(Span::styled("  THERM ", Style::default().fg(th::accent())));
         l4.extend(thermal_spans(&sys.thermal, sys.temp_c));
         l4.extend([
-            Span::styled("  NET ", Style::default().fg(ACCENT)),
+            Span::styled("  NET ", Style::default().fg(th::accent())),
             Span::raw(format!("↓{}/s ↑{}/s", fmt_bytes(sys.net_rx_bps), fmt_bytes(sys.net_tx_bps))),
-            Span::styled("  DISK ", Style::default().fg(ACCENT)),
+            Span::styled("  DISK ", Style::default().fg(th::accent())),
             Span::raw(format!("r{}/s w{}/s", fmt_bytes(sys.disk_read_bps), fmt_bytes(sys.disk_write_bps))),
         ]);
         if let Some(b) = sys.battery_pct {
@@ -207,10 +209,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 Some(false) => " AC",
                 None => "",
             };
-            l4.push(Span::styled("  BAT ", Style::default().fg(ACCENT)));
+            l4.push(Span::styled("  BAT ", Style::default().fg(th::accent())));
             l4.push(Span::styled(
                 format!("{b:.0}%{src}"),
-                Style::default().fg(if b < 20.0 { Color::Red } else { Color::Reset }),
+                Style::default().fg(if b < 20.0 { th::crit() } else { Color::Reset }),
             ));
         }
         lines.push(Line::from(l4));
@@ -221,7 +223,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 /// "PSI cpu▃12 mem▁0 io▆31": avg10 stall percentages as one-cell gauges. Stalls are bad well
 /// below 100%, so the gauge saturates at 25% (10% some-pressure is already noticeable).
 pub(super) fn psi_spans(psi: &crate::model::Psi) -> Vec<Span<'static>> {
-    let mut v = vec![Span::styled("  PSI", Style::default().fg(ACCENT))];
+    let mut v = vec![Span::styled("  PSI", Style::default().fg(th::accent()))];
     for (label, val) in [("cpu", psi.cpu_some), ("mem", psi.mem_some.max(psi.mem_full)), ("io", psi.io_some)] {
         let st = Style::default().fg(psi_color(val));
         v.push(Span::raw(format!(" {label}")));
@@ -233,11 +235,11 @@ pub(super) fn psi_spans(psi: &crate::model::Psi) -> Vec<Span<'static>> {
 
 fn psi_color(pct: f32) -> Color {
     if pct >= 20.0 {
-        Color::Red
+        th::crit()
     } else if pct >= 5.0 {
-        Color::Yellow
+        th::warn()
     } else {
-        Color::Green
+        th::good()
     }
 }
 
@@ -264,13 +266,13 @@ fn thermal_spans(thermal: &str, temp_c: Option<f32>) -> Vec<Span<'static>> {
     }
     if let Some(t) = temp_c.filter(|t| t.is_finite()) {
         let c = if t >= 90.0 {
-            Color::Red
+            th::crit()
         } else if t >= 75.0 {
-            Color::LightRed
+            th::hot()
         } else if t >= 60.0 {
-            Color::Yellow
+            th::warn()
         } else {
-            Color::Green
+            th::good()
         };
         v.push(Span::styled(format!("{}{t:.0}°C", if known { " " } else { "" }), Style::default().fg(c)));
     }
@@ -284,7 +286,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .flat_map(|(i, t)| {
             let key = if *t == Tab::Log { "a " } else { ", " };
-            let st = if app.tab == *t { Style::default().fg(Color::Black).bg(ACCENT).bold() } else { dim() };
+            let st = if app.tab == *t { th::badge(th::accent()).bold() } else { dim() };
             let mut v = vec![Span::styled(format!(" {key}{} ", t.title()), st)];
             if i + 1 < Tab::SCREENS.len() {
                 v.push(Span::styled("│", dim()));
@@ -319,7 +321,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|t| {
             let mut spans = vec![
-                Span::styled(format!("{}", app.tab_number(*t)), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{}", app.tab_number(*t)), Style::default().fg(th::key())),
                 Span::raw(t.title()),
             ];
             if let Some(b) = server_ui::tab_badge(app, *t) {
@@ -329,9 +331,9 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
                 let crit = app.findings.iter().filter(|x| x.severity == "crit").count();
                 let warn = app.findings.iter().filter(|x| x.severity == "warn").count();
                 if crit > 0 {
-                    spans.push(Span::styled(format!(" {crit}"), Style::default().fg(Color::Red).bold()));
+                    spans.push(Span::styled(format!(" {crit}"), Style::default().fg(th::crit()).bold()));
                 } else if warn > 0 {
-                    spans.push(Span::styled(format!(" {warn}"), Style::default().fg(Color::Yellow)));
+                    spans.push(Span::styled(format!(" {warn}"), Style::default().fg(th::warn())));
                 }
             }
             if *t == Tab::Fs {
@@ -339,13 +341,13 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
                 let hot = vols.iter().filter(|v| !v.read_only && !v.remote && !volume_hidden(v, vols));
                 let worst = hot.fold(None::<Color>, |acc, v| {
                     let c = if volume_ratio(v) >= 0.97 || v.eta_full_s.is_some_and(|e| e < 2 * 3600) {
-                        Some(Color::Red)
+                        Some(th::crit())
                     } else if volume_ratio(v) >= 0.90 || v.eta_full_s.is_some_and(|e| e < 86_400) {
-                        Some(Color::Yellow)
+                        Some(th::warn())
                     } else {
                         None
                     };
-                    if acc == Some(Color::Red) { acc } else { c.or(acc) }
+                    if acc == Some(th::crit()) { acc } else { c.or(acc) }
                 });
                 if let Some(c) = worst {
                     spans.push(Span::styled(" ⚠", Style::default().fg(c).bold()));
@@ -354,7 +356,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
             if *t == Tab::Ports
                 && let Some(n) = app.view().map(|s| s.ports.iter().filter(|p| p.orphan).count()).filter(|n| *n > 0)
             {
-                spans.push(Span::styled(format!(" ⚠{n}"), Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled(format!(" ⚠{n}"), Style::default().fg(th::warn())));
             }
             Line::from(spans)
         })
@@ -365,7 +367,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let tabs = Tabs::new(titles)
         .select(tabs.iter().position(|t| *t == app.tab))
         .style(dim())
-        .highlight_style(Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
+        .highlight_style(th::badge(th::accent()).add_modifier(Modifier::BOLD))
         .divider("│")
         .padding(pad, pad);
     f.render_widget(tabs, area);
@@ -441,7 +443,7 @@ fn col_title(c: Col, sort: SortKey, desc: bool) -> Cell<'static> {
     };
     let sorted = key == Some(sort);
     let text = if sorted { format!("{t}{}", if desc { "▼" } else { "▲" }) } else { t.to_string() };
-    let style = if sorted { Style::default().fg(ACCENT).bold() } else { Style::default().bold() };
+    let style = if sorted { Style::default().fg(th::accent()).bold() } else { Style::default().bold() };
     let line = Line::styled(text, style);
     Cell::from(if right { line.alignment(Alignment::Right) } else { line })
 }
@@ -457,7 +459,7 @@ fn proc_cell<'a>(c: Col, p: &'a Proc, depth: u16, tree: bool, containers: &[Cont
             Some(id) => {
                 let known = crate::fleet::find_container(containers, id);
                 let label = crate::fleet::container_label(containers, id);
-                let st = if known.is_some() { Style::default().fg(Color::LightBlue) } else { dim() };
+                let st = if known.is_some() { Style::default().fg(th::info()) } else { dim() };
                 Cell::from(Span::styled(clip(&label, 12).to_string(), st))
             }
             None => Cell::from(""),
@@ -480,11 +482,11 @@ fn proc_cell<'a>(c: Col, p: &'a Proc, depth: u16, tree: bool, containers: &[Cont
         Col::Thr => num(p.threads.to_string(), dim()),
         Col::S => {
             let st = if paused {
-                Style::default().fg(Color::Black).bg(Color::Magenta).bold()
+                th::badge(th::mark()).bold()
             } else if p.status == "R" {
-                Style::default().fg(Color::Green)
+                Style::default().fg(th::good())
             } else if p.status == "Z" {
-                Style::default().fg(Color::Red)
+                Style::default().fg(th::crit())
             } else {
                 dim()
             };
@@ -496,10 +498,10 @@ fn proc_cell<'a>(c: Col, p: &'a Proc, depth: u16, tree: bool, containers: &[Cont
                 spans.push(Span::styled(indent(depth - 1), dim()));
                 spans.push(Span::styled("└ ", dim()));
             }
-            let name_style = if paused { Style::default().fg(Color::Magenta).bold() } else { Style::default().bold() };
+            let name_style = if paused { Style::default().fg(th::mark()).bold() } else { Style::default().bold() };
             spans.push(Span::styled(p.name.as_str(), name_style));
             if paused {
-                spans.push(Span::styled(" [paused]", Style::default().fg(Color::Magenta)));
+                spans.push(Span::styled(" [paused]", Style::default().fg(th::mark())));
             }
             if !p.cmd.is_empty() {
                 spans.push(Span::raw(" "));
@@ -550,13 +552,13 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
         Span::raw(format!("· sort {}{} ", app.sort.label(), if app.sort_desc { "▼" } else { "▲" })),
     ];
     if app.tree {
-        title.push(Span::styled("· tree ", Style::default().fg(Color::Green)));
+        title.push(Span::styled("· tree ", Style::default().fg(th::good())));
     }
     if !app.filter.is_empty() {
-        title.push(Span::styled(format!("· /{} ", app.filter), Style::default().fg(Color::Yellow)));
+        title.push(Span::styled(format!("· /{} ", app.filter), Style::default().fg(th::key())));
     }
     if let Some(ts) = app.cursor {
-        title.push(Span::styled(format!("· ⏪ {} ", fmt_clock(ts)), Style::default().fg(Color::Magenta).bold()));
+        title.push(Span::styled(format!("· ⏪ {} ", fmt_clock(ts)), Style::default().fg(th::mark()).bold()));
     }
 
     let cols = columns(area.width, app.has_containers);
@@ -566,7 +568,7 @@ fn draw_procs(f: &mut Frame, app: &mut App, area: Rect) {
         let p = &snap.procs[r.idx];
         let mut row = Row::new(cols.iter().map(|&c| proc_cell(c, p, r.depth, app.tree, containers)));
         if i == app.sel {
-            row = row.style(Style::default().bg(SEL_BG));
+            row = row.style(Style::default().bg(th::selection()));
         }
         row
     });
@@ -632,9 +634,9 @@ fn draw_ports(f: &mut Frame, app: &mut App, area: Rect) {
             _ => false,
         };
         let st = if v == app.port_view {
-            Style::default().fg(Color::Black).bg(ACCENT).bold()
+            th::badge(th::accent()).bold()
         } else if warn {
-            Style::default().fg(Color::Yellow).bold()
+            Style::default().fg(th::warn()).bold()
         } else if n == 0 {
             dim()
         } else {
@@ -655,7 +657,7 @@ fn draw_ports(f: &mut Frame, app: &mut App, area: Rect) {
     if !app.port_filter.is_empty() {
         title.push(Span::styled(
             format!("· filter: {} (Esc clears) ", app.port_filter.describe()),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(th::warn()),
         ));
     }
     if c.more_groups > 0 {
@@ -666,11 +668,11 @@ fn draw_ports(f: &mut Frame, app: &mut App, area: Rect) {
             .map(|h| Cell::from(Span::styled(h, Style::default().bold()))),
     );
     let state_style = |st: &str| match st {
-        "LISTEN" => Style::default().fg(Color::Green),
-        "ESTABLISHED" => Style::default().fg(ACCENT),
-        "CLOSE_WAIT" => Style::default().fg(Color::Yellow),
+        "LISTEN" => Style::default().fg(th::good()),
+        "ESTABLISHED" => Style::default().fg(th::accent()),
+        "CLOSE_WAIT" => Style::default().fg(th::warn()),
         "TIME_WAIT" => dim(),
-        _ => Style::default().fg(Color::Magenta),
+        _ => Style::default().fg(th::mark()),
     };
     let rows = app.port_rows.iter().enumerate().skip(app.port_offset).take(body_h).map(|(i, r)| {
         let mut row = match *r {
@@ -682,8 +684,8 @@ fn draw_ports(f: &mut Frame, app: &mut App, area: Rect) {
                 };
                 let note = if p.orphan {
                     Line::from(vec![
-                        Span::styled("⚠ orphan ", Style::default().fg(Color::Black).bg(Color::Yellow).bold()),
-                        Span::styled(format!(" {}", p.note), Style::default().fg(Color::Yellow)),
+                        Span::styled("⚠ orphan ", th::badge(th::warn()).bold()),
+                        Span::styled(format!(" {}", p.note), Style::default().fg(th::warn())),
                     ])
                 } else {
                     Line::styled(p.note.as_str(), dim())
@@ -717,7 +719,7 @@ fn draw_ports(f: &mut Frame, app: &mut App, area: Rect) {
                     note.push(Span::raw(format!("  {}", g.peer_name)));
                     if !g.peer_name_verified {
                         // The address's owner picks its PTR name: unconfirmed names prove nothing.
-                        note.push(Span::styled("?", Style::default().fg(Color::Yellow)));
+                        note.push(Span::styled("?", Style::default().fg(th::warn())));
                     }
                 }
                 if let Some(n) = &g.peer_net {
@@ -738,7 +740,7 @@ fn draw_ports(f: &mut Frame, app: &mut App, area: Rect) {
             }
         };
         if i == app.port_sel {
-            row = row.style(Style::default().bg(SEL_BG));
+            row = row.style(Style::default().bg(th::selection()));
         }
         row
     });
@@ -807,7 +809,7 @@ fn draw_port_filter(f: &mut Frame, app: &App, form: &crate::tui::app::PortFilter
             Span::styled(hints[i], dim()),
         ]);
         if selected {
-            line = line.style(Style::default().bg(SEL_BG));
+            line = line.style(Style::default().bg(th::selection()));
         }
         lines.push(line);
     }
@@ -817,7 +819,7 @@ fn draw_port_filter(f: &mut Frame, app: &App, form: &crate::tui::app::PortFilter
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT))
+                .border_style(Style::default().fg(th::accent()))
                 .title(" Filter ports ")
                 .title_bottom(Line::styled(
                     if form.editing {
@@ -879,7 +881,7 @@ fn volume_line(app: &App, v: &Volume, mount_w: usize, width: u16) -> Line<'stati
         Span::styled(format!(" {:>3.0}%", ratio * 100.0), Style::default().fg(fill_color(ratio))),
     ];
     if past {
-        spans.push(Span::styled(" ⏪", Style::default().fg(Color::Magenta).bold()));
+        spans.push(Span::styled(" ⏪", Style::default().fg(th::mark()).bold()));
         return Line::from(spans);
     }
     // Most important first: narrow terminals cut the end of the line.
@@ -888,9 +890,9 @@ fn volume_line(app: &App, v: &Volume, mount_w: usize, width: u16) -> Line<'stati
     }
     if let Some(fill) = fmt_fill(v.fill_bps, app.fs.window_ms()) {
         let st = if v.fill_bps.is_some_and(|b| b > 0.0) {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(th::warn())
         } else {
-            Style::default().fg(Color::Green)
+            Style::default().fg(th::good())
         };
         spans.push(Span::styled(format!("  {fill}"), st));
     }
@@ -921,7 +923,7 @@ fn scan_status(app: &App) -> Vec<Span<'static>> {
     if let Some(e) = &fs.error {
         return vec![Span::styled(
             format!("storage engine unavailable: {}", clip(e, 80)),
-            Style::default().fg(Color::Red),
+            Style::default().fg(th::crit()),
         )];
     }
     let Some(l) = fs.current() else {
@@ -931,7 +933,7 @@ fn scan_status(app: &App) -> Vec<Span<'static>> {
     let p = &l.progress;
     if p.running || l.dir.partial {
         let pct = p.fraction.map(|f| format!(" {:.0}%", (f * 100.0).clamp(0.0, 100.0))).unwrap_or_default();
-        v.push(Span::styled(format!("scanning{pct}"), Style::default().fg(Color::Yellow)));
+        v.push(Span::styled(format!("scanning{pct}"), Style::default().fg(th::warn())));
         v.push(Span::styled(format!(" · {} files", fmt_count(p.files_seen.max(l.dir.files))), dim()));
         if l.dir.partial {
             v.push(Span::styled(" · partial (lower bound)", dim()));
@@ -946,7 +948,7 @@ fn scan_status(app: &App) -> Vec<Span<'static>> {
     let locked = l.children.iter().filter(|c| c.denied > 0 && !c.mount_point).count();
     if l.dir.denied > 0 && l.dir.size == 0 && l.children.is_empty() {
         let why = if cfg!(target_os = "macos") { "macOS privacy or permissions" } else { "permission denied" };
-        v.push(Span::styled(format!("  🔒 not read ({why})"), Style::default().fg(Color::Yellow)));
+        v.push(Span::styled(format!("  🔒 not read ({why})"), Style::default().fg(th::warn())));
     } else if locked > 0 {
         let s = if locked == 1 { "" } else { "s" };
         v.push(Span::styled(
@@ -955,7 +957,7 @@ fn scan_status(app: &App) -> Vec<Span<'static>> {
             } else {
                 format!("  🔒 {locked} subdir{s} could not be read (permission denied): not counted")
             },
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(th::warn()),
         ));
     }
     v
@@ -999,17 +1001,17 @@ fn draw_fs(f: &mut Frame, app: &mut App, area: Rect) {
 
     // breadcrumb + status
     let fs = &app.fs;
-    let mut crumb = vec![Span::styled(" ⛁ ", Style::default().fg(ACCENT))];
+    let mut crumb = vec![Span::styled(" ⛁ ", Style::default().fg(th::accent()))];
     match fs.mode {
-        FsMode::Tree => crumb.push(Span::styled(fs.path.clone(), Style::default().fg(ACCENT).bold())),
+        FsMode::Tree => crumb.push(Span::styled(fs.path.clone(), Style::default().fg(th::accent()).bold())),
         FsMode::Growth => {
-            crumb.push(Span::styled("growth ", Style::default().fg(Color::Yellow).bold()));
+            crumb.push(Span::styled("growth ", Style::default().fg(th::warn()).bold()));
             crumb
                 .push(Span::styled(format!("last {} · anywhere", fmt_window(fs.window_ms())), Style::default().bold()));
         }
         FsMode::Largest => {
-            crumb.push(Span::styled("largest below ", Style::default().fg(Color::Yellow).bold()));
-            crumb.push(Span::styled(fs.largest_path.clone(), Style::default().fg(ACCENT).bold()));
+            crumb.push(Span::styled("largest below ", Style::default().fg(th::warn()).bold()));
+            crumb.push(Span::styled(fs.largest_path.clone(), Style::default().fg(th::accent()).bold()));
         }
     }
     if fs.mode == FsMode::Tree {
@@ -1030,7 +1032,7 @@ fn draw_fs(f: &mut Frame, app: &mut App, area: Rect) {
             }
             None => format!("  ⏪ as of {} · no directory sizes recorded then, showing the latest scan", fmt_clock(ts)),
         };
-        crumb.push(Span::styled(text, Style::default().fg(Color::Magenta).bold()));
+        crumb.push(Span::styled(text, Style::default().fg(th::mark()).bold()));
     }
     crumb.push(Span::raw("  "));
     if fs.past_view().is_none() || fs.mode != FsMode::Tree {
@@ -1038,7 +1040,7 @@ fn draw_fs(f: &mut Frame, app: &mut App, area: Rect) {
         crumb.extend(scan_status(app));
     }
     if !fs.filter.is_empty() {
-        crumb.push(Span::styled(format!("  /{}", fs.filter), Style::default().fg(Color::Yellow)));
+        crumb.push(Span::styled(format!("  /{}", fs.filter), Style::default().fg(th::key())));
     }
     f.render_widget(Paragraph::new(Line::from(crumb)), crumb_area);
 
@@ -1071,10 +1073,10 @@ fn fs_detail(app: &App) -> Line<'static> {
     if let Some(cg) = fs.selected_child_growth()
         && let Some((pid, name, bps)) = &cg.top_writer
     {
-        v.push(Span::styled(format!(" ✎ {name} ({pid}) {}/s", fmt_bytes(*bps)), Style::default().fg(Color::Yellow)));
+        v.push(Span::styled(format!(" ✎ {name} ({pid}) {}/s", fmt_bytes(*bps)), Style::default().fg(th::warn())));
     }
     match crate::blame::explain_path(&e.path) {
-        Some(t) => v.push(Span::styled(format!(" 💡 {t}"), Style::default().fg(Color::Green))),
+        Some(t) => v.push(Span::styled(format!(" 💡 {t}"), Style::default().fg(th::good()))),
         None => {
             let mut info = format!(" {}", e.path);
             if e.apparent > 0 && e.apparent != e.size {
@@ -1095,14 +1097,14 @@ fn fs_detail(app: &App) -> Line<'static> {
 fn fs_name_cell(e: &crate::fs::DirEntry) -> Cell<'static> {
     let mut spans = Vec::with_capacity(3);
     if e.mount_point {
-        spans.push(Span::styled("⛁ ", Style::default().fg(Color::LightBlue)));
+        spans.push(Span::styled("⛁ ", Style::default().fg(th::info())));
     } else if e.denied > 0 && e.size == 0 {
-        spans.push(Span::styled("🔒", Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled("🔒", Style::default().fg(th::warn())));
     }
     let name = if e.is_dir { format!("{}/", e.name) } else { e.name.clone() };
     spans.push(Span::styled(name, if e.is_dir { Style::default().bold() } else { Style::default() }));
     if e.denied > 0 && e.size > 0 {
-        spans.push(Span::styled(" 🔒", Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(" 🔒", Style::default().fg(th::warn())));
     }
     if e.partial {
         spans.push(Span::styled(" …", dim()));
@@ -1118,7 +1120,7 @@ fn draw_fs_tree(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
     let sort = fs.sort;
     let head = |t: String, key: Option<crate::tui::app::FsSort>, right: bool| {
         let sorted = key == Some(sort);
-        let st = if sorted { Style::default().fg(ACCENT).bold() } else { Style::default().bold() };
+        let st = if sorted { Style::default().fg(th::accent()).bold() } else { Style::default().bold() };
         let l = Line::styled(if sorted { format!("{t}▼") } else { t }, st);
         Cell::from(if right { l.alignment(Alignment::Right) } else { l })
     };
@@ -1177,7 +1179,7 @@ fn draw_fs_tree(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
         let g = fs.child_growth.get(ci).cloned().unwrap_or_default();
         let ratio = e.size as f64 / parent as f64;
         let size_cell = if e.mount_point && e.size == 0 {
-            num("mount".into(), Style::default().fg(Color::LightBlue))
+            num("mount".into(), Style::default().fg(th::info()))
         } else if e.denied > 0 && e.size == 0 {
             num("?".into(), dim())
         } else {
@@ -1187,7 +1189,7 @@ fn draw_fs_tree(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
         if mid {
             let bw = if wide { 10 } else { 5 };
             cells.push(Cell::from(Line::from(vec![
-                Span::styled(bar(ratio, bw), Style::default().fg(ACCENT)),
+                Span::styled(bar(ratio, bw), Style::default().fg(th::accent())),
                 Span::styled(format!("{:>4.0}%", ratio * 100.0), dim()),
             ])));
         }
@@ -1203,7 +1205,7 @@ fn draw_fs_tree(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
         cells.push(fs_name_cell(e));
         let mut row = Row::new(cells);
         if i == fs.sel {
-            row = row.style(Style::default().bg(SEL_BG));
+            row = row.style(Style::default().bg(th::selection()));
         }
         row
     });
@@ -1287,7 +1289,7 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
                         vec![Span::styled(grower_label(x), Style::default().bold())]
                     };
                     if let Some(w) = x.writers.iter().max_by_key(|w| w.2) {
-                        spans.push(Span::styled(format!("  ← {} ({})", w.1, w.0), Style::default().fg(Color::Yellow)));
+                        spans.push(Span::styled(format!("  ← {} ({})", w.1, w.0), Style::default().fg(th::warn())));
                         if x.writers.len() > 1 {
                             spans.push(Span::styled(format!(" +{}", x.writers.len() - 1), dim()));
                         }
@@ -1314,15 +1316,15 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
                         format!("{} deleted files, biggest {}", d.files, d.biggest)
                     };
                     let line = Line::from(vec![
-                        Span::styled(format!("{} ({}) holds ", d.name, d.pid), Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("{} ({}) holds ", d.name, d.pid), Style::default().fg(th::warn())),
                         Span::raw(files),
                         Span::styled(" · restart it to free the space · ⏎ why", dim()),
                     ]);
                     (
                         "deleted",
-                        Style::default().fg(Color::Magenta),
+                        Style::default().fg(th::mark()),
                         fmt_bytes(d.bytes),
-                        Style::default().fg(Color::Magenta),
+                        Style::default().fg(th::mark()),
                         String::new(),
                         0,
                         "open-files".into(),
@@ -1338,7 +1340,7 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
                     ]);
                     (
                         "writer",
-                        Style::default().fg(ACCENT),
+                        Style::default().fg(th::accent()),
                         fmt_bytes(*bytes),
                         Style::default(),
                         String::new(),
@@ -1359,7 +1361,7 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
         cells.push(Cell::from(what));
         let mut row = Row::new(cells);
         if i == fs.sel {
-            row = row.style(Style::default().bg(SEL_BG));
+            row = row.style(Style::default().bg(th::selection()));
         }
         row
     });
@@ -1384,7 +1386,7 @@ fn draw_fs_growth(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
         let r = Rect { y: area.y + 2, height: 1, ..area };
         f.render_widget(
             Paragraph::new(format!("✓ nothing grew noticeably in the last {win}"))
-                .style(Style::default().fg(Color::Green)),
+                .style(Style::default().fg(th::good())),
             r,
         );
     }
@@ -1419,7 +1421,7 @@ fn draw_fs_largest(f: &mut Frame, app: &App, area: Rect, body_h: usize) {
             )),
         ]);
         if i == fs.sel {
-            row = row.style(Style::default().bg(SEL_BG));
+            row = row.style(Style::default().bg(th::selection()));
         }
         row
     });
@@ -1456,10 +1458,10 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
         rows.push(Row::new(vec![
             Cell::from(Span::styled(
                 format!("● {}", if sys.hostname.is_empty() { "local" } else { &sys.hostname }),
-                Style::default().fg(Color::Green).bold(),
+                Style::default().fg(th::good()).bold(),
             )),
             Cell::from("local"),
-            Cell::from(Span::styled("live", Style::default().fg(Color::Green))),
+            Cell::from(Span::styled("live", Style::default().fg(th::good()))),
             num(format!("{:.0}", sys.cpu), Style::default().fg(pct_color(sys.cpu))),
             Cell::from(format!("{}/{}", fmt_bytes(sys.mem_used), fmt_bytes(sys.mem_total))),
             Cell::from(Span::styled(format!("{} procs · {} ports", s.procs.len(), s.ports.len()), dim())),
@@ -1493,7 +1495,7 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
             Cell::from(Span::styled(c.runtime.as_str(), dim())),
             Cell::from(Span::styled(
                 clip(&c.status, 14),
-                Style::default().fg(if running { Color::Green } else { Color::Gray }),
+                Style::default().fg(if running { th::good() } else { th::muted() }),
             )),
             num(format!("{:.1}", c.cpu), cpu_style(c.cpu)),
             Cell::from(Span::styled(fmt_bytes(c.mem), mem_style(c.mem))),
@@ -1504,7 +1506,7 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
     let rows = rows
         .into_iter()
         .enumerate()
-        .map(|(i, r)| if i == app.fleet_sel { r.style(Style::default().bg(SEL_BG)) } else { r });
+        .map(|(i, r)| if i == app.fleet_sel { r.style(Style::default().bg(th::selection())) } else { r });
     let title = Line::from(vec![
         Span::styled(" Fleet ", Style::default().bold()),
         Span::styled(format!("1 local · {nc} containers "), dim()),
@@ -1542,11 +1544,11 @@ fn draw_fleet(f: &mut Frame, app: &App, area: Rect) {
                 "• Containers (docker / podman / orbstack / nerdctl) appear here automatically while they run.",
             ));
             t.lines.push(Line::raw(format!("• Remote hosts: add them to {}", app.config_path)));
-            t.lines.push(Line::styled("      [[hosts]]", Style::default().fg(Color::Green)));
-            t.lines.push(Line::styled("      name = \"devbox\"", Style::default().fg(Color::Green)));
+            t.lines.push(Line::styled("      [[hosts]]", Style::default().fg(th::good())));
+            t.lines.push(Line::styled("      name = \"devbox\"", Style::default().fg(th::good())));
             t.lines.push(Line::styled(
                 "      ssh  = \"me@devbox\"   # needs `fat` installed there",
-                Style::default().fg(Color::Green),
+                Style::default().fg(th::good()),
             ));
             t.lines.push(Line::raw("  or list many hosts in a file: [fleet] hosts_file = \"~/.config/fat/hosts\""));
         }
@@ -1576,9 +1578,9 @@ fn draw_chart(f: &mut Frame, app: &App, area: Rect) {
     let source = if app.timeline_from_history { "recorder" } else { "memory" };
     let title = Line::from(vec![
         Span::styled(" Timeline ", Style::default().bold()),
-        Span::styled(format!("last {} ", ZOOM_NAMES[app.zoom]), Style::default().fg(Color::Yellow)),
-        Span::styled("· cpu ", Style::default().fg(ACCENT)),
-        Span::styled("· power ", Style::default().fg(Color::Yellow)),
+        Span::styled(format!("last {} ", ZOOM_NAMES[app.zoom]), Style::default().fg(th::warn())),
+        Span::styled("· cpu ", Style::default().fg(th::accent())),
+        Span::styled("· power ", Style::default().fg(th::warn())),
         Span::styled(format!("· {} spikes · source {source} ", app.spikes.len()), dim()),
     ]);
     let block = Block::default().borders(Borders::TOP).border_style(dim()).title(title);
@@ -1605,13 +1607,13 @@ fn draw_chart(f: &mut Frame, app: &App, area: Rect) {
             .name("cpu%")
             .marker(Marker::Braille)
             .graph_type(GraphType::Line)
-            .style(Style::default().fg(ACCENT))
+            .style(Style::default().fg(th::accent()))
             .data(&cpu),
         Dataset::default()
             .name(format!("power (max {})", fmt_power(max_pw)))
             .marker(Marker::Braille)
             .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Yellow))
+            .style(Style::default().fg(th::warn()))
             .data(&pw),
     ];
     if !spikes.is_empty() {
@@ -1620,7 +1622,7 @@ fn draw_chart(f: &mut Frame, app: &App, area: Rect) {
                 .name("spike")
                 .marker(Marker::Dot)
                 .graph_type(GraphType::Scatter)
-                .style(Style::default().fg(Color::Red))
+                .style(Style::default().fg(th::crit()))
                 .data(&spikes),
         );
     }
@@ -1629,7 +1631,7 @@ fn draw_chart(f: &mut Frame, app: &App, area: Rect) {
             Dataset::default()
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(Style::default().fg(Color::Magenta))
+                .style(Style::default().fg(th::mark()))
                 .data(&cursor),
         );
     }
@@ -1654,14 +1656,11 @@ fn draw_chart(f: &mut Frame, app: &App, area: Rect) {
 fn draw_cursor_info(f: &mut Frame, app: &App, area: Rect) {
     let line = match app.cursor {
         None => Line::from(vec![
-            Span::styled("● live ", Style::default().fg(Color::Green).bold()),
+            Span::styled("● live ", Style::default().fg(th::good()).bold()),
             Span::styled("← / [ rewind · s jump to spike · +/- zoom · procs below follow the cursor", dim()),
         ]),
         Some(ts) => {
-            let mut v = vec![Span::styled(
-                format!(" ⏪ {} ", fmt_clock(ts)),
-                Style::default().fg(Color::White).bg(Color::Magenta).bold(),
-            )];
+            let mut v = vec![Span::styled(format!(" ⏪ {} ", fmt_clock(ts)), th::badge(th::mark()).bold())];
             v.push(Span::styled(format!(" -{} ", fmt_dur(((app.now - ts).max(0) / 1000) as u64)), dim()));
             if let Some(p) = app.timeline.iter().min_by_key(|p| (p.ts - ts).abs()) {
                 v.push(Span::styled(format!(" cpu {:.0}%", p.cpu), Style::default().fg(pct_color(p.cpu))));
@@ -1689,7 +1688,7 @@ fn draw_doctor(f: &mut Frame, app: &App, area: Rect) {
     ]));
     if app.findings.is_empty() {
         let p = if app.findings_loaded {
-            Paragraph::new(Line::styled("✓ All good. Nothing unusual.", Style::default().fg(Color::Green).bold()))
+            Paragraph::new(Line::styled("✓ All good. Nothing unusual.", Style::default().fg(th::good()).bold()))
         } else {
             Paragraph::new(Line::styled("diagnosing…", dim()))
         };
@@ -1720,13 +1719,14 @@ fn draw_doctor(f: &mut Frame, app: &App, area: Rect) {
             if let Some(a) = &x.action {
                 lines.push(Line::from(vec![
                     Span::raw("       → "),
-                    Span::styled(a.as_str(), Style::default().fg(Color::Green)),
+                    Span::styled(a.as_str(), Style::default().fg(th::good())),
                 ]));
             }
             ListItem::new(lines)
         })
         .collect();
-    let list = List::new(items).block(block).highlight_style(Style::default().bg(SEL_BG)).highlight_symbol("▌");
+    let list =
+        List::new(items).block(block).highlight_style(Style::default().bg(th::selection())).highlight_symbol("▌");
     let mut state = ListState::default().with_selected(Some(app.doctor_sel));
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -1779,15 +1779,15 @@ fn draw_log(f: &mut Frame, app: &App, area: Rect) {
     let table_rows = rows.iter().enumerate().skip(offset).take(body_h).map(|(i, &ri)| {
         let r = &app.log[ri];
         let (mark, ms) =
-            if r.ok { ("✓", Style::default().fg(Color::Green)) } else { ("✗", Style::default().fg(Color::Red)) };
+            if r.ok { ("✓", Style::default().fg(th::good())) } else { ("✗", Style::default().fg(th::crit())) };
         let mut result = vec![Span::styled(mark, ms), Span::raw(" "), Span::raw(r.message.as_str())];
         if r.undone {
             result.push(Span::styled("  (undone)", dim()));
         } else if r.undoable && r.ok {
-            result.push(Span::styled("  undoable", Style::default().fg(ACCENT)));
+            result.push(Span::styled("  undoable", Style::default().fg(th::accent())));
         }
         let who = if r.origin.is_empty() { "-" } else { r.origin.as_str() };
-        let who_style = if r.origin.starts_with("mcp") { Style::default().fg(Color::Magenta) } else { dim() };
+        let who_style = if r.origin.starts_with("mcp") { Style::default().fg(th::mark()) } else { dim() };
         let mut row = Row::new(vec![
             Cell::from(Span::styled(fmt_datetime(r.ts), dim())),
             num(r.id.to_string(), dim()),
@@ -1801,7 +1801,7 @@ fn draw_log(f: &mut Frame, app: &App, area: Rect) {
             row = row.style(Style::default().add_modifier(Modifier::DIM));
         }
         if i == app.log_sel {
-            row = row.style(Style::default().bg(SEL_BG));
+            row = row.style(Style::default().bg(th::selection()));
         }
         row
     });
@@ -1879,7 +1879,7 @@ fn draw_log(f: &mut Frame, app: &App, area: Rect) {
 fn draw_why(f: &mut Frame, app: &App, area: Rect) {
     let Some(e) = &app.why else { return };
     let mut t = Text::default();
-    t.lines.push(Line::styled(e.headline.as_str(), Style::default().fg(Color::Yellow).bold()));
+    t.lines.push(Line::styled(e.headline.as_str(), Style::default().fg(th::warn()).bold()));
     if let Some(p) = app.view().and_then(|s| s.proc(e.pid)) {
         let cs: &[Container] = match app.view() {
             Some(s) if !s.containers.is_empty() => &s.containers,
@@ -1889,10 +1889,10 @@ fn draw_why(f: &mut Frame, app: &App, area: Rect) {
             let mut v = vec![Span::styled("container ", dim())];
             match crate::fleet::find_container(cs, id) {
                 Some(c) => {
-                    v.push(Span::styled(c.name.clone(), Style::default().fg(Color::LightBlue).bold()));
+                    v.push(Span::styled(c.name.clone(), Style::default().fg(th::info()).bold()));
                     v.push(Span::styled(format!(" ({id}) {} · {}", c.image, c.runtime), dim()));
                 }
-                None => v.push(Span::styled(id.clone(), Style::default().fg(Color::LightBlue))),
+                None => v.push(Span::styled(id.clone(), Style::default().fg(th::info()))),
             }
             t.lines.push(Line::from(v));
         }
@@ -1902,7 +1902,7 @@ fn draw_why(f: &mut Frame, app: &App, area: Rect) {
     }
     if !e.chain.is_empty() {
         t.lines.push(Line::raw(""));
-        t.lines.push(Line::styled("Blame chain", Style::default().fg(ACCENT).bold()));
+        t.lines.push(Line::styled("Blame chain", Style::default().fg(th::accent()).bold()));
         for (i, step) in e.chain.iter().enumerate() {
             let lead = if i == 0 { "● ".to_string() } else { format!("{}↳ ", indent(i.min(10) as u16 - 1)) };
             t.lines.push(Line::from(vec![Span::styled(lead, dim()), Span::raw(step.as_str())]));
@@ -1910,22 +1910,21 @@ fn draw_why(f: &mut Frame, app: &App, area: Rect) {
     }
     if !e.evidence.is_empty() {
         t.lines.push(Line::raw(""));
-        t.lines.push(Line::styled("Evidence", Style::default().fg(ACCENT).bold()));
+        t.lines.push(Line::styled("Evidence", Style::default().fg(th::accent()).bold()));
         for ev in &e.evidence {
             t.lines.push(Line::from(vec![Span::styled("• ", dim()), Span::raw(ev.as_str())]));
         }
     }
     if !e.suggestions.is_empty() {
         t.lines.push(Line::raw(""));
-        t.lines.push(Line::styled("What you can do", Style::default().fg(ACCENT).bold()));
+        t.lines.push(Line::styled("What you can do", Style::default().fg(th::accent()).bold()));
         for s in &e.suggestions {
-            t.lines
-                .push(Line::from(vec![Span::styled("→ ", Style::default().fg(Color::Green)), Span::raw(s.as_str())]));
+            t.lines.push(Line::from(vec![Span::styled("→ ", Style::default().fg(th::good())), Span::raw(s.as_str())]));
         }
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(th::accent()))
         .title(Line::styled(format!(" Why · pid {} ", e.pid), Style::default().bold()))
         .title_bottom(Line::styled(" Esc close · PgUp/PgDn scroll ", dim()));
     f.render_widget(Clear, area);
@@ -1971,7 +1970,7 @@ fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
     if !narrow {
         let mut items: Vec<ListItem> = Vec::new();
         if let Some(e) = &a.error {
-            items.push(ListItem::new(Line::styled(e.clone(), Style::default().fg(Color::Red))));
+            items.push(ListItem::new(Line::styled(e.clone(), Style::default().fg(th::crit()))));
         }
         if a.threads.is_empty() && a.error.is_none() {
             items.push(ListItem::new(Line::styled("no threads yet: ? or Enter to ask", dim())));
@@ -1980,13 +1979,13 @@ fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
         for (i, t) in a.threads.iter().enumerate() {
             let selected = i == a.sel;
             let open = a.open == Some(t.id);
-            let title_style = if open { Style::default().fg(ACCENT).bold() } else { Style::default() };
+            let title_style = if open { Style::default().fg(th::accent()).bold() } else { Style::default() };
             let age = fmt_ago((app.now - t.updated) / 1000);
             let turns = if t.turns == 1 { "1 turn".to_string() } else { format!("{} turns", t.turns) };
             let mut lines = vec![Line::styled(clip(&t.title, w).to_string(), title_style)];
             lines.push(Line::styled(format!("{age} · {turns}"), dim()));
             let item = ListItem::new(lines);
-            items.push(if selected { item.style(Style::default().bg(Color::DarkGray)) } else { item });
+            items.push(if selected { item.style(Style::default().bg(th::dim_color())) } else { item });
         }
         let block = Block::default()
             .borders(Borders::ALL)
@@ -2003,12 +2002,12 @@ fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or_else(|| " New thread ".to_string());
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if a.typing { Color::DarkGray } else { ACCENT }))
+        .border_style(Style::default().fg(if a.typing { th::dim_color() } else { th::accent() }))
         .title(Line::styled(title, Style::default().bold()))
         .title(
             Line::styled(
                 format!(" {} ", clip(&app.ask_dest, (body.width as usize).saturating_sub(30))),
-                if app.ask_ready { dim() } else { Style::default().fg(Color::Yellow) },
+                if app.ask_ready { dim() } else { Style::default().fg(th::warn()) },
             )
             .right_aligned(),
         );
@@ -2018,7 +2017,7 @@ fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
         let when = chrono::DateTime::from_timestamp_millis(ts)
             .map(|d| d.with_timezone(&chrono::Local).format("%b %d %H:%M").to_string())
             .unwrap_or_default();
-        Line::from(vec![Span::styled("▍You ", Style::default().fg(ACCENT).bold()), Span::styled(when, dim())])
+        Line::from(vec![Span::styled("▍You ", Style::default().fg(th::accent()).bold()), Span::styled(when, dim())])
     };
     for t in &a.turns {
         lines.push(you(t.ts));
@@ -2033,7 +2032,7 @@ fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
         lines.extend(super::markdown::render(&p.question, inner_w));
         lines.push(Line::raw(""));
         let spin = SPINNER[((app.now - p.since).max(0) / 100) as usize % SPINNER.len()];
-        lines.push(Line::styled(format!("{spin} thinking…  (Esc to stop waiting)"), Style::default().fg(ACCENT)));
+        lines.push(Line::styled(format!("{spin} thinking…  (Esc to stop waiting)"), Style::default().fg(th::accent())));
         if !app.ask_dest.is_empty() {
             lines.push(Line::styled(format!("→ {}", app.ask_dest), dim()));
         }
@@ -2060,7 +2059,7 @@ fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
     let top = max_top.saturating_sub(a.scroll_up.min(max_top));
     f.render_widget(Paragraph::new(lines).scroll((top, 0)).block(block), body);
 
-    let prompt_style = Style::default().fg(ACCENT).bold();
+    let prompt_style = Style::default().fg(th::accent()).bold();
     let line = if a.typing {
         let w = input.width.saturating_sub(6) as usize;
         let shown: String = {
@@ -2079,7 +2078,7 @@ fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(line).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(if a.typing { ACCENT } else { Color::DarkGray }))
+                .border_style(Style::default().fg(if a.typing { th::accent() } else { th::dim_color() }))
                 .title_bottom(Line::styled(hint, dim())),
         ),
         input,
@@ -2099,8 +2098,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|g| {
             let count = if *g == "Hosts" { ui.hosts.len() } else { ui.fields.iter().filter(|f| f.group == *g).count() };
-            let st =
-                if *g == cur_group { Style::default().fg(Color::Black).bg(ACCENT).bold() } else { Style::default() };
+            let st = if *g == cur_group { th::badge(th::accent()).bold() } else { Style::default() };
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {g:<10}"), st),
                 Span::styled(format!(" {count}"), dim()),
@@ -2116,7 +2114,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(th::accent()))
         .title(Line::styled(format!(" {cur_group} "), Style::default().bold()))
         .title(
             Line::styled(format!(" {} ", clip(&ui.path, (main.width as usize).saturating_sub(20))), dim())
@@ -2148,7 +2146,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     let mut sel_line = 0usize;
     if let Some(form) = &ui.host_form {
         let title = if form.index.is_some() { "Edit host" } else { "Add a host" };
-        lines.push(Line::styled(title, Style::default().fg(ACCENT).bold()));
+        lines.push(Line::styled(title, Style::default().fg(th::accent()).bold()));
         lines.push(Line::raw(""));
         for (i, label) in crate::tui::app::HostForm::LABELS.iter().enumerate() {
             let selected = i == form.sel;
@@ -2161,7 +2159,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(if v.is_empty() { "—".to_string() } else { v }, Style::default().bold()),
             ]);
             if selected {
-                line = line.style(Style::default().bg(SEL_BG));
+                line = line.style(Style::default().bg(th::selection()));
                 sel_line = lines.len();
             }
             lines.push(line);
@@ -2177,11 +2175,11 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
             let cfg = ask_cfg_of(ui);
             let ready = cfg.enabled && crate::llm::resolve(&cfg).is_ok_and(|e| e.usable());
             let (mark, st) = if ready {
-                ("● Ready", Style::default().fg(Color::Green).bold())
+                ("● Ready", Style::default().fg(th::good()).bold())
             } else if !cfg.enabled {
                 ("○ Off", dim())
             } else {
-                ("○ Not ready", Style::default().fg(Color::Yellow).bold())
+                ("○ Not ready", Style::default().fg(th::warn()).bold())
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {mark}  "), st),
@@ -2250,13 +2248,13 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
                         Span::styled(format!(" {}", parts.join(" · ")), dim()),
                     ])
                 }
-                SRow::AddHost => Line::styled("  + add a host", Style::default().fg(ACCENT)),
+                SRow::AddHost => Line::styled("  + add a host", Style::default().fg(th::accent())),
                 SRow::AskOption(i) => {
                     let o = &ui.ask_options[i];
                     let on = current_opt == Some(i);
-                    let st = if o.ready { Style::default().fg(Color::Green) } else { dim() };
+                    let st = if o.ready { Style::default().fg(th::good()) } else { dim() };
                     Line::from(vec![
-                        Span::styled(if on { "  ● " } else { "  ○ " }, Style::default().fg(ACCENT).bold()),
+                        Span::styled(if on { "  ● " } else { "  ○ " }, Style::default().fg(th::accent()).bold()),
                         Span::styled(
                             format!("{:<width$}", clip(&o.label, label_w - 4), width = label_w - 4),
                             if on { Style::default().bold() } else { Style::default() },
@@ -2296,9 +2294,9 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
                     let val_style = if !fd.editable() {
                         dim()
                     } else if ui.editing.is_some() && selected {
-                        Style::default().fg(Color::Yellow)
+                        Style::default().fg(th::warn())
                     } else if fd.sensitive() && !fd.value.is_empty() {
-                        Style::default().fg(Color::Magenta).bold()
+                        Style::default().fg(th::mark()).bold()
                     } else {
                         Style::default().bold()
                     };
@@ -2310,7 +2308,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
                 }
             };
             if selected {
-                line = line.style(Style::default().bg(SEL_BG));
+                line = line.style(Style::default().bg(th::selection()));
             }
             lines.push(line);
         }
@@ -2354,9 +2352,9 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(b) = &ui.busy {
         let spin = SPINNER[(app.now / 100) as usize % SPINNER.len()];
-        foot_lines.push(Line::styled(format!("{spin} {b}"), Style::default().fg(ACCENT)));
+        foot_lines.push(Line::styled(format!("{spin} {b}"), Style::default().fg(th::accent())));
     } else if let Some((text, err)) = &ui.note {
-        let st = if *err { Style::default().fg(Color::Red) } else { Style::default().fg(Color::Green) };
+        let st = if *err { Style::default().fg(th::crit()) } else { Style::default().fg(th::good()) };
         foot_lines.push(Line::styled(text.clone(), st));
     }
     f.render_widget(Paragraph::new(foot_lines).wrap(Wrap { trim: true }), foot);
@@ -2372,10 +2370,10 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(ACCENT))
+                        .border_style(Style::default().fg(th::accent()))
                         .title(format!(" {title} ")),
                 )
-                .highlight_style(Style::default().bg(SEL_BG).bold()),
+                .highlight_style(Style::default().bg(th::selection()).bold()),
             pr,
             &mut state,
         );
@@ -2431,9 +2429,9 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
                 Line::styled(prompt.as_str(), Style::default().bold()),
                 Line::raw(""),
                 Line::from(vec![
-                    Span::styled(" y ", Style::default().fg(Color::Black).bg(Color::Red).bold()),
+                    Span::styled(" y ", th::badge(th::crit()).bold()),
                     Span::raw(" yes    "),
-                    Span::styled(" n ", Style::default().fg(Color::Black).bg(Color::Gray).bold()),
+                    Span::styled(" n ", th::badge(th::muted()).bold()),
                     Span::raw(" no / Esc"),
                 ]),
             ]);
@@ -2442,7 +2440,7 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
                 Paragraph::new(t).wrap(Wrap { trim: true }).block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Red))
+                        .border_style(Style::default().fg(th::crit()))
                         .title(" Confirm "),
                 ),
                 r,
@@ -2457,15 +2455,18 @@ fn draw_modal(f: &mut Frame, app: &App, area: Rect) {
                 ]),
                 Line::from(vec![
                     Span::raw("> "),
-                    Span::styled(input.as_str(), Style::default().fg(Color::Yellow).bold()),
-                    Span::styled("▏", Style::default().fg(ACCENT)),
+                    Span::styled(input.as_str(), Style::default().fg(th::warn()).bold()),
+                    Span::styled("▏", Style::default().fg(th::accent())),
                 ]),
                 Line::styled("-20 highest … 20 lowest priority · Enter apply · Esc cancel · undo with u", dim()),
             ]);
             f.render_widget(Clear, r);
             f.render_widget(
                 Paragraph::new(t).wrap(Wrap { trim: true }).block(
-                    Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)).title(" Renice "),
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(th::accent()))
+                        .title(" Renice "),
                 ),
                 r,
             );
@@ -2541,7 +2542,7 @@ fn help_lines(inner: usize) -> Vec<Line<'static>> {
         }
         for (i, row) in rows.into_iter().enumerate() {
             let key = if i == 0 { format!("{k:>18}  ") } else { " ".repeat(HELP_KEY_W) };
-            out.push(Line::from(vec![Span::styled(key, Style::default().fg(Color::Yellow).bold()), Span::raw(row)]));
+            out.push(Line::from(vec![Span::styled(key, Style::default().fg(th::key()).bold()), Span::raw(row)]));
         }
     }
     out
@@ -2556,7 +2557,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT))
+                .border_style(Style::default().fg(th::accent()))
                 .title(Line::styled(" fat — keys ", Style::default().bold()))
                 .title_bottom(Line::styled(" any key closes ", dim())),
         ),
@@ -2567,17 +2568,17 @@ fn draw_help(f: &mut Frame, area: Rect) {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if app.modal == Modal::Filter {
         let line = Line::from(vec![
-            Span::styled(" / ", Style::default().fg(Color::Black).bg(Color::Yellow).bold()),
+            Span::styled(" / ", th::badge(th::key()).bold()),
             Span::raw(" "),
             Span::raw(app.active_filter()),
-            Span::styled("▏", Style::default().fg(ACCENT)),
+            Span::styled("▏", Style::default().fg(th::accent())),
             Span::styled("   Enter keep · Esc clear", dim()),
         ]);
         f.render_widget(Paragraph::new(line), area);
         return;
     }
     if let Some(s) = &app.status {
-        let style = if s.error { Style::default().fg(Color::Red).bold() } else { Style::default().fg(Color::Green) };
+        let style = if s.error { Style::default().fg(th::crit()).bold() } else { Style::default().fg(th::good()) };
         f.render_widget(Paragraph::new(Line::styled(format!(" {}", s.text), style)), area);
         return;
     }
@@ -2700,10 +2701,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         if app.panel.is_some() { &[("↑↓", "scroll"), ("w", "why pid"), ("Esc", "close")] } else { hints };
     let mut spans = Vec::with_capacity(hints.len() * 3);
     if app.rewound() && app.tab != Tab::Timeline {
-        spans.push(Span::styled(" ⏪ L live ", Style::default().fg(Color::White).bg(Color::Magenta).bold()));
+        spans.push(Span::styled(" ⏪ L live ", th::badge(th::mark()).bold()));
     }
     for (k, d) in hints {
-        spans.push(Span::styled(format!(" {k} "), Style::default().fg(Color::Black).bg(Color::Gray)));
+        spans.push(Span::styled(format!(" {k} "), th::badge(th::muted())));
         spans.push(Span::styled(format!(" {d} "), dim()));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
