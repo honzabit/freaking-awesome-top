@@ -2088,57 +2088,45 @@ fn draw_ask_tab(f: &mut Frame, app: &App, area: Rect) {
 
 /// The Settings screen: groups on the left, the selected group's settings on the right.
 fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
-    use crate::settings::{GROUPS, Kind, Source};
+    use crate::settings::{GROUPS, Source};
     use crate::tui::app::SRow;
     let ui = &app.settings;
     let rows = ui.rows();
-    let cur_group = ui.selected().map(|r| ui.group_of(r)).unwrap_or(GROUPS[0]);
+    let cur_group = ui.group();
+    let focus_fields = ui.in_fields || ui.capturing();
+    let pane = |focused: bool| Style::default().fg(if focused { th::accent() } else { th::dim_color() });
     let [side, main] = Layout::horizontal([Constraint::Length(18), Constraint::Min(30)]).areas(area);
     // Sidebar.
     let items: Vec<ListItem> = GROUPS
         .iter()
         .map(|g| {
             let count = if *g == "Hosts" { ui.hosts.len() } else { ui.fields.iter().filter(|f| f.group == *g).count() };
-            let st = if *g == cur_group { th::badge(th::accent()).bold() } else { Style::default() };
+            let (mark, st) = match (*g == cur_group, focus_fields) {
+                (true, false) => (" ", th::badge(th::accent()).bold()),
+                (true, true) => ("▸", Style::default().fg(th::accent()).bold()),
+                _ => (" ", Style::default()),
+            };
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {g:<10}"), st),
+                Span::styled(mark, Style::default().fg(th::accent()).bold()),
+                Span::styled(format!("{g:<10}"), st),
                 Span::styled(format!(" {count}"), dim()),
             ]))
         })
         .collect();
     f.render_widget(
-        List::new(items).block(
-            Block::default().borders(Borders::ALL).title(" Settings ").title_bottom(Line::styled(" ←→ ", dim())),
-        ),
+        List::new(items)
+            .block(Block::default().borders(Borders::ALL).border_style(pane(!focus_fields)).title(" Settings ")),
         side,
     );
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(th::accent()))
+        .border_style(pane(focus_fields))
         .title(Line::styled(format!(" {cur_group} "), Style::default().bold()))
         .title(
             Line::styled(format!(" {} ", clip(&ui.path, (main.width as usize).saturating_sub(20))), dim())
                 .right_aligned(),
-        )
-        .title_bottom(Line::styled(
-            if ui.editing.is_some() {
-                " ⏎ save · Esc cancel · Ctrl-U clear "
-            } else if ui.picker.is_some() {
-                " ↑↓ choose · ⏎ use this model · Esc back "
-            } else if ui.multi.is_some() {
-                " ↑↓ move · space toggle · ⏎ save · Esc back "
-            } else if ui.host_form.as_ref().is_some_and(|h| h.editing) {
-                " type · Tab next field · ⏎/Esc done "
-            } else if ui.host_form.is_some() {
-                " ↑↓ field · ⏎ edit · s save · t test ssh · Esc back "
-            } else if cur_group == "Hosts" {
-                " ⏎ edit / add · d remove · t test ssh · ←→ groups · Esc back "
-            } else {
-                " ↑↓ move · ⏎ change · r reset · t test model · m pick model · ←→ groups · Esc back "
-            },
-            dim(),
-        ));
+        );
     let inner = block.inner(main);
     f.render_widget(block, main);
     let [list, foot] = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(inner);
@@ -2166,7 +2154,25 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
             lines.push(line);
         }
         lines.push(Line::raw(""));
-        lines.push(Line::styled(format!("  {}", crate::tui::app::HostForm::HELP[form.sel]), dim()));
+        let button = |i: usize, label: &str| {
+            let st = if i == form.sel { th::badge(th::accent()).bold() } else { Style::default().fg(th::accent()) };
+            Span::styled(format!(" {label} "), st)
+        };
+        if form.sel >= crate::tui::app::HostForm::SAVE {
+            sel_line = lines.len();
+        }
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            button(crate::tui::app::HostForm::SAVE, "Save"),
+            Span::raw("  "),
+            button(crate::tui::app::HostForm::TEST, "Test ssh"),
+        ]));
+        lines.push(Line::raw(""));
+        let help = crate::tui::app::HostForm::HELP.get(form.sel).copied().unwrap_or(match form.sel {
+            crate::tui::app::HostForm::SAVE => "write this host to the config file",
+            _ => "connect with ssh and run fat --version there",
+        });
+        lines.push(Line::styled(format!("  {help}"), dim()));
     } else {
         let label_w = 28usize;
         let src_w = 20usize;
@@ -2228,6 +2234,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
             if selected {
                 sel_line = lines.len();
             }
+            let highlight = selected && focus_fields;
             let mut line = match *r {
                 SRow::Host(i) => {
                     let h = &ui.hosts[i];
@@ -2274,18 +2281,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
                     let fd = &ui.fields[i];
                     let value = match (&ui.editing, selected) {
                         (Some(input), true) => format!("{input}▏"),
-                        _ => match (&fd.kind, fd.value.as_str()) {
-                            (Kind::Bool, "true") => "on".to_string(),
-                            (Kind::Bool, _) => "off".to_string(),
-                            (Kind::Multi(_), "") => "nothing (read-only)".to_string(),
-                            (Kind::Text | Kind::List | Kind::Map, "") => "—".to_string(),
-                            (Kind::Number(..), "0")
-                                if matches!(fd.key.as_str(), "context_bytes" | "num_ctx" | "timeout_s") =>
-                            {
-                                "auto".to_string()
-                            }
-                            (_, v) => v.to_string(),
-                        },
+                        _ => crate::tui::app::shown_value(fd),
                     };
                     let src = match &fd.source {
                         Source::Default => "default".to_string(),
@@ -2308,7 +2304,7 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
                     ])
                 }
             };
-            if selected {
+            if highlight {
                 line = line.style(Style::default().bg(th::selection()));
             }
             lines.push(line);
@@ -2379,8 +2375,14 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
             &mut state,
         );
     };
-    if let Some((models, i)) = &ui.picker {
-        popup(f, "Models", models.iter().map(|m| ListItem::new(m.clone())).collect(), *i);
+    if let Some(p) = &ui.picker {
+        let items = p
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, m)| ListItem::new(format!("{} {m}", if p.current == Some(i) { "●" } else { " " })))
+            .collect();
+        popup(f, &p.title, items, p.sel);
     }
     if let Some((items, i)) = &ui.multi {
         let rows =
@@ -2782,7 +2784,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("q", "quit"),
         ],
         Tab::Log => &[("⏎", "undo selected"), ("u", "undo last"), ("f", "kind"), ("/", "search"), ("Esc", "back")],
-        Tab::Settings => &[("⏎", "change"), ("←→", "groups"), ("r", "reset"), ("t", "test"), ("Esc", "back")],
+        Tab::Settings => app.settings.key_hint(),
     };
     let hints: &[(&str, &str)] =
         if app.panel.is_some() { &[("↑↓", "scroll"), ("w", "why pid"), ("Esc", "close")] } else { hints };
@@ -2791,6 +2793,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(" ⏪ L live ", th::badge(th::mark()).bold()));
     }
     for (k, d) in hints {
+        if k.is_empty() {
+            spans.push(Span::styled(format!(" {d} "), dim()));
+            continue;
+        }
         spans.push(Span::styled(format!(" {k} "), th::badge(th::muted())));
         spans.push(Span::styled(format!(" {d} "), dim()));
     }
@@ -3172,7 +3178,15 @@ mod tests {
                 assert!(out.contains("qwen3:32▏"), "{out}");
             }
             ui.editing = None;
-            ui.picker = Some((vec!["llama3.3:70b".into(), "qwen3:32b".into()], 1));
+            ui.picker = Some(crate::tui::app::Picker {
+                title: "Models".into(),
+                section: "ask".into(),
+                key: "model".into(),
+                items: vec!["llama3.3:70b".into(), "qwen3:32b".into()],
+                sel: 1,
+                current: Some(0),
+                preview_from: None,
+            });
             a.settings = ui.clone();
             let out = render(&mut a, w, h);
             if h >= 24 {
@@ -3199,6 +3213,7 @@ mod tests {
             let out = render(&mut a, w, h);
             if h >= 24 && w >= 80 {
                 assert!(out.contains("Edit host") && out.contains("ssh destination"), "{out}");
+                assert!(out.contains(" Save ") && out.contains(" Test ssh "), "{out}");
             }
             a.settings = Default::default();
             a.tab = Tab::Procs;

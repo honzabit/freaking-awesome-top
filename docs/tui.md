@@ -287,7 +287,8 @@ A health table of every host, in any profile. See [Fleets](fleet.md).
 `,` opens the Settings screen, where every setting can be read and edited. It sits with the Log screen at the right
 end of the tab bar; neither has a number key, and `Esc` returns to the view you came from.
 
-- **Groups** (on the left, `←` `→`): Ask, Recording, Server, Fleet, Hosts, Agents, Peers, Updates, Interface.
+- **Groups** (on the left): Ask, Recording, Server, Fleet, Hosts, Agents, Peers, Updates, Interface. `↑` `↓` pick
+  one, `→` or `⏎` go into it, and `←` or `Esc` come back. The side that has the keyboard has the colored border.
 - **Source:** every setting shows its value and where that value comes from: the default, the config file, or an
   environment variable. An environment variable wins and can't be changed there.
 
@@ -311,7 +312,8 @@ end of the tab bar; neither has a number key, and `Esc` returns to the view you 
   (`ssh_options`) and host groups (`db=db-*,pg-*; web=web-*`). These apply the next time fat (or `fat record`)
   starts, and the screen says so.
 - **Hosts:** the `[[hosts]]` list.
-  - `⏎` edits a host or adds one (name, ssh destination, fat path, groups, tags).
+  - `⏎` edits a host or adds one (name, ssh destination, fat path, groups, tags). In the form, `⏎` edits a field
+    (`Esc` undoes that field) and presses **Save** or **Test ssh**; `Esc` closes it without saving.
   - `t` runs `fat --version` on it over ssh with your own ssh config (batch mode, never prompts).
   - `d` removes it.
 - **Agents:** which side-effect tools agents may use over MCP (`[mcp] allow_actions`), as a checklist. Allowing
@@ -324,10 +326,16 @@ end of the tab bar; neither has a number key, and `Esc` returns to the view you 
 
 ### Editing
 
-| Key | Action |
-| --- | --- |
-| `⏎` | toggle, cycle or edit |
-| `r` | remove a value from the file, so the default applies |
+`⏎` always means "change this", and the line under the list says what it does for the selected setting.
 
-Changes are written to your `config.toml` at once, keeping its comments and layout, and only if the result is still
-a valid config. See [Configuration](configuration.md).
+| Setting | `⏎` |
+| --- | --- |
+| on / off | switches it (saved at once) |
+| a choice | opens the list of options, the current one marked `●`. `↑` `↓` pick, `⏎` saves, `Esc` leaves it as it was. The theme previews as you move. |
+| text, a number, a list | edits the current value. `⏎` saves if the value is valid (otherwise it says why and stays open), `Esc` cancels. |
+| a checklist | `Space` ticks, `⏎` saves, `Esc` cancels |
+
+`r` sets a setting back to its default, after asking (it names the default). It removes the key from the file.
+
+Changes are written to your `config.toml` when you save them, keeping its comments and layout, and only if the
+result is still a valid config. See [Configuration](configuration.md).

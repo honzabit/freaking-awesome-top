@@ -458,8 +458,10 @@ pub struct SettingsUi {
     pub sel: usize,
     /// Text being typed for the selected field.
     pub editing: Option<String>,
-    /// Models offered by the server, and the highlighted one.
-    pub picker: Option<(Vec<String>, usize)>,
+    /// The keyboard is in the settings list (else in the group list on the left).
+    pub in_fields: bool,
+    /// Choosing one value from a list (a choice, the server's models).
+    pub picker: Option<Picker>,
     /// A checklist being edited (agents' allowed actions): (option, on), highlighted row.
     pub multi: Option<(Vec<(String, bool)>, usize)>,
     pub host_form: Option<HostForm>,
@@ -474,6 +476,20 @@ pub struct SettingsUi {
     pub busy: Option<String>,
     pub path: String,
     pub key_status: String,
+}
+
+/// A list to choose one value from. Nothing is saved until ⏎.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Picker {
+    pub title: String,
+    pub section: String,
+    pub key: String,
+    pub items: Vec<String>,
+    pub sel: usize,
+    /// The value when the picker opened.
+    pub current: Option<usize>,
+    /// The theme in use before a live preview (put back on Esc).
+    pub preview_from: Option<crate::tui::theme::Theme>,
 }
 
 /// One row of the Settings screen.
@@ -562,6 +578,100 @@ impl SettingsUi {
         self.rows().get(self.sel).copied()
     }
 
+    /// The group of the selected row.
+    pub fn group(&self) -> &'static str {
+        self.selected().map(|r| self.group_of(r)).unwrap_or(crate::settings::GROUPS[0])
+    }
+
+    /// A name for a row that survives the rows being rebuilt (ask options arriving, a save).
+    pub fn row_id(&self, r: SRow) -> String {
+        match r {
+            SRow::Field(i) => self.fields.get(i).map_or(String::new(), |f| format!("f:{}.{}", f.section, f.key)),
+            SRow::Host(i) => format!("h:{i}"),
+            SRow::AddHost => "h:+".into(),
+            SRow::AskOption(i) => format!("o:{i}"),
+            SRow::AskAdvanced => "o:adv".into(),
+        }
+    }
+
+    pub fn selected_id(&self) -> Option<String> {
+        self.selected().map(|r| self.row_id(r))
+    }
+
+    /// Select the row named `id` again; else stay in `group`; else the first row.
+    pub fn reselect(&mut self, id: Option<&str>, group: &str) {
+        let rows = self.rows();
+        self.sel = id
+            .and_then(|id| rows.iter().position(|r| self.row_id(*r) == id))
+            .or_else(|| rows.iter().position(|r| self.group_of(*r) == group))
+            .unwrap_or(0);
+    }
+
+    /// Move within the current group (the list on the right).
+    fn move_in_group(&mut self, code: KeyCode) {
+        let rows = self.rows();
+        let g = self.group();
+        let idx: Vec<usize> = (0..rows.len()).filter(|i| self.group_of(rows[*i]) == g).collect();
+        let mut at = idx.iter().position(|i| *i == self.sel).unwrap_or(0);
+        if list_nav(&mut at, idx.len(), code)
+            && let Some(i) = idx.get(at)
+        {
+            self.sel = *i;
+        }
+    }
+
+    /// Select the first row of the next (`1`) or previous (`-1`) group.
+    fn move_group(&mut self, delta: isize) {
+        let groups = crate::settings::GROUPS;
+        let gi = groups.iter().position(|g| *g == self.group()).unwrap_or(0) as isize;
+        let next = (gi + delta).clamp(0, groups.len() as isize - 1) as usize;
+        let rows = self.rows();
+        if let Some(i) = rows.iter().position(|r| self.group_of(*r) == groups[next]) {
+            self.sel = i;
+        }
+    }
+
+    /// What the keys do right now (the footer).
+    pub fn key_hint(&self) -> &'static [(&'static str, &'static str)] {
+        use crate::settings::Kind;
+        if self.editing.is_some() {
+            return &[("⏎", "save"), ("Esc", "cancel"), ("Ctrl-U", "clear")];
+        }
+        if self.picker.is_some() {
+            return &[("↑↓", "choose"), ("⏎", "save"), ("Esc", "cancel")];
+        }
+        if self.multi.is_some() {
+            return &[("↑↓", "move"), ("Space", "tick"), ("⏎", "save"), ("Esc", "cancel")];
+        }
+        if let Some(h) = &self.host_form {
+            return if h.editing {
+                &[("⏎", "done"), ("Tab", "next field"), ("Esc", "undo this field")]
+            } else {
+                &[("↑↓", "move"), ("⏎", "edit / press"), ("Esc", "close without saving")]
+            };
+        }
+        if !self.in_fields {
+            return &[("↑↓", "group"), ("→ ⏎", "open"), ("Esc", "close settings")];
+        }
+        match self.selected() {
+            Some(SRow::Field(i)) => match self.fields.get(i).map(|f| (&f.kind, f.editable(), f.section.as_str())) {
+                Some((_, false, _)) => &[("", "set by the environment"), ("←", "groups")],
+                Some((Kind::Bool, _, "ask")) => &[("⏎", "switch"), ("r", "default"), ("t", "test"), ("←", "groups")],
+                Some((Kind::Bool, ..)) => &[("⏎", "switch on/off"), ("r", "default"), ("←", "groups")],
+                Some((Kind::Choice(_) | Kind::Multi(_), ..)) => &[("⏎", "choose"), ("r", "default"), ("←", "groups")],
+                Some((_, _, "ask")) => {
+                    &[("⏎", "edit"), ("r", "default"), ("t", "test"), ("m", "models"), ("←", "groups")]
+                }
+                _ => &[("⏎", "edit"), ("r", "default"), ("←", "groups")],
+            },
+            Some(SRow::Host(_)) => &[("⏎", "edit"), ("d", "remove"), ("t", "test ssh"), ("←", "groups")],
+            Some(SRow::AddHost) => &[("⏎", "add a host"), ("←", "groups")],
+            Some(SRow::AskOption(_)) => &[("⏎", "use this"), ("t", "test"), ("m", "models"), ("←", "groups")],
+            Some(SRow::AskAdvanced) => &[("⏎", "show / hide"), ("←", "groups")],
+            None => &[("←", "groups")],
+        }
+    }
+
     pub fn field(&self) -> Option<&crate::settings::Field> {
         match self.selected() {
             Some(SRow::Field(i)) => self.fields.get(i),
@@ -582,12 +692,17 @@ pub struct HostForm {
     pub index: Option<usize>,
     /// name, ssh destination, fat path, groups, tags.
     pub values: [String; 5],
+    /// Field, or [`HostForm::SAVE`] / [`HostForm::TEST`].
     pub sel: usize,
     pub editing: bool,
+    /// The field's value before this edit (Esc puts it back).
+    pub undo: String,
 }
 
 impl HostForm {
     pub const LABELS: [&'static str; 5] = ["Name", "ssh destination", "fat path", "Groups", "Tags"];
+    pub const SAVE: usize = 5;
+    pub const TEST: usize = 6;
     pub const HELP: [&'static str; 5] = [
         "how fat names it (and the ssh destination if none is given)",
         "user@host or an ssh config alias; empty = the name",
@@ -608,6 +723,7 @@ impl HostForm {
             ],
             sel: 0,
             editing: index.is_none(),
+            undo: String::new(),
         }
     }
 
@@ -2109,7 +2225,10 @@ impl App {
         if self.modal != Modal::None {
             return self.on_modal_key(k);
         }
-        if self.tab == Tab::Settings && self.settings.capturing() {
+        if self.tab == Tab::Settings
+            && (self.settings.capturing()
+                || (self.settings.in_fields && matches!(k.code, KeyCode::Esc | KeyCode::Left)))
+        {
             return self.on_settings_key(k);
         }
         if self.tab == Tab::Ask && (self.ask.typing || (k.code == KeyCode::Esc && self.ask.pending.is_some())) {
@@ -2215,19 +2334,18 @@ impl App {
     fn on_settings_key(&mut self, k: KeyEvent) -> Vec<Command> {
         use crate::settings::{Kind, Source};
         let ui = &mut self.settings;
-        let rows = ui.rows();
-        let n = rows.len();
-        // Typing a value.
+        // Typing a value: ⏎ saves when it is valid, Esc leaves it as it was.
         if let Some(mut input) = ui.editing.take() {
             match k.code {
                 KeyCode::Esc => {}
                 KeyCode::Enter => {
-                    if let Some(f) = ui.field() {
-                        return vec![Command::SetSetting {
-                            section: f.section.clone(),
-                            key: f.key.clone(),
-                            value: Some(input),
-                        }];
+                    if let Some(f) = ui.field().cloned() {
+                        if let Err(e) = crate::settings::parse_input(&f, &input) {
+                            ui.note = Some((e, true));
+                            ui.editing = Some(input);
+                            return Vec::new();
+                        }
+                        return vec![Command::SetSetting { section: f.section, key: f.key, value: Some(input) }];
                     }
                 }
                 KeyCode::Backspace => {
@@ -2243,22 +2361,35 @@ impl App {
             }
             return Vec::new();
         }
-        // Choosing a model.
-        if let Some((models, mut i)) = ui.picker.take() {
+        // Choosing one value: ⏎ saves, Esc leaves it (and puts back a previewed theme).
+        if let Some(mut p) = ui.picker.take() {
             match k.code {
-                KeyCode::Esc => {}
+                KeyCode::Esc => {
+                    if let Some(t) = p.preview_from {
+                        crate::tui::theme::set(t);
+                    }
+                }
                 KeyCode::Enter => {
-                    if let Some(m) = models.get(i) {
-                        return vec![Command::SetSetting {
-                            section: "ask".into(),
-                            key: "model".into(),
-                            value: Some(m.clone()),
-                        }];
+                    if p.current == Some(p.sel) {
+                        if let Some(t) = p.preview_from {
+                            crate::tui::theme::set(t);
+                        }
+                        return Vec::new();
+                    }
+                    if let Some(v) = p.items.get(p.sel) {
+                        return vec![Command::SetSetting { section: p.section, key: p.key, value: Some(v.clone()) }];
                     }
                 }
                 code => {
-                    list_nav(&mut i, models.len(), code);
-                    ui.picker = Some((models, i));
+                    list_nav(&mut p.sel, p.items.len(), code);
+                    if p.preview_from.is_some()
+                        && let Some(name) = p.items.get(p.sel)
+                    {
+                        let cfg = crate::config::ThemeCfg { name: name.clone(), ..Default::default() };
+                        let env = |k: &str| std::env::var(k).ok();
+                        crate::tui::theme::set(crate::tui::theme::Theme::from_cfg(&cfg, &env).0);
+                    }
+                    ui.picker = Some(p);
                 }
             }
             return Vec::new();
@@ -2303,29 +2434,55 @@ impl App {
             }
             return Vec::new();
         }
-        // The host form.
+        // The host form: fields, then the Save and Test buttons.
         if let Some(mut form) = ui.host_form.take() {
+            const ROWS: usize = HostForm::LABELS.len() + 2;
             if form.editing {
                 match k.code {
-                    KeyCode::Esc | KeyCode::Enter => form.editing = false,
+                    KeyCode::Enter => form.editing = false,
+                    KeyCode::Esc => {
+                        form.values[form.sel] = std::mem::take(&mut form.undo);
+                        form.editing = false;
+                    }
                     KeyCode::Backspace => {
                         form.values[form.sel].pop();
                     }
                     KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => form.values[form.sel].clear(),
                     KeyCode::Char(c) => form.values[form.sel].push(c),
-                    KeyCode::Tab | KeyCode::Down => form.sel = (form.sel + 1) % 5,
-                    KeyCode::BackTab | KeyCode::Up => form.sel = (form.sel + 4) % 5,
+                    KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
+                        let n = HostForm::LABELS.len();
+                        form.sel = if matches!(k.code, KeyCode::Tab | KeyCode::Down) {
+                            (form.sel + 1) % n
+                        } else {
+                            (form.sel + n - 1) % n
+                        };
+                        form.undo = form.values[form.sel].clone();
+                    }
                     _ => {}
                 }
                 ui.host_form = Some(form);
                 return Vec::new();
             }
-            match k.code {
-                KeyCode::Esc => return Vec::new(),
-                KeyCode::Up | KeyCode::Char('k') => form.sel = form.sel.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => form.sel = (form.sel + 1).min(4),
-                KeyCode::Enter | KeyCode::Char('e') => form.editing = true,
-                KeyCode::Char('s') => {
+            let press = match k.code {
+                KeyCode::Esc => {
+                    ui.note = Some(("closed without saving".into(), false));
+                    return Vec::new();
+                }
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                    form.sel = form.sel.saturating_sub(1);
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    form.sel = (form.sel + 1).min(ROWS - 1);
+                    None
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => Some(form.sel),
+                KeyCode::Char('s') => Some(HostForm::SAVE),
+                KeyCode::Char('t') => Some(HostForm::TEST),
+                _ => None,
+            };
+            match press {
+                Some(HostForm::SAVE) => {
                     let host = form.host();
                     let index = form.index;
                     if let Err(e) = crate::settings::check_host(&host) {
@@ -2335,39 +2492,48 @@ impl App {
                     }
                     return vec![Command::SaveHost { index, host }];
                 }
-                KeyCode::Char('t') if ui.busy.is_none() => {
+                Some(HostForm::TEST) if ui.busy.is_none() => {
                     let host = form.host();
                     ui.busy = Some(format!("ssh {}…", host.ssh.as_deref().unwrap_or(&host.name)));
                     ui.note = None;
                     ui.host_form = Some(form);
                     return vec![Command::TestHost(host)];
                 }
+                Some(i) if i < HostForm::LABELS.len() => {
+                    form.undo = form.values[i].clone();
+                    form.editing = true;
+                }
                 _ => {}
             }
             ui.host_form = Some(form);
             return Vec::new();
         }
-        let group_start = |ui: &SettingsUi, g: &str| rows.iter().position(|r| ui.group_of(*r) == g);
-        match k.code {
-            KeyCode::Up | KeyCode::Char('k') => ui.sel = ui.sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => ui.sel = (ui.sel + 1).min(n.saturating_sub(1)),
-            KeyCode::PageUp => ui.sel = ui.sel.saturating_sub(10),
-            KeyCode::PageDown => ui.sel = (ui.sel + 10).min(n.saturating_sub(1)),
-            KeyCode::Home | KeyCode::Char('g') => ui.sel = 0,
-            KeyCode::End | KeyCode::Char('G') => ui.sel = n.saturating_sub(1),
-            KeyCode::Left | KeyCode::Right => {
-                let groups = crate::settings::GROUPS;
-                let cur = rows.get(ui.sel).map(|r| ui.group_of(*r)).unwrap_or(groups[0]);
-                let gi = groups.iter().position(|g| *g == cur).unwrap_or(0);
-                let next = if k.code == KeyCode::Right {
-                    (gi + 1) % groups.len()
-                } else {
-                    (gi + groups.len() - 1) % groups.len()
-                };
-                if let Some(i) = group_start(ui, groups[next]) {
-                    ui.sel = i;
-                }
+        // The group list on the left.
+        if !ui.in_fields {
+            match k.code {
+                KeyCode::Up | KeyCode::Char('k') => ui.move_group(-1),
+                KeyCode::Down | KeyCode::Char('j') => ui.move_group(1),
+                KeyCode::Home | KeyCode::Char('g') => ui.move_group(-99),
+                KeyCode::End | KeyCode::Char('G') => ui.move_group(99),
+                KeyCode::Right | KeyCode::Enter => ui.in_fields = true,
+                _ => {}
             }
+            return Vec::new();
+        }
+        // The settings of one group.
+        let rows = ui.rows();
+        match k.code {
+            KeyCode::Left | KeyCode::Esc => ui.in_fields = false,
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::Char('g')
+            | KeyCode::Char('G') => ui.move_in_group(k.code),
+            KeyCode::Char('k') => ui.move_in_group(KeyCode::Up),
+            KeyCode::Char('j') => ui.move_in_group(KeyCode::Down),
             KeyCode::Enter | KeyCode::Char(' ') => match rows.get(ui.sel).copied() {
                 Some(SRow::Host(i)) => {
                     if let Some(h) = ui.hosts.get(i) {
@@ -2393,12 +2559,17 @@ impl App {
                             return vec![Command::SetSetting { section: f.section, key: f.key, value: Some(v.into()) }];
                         }
                         (Kind::Choice(opts), _) => {
-                            let i = opts.iter().position(|o| *o == f.value).map_or(0, |i| (i + 1) % opts.len());
-                            return vec![Command::SetSetting {
+                            let current = opts.iter().position(|o| *o == f.value);
+                            let theme = f.section == "theme" && f.key == "name";
+                            ui.picker = Some(Picker {
+                                title: f.label.clone(),
                                 section: f.section,
                                 key: f.key,
-                                value: Some(opts[i].to_string()),
-                            }];
+                                items: opts.iter().map(|o| o.to_string()).collect(),
+                                sel: current.unwrap_or(0),
+                                current,
+                                preview_from: theme.then(crate::tui::theme::get),
+                            });
                         }
                         (Kind::Multi(opts), _) => {
                             let on: Vec<&str> = f.value.split(',').map(str::trim).collect();
@@ -2423,7 +2594,16 @@ impl App {
                 if let Some(f) = ui.field() {
                     if f.editable() && f.source == Source::File {
                         let f = f.clone();
-                        return vec![Command::SetSetting { section: f.section, key: f.key, value: None }];
+                        let env = |_: &str| None;
+                        let default = crate::settings::fields(&crate::config::Config::default(), "", &env)
+                            .into_iter()
+                            .find(|d| d.section == f.section && d.key == f.key)
+                            .map(|d| shown_value(&d))
+                            .unwrap_or_else(|| "its default".into());
+                        self.modal = Modal::Confirm {
+                            prompt: format!("Set {} back to the default ({default})?", f.label),
+                            cmd: Command::SetSetting { section: f.section, key: f.key, value: None },
+                        };
                     } else if f.editable() {
                         ui.note = Some((format!("{} already uses its default", f.label), false));
                     }
@@ -2437,13 +2617,14 @@ impl App {
                         return vec![Command::TestHost(h)];
                     }
                 }
-                _ => {
+                _ if ui.group() == "Ask" => {
                     ui.busy = Some("testing the model…".into());
                     ui.note = None;
                     return vec![Command::SettingsTest];
                 }
+                _ => {}
             },
-            KeyCode::Char('m') if ui.busy.is_none() => {
+            KeyCode::Char('m') if ui.busy.is_none() && ui.group() == "Ask" => {
                 ui.busy = Some("asking the server for its models…".into());
                 ui.note = None;
                 return vec![Command::SettingsModels];
@@ -3590,6 +3771,21 @@ pub(crate) fn step(cur: usize, delta: isize, len: usize) -> usize {
 }
 
 /// Up/Down/PgUp/PgDn/Home/End on a plain list. Returns true if handled.
+/// A setting's value the way the screen shows it ("on", "auto", "—").
+pub fn shown_value(fd: &crate::settings::Field) -> String {
+    use crate::settings::Kind;
+    match (&fd.kind, fd.value.as_str()) {
+        (Kind::Bool, "true") => "on".to_string(),
+        (Kind::Bool, _) => "off".to_string(),
+        (Kind::Multi(_), "") => "nothing (read-only)".to_string(),
+        (Kind::Text | Kind::List | Kind::Map, "") => "—".to_string(),
+        (Kind::Number(..), "0") if matches!(fd.key.as_str(), "context_bytes" | "num_ctx" | "timeout_s") => {
+            "auto".to_string()
+        }
+        (_, v) => v.to_string(),
+    }
+}
+
 pub(crate) fn list_nav(sel: &mut usize, len: usize, code: KeyCode) -> bool {
     let delta = match code {
         KeyCode::Up => -1,
@@ -5209,6 +5405,7 @@ pub(crate) mod tests {
         a.settings = ui;
         a.tab = Tab::Settings;
         a.settings.sel = 1;
+        a.settings.in_fields = true;
         assert_eq!(
             a.on_key(code(KeyCode::Enter)),
             vec![Command::ApplyAskOption(opt("ollama", Some("http://127.0.0.1:11434")))]
@@ -5216,6 +5413,99 @@ pub(crate) mod tests {
         a.settings.sel = a.settings.rows().iter().position(|r| *r == SRow::AskAdvanced).unwrap();
         a.on_key(code(KeyCode::Enter));
         assert!(!a.settings.ask_advanced, "Enter folds Advanced");
+    }
+
+    fn settings_app() -> App {
+        let mut a = app();
+        let env = |_: &str| None;
+        a.settings.fields = crate::settings::fields(&crate::config::Config::default(), "", &env);
+        a.tab = Tab::Settings;
+        a
+    }
+
+    #[test]
+    fn theme_choice_previews_and_esc_puts_it_back() {
+        use crate::tui::theme::{self, Theme};
+        theme::set(Theme::dark());
+        let mut a = settings_app();
+        a.settings.sel = a.settings.rows().iter().position(|r| a.settings.row_id(*r) == "f:theme.name").unwrap();
+        a.settings.in_fields = true;
+        a.on_key(code(KeyCode::Enter));
+        assert_eq!(a.settings.picker.as_ref().unwrap().current, Some(0), "auto");
+        a.on_key(code(KeyCode::Down));
+        a.on_key(code(KeyCode::Down));
+        assert_eq!(theme::get().name, "light", "moving previews the theme");
+        assert!(a.on_key(code(KeyCode::Esc)).is_empty());
+        assert_eq!(theme::get(), Theme::dark(), "Esc goes back to the theme in use");
+        a.on_key(code(KeyCode::Enter));
+        a.on_key(code(KeyCode::Down));
+        assert_eq!(
+            a.on_key(code(KeyCode::Enter)),
+            vec![Command::SetSetting { section: "theme".into(), key: "name".into(), value: Some("dark".into()) }]
+        );
+        theme::set(Theme::dark());
+    }
+
+    #[test]
+    fn settings_focus_moves_between_groups_and_fields() {
+        let mut a = settings_app();
+        a.settings.reselect(None, "Interface");
+        assert_eq!(a.settings.group(), "Interface");
+        a.on_key(code(KeyCode::Down));
+        assert_eq!(a.settings.group(), "Interface", "the last group stays put");
+        a.on_key(code(KeyCode::Up));
+        assert_eq!(a.settings.group(), "Updates");
+        a.on_key(code(KeyCode::Enter));
+        assert!(a.settings.in_fields);
+        for _ in 0..10 {
+            a.on_key(code(KeyCode::Down));
+        }
+        assert_eq!(a.settings.group(), "Updates", "↓ stays inside the group");
+        a.on_key(code(KeyCode::Left));
+        assert!(!a.settings.in_fields);
+        // Rows added above (the ways to connect ask, detected late) don't move the selection.
+        let id = a.settings.selected_id();
+        a.settings.ask_options = vec![crate::llm::AskOption { key: "off".into(), ..Default::default() }; 4];
+        a.settings.reselect(id.as_deref(), "Updates");
+        assert_eq!(a.settings.selected_id(), id);
+    }
+
+    #[test]
+    fn host_form_edits_undo_and_buttons() {
+        let mut a = settings_app();
+        a.settings.reselect(Some("h:+"), "Hosts");
+        a.settings.in_fields = true;
+        a.on_key(code(KeyCode::Enter));
+        let f = a.settings.host_form.as_ref().unwrap();
+        assert!(f.editing && f.sel == 0, "a new host starts typing its name");
+        for c in "web-01".chars() {
+            a.on_key(key(c));
+        }
+        a.on_key(code(KeyCode::Enter));
+        a.on_key(code(KeyCode::Down));
+        a.on_key(code(KeyCode::Enter));
+        for c in "oops".chars() {
+            a.on_key(key(c));
+        }
+        a.on_key(code(KeyCode::Esc));
+        let f = a.settings.host_form.as_ref().unwrap();
+        assert_eq!(
+            (f.values[0].as_str(), f.values[1].as_str(), f.editing),
+            ("web-01", "", false),
+            "Esc undid the field"
+        );
+        for _ in 0..10 {
+            a.on_key(code(KeyCode::Down));
+        }
+        assert_eq!(a.settings.host_form.as_ref().unwrap().sel, HostForm::TEST);
+        a.on_key(code(KeyCode::Up));
+        let cmds = a.on_key(code(KeyCode::Enter));
+        assert!(matches!(&cmds[..], [Command::SaveHost { index: None, host }] if host.name == "web-01"), "{cmds:?}");
+        // Esc outside a field closes the form without saving.
+        a.settings.host_form = Some(HostForm::from(None, &Default::default()));
+        a.settings.host_form.as_mut().unwrap().editing = false;
+        assert!(a.on_key(code(KeyCode::Esc)).is_empty());
+        assert!(a.settings.host_form.is_none() && a.tab == Tab::Settings);
     }
 
     #[test]

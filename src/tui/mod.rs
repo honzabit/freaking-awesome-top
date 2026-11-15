@@ -1125,7 +1125,7 @@ impl Ctx {
             }
             Err(e) => (e, true),
         };
-        let sel = app.settings.sel;
+        let (id, group, in_fields) = (app.settings.selected_id(), app.settings.group(), app.settings.in_fields);
         let host_form = app.settings.host_form.take();
         let ask_options = std::mem::take(&mut app.settings.ask_options);
         let ask_advanced = app.settings.ask_advanced;
@@ -1138,10 +1138,11 @@ impl Ctx {
             ui.fields = crate::settings::fields(&Config { ask: self.cfg.ask.clone(), ..file_cfg.clone() }, &text, &env);
             ui.hosts = file_cfg.hosts;
         }
-        ui.sel = sel.min(ui.rows().len().saturating_sub(1));
         ui.host_form = host_form;
         ui.ask_options = ask_options;
         ui.ask_advanced = ask_advanced;
+        ui.in_fields = in_fields;
+        ui.reselect(id.as_deref(), group);
         ui.note = Some(note);
         app.settings = ui;
     }
@@ -1369,6 +1370,7 @@ impl Ctx {
                 }
             }
             Command::LoadSettings => {
+                let (id, group) = (app.settings.selected_id(), app.settings.group());
                 let keep = std::mem::take(&mut app.settings);
                 let mut ui = settings_ui(&self.cfg, self.settings_path.as_deref());
                 ui.ask_options = keep.ask_options.clone();
@@ -1383,10 +1385,9 @@ impl Ctx {
                         }
                     });
                 }
-                ui.sel = keep.sel.min(ui.rows().len().saturating_sub(1));
-                ui.note = keep.note.or_else(|| {
-                    Some(("⏎ change · r reset to default · t test · m pick a model · ←→ groups".into(), false))
-                });
+                ui.in_fields = keep.in_fields;
+                ui.reselect(id.as_deref(), group);
+                ui.note = keep.note;
                 app.settings = ui;
             }
             Command::SetSetting { section, key, value } => {
@@ -1448,6 +1449,7 @@ impl Ctx {
                     let rows = app.settings.rows();
                     if let Some(i) = rows.iter().position(|r| matches!(r, app::SRow::Field(f) if app.settings.fields[*f].key == key && app.settings.fields[*f].section == "ask")) {
                         app.settings.sel = i;
+                        app.settings.in_fields = true;
                         app.settings.editing = Some(String::new());
                     }
                 } else if o.key != "off" && app.ask_ready {
@@ -1568,8 +1570,11 @@ fn apply_msg(app: &mut App, msg: Msg) {
             }
         }
         Msg::AskOptions(opts) => {
+            // New rows at the top of Ask: keep the same row selected, wherever it moved to.
+            let (id, group) = (app.settings.selected_id(), app.settings.group());
             app.settings.ask_options = opts;
             app.settings.ask_detecting = false;
+            app.settings.reselect(id.as_deref(), group);
         }
         Msg::SettingsModels(r) => {
             if let Some(ui) = app.settings_ui() {
@@ -1578,8 +1583,16 @@ fn apply_msg(app: &mut App, msg: Msg) {
                     Ok(models) => {
                         let cur =
                             ui.fields.iter().find(|f| f.key == "model").map(|f| f.value.clone()).unwrap_or_default();
-                        let i = models.iter().position(|m| *m == cur).unwrap_or(0);
-                        ui.picker = Some((models, i));
+                        let current = models.iter().position(|m| *m == cur);
+                        ui.picker = Some(app::Picker {
+                            title: "Models".into(),
+                            section: "ask".into(),
+                            key: "model".into(),
+                            items: models,
+                            sel: current.unwrap_or(0),
+                            current,
+                            preview_from: None,
+                        });
                     }
                     Err(e) => ui.note = Some((e, true)),
                 }
@@ -1901,13 +1914,30 @@ mod tests {
             let ui = &mut app.settings;
             ui.sel =
                 ui.rows().iter().position(|r| matches!(r, app::SRow::Field(i) if ui.fields[*i].key == key)).unwrap();
+            ui.in_fields = true;
         };
         for c in app.on_key(KeyEvent::from(KeyCode::Char(','))) {
             ctx.exec(&mut app, c);
         }
         assert_eq!(app.tab, app::Tab::Settings);
-        // Choices cycle and save at once.
+        // The group list has the keyboard first; → goes into the settings.
+        assert!(!app.settings.in_fields);
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.settings.group(), "Recording", "↓ moves between groups");
+        app.on_key(KeyEvent::from(KeyCode::Right));
+        assert!(app.settings.in_fields);
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(!app.settings.in_fields && app.tab == app::Tab::Settings, "Esc goes back to the groups first");
+        // A choice opens a list; nothing is saved until ⏎, and Esc leaves it as it was.
         select(&mut app, "detail");
+        assert!(app.on_key(KeyEvent::from(KeyCode::Enter)).is_empty());
+        let p = app.settings.picker.clone().expect("a list of the choices");
+        assert_eq!((p.items.clone(), p.current), (vec!["full".to_string(), "minimal".to_string()], Some(0)));
+        assert!(app.on_key(KeyEvent::from(KeyCode::Down)).is_empty(), "moving saves nothing");
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.settings.picker.is_none() && ctx.cfg.ask.detail == "full");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app.on_key(KeyEvent::from(KeyCode::Down));
         let cmds = app.on_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(
             cmds,
@@ -1940,10 +1970,24 @@ mod tests {
         ctx.exec(&mut app, set("url", Some("llm:1234")));
         assert!(app.settings.note.as_ref().is_some_and(|(t, e)| *e && t.contains("http://")));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        // Typed: refused before saving, and the text stays to be fixed.
+        select(&mut app, "url");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app.settings.editing = Some("llm:1234".into());
+        assert!(app.on_key(KeyEvent::from(KeyCode::Enter)).is_empty());
+        assert_eq!(app.settings.editing.as_deref(), Some("llm:1234"));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.settings.editing.is_none());
         ctx.exec(&mut app, set("url", Some("http://127.0.0.1:1")));
         ctx.exec(&mut app, set("model", Some("m")));
         assert_eq!(app.ask_dest, "openai · m · http://127.0.0.1:1 · minimal detail");
-        // Reset removes the key; the default applies again.
+        // r asks first, naming the default; then the key is removed and the default applies again.
+        select(&mut app, "model");
+        assert!(app.on_key(KeyEvent::from(KeyCode::Char('r'))).is_empty());
+        let Modal::Confirm { prompt, cmd } = app.modal.clone() else { panic!("expected a confirmation") };
+        assert!(prompt.contains("back to the default (—)"), "{prompt}");
+        assert_eq!(cmd, set("model", None));
+        app.modal = Modal::None;
         ctx.exec(&mut app, set("model", None));
         assert!(ctx.cfg.ask.model.is_empty());
         assert!(!std::fs::read_to_string(&path).unwrap().contains("model ="));
@@ -1983,7 +2027,9 @@ mod tests {
         assert!(std::fs::read_to_string(&path).unwrap().contains("[[hosts]]"));
         ctx.exec(&mut app, Command::DeleteHost(0));
         assert!(app.settings.hosts.is_empty());
-        // Esc goes back to the view.
+        // Esc goes to the groups, then back to the view.
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.tab, app::Tab::Settings);
         app.on_key(KeyEvent::from(KeyCode::Esc));
         assert_eq!(app.tab, app::Tab::Procs);
         let _ = std::fs::remove_dir_all(&dir);

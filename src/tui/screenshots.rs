@@ -571,6 +571,7 @@ fn screenshots() {
         opt("off", "Off", "ask sends nothing", true, None),
     ];
     a.settings.sel = 6;
+    a.settings.in_fields = true;
     a.tab = Tab::Settings;
     let out = shot(&mut a, "settings", "fat · Settings", 34);
     assert!(out.contains("Connect ask to") && out.contains("Claude Code"), "{out}");
