@@ -2150,9 +2150,13 @@ mod tests {
         if !have_perl_hires() {
             return;
         }
-        // Sequential ~0.4s busy children: each lives about one poll, so per-process sampling
-        // used to read them as 0% CPU.
-        let script = "for i in 1 2 3 4 5 6 7 8; do perl -MTime::HiRes=time -e '$t=time; 1 while time-$t<0.4'; done";
+        // Waves of ~0.4s busy children: each lives about one poll, so per-process sampling
+        // used to read them as 0% CPU. Four per wave so the job demands several cores: on a
+        // loaded machine one busy loop really gets well under the 50% budget (the meter is
+        // right, the job just isn't over), while four stay over it even at a small share.
+        let script = "for i in 1 2 3 4 5 6 7 8; do \
+                      for j in 1 2 3 4; do perl -MTime::HiRes=time -e '$t=time; 1 while time-$t<0.4' & done; \
+                      wait; done";
         let b = Budget { cpu: Some(50.0), on_violation: "warn".into(), ..Default::default() };
         let r = supervise(&sv(&["sh", "-c", script]), &b, Mode::Poll).unwrap();
         assert_eq!(r.code, 0);
