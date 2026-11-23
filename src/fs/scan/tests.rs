@@ -412,10 +412,22 @@ fn interrupted_scan_resumes_from_cache() {
     let sc = Scanner::with_options(Options { cache_path: Some(db), ..opts() });
     let a = sc.list(&fx.s(done)).expect("finished dir loaded from cache");
     assert!(!a.dir.partial);
-    sc.ensure(&root, true);
+    // What `ensure` does to a never-measured root, minus starting the workers: they can finish
+    // this tiny tree before the partial state below is read.
+    {
+        let p = norm(&root);
+        let mut st = lock(&sc.sh().st);
+        st.allow(&p);
+        st.add_root(&p, true, 0);
+        let id = st.tree.find_or_create(&p);
+        assert!(st.prepare_root(id, &p));
+        st.requeue(id, false, true);
+    }
     // The root's lower bound includes the finished dir from the cache even before anything is re-read.
     let l = sc.list(&root).unwrap();
-    assert!(l.dir.partial && l.dir.size >= a.dir.size, "{} < {}", l.dir.size, a.dir.size);
+    assert!(l.dir.partial, "root is still being measured");
+    assert!(l.dir.size >= a.dir.size, "{} < {}", l.dir.size, a.dir.size);
+    sc.ensure(&root, true);
     let fin = sc.scan_blocking(&root, 30_000).unwrap();
     assert!(!fin.dir.partial);
     assert!(!child(&fin, done).partial);
@@ -809,7 +821,8 @@ fn reader_drops_deleted_dirs() {
     wait_complete(&a, &root);
     let b = Scanner::with_options(o);
     b.ensure(&root, false);
-    assert!(b.list(&fx.s("gone")).is_some(), "b loaded a's cache");
+    // a flushes on its own schedule; b picks that up on its next reload.
+    wait_for("b loaded a's cache", 20, &|| b.list(&fx.s("gone")).is_some());
     std::fs::remove_dir_all(fx.p("gone")).unwrap();
     a.rescan(&root);
     wait_for("b drops gone/", 20, &|| {
@@ -891,9 +904,14 @@ fn wants_are_validated_and_pruned() {
     let b = Scanner::with_options(Options { background: true, ..o.clone() });
     b.ensure(&fx.s("pub"), false);
     wait_for("b is writer and loaded wants", 20, &|| lock(&b.sh().st).writer && lock(&b.sh().st).last_wants > 0);
-    thread::sleep(Duration::from_millis(200));
-    let w: Vec<String> = cache::Db::open(&db.p("fs-index.db")).unwrap().wants().into_iter().map(|w| w.0).collect();
-    assert_eq!(w, vec![fx.s("pub")], "nested, expired and vanished wants are dropped");
+    // `last_wants` is set just before the pruning runs.
+    let wants =
+        || -> Vec<String> { cache::Db::open(&db.p("fs-index.db")).unwrap().wants().into_iter().map(|w| w.0).collect() };
+    let t0 = Instant::now();
+    while wants() != vec![fx.s("pub")] && t0.elapsed() < Duration::from_secs(20) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(wants(), vec![fx.s("pub")], "nested, expired and vanished wants are dropped");
     drop(b);
 }
 

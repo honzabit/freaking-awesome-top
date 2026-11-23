@@ -1242,6 +1242,14 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
         let t1 = now_ms();
         t.observe(&snap(t1));
+        // The writer may be starved on a loaded machine: wait until it has really written
+        // past what the first observation can have seen.
+        let len = || std::fs::metadata(&fp).map_or(0, |m| m.len());
+        let seen = len();
+        let t0 = std::time::Instant::now();
+        while len() <= seen && t0.elapsed() < std::time::Duration::from_secs(20) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         std::thread::sleep(std::time::Duration::from_millis(800));
         t.observe(&snap(t1 + openfiles::MIN_INTERVAL_MS));
         let _ = child.kill();
