@@ -658,6 +658,11 @@ unsafe extern "C" {
 /// macOS: QoS background (also throttles disk I/O) vs utility. Linux: ioprio idle vs
 /// best-effort/7, and nice 19 on the first lowering (nice cannot be raised back unprivileged).
 pub fn set_background(on: bool) {
+    // Tests wait on the scanner with deadlines; at background priority a busy machine can
+    // starve it for longer than any of them.
+    if cfg!(test) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     // SAFETY: changes only the calling thread's QoS class.
     unsafe {

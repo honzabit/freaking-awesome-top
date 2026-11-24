@@ -3356,12 +3356,20 @@ mod tests {
         a.on_snapshot(s);
         let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
         term.draw(|f| draw(f, &mut a)).unwrap(); // includes the one-time sort
-        let t = std::time::Instant::now();
+        // This thread's CPU time: the cost of a render, without the time a busy machine keeps
+        // the thread waiting for a core.
+        let cpu = || {
+            // SAFETY: clock_gettime writes into a zeroed timespec we own.
+            let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) }, 0);
+            std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+        };
+        let t = cpu();
         let n = 50;
         for _ in 0..n {
             term.draw(|f| draw(f, &mut a)).unwrap();
         }
-        let per = t.elapsed() / n;
+        let per = (cpu() - t) / n;
         eprintln!("render 800 procs @160x48: {per:?}/frame");
         // generous bound for debug builds on CI; release is far below 5ms
         assert!(per < std::time::Duration::from_millis(40), "render took {per:?}");

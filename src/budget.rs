@@ -2100,10 +2100,14 @@ mod tests {
 
     #[test]
     fn cpu_budget_kills() {
-        let b = Budget { cpu: Some(50.0), on_violation: "kill".into(), ..Default::default() };
+        let _busy = busy_test();
+        // `time` is only a watchdog: if the cpu budget never fires, fail instead of hanging.
+        let b = Budget { cpu: Some(50.0), time: Some(30), on_violation: "kill".into(), ..Default::default() };
+        let script = format!("{}wait", "yes > /dev/null & ".repeat(spinners()));
         let t = Instant::now();
-        let code = supervise(&sv(&["sh", "-c", "yes > /dev/null"]), &b, Mode::Poll).unwrap().code;
-        assert_ne!(code, 0);
+        let r = supervise(&sv(&["sh", "-c", &script]), &b, Mode::Poll).unwrap();
+        assert_ne!(r.code, 0);
+        assert!(r.fired.contains(&Kind::Cpu), "{r:?}");
         assert!(t.elapsed() < Duration::from_secs(10), "took {:?}", t.elapsed());
     }
 
@@ -2114,6 +2118,18 @@ mod tests {
         let code = supervise(&sv(&["sleep", "30"]), &b, Mode::Poll).unwrap().code;
         assert_eq!(code, 128 + libc::SIGTERM);
         assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Busy processes a cpu-budget test runs at once: one per core, so the job's share stays
+    /// over its budget even when the scheduler gives each process a small slice.
+    fn spinners() -> usize {
+        std::thread::available_parallelism().map_or(4, |n| n.get().max(4))
+    }
+
+    /// Serializes the tests that saturate the cpu, so they don't starve each other.
+    fn busy_test() -> std::sync::MutexGuard<'static, ()> {
+        static BUSY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        BUSY.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn have_perl() -> bool {
@@ -2150,11 +2166,15 @@ mod tests {
         if !have_perl_hires() {
             return;
         }
-        // Sequential ~0.4s busy children: each lives about one poll, so per-process sampling
-        // used to read them as 0% CPU.
-        let script = "for i in 1 2 3 4 5 6 7 8; do perl -MTime::HiRes=time -e '$t=time; 1 while time-$t<0.4'; done";
+        let _busy = busy_test();
+        // Waves of ~0.4s busy children: each lives about one poll, so per-process sampling
+        // used to read them as 0% CPU. One per core in each wave: on a loaded machine a single
+        // busy loop really gets well under the 50% budget (the meter is right, the job just
+        // isn't over).
+        let wave = "perl -MTime::HiRes=time -e '$t=time; 1 while time-$t<0.4' & ".repeat(spinners());
+        let script = format!("for i in 1 2 3 4 5 6 7 8; do {wave}wait; done");
         let b = Budget { cpu: Some(50.0), on_violation: "warn".into(), ..Default::default() };
-        let r = supervise(&sv(&["sh", "-c", script]), &b, Mode::Poll).unwrap();
+        let r = supervise(&sv(&["sh", "-c", &script]), &b, Mode::Poll).unwrap();
         assert_eq!(r.code, 0);
         assert!(r.fired.contains(&Kind::Cpu), "short-lived children escaped the cpu budget: {r:?}");
         assert!(r.peak.cpu > 60.0, "{r:?}");
@@ -2162,32 +2182,40 @@ mod tests {
 
     #[test]
     fn kill_reaches_descendants_that_left_the_group() {
+        let _busy = busy_test();
         let dir = std::env::temp_dir().join(format!("fat-budget-escape-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let pidfile = dir.join("yes.pid");
         let _ = std::fs::remove_file(&pidfile);
-        // `set -m` puts the background job in its own process group; `kill -pgid` misses it.
-        let script = format!("set -m; yes > /dev/null & echo $! > {}; sleep 30", pidfile.display());
-        let b = Budget { cpu: Some(50.0), on_violation: "kill".into(), ..Default::default() };
+        // `set -m` puts each background job in its own process group; `kill -pgid` misses them.
+        let jobs = format!("yes > /dev/null & echo $! >> {}; ", pidfile.display()).repeat(spinners());
+        let script = format!("set -m; {jobs}sleep 30");
+        // `time` is only a watchdog: if the cpu budget never fires, fail instead of hanging.
+        let b = Budget { cpu: Some(50.0), time: Some(20), on_violation: "kill".into(), ..Default::default() };
         let t = Instant::now();
         let r = supervise(&sv(&["sh", "-c", &script]), &b, Mode::Poll).unwrap();
-        assert!(t.elapsed() < Duration::from_secs(15));
-        assert!(r.fired.contains(&Kind::Cpu), "{r:?}");
-        let esc: u32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
-        let mut gone = false;
-        for _ in 0..40 {
-            if crate::actions::live_proc(esc).is_none() {
-                gone = true;
-                break;
-            }
+        let took = t.elapsed();
+        let escaped: Vec<u32> = std::fs::read_to_string(&pidfile)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut left = escaped.clone();
+        while !left.is_empty() && Instant::now() < deadline {
+            left.retain(|&pid| crate::actions::live_proc(pid).is_some());
             std::thread::sleep(Duration::from_millis(50));
         }
-        if !gone {
-            // Clean up the process our own test spawned before failing.
-            unsafe { libc::kill(esc as libc::pid_t, libc::SIGKILL) };
+        left.retain(|&pid| crate::actions::live_proc(pid).is_some());
+        for &pid in &left {
+            // Clean up the processes our own test spawned before failing.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         }
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(gone, "escaped `yes` (pid {esc}) survived the kill");
+        assert!(!escaped.is_empty(), "no job started: {r:?}");
+        assert!(left.is_empty(), "escaped `yes` (pids {left:?}) survived the kill");
+        assert!(r.fired.contains(&Kind::Cpu), "{r:?}");
+        assert!(took < Duration::from_secs(15), "took {took:?}");
     }
 
     #[test]
